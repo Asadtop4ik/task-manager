@@ -6,6 +6,7 @@ import { countTasks, isOverdue } from "@/lib/format";
 import ProjectTag from "@/components/ProjectTag";
 import NewProjectSheet from "@/components/NewProjectSheet";
 import Empty from "@/components/Empty";
+import Page from "@/components/Page";
 
 export default function Projects() {
   const { state } = useAuth();
@@ -19,6 +20,7 @@ export default function Projects() {
   const tasks = data?.items ?? [];
 
   return (
+    <Page>
     <div className="pb-20 sm:pb-6">
       <header className="flex flex-wrap items-center gap-3 px-4 pt-8 pb-5">
         <h1 className="mr-auto text-page font-semibold">Loyihalar</h1>
@@ -96,5 +98,6 @@ export default function Projects() {
 
       {composing && <NewProjectSheet onClose={() => setComposing(false)} />}
     </div>
+    </Page>
   );
 }

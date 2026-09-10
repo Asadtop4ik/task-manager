@@ -23,6 +23,7 @@ import {
 import StatusMenu from "@/components/StatusMenu";
 import ProjectTag from "@/components/ProjectTag";
 import type { Activity, TaskPriority, TaskStatus } from "@/lib/types";
+import Page from "@/components/Page";
 
 function describe(entry: Activity): string {
   const payload = entry.payload as Record<string, string | number | null>;
@@ -85,6 +86,7 @@ export default function TaskDetail() {
   const late = isOverdue(item);
 
   return (
+    <Page>
     <div className="pb-20 sm:pb-6">
       <header className="border-b border-hairline px-4 pt-6 pb-5">
         {/* The bot's "Ochish" button deep-links straight here, so this screen is
@@ -249,5 +251,6 @@ export default function TaskDetail() {
         </ul>
       </section>
     </div>
+    </Page>
   );
 }

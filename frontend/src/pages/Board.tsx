@@ -5,6 +5,7 @@ import { BOARD_COLUMNS, STATUS_LABEL, TRANSITIONS, isOverdue } from "@/lib/forma
 import TaskRow from "@/components/TaskRow";
 import Empty from "@/components/Empty";
 import type { Task, TaskStatus } from "@/lib/types";
+import Page from "@/components/Page";
 
 export default function Board() {
   const { state } = useAuth();
@@ -45,6 +46,7 @@ export default function Board() {
   }
 
   return (
+    <Page wide>
     <div className="pb-20 sm:pb-6">
       <header className="px-4 pt-8 pb-4">
         <h1 className="text-page font-semibold">Doska</h1>
@@ -170,5 +172,6 @@ export default function Board() {
       )}
 
     </div>
+    </Page>
   );
 }

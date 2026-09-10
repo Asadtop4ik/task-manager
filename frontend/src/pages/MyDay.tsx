@@ -4,6 +4,7 @@ import { countTasks, isOverdue, isToday } from "@/lib/format";
 import TaskRow from "@/components/TaskRow";
 import Empty from "@/components/Empty";
 import type { Task } from "@/lib/types";
+import Page from "@/components/Page";
 
 function Section({ title, tasks, tz }: { title: string; tasks: Task[]; tz: string }) {
   if (!tasks.length) return null;
@@ -44,6 +45,7 @@ export default function MyDay() {
   );
 
   return (
+    <Page>
     <div className="pb-20 sm:pb-6">
       <header className="px-4 pt-8 pb-2">
         {isPending ? (
@@ -72,5 +74,6 @@ export default function MyDay() {
         />
       )}
     </div>
+    </Page>
   );
 }

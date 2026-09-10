@@ -24,9 +24,12 @@ export default function Shell() {
   const user = state.status === "authenticated" ? state.user : null;
   const [composing, setComposing] = useState(false);
 
+  // Full width on purpose. Capping the whole shell left the rail floating in the
+  // middle of a wide monitor with paper on both sides of it; the rail belongs
+  // against the edge, and only the reading column inside is measured (see Page).
   return (
-    <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col sm:flex-row">
-      <nav className="order-2 sticky bottom-0 z-20 border-t border-hairline bg-card sm:order-1 sm:sticky sm:top-0 sm:h-screen sm:w-52 sm:shrink-0 sm:border-r sm:border-t-0">
+    <div className="flex min-h-screen w-full flex-col sm:flex-row">
+      <nav className="order-2 sticky bottom-0 z-20 border-t border-hairline bg-card sm:order-1 sm:sticky sm:top-0 sm:h-screen sm:w-56 sm:shrink-0 sm:border-r sm:border-t-0">
         <div className="hidden px-5 py-6 sm:block">
           <p className="text-page font-semibold">Vazifalar</p>
           {user && <p className="mt-0.5 truncate text-sm text-muted">{user.full_name}</p>}

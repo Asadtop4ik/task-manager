@@ -14,6 +14,7 @@ import { countTasks, isOverdue } from "@/lib/format";
 import ProjectTag, { PROJECT_COLOURS } from "@/components/ProjectTag";
 import TaskRow from "@/components/TaskRow";
 import { fieldClass, labelClass, primaryButton } from "@/components/Sheet";
+import Page from "@/components/Page";
 
 export default function ProjectDetail() {
   const { id } = useParams();
@@ -55,6 +56,7 @@ export default function ProjectDetail() {
   const addable = users.data?.filter((person) => !memberIds.has(person.id)) ?? [];
 
   return (
+    <Page>
     <div className="pb-20 sm:pb-6">
       <header className="border-b border-hairline px-4 pt-6 pb-5">
         <Link to="/projects" className="text-sm text-muted underline underline-offset-4">
@@ -203,5 +205,6 @@ export default function ProjectDetail() {
         </section>
       )}
     </div>
+    </Page>
   );
 }
