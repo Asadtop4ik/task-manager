@@ -6,10 +6,29 @@ manager assigns todos from a Telegram bot; the work happens on the web at
 
 Design and milestones: **[PLAN.md](PLAN.md)**.
 
-Status: **milestone 2 — the API works.** Telegram login, the approval queue,
-projects, tasks with a real status machine, comments, an activity log and
-permissions are done and tested. The bot's command set is milestone 3; the full
-board is milestone 4.
+Status: **milestone 3 — the bot works.** Telegram login, the approval queue,
+projects, tasks with a real status machine, comments, an activity log,
+permissions, and the bot's full command set are done and tested. The web board
+is milestone 4; reminders and digests are milestone 5.
+
+## Using the bot
+
+Type a line and confirm what it understood:
+
+```
+keto: mini app url ni tuzat !shoshilinch @asad ertaga 18:00
+```
+
+Project by prefix (`keto` → ketoshop, only when unambiguous), `!priority` in
+uz/ru/en, `@username`, and a deadline as `ertaga` / `завтра` / `tomorrow`,
+`indinga`, a weekday, `25.12 09:00`, `18:00` or `+3`. **Nothing is created from
+the parse** — the bot shows what it read and waits, because a silently mis-read
+deadline is worse than no parsing at all.
+
+`/new` walks the same thing with buttons. `/my`, `/today`, `/projects` list work;
+`/task` as a reply turns that message into a task. Task cards carry Start / Done
+/ Block / Comment / Snooze / Open and are **edited in place**, so a task keeps one
+card instead of filling the chat.
 
 ## API
 

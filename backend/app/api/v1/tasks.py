@@ -13,6 +13,7 @@ from app.schemas.activity import ActivityOut
 from app.schemas.comment import CommentCreate, CommentOut
 from app.schemas.task import (
     TaskAssign,
+    TaskCard,
     TaskCreate,
     TaskListResponse,
     TaskOut,
@@ -292,6 +293,23 @@ async def log_time(
         kind=ActivityKind.TIME_LOGGED,
         payload={"minutes": payload.minutes, "total": task.spent_minutes},
     )
+    await session.commit()
+    return TaskOut.model_validate(await _load(session, task.id))
+
+
+@router.post("/{task_id}/card", response_model=TaskOut)
+async def set_card(
+    task_id: int, payload: TaskCard, session: DbSession, user: CurrentUser
+) -> TaskOut:
+    """Remember which Telegram message is this task's card.
+
+    Separate from PATCH because it is bookkeeping the bot does about its own
+    messages, not a change to the task that anyone should see in the activity
+    log.
+    """
+    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task.source_chat_id = payload.chat_id
+    task.source_message_id = payload.message_id
     await session.commit()
     return TaskOut.model_validate(await _load(session, task.id))
 

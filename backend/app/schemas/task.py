@@ -79,3 +79,14 @@ class TaskListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class TaskCard(BaseModel):
+    """Where this task's card lives in Telegram.
+
+    Recorded after the bot sends it, so a later status change edits that message
+    instead of posting a second card into the chat.
+    """
+
+    chat_id: int
+    message_id: int

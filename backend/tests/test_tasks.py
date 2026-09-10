@@ -255,3 +255,35 @@ class TestComments:
             f"/api/v1/tasks/{task_id}/comments", json={"body": "hello"}, headers=auth(outsider)
         )
         assert response.status_code == 404
+
+
+class TestCard:
+    async def test_recording_the_card_does_not_pollute_the_activity_log(
+        self, client: AsyncClient, manager: User, project: Project
+    ) -> None:
+        task_id = (await _create(client, manager, project)).json()["id"]
+        response = await client.post(
+            f"/api/v1/tasks/{task_id}/card",
+            json={"chat_id": 555, "message_id": 12},
+            headers=auth(manager),
+        )
+        assert response.status_code == 200
+
+        kinds = [
+            entry["kind"]
+            for entry in (
+                await client.get(f"/api/v1/tasks/{task_id}/activity", headers=auth(manager))
+            ).json()
+        ]
+        assert kinds == ["created"]
+
+    async def test_an_outsider_cannot_record_a_card(
+        self, client: AsyncClient, manager: User, outsider: User, project: Project
+    ) -> None:
+        task_id = (await _create(client, manager, project)).json()["id"]
+        response = await client.post(
+            f"/api/v1/tasks/{task_id}/card",
+            json={"chat_id": 1, "message_id": 1},
+            headers=auth(outsider),
+        )
+        assert response.status_code == 404

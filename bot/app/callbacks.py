@@ -1,0 +1,23 @@
+from aiogram.filters.callback_data import CallbackData
+
+
+class TaskAction(CallbackData, prefix="t"):
+    """Buttons on a task card.
+
+    Telegram caps callback data at 64 bytes, so this stays to an action name and
+    an id rather than anything descriptive.
+    """
+
+    action: str  # start | done | review | block | comment | snooze | refresh
+    task_id: int
+
+
+class NewTaskChoice(CallbackData, prefix="n"):
+    """A step of the guided /new flow."""
+
+    field: str  # project | assignee | priority | due
+    value: str
+
+
+class QuickConfirm(CallbackData, prefix="q"):
+    action: str  # create | cancel | edit

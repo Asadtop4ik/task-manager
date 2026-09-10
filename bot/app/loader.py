@@ -2,6 +2,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.types import BotCommand
 
 from app.config import settings
 from app.handlers import router
@@ -28,3 +29,22 @@ def create_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher(storage=storage)
     dispatcher.include_router(router)
     return dispatcher
+
+
+COMMANDS = [
+    BotCommand(command="new", description="Yangi vazifa (bosqichma-bosqich)"),
+    BotCommand(command="my", description="Mening ochiq vazifalarim"),
+    BotCommand(command="today", description="Bugungi va muddati o‘tganlari"),
+    BotCommand(command="projects", description="Loyihalar"),
+    BotCommand(command="cancel", description="Amalni bekor qilish"),
+    BotCommand(command="help", description="Yordam"),
+]
+
+
+async def setup_commands(bot: Bot) -> None:
+    """Populate the command menu.
+
+    Done at startup rather than by hand in BotFather so the list cannot drift
+    away from the handlers that actually exist.
+    """
+    await bot.set_my_commands(COMMANDS)

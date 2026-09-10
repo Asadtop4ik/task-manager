@@ -238,7 +238,7 @@ and a hard fail at boot on placeholder secrets.
 |---|---|---|
 | 1 | ✅ **Done.** Repo layout, compose, full schema in `0001_initial_schema`, `/health` + `/ready`, CI, three Dockerfiles | Local stack up; `/ready` green on Postgres + Redis; ruff/black/mypy clean; 14 tests pass |
 | 2 | ✅ **Done.** Telegram auth (widget + Mini App), users/approval, projects, tasks, comments, activity, permissions | 60 backend tests; full flow verified against the running API. The widget itself still needs a real bot token + BotFather `/setdomain` |
-| 3 | Bot: `/new` guided + quick parse, assignment card, status buttons | Manager can create a task from the phone and I get the card |
+| 3 | ✅ **Done.** Quick capture with a confirmation card, guided `/new`, `/my`, `/today`, `/projects`, `/task` on a reply, status buttons, comment and snooze | 47 bot tests; the full parse → create → card → transition path verified against the running API. Needs a real bot token to try from a phone |
 | 4 | Web: My Day, board, task detail, comments | Usable as a daily driver |
 | 5 | Reminders, digests, SSE realtime | Overdue and 09:00 digest fire correctly across timezones |
 | 6 | Deploy to `tasks.standart-eko.uz`, seed the 3 projects, both users in | Live, CI/CD deploying on push to `main` |
@@ -310,3 +310,24 @@ Things that were not obvious from the plan and are now settled in code:
   navigation, which looks exactly like a broken login.
 - **One shared in-flight refresh on the client.** Three parallel 401s must not
   fire three refreshes and race each other's tokens.
+
+### Milestone 3
+
+- **`.` separates both dates and times** (`25.12` vs `18.00`) and one regex
+  cannot tell them apart. The rule is date-first: a pair that is a real day/month
+  reads as a date, anything else falls through to a time. This was found by a
+  failing test, not by reasoning.
+- **A bare time already past means tomorrow**, and a bare day/month already past
+  means next year. Nobody files a task due nine months ago.
+- **Telegram returns an `InaccessibleMessage`** for a callback on a message older
+  than ~48 hours, and editing one raises. Cards for long-running tasks reach that
+  age routinely, so every edit goes through an `editable()` guard.
+- **The card keyboard mirrors the transition table.** Offering "Done" on a
+  backlog item invites a tap the API will only reject.
+- **Every callback is answered**, including a catch-all for buttons on cards the
+  bot no longer understands — an unanswered callback leaves Telegram's spinner
+  turning, which reads as a hung bot.
+- **The snooze prompt reuses the quick-capture parser**, so `ertaga 18:00` means
+  the same thing everywhere rather than having a second, subtly different reader.
+- **A blocked assignee does not fail the create.** Telegram refuses to message
+  someone who never started the bot; the task still exists and shows on the web.

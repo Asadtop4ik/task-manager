@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from redis.exceptions import RedisError
 
 from app.config import settings
-from app.loader import create_bot, create_dispatcher
+from app.loader import create_bot, create_dispatcher, setup_commands
 from app.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -20,6 +20,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     dispatcher = create_dispatcher()
     app.state.bot = bot
     app.state.dispatcher = dispatcher
+
+    try:
+        await setup_commands(bot)
+    except Exception as error:
+        # A menu that failed to update is not a reason to refuse to serve.
+        log.warning("set_commands_failed", error=str(error))
 
     if settings.public_url:
         await bot.set_webhook(
