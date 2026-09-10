@@ -24,7 +24,7 @@ export default function StatusMenu({ status, onChange, disabled }: Props) {
       disabled={disabled}
       onChange={(event) => onChange(event.target.value as TaskStatus)}
       aria-label="Holatni o‘zgartirish"
-      className="rounded-md border border-hairline bg-card px-2 py-1.5 text-sm disabled:opacity-50"
+      className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm font-medium disabled:opacity-50"
     >
       <option value={status}>{STATUS_LABEL[status]}</option>
       {TRANSITIONS[status].map((next) => (

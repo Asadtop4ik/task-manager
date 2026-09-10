@@ -1,37 +1,40 @@
 @import "tailwindcss";
 
 /* Colour is information here, never decoration. The three projects own their
-   hues (emerald / amber / indigo, set in the database), lateness owns red, and
-   everything else — buttons, nav, chrome — is ink and grey. That is why there is
-   no "brand accent" token: the work supplies the colour. */
+   hues (set in the database), lateness owns red, and everything else — buttons,
+   nav, chrome — is ink and grey. There is no brand accent, because a fourth
+   colour competing with the ones that mean something would make them all mean
+   less. New projects pick from PROJECT_COLOURS, which deliberately excludes red. */
 :root {
-  --paper: #f4f6f7;
+  --paper: #edf0f3;
   --card: #ffffff;
-  --ink: #171c24;
-  --muted: #5f6a77;
-  --hairline: #e2e6ea;
-  --late: #c0341c;
-  --late-wash: #fdecea;
-  --focus: #171c24;
+  --ink: #10161d;
+  --muted: #5b6672;
+  --hairline: #dbe0e6;
+  --late: #b8321a;
+  --late-wash: #fbeceb;
+  --focus: #10161d;
+  --lift: rgb(0 0 0 / 0.04);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper: #0f1317;
-    --card: #171d23;
-    --ink: #e7ecf0;
-    --muted: #8f9aa6;
-    --hairline: #262e37;
-    --late: #ff8a70;
-    --late-wash: #2a1713;
-    --focus: #e7ecf0;
+    --paper: #0b0e12;
+    --card: #141a20;
+    --ink: #e9eef2;
+    --muted: #8d99a6;
+    --hairline: #232b34;
+    --late: #ff8b71;
+    --late-wash: #2a1512;
+    --focus: #e9eef2;
+    --lift: rgb(255 255 255 / 0.05);
   }
 }
 
 @theme {
   /* Archivo: a squared-off grotesque. Reads as tooling rather than marketing,
-     holds up at the small sizes this app spends most of its life in, and covers
-     the Latin Extended range Uzbek needs (oʻ, gʻ). */
+     holds up at the small sizes this app lives in, and covers the Latin Extended
+     range Uzbek needs (oʻ, gʻ). One family, worked hard. */
   --font-sans: "Archivo", ui-sans-serif, system-ui, sans-serif;
 
   --color-paper: var(--paper);
@@ -41,6 +44,15 @@
   --color-hairline: var(--hairline);
   --color-late: var(--late);
   --color-late-wash: var(--late-wash);
+
+  /* A short scale, not a continuum. Four sizes cover every screen: the answer,
+     the page, the row, the aside. */
+  --text-display: 1.9rem;
+  --text-display--line-height: 1.1;
+  --text-display--letter-spacing: -0.022em;
+  --text-page: 1.3rem;
+  --text-page--line-height: 1.2;
+  --text-page--letter-spacing: -0.015em;
 }
 
 html {
@@ -51,10 +63,11 @@ body {
   background: var(--paper);
   color: var(--ink);
   font-family: var(--font-sans);
-  /* Times, task ids and counts sit in columns; lining tabular figures keep them
-     from jittering as the numbers change. */
+  /* Times, task ids and counts sit in columns; tabular figures keep them from
+     jittering as the numbers change. */
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 html,
@@ -66,7 +79,22 @@ body,
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
-  border-radius: 2px;
+  border-radius: 3px;
+}
+
+/* The one orchestrated moment in the app: a row that just changed status lifts
+   its own colour for a beat, so a drag or a tap shows you what moved. */
+@keyframes settle {
+  from {
+    background-color: var(--lift);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.settle {
+  animation: settle 900ms ease-out;
 }
 
 @media (prefers-reduced-motion: reduce) {

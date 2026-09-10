@@ -94,3 +94,8 @@ export type Activity = {
   actor: User | null;
   created_at: string;
 };
+
+export type Member = {
+  user: User;
+  role_in_project: string;
+};

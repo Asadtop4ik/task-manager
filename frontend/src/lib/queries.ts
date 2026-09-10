@@ -5,7 +5,16 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { Activity, Comment, Project, Task, TaskList, TaskStatus, User } from "@/lib/types";
+import type {
+  Activity,
+  Comment,
+  Member,
+  Project,
+  Task,
+  TaskList,
+  TaskStatus,
+  User,
+} from "@/lib/types";
 
 export type TaskFilters = {
   project_id?: number;
@@ -17,11 +26,64 @@ export type TaskFilters = {
   limit?: number;
 };
 
-export function useProjects() {
+export function useProjects(includeArchived = false) {
   return useQuery({
-    queryKey: ["projects"],
-    queryFn: async () => (await api.get<Project[]>("/projects")).data,
+    queryKey: ["projects", { includeArchived }],
+    queryFn: async () =>
+      (await api.get<Project[]>("/projects", { params: { include_archived: includeArchived } }))
+        .data,
     staleTime: 5 * 60_000,
+  });
+}
+
+export function useCreateProject() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { key: string; name: string; color: string }) =>
+      (await api.post<Project>("/projects", payload)).data,
+    onSuccess: () => void client.invalidateQueries({ queryKey: ["projects"] }),
+  });
+}
+
+export function useUpdateProject() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, ...patch }: { id: number } & Partial<Project>) =>
+      (await api.patch<Project>(`/projects/${id}`, patch)).data,
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["projects"] });
+      // Tasks carry an embedded copy of the project, so a rename or a recolour
+      // has to reach every list too.
+      void client.invalidateQueries({ queryKey: ["tasks"] });
+    },
+  });
+}
+
+export function useMembers(projectId: number) {
+  return useQuery({
+    queryKey: ["members", projectId],
+    queryFn: async () => (await api.get<Member[]>(`/projects/${projectId}/members`)).data,
+  });
+}
+
+export function useAddMember() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ projectId, userId }: { projectId: number; userId: number }) =>
+      (await api.put<Member>(`/projects/${projectId}/members/${userId}`)).data,
+    onSuccess: (_data, variables) =>
+      void client.invalidateQueries({ queryKey: ["members", variables.projectId] }),
+  });
+}
+
+export function useRemoveMember() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ projectId, userId }: { projectId: number; userId: number }) => {
+      await api.delete(`/projects/${projectId}/members/${userId}`);
+    },
+    onSuccess: (_data, variables) =>
+      void client.invalidateQueries({ queryKey: ["members", variables.projectId] }),
   });
 }
 

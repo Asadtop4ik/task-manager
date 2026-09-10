@@ -355,3 +355,19 @@ Things that were not obvious from the plan and are now settled in code:
 - **The status menu is built from the same transition table the API enforces**,
   and a drop into a column that would be refused does nothing rather than
   flashing the card there and snapping it back.
+
+### Milestone 4b — project management and a design pass
+
+- **A project's label is its key**, shown in its own colour: `keto`, `qurbot`,
+  `kans-shop`. Not an invented monogram — the key is what the bot's quick capture
+  matches on and what the deploy scripts call the stack, so the word on screen
+  and the word you type into Telegram are the same word.
+- **The new-project palette has no reds.** Red means late; a project wearing it
+  would make every one of its rows read as urgent.
+- **The key follows the name until you edit it**, then it is yours. A live
+  preview row shows the rail, tag and name exactly as they will appear in a list.
+- **"Yangi vazifa" moved into the nav**, because the thought arrives while you
+  are looking at something else, not only while you are on the board.
+- **One orchestrated motion:** a row that just changed status lifts for 900ms, so
+  a drag shows you what moved after your eye followed the cursor. Nothing else
+  animates.

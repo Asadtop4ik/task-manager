@@ -21,6 +21,7 @@ import {
   lateness,
 } from "@/lib/format";
 import StatusMenu from "@/components/StatusMenu";
+import ProjectTag from "@/components/ProjectTag";
 import type { Activity, TaskPriority, TaskStatus } from "@/lib/types";
 
 function describe(entry: Activity): string {
@@ -84,7 +85,7 @@ export default function TaskDetail() {
   const late = isOverdue(item);
 
   return (
-    <div className="pb-16 sm:pb-0">
+    <div className="pb-20 sm:pb-6">
       <header className="border-b border-hairline px-4 pt-6 pb-5">
         {/* The bot's "Ochish" button deep-links straight here, so this screen is
             often someone's first. Give it a way back that is not the browser. */}
@@ -93,16 +94,14 @@ export default function TaskDetail() {
         </Link>
 
         <div className="mt-4 flex items-center gap-2 text-sm text-muted">
-          <span
-            aria-hidden
-            className="size-2.5 rounded-full"
-            style={{ backgroundColor: item.project.color }}
-          />
-          {item.project.name}
+          <ProjectTag project={item.project} />
+          <Link to={`/projects/${item.project.id}`} className="truncate hover:underline">
+            {item.project.name}
+          </Link>
           <span className="ml-auto">#{item.id}</span>
         </div>
 
-        <h1 className="mt-2 text-2xl leading-snug font-semibold tracking-tight">{item.title}</h1>
+        <h1 className="mt-2 text-page font-semibold">{item.title}</h1>
 
         {late && (
           <p className="mt-2 font-medium text-late">
@@ -126,7 +125,7 @@ export default function TaskDetail() {
               })
             }
             aria-label="Bajaruvchi"
-            className="rounded-md border border-hairline bg-card px-2 py-1.5 text-sm"
+            className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
           >
             <option value="">biriktirilmagan</option>
             {users.data?.map((person) => (
@@ -142,7 +141,7 @@ export default function TaskDetail() {
               update.mutate({ id: item.id, priority: event.target.value as TaskPriority })
             }
             aria-label="Muhimligi"
-            className="rounded-md border border-hairline bg-card px-2 py-1.5 text-sm"
+            className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
           >
             {(Object.keys(PRIORITY_LABEL) as TaskPriority[]).map((value) => (
               <option key={value} value={value}>
@@ -186,11 +185,11 @@ export default function TaskDetail() {
             onChange={(event) => setMinutes(event.target.value)}
             placeholder="30"
             aria-label="Daqiqa"
-            className="w-24 rounded-md border border-hairline bg-paper px-3 py-2 text-sm"
+            className="w-24 rounded-lg border border-hairline bg-paper px-3 py-2.5 text-sm"
           />
           <button
             type="submit"
-            className="rounded-md border border-hairline px-3 py-2 text-sm font-medium"
+            className="rounded-lg border border-hairline px-3 py-2.5 text-sm font-medium"
           >
             Qo‘shish
           </button>
@@ -224,7 +223,7 @@ export default function TaskDetail() {
             onChange={(event) => setDraft(event.target.value)}
             rows={2}
             placeholder="Izoh yozish"
-            className="flex-1 rounded-md border border-hairline bg-paper px-3 py-2 text-base"
+            className="flex-1 rounded-lg border border-hairline bg-paper px-3 py-2.5 text-base"
           />
           <button
             type="submit"

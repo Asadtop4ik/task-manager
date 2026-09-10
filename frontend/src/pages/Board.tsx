@@ -4,7 +4,6 @@ import { useProjects, useTasks, useTransition, useUsers } from "@/lib/queries";
 import { BOARD_COLUMNS, STATUS_LABEL, TRANSITIONS, isOverdue } from "@/lib/format";
 import TaskRow from "@/components/TaskRow";
 import Empty from "@/components/Empty";
-import NewTaskSheet from "@/components/NewTaskSheet";
 import type { Task, TaskStatus } from "@/lib/types";
 
 export default function Board() {
@@ -16,8 +15,8 @@ export default function Board() {
   const [assigneeId, setAssigneeId] = useState<number | "all">("all");
   const [onlyLate, setOnlyLate] = useState(false);
   const [column, setColumn] = useState<TaskStatus>("todo");
-  const [composing, setComposing] = useState(false);
   const [dragging, setDragging] = useState<Task | null>(null);
+  const [settled, setSettled] = useState<number | null>(null);
 
   const projects = useProjects();
   const users = useUsers();
@@ -39,19 +38,16 @@ export default function Board() {
     // nothing rather than flash the card there and snap it back.
     if (!task || task.status === status || !TRANSITIONS[task.status].includes(status)) return;
     transition.mutate({ id: task.id, status });
+    // The card has already moved optimistically; the lift is what tells you
+    // which one it was after your eye followed the cursor.
+    setSettled(task.id);
+    window.setTimeout(() => setSettled((current) => (current === task.id ? null : current)), 900);
   }
 
   return (
-    <div className="pb-16 sm:pb-0">
-      <header className="flex flex-wrap items-center gap-3 px-4 pt-8 pb-4">
-        <h1 className="mr-auto text-2xl font-semibold tracking-tight">Doska</h1>
-        <button
-          type="button"
-          onClick={() => setComposing(true)}
-          className="rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-paper"
-        >
-          Vazifa qo‘shish
-        </button>
+    <div className="pb-20 sm:pb-6">
+      <header className="px-4 pt-8 pb-4">
+        <h1 className="text-page font-semibold">Doska</h1>
       </header>
 
       <div className="flex flex-wrap gap-2 px-4 pb-4">
@@ -61,7 +57,7 @@ export default function Board() {
             setProjectId(event.target.value === "all" ? "all" : Number(event.target.value))
           }
           aria-label="Loyiha"
-          className="rounded-md border border-hairline bg-card px-2 py-1.5 text-sm"
+          className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
         >
           <option value="all">Barcha loyihalar</option>
           {projects.data?.map((project) => (
@@ -77,7 +73,7 @@ export default function Board() {
             setAssigneeId(event.target.value === "all" ? "all" : Number(event.target.value))
           }
           aria-label="Bajaruvchi"
-          className="rounded-md border border-hairline bg-card px-2 py-1.5 text-sm"
+          className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
         >
           <option value="all">Hamma</option>
           {users.data?.map((person) => (
@@ -87,7 +83,7 @@ export default function Board() {
           ))}
         </select>
 
-        <label className="flex items-center gap-2 rounded-md border border-hairline bg-card px-2 py-1.5 text-sm">
+        <label className="flex items-center gap-2 rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm">
           <input
             type="checkbox"
             checked={onlyLate}
@@ -141,7 +137,7 @@ export default function Board() {
               }}
               onDrop={() => drop(status)}
               className={[
-                "min-h-40 rounded-lg border bg-card p-2",
+                "min-h-40 rounded-xl border bg-card p-2",
                 receiving ? "border-ink border-dashed" : "border-hairline",
               ].join(" ")}
             >
@@ -157,6 +153,7 @@ export default function Board() {
                     tz={tz}
                     draggable
                     onDragStart={() => setDragging(task)}
+                    settling={settled === task.id}
                   />
                 ))}
               </ul>
@@ -172,7 +169,6 @@ export default function Board() {
         />
       )}
 
-      {composing && <NewTaskSheet onClose={() => setComposing(false)} />}
     </div>
   );
 }

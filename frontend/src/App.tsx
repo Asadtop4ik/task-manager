@@ -4,6 +4,7 @@ import Shell from "@/components/Shell";
 import Board from "@/pages/Board";
 import Login from "@/pages/Login";
 import MyDay from "@/pages/MyDay";
+import ProjectDetail from "@/pages/ProjectDetail";
 import Projects from "@/pages/Projects";
 import TaskDetail from "@/pages/TaskDetail";
 
@@ -29,6 +30,7 @@ export default function App() {
           <Route index element={<MyDay />} />
           <Route path="board" element={<Board />} />
           <Route path="projects" element={<Projects />} />
+          <Route path="projects/:id" element={<ProjectDetail />} />
           <Route path="tasks/:id" element={<TaskDetail />} />
           {/* Deep links from the bot's "Ochish" button land here if the id is
               gone; send them somewhere useful rather than a blank screen. */}

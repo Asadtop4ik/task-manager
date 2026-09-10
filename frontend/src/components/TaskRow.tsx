@@ -9,6 +9,8 @@ type Props = {
   showProject?: boolean;
   draggable?: boolean;
   onDragStart?: (event: React.DragEvent) => void;
+  /** Briefly lifts the row after it moves, so a drag shows you what changed. */
+  settling?: boolean;
 };
 
 /**
@@ -24,13 +26,20 @@ type Props = {
  * Lateness is the only other colour, and urgency is a dot rather than a second
  * red label, so red keeps one meaning per shape.
  */
-export default function TaskRow({ task, tz, showProject = true, draggable, onDragStart }: Props) {
+export default function TaskRow({
+  task,
+  tz,
+  showProject = true,
+  draggable,
+  onDragStart,
+  settling,
+}: Props) {
   const late = isOverdue(task);
   const due = formatDue(task.due_at, tz);
   const urgent = task.priority === "urgent";
 
   return (
-    <li className={late ? "bg-late-wash" : undefined}>
+    <li className={[late ? "bg-late-wash" : "", settling ? "settle" : ""].join(" ").trim() || undefined}>
       <Link
         to={`/tasks/${task.id}`}
         draggable={draggable}

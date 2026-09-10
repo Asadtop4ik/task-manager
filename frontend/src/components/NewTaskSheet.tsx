@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useCreateTask, useProjects, useUsers } from "@/lib/queries";
 import { PRIORITY_LABEL } from "@/lib/format";
+import Sheet, { fieldClass, labelClass, primaryButton, quietButton } from "@/components/Sheet";
 import type { TaskPriority } from "@/lib/types";
 
 /**
@@ -39,35 +40,25 @@ export default function NewTaskSheet({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div
-      className="fixed inset-0 z-20 flex items-end justify-center bg-black/40 sm:items-center"
-      onClick={onClose}
-    >
-      <form
-        onClick={(event) => event.stopPropagation()}
-        onSubmit={submit}
-        className="w-full max-w-md rounded-t-xl border border-hairline bg-card p-4 sm:rounded-xl"
-      >
-        <h2 className="text-lg font-semibold">Yangi vazifa</h2>
-
-        <label className="mt-4 block text-sm">
+    <Sheet title="Yangi vazifa" onClose={onClose}>
+      <form onSubmit={submit}>
+        <label className={`mt-4 ${labelClass}`}>
           Nima qilish kerak
           <input
-            autoFocus
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             placeholder="Mini app url ni tuzatish"
-            className="mt-1 w-full rounded-md border border-hairline bg-paper px-3 py-2 text-base"
+            className={fieldClass}
           />
         </label>
 
         <div className="mt-3 grid grid-cols-2 gap-3">
-          <label className="block text-sm">
+          <label className={labelClass}>
             Loyiha
             <select
               value={chosenProject ?? ""}
               onChange={(event) => setProjectId(Number(event.target.value))}
-              className="mt-1 w-full rounded-md border border-hairline bg-paper px-2 py-2 text-sm"
+              className="mt-1 w-full rounded-lg border border-hairline bg-paper px-2.5 py-2.5 text-sm"
             >
               {projects.data?.map((project) => (
                 <option key={project.id} value={project.id}>
@@ -77,12 +68,12 @@ export default function NewTaskSheet({ onClose }: { onClose: () => void }) {
             </select>
           </label>
 
-          <label className="block text-sm">
+          <label className={labelClass}>
             Muhimligi
             <select
               value={priority}
               onChange={(event) => setPriority(event.target.value as TaskPriority)}
-              className="mt-1 w-full rounded-md border border-hairline bg-paper px-2 py-2 text-sm"
+              className="mt-1 w-full rounded-lg border border-hairline bg-paper px-2.5 py-2.5 text-sm"
             >
               {(Object.keys(PRIORITY_LABEL) as TaskPriority[]).map((value) => (
                 <option key={value} value={value}>
@@ -92,14 +83,14 @@ export default function NewTaskSheet({ onClose }: { onClose: () => void }) {
             </select>
           </label>
 
-          <label className="block text-sm">
+          <label className={labelClass}>
             Kimga
             <select
               value={assigneeId}
               onChange={(event) =>
                 setAssigneeId(event.target.value ? Number(event.target.value) : "")
               }
-              className="mt-1 w-full rounded-md border border-hairline bg-paper px-2 py-2 text-sm"
+              className="mt-1 w-full rounded-lg border border-hairline bg-paper px-2.5 py-2.5 text-sm"
             >
               <option value="">biriktirmasdan</option>
               {users.data?.map((person) => (
@@ -110,13 +101,13 @@ export default function NewTaskSheet({ onClose }: { onClose: () => void }) {
             </select>
           </label>
 
-          <label className="block text-sm">
+          <label className={labelClass}>
             Muddati
             <input
               type="datetime-local"
               value={due}
               onChange={(event) => setDue(event.target.value)}
-              className="mt-1 w-full rounded-md border border-hairline bg-paper px-2 py-2 text-sm"
+              className="mt-1 w-full rounded-lg border border-hairline bg-paper px-2.5 py-2.5 text-sm"
             />
           </label>
         </div>
@@ -127,19 +118,15 @@ export default function NewTaskSheet({ onClose }: { onClose: () => void }) {
           </p>
         )}
 
-        <div className="mt-4 flex justify-end gap-2">
-          <button type="button" onClick={onClose} className="px-3 py-2 text-sm text-muted">
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} className={quietButton}>
             Bekor qilish
           </button>
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="rounded-md bg-ink px-4 py-2 text-sm font-medium text-paper disabled:opacity-40"
-          >
-            {create.isPending ? "Saqlanmoqda…" : "Qo‘shish"}
+          <button type="submit" disabled={!canSubmit} className={primaryButton}>
+            {create.isPending ? "Saqlanmoqda…" : "Vazifa qo‘shish"}
           </button>
         </div>
       </form>
-    </div>
+    </Sheet>
   );
 }

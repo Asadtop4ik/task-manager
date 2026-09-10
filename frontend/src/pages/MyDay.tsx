@@ -1,4 +1,3 @@
-import { Link } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { useTasks } from "@/lib/queries";
 import { countTasks, isOverdue, isToday } from "@/lib/format";
@@ -9,7 +8,7 @@ import type { Task } from "@/lib/types";
 function Section({ title, tasks, tz }: { title: string; tasks: Task[]; tz: string }) {
   if (!tasks.length) return null;
   return (
-    <section className="mt-8">
+    <section className="mt-7">
       <h2 className="px-4 text-sm font-semibold">{title}</h2>
       <ul className="mt-1 divide-y divide-hairline border-y border-hairline bg-card pl-4">
         {tasks.map((task) => (
@@ -45,18 +44,16 @@ export default function MyDay() {
   );
 
   return (
-    <div className="pb-16 sm:pb-0">
+    <div className="pb-20 sm:pb-6">
       <header className="px-4 pt-8 pb-2">
         {isPending ? (
           <p className="text-muted">yuklanmoqda…</p>
         ) : late.length ? (
-          <h1 className="text-3xl leading-tight font-semibold tracking-tight text-late">
+          <h1 className="text-display font-semibold text-late">
             {countTasks(late.length)} kechikdi
           </h1>
         ) : (
-          <h1 className="text-3xl leading-tight font-semibold tracking-tight">
-            Hech narsa kechikmagan
-          </h1>
+          <h1 className="text-display font-semibold">Hech narsa kechikmagan</h1>
         )}
         <p className="mt-2 text-muted">
           {tasks.length ? `${countTasks(tasks.length)} ochiq` : "Ochiq vazifa yo‘q"}
@@ -74,12 +71,6 @@ export default function MyDay() {
           hint="Yangi vazifani botdan yozing yoki doskadan qo‘shing."
         />
       )}
-
-      <div className="px-4 pt-8">
-        <Link to="/board" className="text-sm underline underline-offset-4">
-          Doskaga o‘tish
-        </Link>
-      </div>
     </div>
   );
 }
