@@ -6,9 +6,25 @@ manager assigns todos from a Telegram bot; the work happens on the web at
 
 Design and milestones: **[PLAN.md](PLAN.md)**.
 
-Status: **milestone 1 — skeleton.** The schema, both service skeletons, the SPA
-shell, CI and the deploy path exist. Auth, tasks and the bot's real command set
-land in milestones 2–3.
+Status: **milestone 2 — the API works.** Telegram login, the approval queue,
+projects, tasks with a real status machine, comments, an activity log and
+permissions are done and tested. The bot's command set is milestone 3; the full
+board is milestone 4.
+
+## API
+
+`/api/v1` — `auth/{config,telegram,telegram/miniapp,refresh,logout,me}`,
+`users`, `users/pending`, `projects`, `projects/{id}/members`, `tasks`,
+`tasks/{id}/{transition,assign,time,comments,activity}`. Plus `/health`
+(liveness) and `/ready` (Postgres + Redis, used by the container healthcheck).
+
+Two ways in, one identity: a browser sends a Bearer access token; the bot sends
+`X-Service-Token` plus `X-Acting-User`, so its actions are attributed to the real
+person and run through exactly the same permission checks.
+
+A first-time Telegram login creates an **inactive** account that waits in
+`users/pending` for a manager. `ADMIN_TELEGRAM_IDS` bootstraps the first one —
+without it nobody could ever approve anybody.
 
 ## Layout
 

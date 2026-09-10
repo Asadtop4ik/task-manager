@@ -37,8 +37,8 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       # Placeholders. ENVIRONMENT=test means the production placeholder check does
       # not fire, and no test reaches Telegram.
-      JWT_SECRET: ci-jwt-secret
-      SERVICE_TOKEN: ci-service-token
+      JWT_SECRET: ci-jwt-secret-0123456789abcdefghijklmno
+      SERVICE_TOKEN: ci-service-token-0123456789abcdefghij
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

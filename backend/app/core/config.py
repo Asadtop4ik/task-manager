@@ -21,6 +21,10 @@ _PLACEHOLDERS = frozenset(
         "ci-secret",
         "ci-jwt-secret",
         "123456:CI-TOKEN",
+        # The .env.example value. It is 32+ characters so local runs match the
+        # production key-length rule, which means it has to be named here or a
+        # copied example file would sail through the check.
+        "dev-only-change-me-0000000000000000",
     }
 )
 
@@ -91,6 +95,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"placeholder value(s) for {', '.join(weak)} in production — "
                 "fill in /srv/stack/env/task-manager.env"
+            )
+        # HS256 keys shorter than the hash they feed weaken the signature, and
+        # PyJWT warns about it at runtime. Refuse at boot instead.
+        short = [
+            name
+            for name, value in (
+                ("JWT_SECRET", self.jwt_secret),
+                ("SERVICE_TOKEN", self.service_token),
+            )
+            if len(value) < 32
+        ]
+        if short:
+            raise ValueError(
+                f"{', '.join(short)} must be at least 32 characters in production — "
+                "generate with `openssl rand -hex 32`"
             )
         return self
 

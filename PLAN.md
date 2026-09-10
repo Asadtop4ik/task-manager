@@ -237,7 +237,7 @@ and a hard fail at boot on placeholder secrets.
 | # | Deliverable | Done when |
 |---|---|---|
 | 1 | ✅ **Done.** Repo layout, compose, full schema in `0001_initial_schema`, `/health` + `/ready`, CI, three Dockerfiles | Local stack up; `/ready` green on Postgres + Redis; ruff/black/mypy clean; 14 tests pass |
-| 2 | Auth + projects + tasks CRUD + permissions, with tests | Login widget works end to end on a local tunnel |
+| 2 | ✅ **Done.** Telegram auth (widget + Mini App), users/approval, projects, tasks, comments, activity, permissions | 60 backend tests; full flow verified against the running API. The widget itself still needs a real bot token + BotFather `/setdomain` |
 | 3 | Bot: `/new` guided + quick parse, assignment card, status buttons | Manager can create a task from the phone and I get the card |
 | 4 | Web: My Day, board, task detail, comments | Usable as a daily driver |
 | 5 | Reminders, digests, SSE realtime | Overdue and 09:00 digest fire correctly across timezones |
@@ -292,3 +292,21 @@ Things that were not obvious from the plan and are now settled in code:
 - **The status transition table lives in `app/db/enums.py`** with tests. It is
   the single place the board, the bot's buttons and the API agree, and it is what
   stops a stale Telegram card from reopening a task closed last week.
+
+### Milestone 2
+
+- **`GET /auth/config` serves the bot username at runtime** instead of baking it
+  in as a Vite build arg, so one frontend image works against any bot.
+- **A missing project or an invisible task answers 404, never 403.** "Exists but
+  is not yours" leaks the id space and how busy other projects are.
+- **JWT_SECRET and SERVICE_TOKEN must be ≥32 characters in production**, checked
+  at boot. PyJWT warns at runtime about short HS256 keys; failing at startup is
+  better than a warning nobody reads.
+- **Model-level `default=` is applied by SQLAlchemy in Python, not by Postgres.**
+  The seed migration has to spell out `is_archived` because a raw INSERT never
+  sees it — the same trap waits for any future data migration.
+- **The refresh cookie is scoped to `/api/v1/auth` and is SameSite=Lax.** Strict
+  would drop the cookie when the Login Widget returns the user by top-level
+  navigation, which looks exactly like a broken login.
+- **One shared in-flight refresh on the client.** Three parallel 401s must not
+  fire three refreshes and race each other's tokens.

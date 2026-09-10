@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "@/App";
+import { AuthProvider } from "@/lib/auth";
 import "@/index.css";
 
 const queryClient = new QueryClient({
@@ -16,7 +17,9 @@ if (!container) throw new Error("#root is missing from index.html");
 createRoot(container).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AuthProvider>
+        <App />
+      </AuthProvider>
     </QueryClientProvider>
   </StrictMode>,
 );
