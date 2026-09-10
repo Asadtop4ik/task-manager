@@ -71,3 +71,26 @@ export type TelegramWidgetUser = {
   auth_date: number;
   hash: string;
 };
+
+export type Comment = {
+  id: number;
+  body: string;
+  author: User | null;
+  created_at: string;
+};
+
+export type Activity = {
+  id: number;
+  kind:
+    | "created"
+    | "assigned"
+    | "status_changed"
+    | "priority_changed"
+    | "due_changed"
+    | "commented"
+    | "time_logged"
+    | "attached";
+  payload: Record<string, unknown>;
+  actor: User | null;
+  created_at: string;
+};

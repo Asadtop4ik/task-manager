@@ -223,12 +223,18 @@ and a hard fail at boot on placeholder secrets.
 
 ## 8. Manual steps only a human can do
 
-1. **Create the bot** in BotFather, take the token, put it straight into the
-   server env file.
-2. **`/setdomain` → `tasks.standart-eko.uz`**, or the web Login Widget renders
-   nothing — this is the exact trap qurbot is still sitting in.
-3. `/setcommands` for `/new /my /today /project /done /help`.
-4. Send the manager the bot link and approve their telegram_id once.
+1. ✅ **Bot created** — `@mn_taskmanagerbot` (2026-09-10).
+2. ✅ **`/setdomain` → `tasks.standart-eko.uz`** done. Without it the Login
+   Widget renders nothing at all — the trap qurbot is still sitting in.
+3. ⚠️ **Rotate the token.** The original was pasted into a chat transcript, so
+   it must be treated as public: BotFather → `/revoke` → `@mn_taskmanagerbot`,
+   then write the new one **directly** into `/srv/stack/env/task-manager.env`.
+   Never into a chat.
+4. **DNS**: A record `tasks` → `159.195.248.216`, DNS-only (not proxied), same
+   as the other three subdomains.
+5. `/setcommands` is handled by the bot itself at startup (`setup_commands`), so
+   there is nothing to type in BotFather.
+6. Approve the manager's telegram_id once, from the pending queue.
 
 ---
 
@@ -239,7 +245,7 @@ and a hard fail at boot on placeholder secrets.
 | 1 | ✅ **Done.** Repo layout, compose, full schema in `0001_initial_schema`, `/health` + `/ready`, CI, three Dockerfiles | Local stack up; `/ready` green on Postgres + Redis; ruff/black/mypy clean; 14 tests pass |
 | 2 | ✅ **Done.** Telegram auth (widget + Mini App), users/approval, projects, tasks, comments, activity, permissions | 60 backend tests; full flow verified against the running API. The widget itself still needs a real bot token + BotFather `/setdomain` |
 | 3 | ✅ **Done.** Quick capture with a confirmation card, guided `/new`, `/my`, `/today`, `/projects`, `/task` on a reply, status buttons, comment and snooze | 47 bot tests; the full parse → create → card → transition path verified against the running API. Needs a real bot token to try from a phone |
-| 4 | Web: My Day, board, task detail, comments | Usable as a daily driver |
+| 4 | ✅ **Done.** My Day, kanban board with drag and filters, task detail with comments, time log and history, compose sheet, phone-first nav | Screenshotted at 390px and 1280px, light and dark, with real seeded data |
 | 5 | Reminders, digests, SSE realtime | Overdue and 09:00 digest fire correctly across timezones |
 | 6 | Deploy to `tasks.standart-eko.uz`, seed the 3 projects, both users in | Live, CI/CD deploying on push to `main` |
 | 7 | Dashboard, time tracking, attachments, uz/ru i18n | — |
@@ -331,3 +337,21 @@ Things that were not obvious from the plan and are now settled in code:
   the same thing everywhere rather than having a second, subtly different reader.
 - **A blocked assignee does not fail the create.** Telegram refuses to message
   someone who never started the bot; the task still exists and shows on the web.
+
+### Milestone 4
+
+- **Colour is information, never chrome.** The three projects own their hues, and
+  lateness owns red. There is no brand accent, because a fourth colour competing
+  with the three that mean something would make all four mean less.
+- **The row puts the title on its own line.** The first version gave the deadline
+  a right-hand column; in a 190px board column every title collapsed to "Ma…".
+  Caught by screenshotting it, not by reading it.
+- **Urgency is a dot, not a second red label.** Red already means late; giving it
+  a second job weakened both readings.
+- **The board becomes a status picker below `sm`.** Four kanban columns at 390px
+  are four unreadable columns.
+- **Navigation sits at the bottom on a phone** and in a rail from `sm` up. This
+  app is read standing up more often than sitting down.
+- **The status menu is built from the same transition table the API enforces**,
+  and a drop into a column that would be refused does nothing rather than
+  flashing the card there and snapping it back.

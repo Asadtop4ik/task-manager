@@ -1,18 +1,79 @@
 @import "tailwindcss";
 
-/* The board is read on a phone as often as on a laptop, and inside Telegram's
-   in-app browser, which follows the system theme. Both themes from day one. */
-@theme {
-  --color-brand-500: oklch(0.62 0.17 258);
-  --color-brand-600: oklch(0.55 0.18 258);
+/* Colour is information here, never decoration. The three projects own their
+   hues (emerald / amber / indigo, set in the database), lateness owns red, and
+   everything else — buttons, nav, chrome — is ink and grey. That is why there is
+   no "brand accent" token: the work supplies the colour. */
+:root {
+  --paper: #f4f6f7;
+  --card: #ffffff;
+  --ink: #171c24;
+  --muted: #5f6a77;
+  --hairline: #e2e6ea;
+  --late: #c0341c;
+  --late-wash: #fdecea;
+  --focus: #171c24;
 }
 
-:root {
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #0f1317;
+    --card: #171d23;
+    --ink: #e7ecf0;
+    --muted: #8f9aa6;
+    --hairline: #262e37;
+    --late: #ff8a70;
+    --late-wash: #2a1713;
+    --focus: #e7ecf0;
+  }
+}
+
+@theme {
+  /* Archivo: a squared-off grotesque. Reads as tooling rather than marketing,
+     holds up at the small sizes this app spends most of its life in, and covers
+     the Latin Extended range Uzbek needs (oʻ, gʻ). */
+  --font-sans: "Archivo", ui-sans-serif, system-ui, sans-serif;
+
+  --color-paper: var(--paper);
+  --color-card: var(--card);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-hairline: var(--hairline);
+  --color-late: var(--late);
+  --color-late-wash: var(--late-wash);
+}
+
+html {
   color-scheme: light dark;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  /* Times, task ids and counts sit in columns; lining tabular figures keep them
+     from jittering as the numbers change. */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
 
 html,
 body,
 #root {
-  height: 100%;
+  min-height: 100%;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

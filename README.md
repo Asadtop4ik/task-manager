@@ -6,10 +6,23 @@ manager assigns todos from a Telegram bot; the work happens on the web at
 
 Design and milestones: **[PLAN.md](PLAN.md)**.
 
-Status: **milestone 3 — the bot works.** Telegram login, the approval queue,
-projects, tasks with a real status machine, comments, an activity log,
-permissions, and the bot's full command set are done and tested. The web board
-is milestone 4; reminders and digests are milestone 5.
+Status: **milestone 4 — usable.** Telegram login, the approval queue, projects,
+tasks with a real status machine, comments, an activity log, permissions, the
+bot's full command set, and the web app are done. Reminders and digests are
+milestone 5.
+
+## The web app
+
+- **Bugun** — the first screen answers one question, am I behind, so the count of
+  late work is the headline rather than a stat tile.
+- **Doska** — kanban with drag between columns on desktop, a status picker on a
+  phone, filtered by project, assignee and lateness.
+- **Task detail** — status, assignee and priority inline; comments; time log; the
+  full history.
+
+Colour is information: each project owns a hue, shown as a rail down every row,
+and lateness owns red. There is no brand accent competing with them. Light and
+dark both follow the system.
 
 ## Using the bot
 
