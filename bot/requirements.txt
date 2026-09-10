@@ -1,0 +1,34 @@
+# Pinned to versions already proven on the netcup box (kans-shop / qurbot).
+
+# --- Telegram ---
+aiogram==3.30.0
+
+# --- Webhook transport ---
+fastapi==0.140.13
+starlette==1.3.1
+uvicorn==0.51.0
+uvloop==0.22.1; sys_platform != "win32"
+
+# --- Queue / FSM storage ---
+arq==0.28.0
+# Held at 5.x because arq 0.28.0 (the newest release) requires redis<6. The API
+# image has no arq and runs redis 8; the two services never share a process, so
+# the split costs nothing.
+redis==5.3.1
+
+# --- Settings ---
+pydantic==2.13.4
+pydantic-settings==2.14.2
+
+# --- API client ---
+httpx==0.28.1
+
+# --- Logging ---
+structlog==26.1.0
+
+# --- Dev / test / lint ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.0
+black==26.5.1
+mypy==2.3.0

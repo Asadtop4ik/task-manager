@@ -1,0 +1,86 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-task-manager
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: task-manager-api
+            context: backend
+          - image: task-manager-bot
+            context: bot
+          - image: task-manager-frontend
+            context: frontend
+    steps:
+      - uses: actions/checkout@v4
+      # GHCR rejects uppercase in a repository name, and this owner is
+      # "Asadtop4ik" — using github.repository_owner raw fails the push.
+      - name: Lowercase the owner
+        run: echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER }}/${{ matrix.image }}:${{ github.sha }}
+            ghcr.io/${{ env.OWNER }}/${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The server side is wired up after the first push (DNS, env file, the
+          # ci-deploy-shell allowlist). Until the secrets exist, skip rather than
+          # fail — a permanently red main teaches everyone to ignore CI.
+          if [ -z "$SSH_HOST" ]; then
+            echo "::warning::DEPLOY_* secrets are not set — images were pushed to GHCR, deploy skipped."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pinned host key, not StrictHostKeyChecking=no: without it this job
+          # would happily hand the deploy key to whoever answers on that IP.
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The token goes in on stdin, never on the command line: an argv is
+          # readable by every other process on the runner.
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
+            "$SSH_USER@$SSH_HOST" \
+            "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }}"

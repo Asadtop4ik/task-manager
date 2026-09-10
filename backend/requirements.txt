@@ -1,0 +1,43 @@
+# Pinned to versions already proven on the netcup box (kans-shop / qurbot).
+# Re-verify with `pip install -r requirements.txt` after any change.
+
+# --- Web framework / API ---
+fastapi==0.140.13
+starlette==1.3.1
+uvicorn==0.51.0
+httptools==0.8.0
+python-multipart==0.0.32
+# Linux-only asyncio accelerator; marker keeps a non-Linux dev venv resolvable.
+uvloop==0.22.1; sys_platform != "win32"
+
+# --- Database ---
+SQLAlchemy==2.0.51
+alembic==1.18.5
+asyncpg==0.31.0
+# Sync driver, used by Alembic only (env.py runs migrations synchronously).
+psycopg[binary]==3.3.4
+greenlet==3.5.4
+
+# --- Cache / queue ---
+redis==8.0.1
+
+# --- Validation / settings ---
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+
+# --- Auth ---
+PyJWT==2.13.0
+
+# --- Logging ---
+structlog==26.1.0
+
+# --- HTTP client (used by tests, and by the API when it calls Telegram) ---
+httpx==0.28.1
+
+# --- Dev / test / lint ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.0
+black==26.5.1
+mypy==2.3.0

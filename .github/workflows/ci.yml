@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Lets deploy.yml gate on the exact same checks instead of duplicating them.
+  workflow_call:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: taskmgr
+          POSTGRES_PASSWORD: taskmgr
+          POSTGRES_DB: taskmgr
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taskmgr"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://taskmgr:taskmgr@localhost:5432/taskmgr
+      DATABASE_URL_SYNC: postgresql+psycopg://taskmgr:taskmgr@localhost:5432/taskmgr
+      REDIS_URL: redis://localhost:6379/0
+      # Placeholders. ENVIRONMENT=test means the production placeholder check does
+      # not fire, and no test reaches Telegram.
+      JWT_SECRET: ci-jwt-secret
+      SERVICE_TOKEN: ci-service-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Lint
+        run: |
+          ruff check app tests
+          black --check app tests
+      - name: Type check
+        run: mypy app
+      # A migration that does not apply to an empty database is the one failure
+      # that takes production down at deploy time, since entrypoint.sh runs this
+      # before uvicorn. Catch it here.
+      - name: Migrations apply from scratch
+        run: alembic upgrade head
+      - name: Migrations are complete
+        # Autogenerate against the just-migrated database must find nothing left
+        # to do; anything else means a model changed without a migration.
+        run: |
+          alembic revision --autogenerate -m ci-drift-check --rev-id ci_drift >/dev/null
+          if grep -qE '^\s+op\.' alembic/versions/ci_drift_*.py; then
+            echo "::error::models drift from migrations — run 'make revision M=\"...\"'"
+            cat alembic/versions/ci_drift_*.py
+            exit 1
+          fi
+          rm alembic/versions/ci_drift_*.py
+      - name: Test
+        run: pytest -q
+
+  bot:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot
+    env:
+      ENVIRONMENT: test
+      REDIS_URL: redis://localhost:6379/0
+      WEBHOOK_SECRET: ci-webhook-secret
+      SERVICE_TOKEN: ci-service-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Lint
+        run: |
+          ruff check app tests
+          black --check app tests
+      - name: Type check
+        run: mypy app
+      - name: Test
+        run: pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      # Build here too: a type-clean project can still fail `vite build`, and
+      # finding that out in the deploy job wastes a round trip.
+      - run: npm run build

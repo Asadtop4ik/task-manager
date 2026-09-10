@@ -1,0 +1,37 @@
+[tool.black]
+line-length = 95
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 95
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# E501: line length is black's job. RUF001-3: the UI is bilingual (uz/ru), Cyrillic in
+# strings and comments is expected, not "ambiguous".
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's DI idiom calls these as argument defaults; not the B008 footgun.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Security",
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"

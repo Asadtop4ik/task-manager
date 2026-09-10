@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* The board is read on a phone as often as on a laptop, and inside Telegram's
+   in-app browser, which follows the system theme. Both themes from day one. */
+@theme {
+  --color-brand-500: oklch(0.62 0.17 258);
+  --color-brand-600: oklch(0.55 0.18 258);
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
