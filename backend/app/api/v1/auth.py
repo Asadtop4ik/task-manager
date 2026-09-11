@@ -55,7 +55,9 @@ async def auth_config() -> AuthConfig:
     Served at runtime rather than baked in as a Vite build arg, so the same
     frontend image works against any bot without a rebuild.
     """
-    return AuthConfig(bot_username=settings.bot_username, login_enabled=bool(settings.bot_username))
+    return AuthConfig(
+        bot_username=settings.bot_username, login_enabled=bool(settings.bot_username)
+    )
 
 
 @router.post("/telegram", response_model=TokenResponse)

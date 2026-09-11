@@ -5,6 +5,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -33,6 +34,8 @@ class Task(Base, TimestampMixin):
         CheckConstraint("spent_minutes >= 0", name="ck_tasks_spent_nonneg"),
         # The board's default query: one project's open tasks, newest first.
         Index("ix_tasks_project_status", "project_id", "status"),
+        # Reading one column in hand-ordered sequence.
+        Index("ix_tasks_status_position", "status", "position"),
         # "My day": what is on one person's plate and when it is due.
         Index("ix_tasks_assignee_due", "assignee_id", "due_at"),
     )
@@ -66,6 +69,11 @@ class Task(Base, TimestampMixin):
 
     estimate_minutes: Mapped[int | None] = mapped_column(Integer)
     spent_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Hand-ordering within a board column. A float, not an integer rank, so
+    # dropping a card between two others is one UPDATE of one row rather than
+    # renumbering everything below it.
+    position: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
 
     source: Mapped[str] = mapped_column(String(8), default=TaskSource.WEB, nullable=False)
     # Where the task came from in Telegram. Keeping these lets the bot EDIT the

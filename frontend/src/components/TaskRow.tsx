@@ -9,6 +9,9 @@ type Props = {
   showProject?: boolean;
   draggable?: boolean;
   onDragStart?: (event: React.DragEvent) => void;
+  onDragEnd?: () => void;
+  /** Marks this row as a board card, so the column can measure the gaps. */
+  card?: boolean;
   /** Briefly lifts the row after it moves, so a drag shows you what changed. */
   settling?: boolean;
 };
@@ -32,6 +35,8 @@ export default function TaskRow({
   showProject = true,
   draggable,
   onDragStart,
+  onDragEnd,
+  card,
   settling,
 }: Props) {
   const late = isOverdue(task);
@@ -39,11 +44,15 @@ export default function TaskRow({
   const urgent = task.priority === "urgent";
 
   return (
-    <li className={[late ? "bg-late-wash" : "", settling ? "settle" : ""].join(" ").trim() || undefined}>
+    <li
+      data-card={card ? "1" : undefined}
+      className={[late ? "bg-late-wash" : "", settling ? "settle" : ""].join(" ").trim() || undefined}
+    >
       <Link
         to={`/tasks/${task.id}`}
         draggable={draggable}
         onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
         className="flex gap-3 py-3 pr-3 hover:bg-ink/[0.03] dark:hover:bg-ink/[0.06]"
       >
         <span

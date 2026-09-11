@@ -18,7 +18,15 @@ milestone 5.
 - **Doska** — kanban with drag between columns on desktop, a status picker on a
   phone, filtered by project, assignee and lateness.
 - **Task detail** — status, assignee and priority inline; comments; time log; the
-  full history.
+  full history. The title and description are edited where they sit: click, type,
+  Enter to save, Escape to abandon.
+
+Keyboard: **⌘K / Ctrl+K** opens search — it looks through open tasks and the
+pages, arrow keys move, Enter opens. **n** starts a new task. A bare letter never
+fires while you are typing into a field.
+
+On the board, drag a card between columns to change its status, or within a
+column to set the order you want to work in. Both are optimistic and both stick.
 
 Colour is information: each project owns a hue, shown as a rail down every row,
 and lateness owns red. There is no brand accent competing with them. Light and

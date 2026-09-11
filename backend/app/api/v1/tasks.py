@@ -1,3 +1,4 @@
+import time
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -17,6 +18,7 @@ from app.schemas.task import (
     TaskCreate,
     TaskListResponse,
     TaskOut,
+    TaskReorder,
     TaskTransition,
     TaskUpdate,
     TimeLog,
@@ -129,7 +131,9 @@ async def create_task(payload: TaskCreate, session: DbSession, user: CurrentUser
             status_code=status.HTTP_403_FORBIDDEN, detail="only a manager can assign to others"
         )
 
-    task = Task(**payload.model_dump(), created_by_id=user.id)
+    # New work lands at the bottom of its column. time() is monotonic enough for
+    # an ordering key and needs no extra query to find the current maximum.
+    task = Task(**payload.model_dump(), created_by_id=user.id, position=time.time())
     session.add(task)
     await session.flush()
 
@@ -293,6 +297,49 @@ async def log_time(
         kind=ActivityKind.TIME_LOGGED,
         payload={"minutes": payload.minutes, "total": task.spent_minutes},
     )
+    await session.commit()
+    return TaskOut.model_validate(await _load(session, task.id))
+
+
+# The gap left between neighbours when a card is dropped at one end of a column.
+# Large enough that the halving below takes a very long time to run out of room.
+_ORDER_GAP = 1024.0
+
+
+@router.post("/{task_id}/reorder", response_model=TaskOut)
+async def reorder_task(
+    task_id: int, payload: TaskReorder, session: DbSession, user: CurrentUser
+) -> TaskOut:
+    """Place a task between two others.
+
+    Only the dragged row is written. Neighbours are re-read here rather than
+    trusting a position the client computed, because the client's copy of the
+    column may be seconds out of date.
+    """
+    task = await _visible_or_404(session, user, await _load(session, task_id))
+
+    async def neighbour(other_id: int | None) -> Task | None:
+        if other_id is None:
+            return None
+        row = await session.get(Task, other_id)
+        if row is None or not await can_see_project(session, user, row.project_id):
+            return None
+        return row
+
+    previous = await neighbour(payload.previous_id)
+    following = await neighbour(payload.next_id)
+
+    if previous is not None and following is not None:
+        task.position = (previous.position + following.position) / 2
+    elif previous is not None:
+        task.position = previous.position + _ORDER_GAP
+    elif following is not None:
+        task.position = following.position - _ORDER_GAP
+    else:
+        # Dropped into an empty column: nothing to be relative to, and the
+        # existing position is as good as any.
+        return TaskOut.model_validate(task)
+
     await session.commit()
     return TaskOut.model_validate(await _load(session, task.id))
 

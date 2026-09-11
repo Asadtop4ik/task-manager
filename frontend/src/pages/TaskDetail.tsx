@@ -22,6 +22,7 @@ import {
 } from "@/lib/format";
 import StatusMenu from "@/components/StatusMenu";
 import ProjectTag from "@/components/ProjectTag";
+import InlineText from "@/components/InlineText";
 import type { Activity, TaskPriority, TaskStatus } from "@/lib/types";
 import Page from "@/components/Page";
 
@@ -103,7 +104,14 @@ export default function TaskDetail() {
           <span className="ml-auto">#{item.id}</span>
         </div>
 
-        <h1 className="mt-2 text-page font-semibold">{item.title}</h1>
+        <h1 className="mt-2">
+          <InlineText
+            label="Sarlavha"
+            value={item.title}
+            className="text-page font-semibold"
+            onSave={(title) => update.mutate({ id: item.id, title })}
+          />
+        </h1>
 
         {late && (
           <p className="mt-2 font-medium text-late">
@@ -163,11 +171,16 @@ export default function TaskDetail() {
         )}
       </header>
 
-      {item.description && (
-        <section className="border-b border-hairline px-4 py-5">
-          <p className="whitespace-pre-wrap">{item.description}</p>
-        </section>
-      )}
+      <section className="border-b border-hairline px-4 py-5">
+        <InlineText
+          label="Tavsif"
+          value={item.description ?? ""}
+          multiline
+          placeholder="Tavsif qo‘shish"
+          className="whitespace-pre-wrap"
+          onSave={(description) => update.mutate({ id: item.id, description })}
+        />
+      </section>
 
       <section className="border-b border-hairline px-4 py-5">
         <h2 className="text-sm font-semibold">Vaqt yozish</h2>

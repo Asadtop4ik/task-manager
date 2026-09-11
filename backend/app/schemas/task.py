@@ -24,6 +24,7 @@ class TaskOut(BaseModel):
     estimate_minutes: int | None
     spent_minutes: int
     source: TaskSource
+    position: float
     created_at: datetime
     updated_at: datetime
 
@@ -90,3 +91,14 @@ class TaskCard(BaseModel):
 
     chat_id: int
     message_id: int
+
+
+class TaskReorder(BaseModel):
+    """Where a dragged card landed, named by the two cards it landed between.
+
+    The client sends neighbours rather than a computed position: it does not know
+    what anyone else has dragged in the meantime, and the server does.
+    """
+
+    previous_id: int | None = None
+    next_id: int | None = None

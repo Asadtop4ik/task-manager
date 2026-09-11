@@ -287,3 +287,102 @@ class TestCard:
             headers=auth(outsider),
         )
         assert response.status_code == 404
+
+
+class TestReorder:
+    async def _column(self, client: AsyncClient, user: User) -> list[int]:
+        body = (await client.get("/api/v1/tasks?status=todo", headers=auth(user))).json()
+        return [t["id"] for t in sorted(body["items"], key=lambda t: t["position"])]
+
+    async def test_new_tasks_land_at_the_bottom(
+        self, client: AsyncClient, manager: User, project: Project
+    ) -> None:
+        ids = [
+            (await _create(client, manager, project, title=f"t{i}")).json()["id"]
+            for i in range(3)
+        ]
+        assert await self._column(client, manager) == ids
+
+    async def test_dragging_between_two_cards(
+        self, client: AsyncClient, manager: User, project: Project
+    ) -> None:
+        a, b, c = [
+            (await _create(client, manager, project, title=t)).json()["id"] for t in "abc"
+        ]
+        response = await client.post(
+            f"/api/v1/tasks/{c}/reorder",
+            json={"previous_id": a, "next_id": b},
+            headers=auth(manager),
+        )
+        assert response.status_code == 200
+        assert await self._column(client, manager) == [a, c, b]
+
+    async def test_dragging_to_the_top(
+        self, client: AsyncClient, manager: User, project: Project
+    ) -> None:
+        a, b = [(await _create(client, manager, project, title=t)).json()["id"] for t in "ab"]
+        await client.post(
+            f"/api/v1/tasks/{b}/reorder", json={"next_id": a}, headers=auth(manager)
+        )
+        assert await self._column(client, manager) == [b, a]
+
+    async def test_reorder_does_not_touch_the_activity_log(
+        self, client: AsyncClient, manager: User, project: Project
+    ) -> None:
+        """Moving a card up a column is not a fact about the work."""
+        a, b = [(await _create(client, manager, project, title=t)).json()["id"] for t in "ab"]
+        await client.post(
+            f"/api/v1/tasks/{b}/reorder", json={"next_id": a}, headers=auth(manager)
+        )
+        entries = (
+            await client.get(f"/api/v1/tasks/{b}/activity", headers=auth(manager))
+        ).json()
+        assert [e["kind"] for e in entries] == ["created"]
+
+    async def test_an_outsider_cannot_reorder(
+        self, client: AsyncClient, manager: User, outsider: User, project: Project
+    ) -> None:
+        task_id = (await _create(client, manager, project)).json()["id"]
+        response = await client.post(
+            f"/api/v1/tasks/{task_id}/reorder", json={}, headers=auth(outsider)
+        )
+        assert response.status_code == 404
+
+    async def test_a_neighbour_you_cannot_see_is_ignored(
+        self, client: AsyncClient, manager: User, executor: User, session: AsyncSession
+    ) -> None:
+        """Otherwise a stranger's id would leak the ordering of a hidden project."""
+        from app.db.models import Project as ProjectModel
+
+        hidden = ProjectModel(key="hidden", name="Hidden")
+        session.add(hidden)
+        await session.commit()
+
+        mine = (
+            await client.post(
+                "/api/v1/tasks",
+                json={
+                    "project_id": (
+                        await client.get("/api/v1/projects", headers=auth(executor))
+                    ).json()[0]["id"],
+                    "title": "mine",
+                },
+                headers=auth(executor),
+            )
+        ).json()
+        theirs = (
+            await client.post(
+                "/api/v1/tasks",
+                json={"project_id": hidden.id, "title": "theirs"},
+                headers=auth(manager),
+            )
+        ).json()
+
+        before = mine["position"]
+        response = await client.post(
+            f"/api/v1/tasks/{mine['id']}/reorder",
+            json={"next_id": theirs["id"]},
+            headers=auth(executor),
+        )
+        assert response.status_code == 200
+        assert response.json()["position"] == before

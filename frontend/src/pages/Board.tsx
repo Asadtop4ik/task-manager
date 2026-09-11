@@ -1,11 +1,13 @@
-import { useState } from "react";
+import { Fragment, useRef, useState } from "react";
 import { useAuth } from "@/lib/auth";
-import { useProjects, useTasks, useTransition, useUsers } from "@/lib/queries";
+import { useProjects, useReorder, useTasks, useTransition, useUsers } from "@/lib/queries";
 import { BOARD_COLUMNS, STATUS_LABEL, TRANSITIONS, isOverdue } from "@/lib/format";
 import TaskRow from "@/components/TaskRow";
 import Empty from "@/components/Empty";
-import type { Task, TaskStatus } from "@/lib/types";
 import Page from "@/components/Page";
+import type { Task, TaskStatus } from "@/lib/types";
+
+type Drop = { status: TaskStatus; index: number };
 
 export default function Board() {
   const { state } = useAuth();
@@ -17,11 +19,15 @@ export default function Board() {
   const [onlyLate, setOnlyLate] = useState(false);
   const [column, setColumn] = useState<TaskStatus>("todo");
   const [dragging, setDragging] = useState<Task | null>(null);
+  const [drop, setDrop] = useState<Drop | null>(null);
   const [settled, setSettled] = useState<number | null>(null);
+
+  const columns = useRef<Partial<Record<TaskStatus, HTMLUListElement | null>>>({});
 
   const projects = useProjects();
   const users = useUsers();
   const transition = useTransition();
+  const reorder = useReorder();
 
   const { data, isPending } = useTasks({
     open_only: true,
@@ -30,148 +36,207 @@ export default function Board() {
   });
 
   const tasks = (data?.items ?? []).filter((task) => !onlyLate || isOverdue(task));
-  const inColumn = (status: TaskStatus) => tasks.filter((task) => task.status === status);
+  // Hand order, set by dragging. The API returns whatever order suits its own
+  // query; the column is the thing people arrange.
+  const inColumn = (status: TaskStatus) =>
+    tasks.filter((task) => task.status === status).sort((a, b) => a.position - b.position);
 
-  function drop(status: TaskStatus) {
+  /** Which gap the cursor is nearest, by comparing it to each card's midpoint. */
+  function gapAt(status: TaskStatus, clientY: number): number {
+    const list = columns.current[status];
+    if (!list) return 0;
+    const cards = Array.from(list.children).filter(
+      (node): node is HTMLElement => node instanceof HTMLElement && node.dataset.card === "1",
+    );
+    for (const [index, card] of cards.entries()) {
+      const box = card.getBoundingClientRect();
+      if (clientY < box.top + box.height / 2) return index;
+    }
+    return cards.length;
+  }
+
+  function canDrop(status: TaskStatus): boolean {
+    if (!dragging) return false;
+    return dragging.status === status || TRANSITIONS[dragging.status].includes(status);
+  }
+
+  function handleDrop(status: TaskStatus) {
     const task = dragging;
+    const target = drop;
     setDragging(null);
-    // The same table the API enforces. Dropping somewhere impossible should do
-    // nothing rather than flash the card there and snap it back.
-    if (!task || task.status === status || !TRANSITIONS[task.status].includes(status)) return;
-    transition.mutate({ id: task.id, status });
-    // The card has already moved optimistically; the lift is what tells you
-    // which one it was after your eye followed the cursor.
+    setDrop(null);
+    if (!task || !target || !canDrop(status)) return;
+
+    const siblings = inColumn(status).filter((row) => row.id !== task.id);
+    const previous = siblings[target.index - 1];
+    const following = siblings[target.index];
+
+    if (task.status !== status) {
+      transition.mutate({ id: task.id, status });
+    }
+    // Reorder even on a cross-column drop: the card should land where it was
+    // dropped, not at whatever end of the new column its old position implies.
+    reorder.mutate({
+      id: task.id,
+      previous_id: previous?.id ?? null,
+      next_id: following?.id ?? null,
+    });
+
     setSettled(task.id);
     window.setTimeout(() => setSettled((current) => (current === task.id ? null : current)), 900);
   }
 
+  const marker = (status: TaskStatus, index: number) =>
+    drop && drop.status === status && drop.index === index ? (
+      <li aria-hidden className="mx-1 my-0.5 h-0.5 rounded-full bg-ink" />
+    ) : null;
+
   return (
     <Page wide>
-    <div className="pb-20 sm:pb-6">
-      <header className="px-4 pt-8 pb-4">
-        <h1 className="text-page font-semibold">Doska</h1>
-      </header>
+      <div className="pb-20 sm:pb-6">
+        <header className="px-4 pt-8 pb-4">
+          <h1 className="text-page font-semibold">Doska</h1>
+        </header>
 
-      <div className="flex flex-wrap gap-2 px-4 pb-4">
-        <select
-          value={projectId}
-          onChange={(event) =>
-            setProjectId(event.target.value === "all" ? "all" : Number(event.target.value))
-          }
-          aria-label="Loyiha"
-          className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
-        >
-          <option value="all">Barcha loyihalar</option>
-          {projects.data?.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
+        <div className="flex flex-wrap gap-2 px-4 pb-4">
+          <select
+            value={projectId}
+            onChange={(event) =>
+              setProjectId(event.target.value === "all" ? "all" : Number(event.target.value))
+            }
+            aria-label="Loyiha"
+            className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
+          >
+            <option value="all">Barcha loyihalar</option>
+            {projects.data?.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
 
-        <select
-          value={assigneeId}
-          onChange={(event) =>
-            setAssigneeId(event.target.value === "all" ? "all" : Number(event.target.value))
-          }
-          aria-label="Bajaruvchi"
-          className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
-        >
-          <option value="all">Hamma</option>
-          {users.data?.map((person) => (
-            <option key={person.id} value={person.id}>
-              {person.full_name}
-            </option>
-          ))}
-        </select>
+          <select
+            value={assigneeId}
+            onChange={(event) =>
+              setAssigneeId(event.target.value === "all" ? "all" : Number(event.target.value))
+            }
+            aria-label="Bajaruvchi"
+            className="rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm"
+          >
+            <option value="all">Hamma</option>
+            {users.data?.map((person) => (
+              <option key={person.id} value={person.id}>
+                {person.full_name}
+              </option>
+            ))}
+          </select>
 
-        <label className="flex items-center gap-2 rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm">
-          <input
-            type="checkbox"
-            checked={onlyLate}
-            onChange={(event) => setOnlyLate(event.target.checked)}
-          />
-          Faqat kechikkan
-        </label>
-      </div>
-
-      {/* Phone: one column at a time. A four-column kanban at 390px is four
-          unreadable columns, so the columns become a picker instead. */}
-      <div className="sm:hidden">
-        <div className="flex gap-1 overflow-x-auto px-4 pb-3">
-          {BOARD_COLUMNS.map((status) => (
-            <button
-              key={status}
-              type="button"
-              onClick={() => setColumn(status)}
-              className={[
-                "shrink-0 rounded-full border px-3 py-1.5 text-sm",
-                status === column
-                  ? "border-ink bg-ink text-paper"
-                  : "border-hairline bg-card text-muted",
-              ].join(" ")}
-            >
-              {STATUS_LABEL[status]} {inColumn(status).length}
-            </button>
-          ))}
+          <label className="flex items-center gap-2 rounded-lg border border-hairline bg-card px-2.5 py-2 text-sm">
+            <input
+              type="checkbox"
+              checked={onlyLate}
+              onChange={(event) => setOnlyLate(event.target.checked)}
+            />
+            Faqat kechikkan
+          </label>
         </div>
-        <ul className="divide-y divide-hairline border-y border-hairline bg-card pl-4">
-          {inColumn(column).map((task) => (
-            <TaskRow key={task.id} task={task} tz={tz} />
-          ))}
-        </ul>
-        {!isPending && !inColumn(column).length && (
-          <Empty title={`${STATUS_LABEL[column]} — bo‘sh.`} />
+
+        {/* Phone: one column at a time. A four-column kanban at 390px is four
+            unreadable columns, so the columns become a picker instead. */}
+        <div className="sm:hidden">
+          <div className="flex gap-1 overflow-x-auto px-4 pb-3">
+            {BOARD_COLUMNS.map((status) => (
+              <button
+                key={status}
+                type="button"
+                onClick={() => setColumn(status)}
+                className={[
+                  "shrink-0 rounded-full border px-3 py-1.5 text-sm",
+                  status === column
+                    ? "border-ink bg-ink text-paper"
+                    : "border-hairline bg-card text-muted",
+                ].join(" ")}
+              >
+                {STATUS_LABEL[status]} {inColumn(status).length}
+              </button>
+            ))}
+          </div>
+          <ul className="divide-y divide-hairline border-y border-hairline bg-card pl-4">
+            {inColumn(column).map((task) => (
+              <TaskRow key={task.id} task={task} tz={tz} />
+            ))}
+          </ul>
+          {!isPending && !inColumn(column).length && (
+            <Empty title={`${STATUS_LABEL[column]} — bo‘sh.`} />
+          )}
+        </div>
+
+        {/* Desktop: real columns. Drag between them to change status, drag within
+            one to set the order you want to work in. */}
+        <div className="hidden gap-3 px-4 sm:grid sm:grid-cols-4">
+          {BOARD_COLUMNS.map((status) => {
+            const rows = inColumn(status);
+            const receiving = canDrop(status);
+            return (
+              <section
+                key={status}
+                onDragOver={(event) => {
+                  if (!receiving) return;
+                  event.preventDefault();
+                  const index = gapAt(status, event.clientY);
+                  setDrop((current) =>
+                    current?.status === status && current.index === index
+                      ? current
+                      : { status, index },
+                  );
+                }}
+                onDragLeave={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget as Node)) {
+                    setDrop((current) => (current?.status === status ? null : current));
+                  }
+                }}
+                onDrop={() => handleDrop(status)}
+                className={[
+                  "min-h-40 rounded-xl border bg-card p-2",
+                  dragging && receiving ? "border-dashed border-ink" : "border-hairline",
+                ].join(" ")}
+              >
+                <h2 className="flex items-baseline justify-between px-1 pb-2 text-sm font-semibold">
+                  {STATUS_LABEL[status]}
+                  <span className="text-muted">{rows.length}</span>
+                </h2>
+                <ul ref={(node) => void (columns.current[status] = node)}>
+                  {rows.map((task, index) => (
+                    <Fragment key={task.id}>
+                      {marker(status, index)}
+                      <TaskRow
+                        task={task}
+                        tz={tz}
+                        draggable
+                        card
+                        onDragStart={() => setDragging(task)}
+                        onDragEnd={() => {
+                          setDragging(null);
+                          setDrop(null);
+                        }}
+                        settling={settled === task.id}
+                      />
+                    </Fragment>
+                  ))}
+                  {marker(status, rows.length)}
+                </ul>
+              </section>
+            );
+          })}
+        </div>
+
+        {!isPending && !tasks.length && (
+          <Empty
+            title="Bu filtrlarda vazifa yo‘q."
+            hint="Filtrlarni kengaytiring yoki ⌘K bosib yangi vazifa qo‘shing."
+          />
         )}
       </div>
-
-      {/* Desktop: real columns, drag between them. */}
-      <div className="hidden gap-3 px-4 sm:grid sm:grid-cols-4">
-        {BOARD_COLUMNS.map((status) => {
-          const rows = inColumn(status);
-          const receiving =
-            dragging && dragging.status !== status && TRANSITIONS[dragging.status].includes(status);
-          return (
-            <section
-              key={status}
-              onDragOver={(event) => {
-                if (receiving) event.preventDefault();
-              }}
-              onDrop={() => drop(status)}
-              className={[
-                "min-h-40 rounded-xl border bg-card p-2",
-                receiving ? "border-ink border-dashed" : "border-hairline",
-              ].join(" ")}
-            >
-              <h2 className="flex items-baseline justify-between px-1 pb-2 text-sm font-semibold">
-                {STATUS_LABEL[status]}
-                <span className="text-muted">{rows.length}</span>
-              </h2>
-              <ul className="space-y-1">
-                {rows.map((task) => (
-                  <TaskRow
-                    key={task.id}
-                    task={task}
-                    tz={tz}
-                    draggable
-                    onDragStart={() => setDragging(task)}
-                    settling={settled === task.id}
-                  />
-                ))}
-              </ul>
-            </section>
-          );
-        })}
-      </div>
-
-      {!isPending && !tasks.length && (
-        <Empty
-          title="Bu filtrlarda vazifa yo‘q."
-          hint="Filtrlarni kengaytiring yoki yangi vazifa qo‘shing."
-        />
-      )}
-
-    </div>
     </Page>
   );
 }

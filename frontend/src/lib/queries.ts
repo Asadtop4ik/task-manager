@@ -168,6 +168,52 @@ export function useTransition() {
   });
 }
 
+/**
+ * Move a card within its column.
+ *
+ * Optimistic like the status change: the card is already under the cursor when
+ * you let go, and watching it jump back for a round trip is what makes a board
+ * feel like a form.
+ */
+export function useReorder() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      previous_id,
+      next_id,
+    }: {
+      id: number;
+      previous_id?: number | null;
+      next_id?: number | null;
+    }) => (await api.post<Task>(`/tasks/${id}/reorder`, { previous_id, next_id })).data,
+    onMutate: async ({ id, previous_id, next_id }) => {
+      await client.cancelQueries({ queryKey: ["tasks"] });
+      const snapshot = client.getQueriesData<TaskList>({ queryKey: ["tasks"] });
+      for (const [key, value] of snapshot) {
+        if (!value) continue;
+        const byId = new Map(value.items.map((task) => [task.id, task]));
+        const previous = previous_id ? byId.get(previous_id) : undefined;
+        const following = next_id ? byId.get(next_id) : undefined;
+        let position: number | undefined;
+        if (previous && following) position = (previous.position + following.position) / 2;
+        else if (previous) position = previous.position + 1024;
+        else if (following) position = following.position - 1024;
+        if (position === undefined) continue;
+        client.setQueryData<TaskList>(key, {
+          ...value,
+          items: value.items.map((task) => (task.id === id ? { ...task, position } : task)),
+        });
+      }
+      return { snapshot };
+    },
+    onError: (_error, _variables, context) => {
+      for (const [key, value] of context?.snapshot ?? []) client.setQueryData(key, value);
+    },
+    onSettled: () => void client.invalidateQueries({ queryKey: ["tasks"] }),
+  });
+}
+
 export function useUpdateTask() {
   const client = useQueryClient();
   return useMutation({

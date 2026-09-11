@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
+import { useHotkeys } from "@/lib/useHotkeys";
 import NewTaskSheet from "@/components/NewTaskSheet";
+import CommandPalette from "@/components/CommandPalette";
 
 const TABS = [
   { to: "/", label: "Bugun", end: true },
@@ -23,6 +25,18 @@ export default function Shell() {
   const { state, logout } = useAuth();
   const user = state.status === "authenticated" ? state.user : null;
   const [composing, setComposing] = useState(false);
+  const [searching, setSearching] = useState(false);
+
+  const openCompose = useCallback(() => setComposing(true), []);
+  const hotkeys = useMemo(
+    () => ({
+      "mod+k": () => setSearching(true),
+      n: openCompose,
+    }),
+    [openCompose],
+  );
+  // Off while a sheet is open: ⌘K over a half-written task would bury it.
+  useHotkeys(hotkeys, !composing && !searching);
 
   // Full width on purpose. Capping the whole shell left the rail floating in the
   // middle of a wide monitor with paper on both sides of it; the rail belongs
@@ -69,8 +83,16 @@ export default function Shell() {
         <div className="hidden px-5 py-5 sm:block">
           <button
             type="button"
+            onClick={() => setSearching(true)}
+            className="flex w-full items-center justify-between text-sm text-muted"
+          >
+            Qidirish
+            <kbd className="rounded border border-hairline px-1.5 py-0.5 text-xs">⌘K</kbd>
+          </button>
+          <button
+            type="button"
             onClick={() => void logout()}
-            className="text-sm text-muted underline underline-offset-4"
+            className="mt-4 text-sm text-muted underline underline-offset-4"
           >
             Chiqish
           </button>
@@ -82,6 +104,15 @@ export default function Shell() {
       </main>
 
       {composing && <NewTaskSheet onClose={() => setComposing(false)} />}
+      {searching && (
+        <CommandPalette
+          onClose={() => setSearching(false)}
+          onNewTask={() => {
+            setSearching(false);
+            setComposing(true);
+          }}
+        />
+      )}
     </div>
   );
 }

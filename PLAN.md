@@ -371,3 +371,23 @@ Things that were not obvious from the plan and are now settled in code:
 - **One orchestrated motion:** a row that just changed status lifts for 900ms, so
   a drag shows you what moved after your eye followed the cursor. Nothing else
   animates.
+
+### Milestone 4c — keyboard and inline editing
+
+- **Hand ordering is a float, not a rank.** Dropping a card between two others
+  writes one row; an integer rank would renumber the column under it.
+- **The client sends neighbours, not a position.** It does not know what anyone
+  else dragged in the last few seconds; the server re-reads both neighbours and
+  computes the midpoint itself.
+- **A reorder writes no activity row.** Moving a card up a column is not a fact
+  about the work, and logging it would bury the facts that are.
+- **A neighbour in a project you cannot see is ignored**, not an error —
+  otherwise a guessed id would leak the ordering of a hidden project.
+- **Bare-letter shortcuts never fire while a field has focus.** Typing "n" into a
+  comment must not open the compose sheet; that is the classic way shortcuts make
+  an app feel hostile.
+- **Search covers open tasks only.** Finished work is what you stop thinking
+  about, and including it would push today's three matches under fifty closed
+  ones.
+- **Escape always abandons an inline edit** and Enter saves a single-line one, so
+  a mistyped title is undone with the key people already reach for.

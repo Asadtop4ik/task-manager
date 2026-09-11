@@ -46,6 +46,7 @@ export type Task = {
   estimate_minutes: number | null;
   spent_minutes: number;
   source: "bot" | "web";
+  position: number;
   created_at: string;
   updated_at: string;
 };
