@@ -391,3 +391,10 @@ Things that were not obvious from the plan and are now settled in code:
   ones.
 - **Escape always abandons an inline edit** and Enter saves a single-line one, so
   a mistyped title is undone with the key people already reach for.
+- **The transition table was too strict and it showed.** The first version had no
+  `in_progress → todo`, so a card dragged out of a column could not be dragged
+  back and the board read as broken. Any open status now reaches any other; the
+  guards that remain are the ones that were actually load-bearing — only started
+  work can be finished, and done or cancelled reopens to todo and nowhere else,
+  which is what stops a stale Telegram card from dropping a closed task back into
+  whatever it used to be.

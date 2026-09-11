@@ -32,12 +32,25 @@ export const BOARD_COLUMNS: TaskStatus[] = ["todo", "in_progress", "blocked", "r
 
 // Mirrors the API's transition table (app/db/enums.py). The UI must not offer a
 // move the server will refuse.
+//
+// Any open status reaches any other: a board is dragged in both directions, and
+// putting a card back where it came from is an ordinary correction. The guards
+// that remain are on the terminal states — only started work can be finished,
+// and done or cancelled reopens to todo and nowhere else.
+const OPEN: TaskStatus[] = ["backlog", "todo", "in_progress", "blocked", "review"];
+const CAN_FINISH: TaskStatus[] = ["in_progress", "review"];
+
 export const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  backlog: ["todo", "cancelled"],
-  todo: ["in_progress", "blocked", "backlog", "cancelled"],
-  in_progress: ["review", "done", "blocked", "cancelled"],
-  blocked: ["in_progress", "todo", "cancelled"],
-  review: ["done", "in_progress", "cancelled"],
+  ...(Object.fromEntries(
+    OPEN.map((status) => [
+      status,
+      [
+        ...OPEN.filter((other) => other !== status),
+        ...(CAN_FINISH.includes(status) ? (["done"] as TaskStatus[]) : []),
+        "cancelled" as TaskStatus,
+      ],
+    ]),
+  ) as Record<TaskStatus, TaskStatus[]>),
   done: ["todo"],
   cancelled: ["todo"],
 };
