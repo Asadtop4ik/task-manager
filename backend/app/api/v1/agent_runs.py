@@ -17,7 +17,12 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.enums import ActivityKind, TaskStatus, can_transition
 from app.db.models import AgentRun, Task
-from app.schemas.agent_run import AgentNotificationOut, AgentRunCallback, AgentRunOut
+from app.schemas.agent_run import (
+    AgentDeployment,
+    AgentNotificationOut,
+    AgentRunCallback,
+    AgentRunOut,
+)
 from app.services import activity
 from app.services.access import can_edit_task, can_see_task
 
@@ -112,6 +117,26 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
 
+async def _verify_deployment(run: AgentRun, sha: str) -> None:
+    if not run.pr_url or not run.head_sha:
+        raise HTTPException(status_code=409, detail="agent PR is not verified")
+    pr_number = run.pr_url.rsplit("/", 1)[-1]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
+            headers=_headers(),
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="GitHub PR verification failed")
+    pr = response.json()
+    if (
+        not pr.get("merged")
+        or pr.get("merge_commit_sha") != sha
+        or pr["head"]["sha"] != run.head_sha
+    ):
+        raise HTTPException(status_code=409, detail="deployed SHA does not match merged PR")
+
+
 @router.get("/notifications", response_model=list[AgentNotificationOut])
 async def pending_notifications(
     session: DbSession, x_agent_worker_token: str | None = Header(default=None)
@@ -119,7 +144,10 @@ async def pending_notifications(
     _worker_auth(x_agent_worker_token)
     runs = await session.scalars(
         select(AgentRun)
-        .where(AgentRun.status.in_(["pr_ready", "failed"]), AgentRun.notified_at.is_(None))
+        .where(
+            AgentRun.status.in_(["pr_ready", "failed", "deployed"]),
+            AgentRun.notified_at.is_(None),
+        )
         .options(selectinload(AgentRun.task).selectinload(Task.created_by))
         .order_by(AgentRun.id)
         .limit(20)
@@ -149,7 +177,7 @@ async def mark_notified(
     run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status not in {"pr_ready", "failed"}:
+    if run.status not in {"pr_ready", "failed", "deployed"}:
         raise HTTPException(status_code=409, detail="run is not finished")
     if run.notified_at is None:
         run.notified_at = datetime.now(UTC)
@@ -253,6 +281,53 @@ async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -
     await session.refresh(run)
     if run.status in {"dispatching", "pending"}:
         run.status = "dispatched"
+    await session.commit()
+    return AgentRunOut.model_validate(run)
+
+
+@router.post("/{run_id}/deployed", response_model=AgentRunOut)
+async def agent_run_deployed(
+    run_id: str,
+    payload: AgentDeployment,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    if (
+        not settings.agent_callback_token
+        or not x_agent_callback_token
+        or not hmac.compare_digest(x_agent_callback_token, settings.agent_callback_token)
+    ):
+        raise HTTPException(status_code=401, detail="invalid callback token")
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.status == "deployed" and run.deployed_sha == payload.sha:
+        return AgentRunOut.model_validate(run)
+    if run.status != "pr_ready":
+        raise HTTPException(status_code=409, detail="agent PR is not ready")
+    expected_url = f"https://github.com/{run.repo_full_name}/actions/runs/"
+    suffix = payload.github_run_url.removeprefix(expected_url)
+    if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
+        raise HTTPException(status_code=400, detail="invalid deploy run URL")
+    await _verify_deployment(run, payload.sha)
+    run.status = "deployed"
+    run.deployed_sha = payload.sha
+    run.github_run_url = payload.github_run_url
+    run.finished_at = datetime.now(UTC)
+    run.notified_at = None
+    if can_transition(TaskStatus(run.task.status), TaskStatus.DONE):
+        old = run.task.status
+        run.task.status = TaskStatus.DONE
+        run.task.done_at = datetime.now(UTC)
+        activity.record(
+            session,
+            task_id=run.task_id,
+            actor=None,
+            kind=ActivityKind.STATUS_CHANGED,
+            payload={"from": old, "to": TaskStatus.DONE.value, "agent_run_id": run_id},
+        )
     await session.commit()
     return AgentRunOut.model_validate(run)
 

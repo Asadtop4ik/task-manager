@@ -36,6 +36,7 @@ def upgrade() -> None:
         sa.Column("github_run_url", sa.Text(), nullable=True),
         sa.Column("pr_url", sa.Text(), nullable=True),
         sa.Column("head_sha", sa.String(40), nullable=True),
+        sa.Column("deployed_sha", sa.String(40), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column("attempts", sa.Integer(), nullable=False),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),

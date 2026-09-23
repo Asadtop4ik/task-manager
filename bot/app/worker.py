@@ -37,6 +37,11 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                 if chat_id:
                     if notice["status"] == "pr_ready":
                         text = f"🤖 #{notice['task_id']} uchun PR tayyor: {notice['pr_url']}"
+                    elif notice["status"] == "deployed":
+                        text = (
+                            f"✅ #{notice['task_id']} serverga chiqdi. "
+                            f"Deploy: {notice['github_run_url']}"
+                        )
                     else:
                         text = (
                             f"⚠️ #{notice['task_id']} Codex ishi to‘xtadi. "

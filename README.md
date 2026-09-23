@@ -34,8 +34,11 @@ private `codex-agent` self-hosted runner. The repository needs these credentials
 
 The workflow keeps GitHub write credentials out of the Codex step. Protected
 paths (CI, agent instructions, migrations and auth code) stop before PR creation.
-PRs require review while the pilot is running. A task is not considered deployed
-until CI, a real SSH deploy and both `/ready` endpoints pass on the exact commit.
+The default-branch auto-merge workflow accepts only README, Markdown docs and
+frontend CSS changes after the latest commit's backend, bot, frontend and policy
+checks pass. Other PRs need review. A coding task is done only after CI, a real
+SSH deploy, the exact running image tag and both `/ready` endpoints pass; the
+deployment callback then records the deployed SHA and notifies Telegram.
 
 ## The web app
 

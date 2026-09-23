@@ -41,6 +41,7 @@ export type AgentRun = {
   github_run_url: string | null;
   pr_url: string | null;
   head_sha: string | null;
+  deployed_sha: string | null;
   error: string | null;
   attempts: number;
   created_at: string;

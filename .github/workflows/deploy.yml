@@ -57,7 +57,11 @@ jobs:
     permissions:
       contents: read
       packages: read
+      pull-requests: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Deploy over SSH
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -96,3 +100,26 @@ jobs:
           curl --fail --silent --show-error --retry 5 --retry-delay 3 \
             https://tasks.standart-eko.uz/bot/ready \
             | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["status"] == "ok" and d["checks"]["redis"] == "ok"'
+
+      - name: Mark an agent PR deployed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+        run: |
+          set -euo pipefail
+          associated_prs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls")
+          agent_run_id=$(printf '%s' "$associated_prs" \
+            | python3 scripts/find_deployed_agent.py "$GITHUB_SHA" "$GITHUB_REPOSITORY")
+          if [ -z "$agent_run_id" ]; then
+            echo 'This commit is not an agent PR.'
+            exit 0
+          fi
+          test -n "$AGENT_CALLBACK_TOKEN"
+          printf '{"sha":"%s","github_run_url":"https://github.com/%s/actions/runs/%s"}' \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" \
+            | curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+                -o /dev/null \
+                -H "X-Agent-Callback-Token: $AGENT_CALLBACK_TOKEN" \
+                -H 'Content-Type: application/json' \
+                --data-binary @- \
+                "https://tasks.standart-eko.uz/api/v1/agent-runs/$agent_run_id/deployed"

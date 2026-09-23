@@ -13,6 +13,7 @@ class AgentRunOut(BaseModel):
     github_run_url: str | None
     pr_url: str | None
     head_sha: str | None
+    deployed_sha: str | None
     error: str | None
     attempts: int
     created_at: datetime
@@ -26,6 +27,13 @@ class AgentRunCallback(BaseModel):
     pr_url: str | None = None
     head_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     error: str | None = Field(default=None, max_length=1000)
+
+
+class AgentDeployment(BaseModel):
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    github_run_url: str = Field(
+        pattern=r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$"
+    )
 
 
 class AgentNotificationOut(BaseModel):
