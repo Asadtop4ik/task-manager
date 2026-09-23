@@ -30,7 +30,7 @@ export default function Board() {
   const reorder = useReorder();
 
   const { data, isPending } = useTasks({
-    open_only: true,
+    status: BOARD_COLUMNS,
     project_id: projectId === "all" ? undefined : projectId,
     assignee_id: assigneeId === "all" ? undefined : assigneeId,
   });
