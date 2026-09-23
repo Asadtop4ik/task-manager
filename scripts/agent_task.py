@@ -115,6 +115,35 @@ def check_diff() -> None:
         raise ValueError(
             f"owner review required for protected paths: {', '.join(blocked)}"
         )
+    result = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
+    if result.exists():
+        summary = result.read_text(encoding="utf-8").strip()[:3000]
+        if summary:
+            with (Path(os.environ["RUNNER_TEMP"]) / "agent-pr-body.md").open(
+                "a", encoding="utf-8"
+            ) as body:
+                body.write(f"\nCodex summary:\n\n{summary}\n")
+
+
+def usage() -> dict[str, int]:
+    events = Path(os.environ["RUNNER_TEMP"]) / "agent-events.jsonl"
+    if not events.exists():
+        return {}
+    last: dict[str, int] = {}
+    for line in events.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "turn.completed":
+            continue
+        values = event.get("usage") or {}
+        last = {
+            key: values[key]
+            for key in ("input_tokens", "cached_input_tokens", "output_tokens")
+            if isinstance(values.get(key), int) and values[key] >= 0
+        }
+    return last
 
 
 def callback() -> None:
@@ -132,6 +161,7 @@ def callback() -> None:
         payload["head_sha"] = os.environ["HEAD_SHA"]
     else:
         payload["error"] = "Agent workflow failed; inspect the GitHub run."
+    payload.update(usage())
     url = f"https://tasks.standart-eko.uz/api/v1/agent-runs/{task['run_id']}/callback"
     request = urllib.request.Request(
         url,

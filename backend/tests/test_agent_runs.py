@@ -126,6 +126,9 @@ async def test_pr_callback_requires_token_and_matching_pr(
         "status": "pr_ready",
         "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/17",
         "head_sha": "a" * 40,
+        "input_tokens": 6194,
+        "cached_input_tokens": 4000,
+        "output_tokens": 280,
     }
     assert (await client.post(url, json=payload)).status_code == 401
     bad_repo = payload | {"pr_url": "https://github.com/other/repo/pull/17"}
@@ -142,6 +145,9 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "pr_ready"
     assert accepted.json()["head_sha"] == "a" * 40
+    assert accepted.json()["input_tokens"] == 6194
+    assert accepted.json()["cached_input_tokens"] == 4000
+    assert accepted.json()["output_tokens"] == 280
     assert (
         await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
     ).json()["status"] == "review"

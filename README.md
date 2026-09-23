@@ -43,6 +43,8 @@ frontend CSS changes after the latest commit's backend, bot, frontend and policy
 checks pass. Other PRs need review. A coding task is done only after CI, a real
 SSH deploy, the exact running image tag and both `/ready` endpoints pass; the
 deployment callback then records the deployed SHA and notifies Telegram.
+Completed Codex runs also store input, cached-input and output token counts;
+these are usage measurements, not a dollar invoice for a ChatGPT subscription.
 
 ## The web app
 

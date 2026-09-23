@@ -50,9 +50,10 @@ jobs:
         run: |
           set -euo pipefail
           codex exec --sandbox workspace-write -c approval_policy=never \
-            --model gpt-6-sol --ephemeral \
+            --model gpt-6-sol --ephemeral --json \
             --output-last-message "$RUNNER_TEMP/agent-result.txt" \
-            - < "$RUNNER_TEMP/agent-prompt.txt"
+            - < "$RUNNER_TEMP/agent-prompt.txt" \
+            > "$RUNNER_TEMP/agent-events.jsonl"
 
       - name: Check changed paths
         if: steps.guard.outputs.exists != 'true'
