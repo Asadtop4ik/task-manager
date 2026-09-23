@@ -161,9 +161,10 @@ async def test_pr_callback_requires_token_and_matching_pr(
     )
     assert acknowledged.status_code == 204
 
-    async def fake_deployment_verify(run, sha: str) -> None:
+    async def fake_deployment_verify(run, sha: str) -> str:
         assert run.pr_url == payload["pr_url"]
         assert sha == "b" * 40
+        return "c" * 40
 
     monkeypatch.setattr(agent_runs, "_verify_deployment", fake_deployment_verify)
     deployment = {
@@ -178,6 +179,7 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert deployed.status_code == 200
     assert deployed.json()["status"] == "deployed"
     assert deployed.json()["deployed_sha"] == "b" * 40
+    assert deployed.json()["head_sha"] == "c" * 40
     assert (
         await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
     ).json()["status"] == "done"
@@ -404,3 +406,51 @@ async def test_verified_pr_rejects_wrong_branch_or_sha(monkeypatch) -> None:
         assert exc.status_code == 409
     else:
         raise AssertionError("wrong branch was accepted")
+
+
+async def test_deployment_accepts_review_fix_only_on_original_pr_branch(monkeypatch) -> None:
+    """A fixed PR head may differ from the agent's initial commit after review."""
+    _credentials(monkeypatch)
+    run = agent_runs.AgentRun(
+        task_id=11,
+        run_id="00000000-0000-0000-0000-000000000011",
+        repo_full_name="Asadtop4ik/task-manager",
+        base_branch="main",
+        pr_url="https://github.com/Asadtop4ik/task-manager/pull/9",
+        head_sha="a" * 40,
+    )
+    pr = {
+        "merged": True,
+        "merge_commit_sha": "b" * 40,
+        "base": {"ref": "main"},
+        "head": {
+            "ref": f"codex/task-{run.task_id}-{run.run_id}",
+            "sha": "c" * 40,
+            "repo": {"full_name": "Asadtop4ik/task-manager"},
+        },
+    }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return httpx.Response(
+                200,
+                json=pr,
+                request=httpx.Request("GET", "https://api.github.com/example"),
+            )
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    assert await agent_runs._verify_deployment(run, "b" * 40) == "c" * 40
+
+    pr["head"]["ref"] = "unrelated-branch"
+    try:
+        await agent_runs._verify_deployment(run, "b" * 40)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("wrong PR branch was accepted")
