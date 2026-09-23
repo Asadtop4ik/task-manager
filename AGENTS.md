@@ -42,7 +42,8 @@ for the original design; verify old deployment notes against the live workflows.
 
 - Flag any bot or frontend change that lets an executor alter a task or project
   outside the backend's permission checks or status transition table.
-- Flag any agent/CI/deploy change that can mark a task done without proving the
-  same commit passed checks, runs in production, and passed readiness probes.
+- Flag agent/CI/deploy changes that can merge a cancelled run's PR, or mark a
+  task done without proving the same commit passed checks, runs in production,
+  and passed readiness probes.
 - Flag writes to money, permissions, customer messages or production data that
   can happen from a test or an unapproved agent task.
