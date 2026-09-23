@@ -16,6 +16,9 @@ class AgentRunOut(BaseModel):
     deployed_sha: str | None
     error: str | None
     attempts: int
+    input_tokens: int | None
+    cached_input_tokens: int | None
+    output_tokens: int | None
     created_at: datetime
     finished_at: datetime | None
 
@@ -27,6 +30,9 @@ class AgentRunCallback(BaseModel):
     pr_url: str | None = None
     head_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     error: str | None = Field(default=None, max_length=1000)
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
 
 
 class AgentDeployment(BaseModel):

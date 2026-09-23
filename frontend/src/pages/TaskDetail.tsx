@@ -216,6 +216,11 @@ export default function TaskDetail() {
                 </a>
               )}
               {run.error && <p className="text-late">{run.error}</p>}
+              {run.input_tokens !== null && run.output_tokens !== null && (
+                <p className="text-muted">
+                  Codex: {run.input_tokens.toLocaleString()} kirish, {run.output_tokens.toLocaleString()} chiqish tokeni
+                </p>
+              )}
             </div>
           ))}
         </section>

@@ -376,6 +376,12 @@ async def agent_run_callback(
             raise HTTPException(status_code=400, detail="invalid GitHub run URL")
         run.github_run_url = payload.github_run_url
     run.error = payload.error
+    if payload.input_tokens is not None:
+        run.input_tokens = payload.input_tokens
+    if payload.cached_input_tokens is not None:
+        run.cached_input_tokens = payload.cached_input_tokens
+    if payload.output_tokens is not None:
+        run.output_tokens = payload.output_tokens
     if payload.status in {"pr_ready", "failed"}:
         run.finished_at = datetime.now(UTC)
     if payload.status == "pr_ready" and can_transition(

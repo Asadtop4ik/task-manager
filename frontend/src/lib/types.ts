@@ -44,6 +44,9 @@ export type AgentRun = {
   deployed_sha: string | null;
   error: string | null;
   attempts: number;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
   created_at: string;
   finished_at: string | null;
 };
