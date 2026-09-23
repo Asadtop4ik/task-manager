@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -117,7 +118,7 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
 
-async def _verify_deployment(run: AgentRun, sha: str) -> None:
+async def _verify_deployment(run: AgentRun, sha: str) -> str:
     if not run.pr_url or not run.head_sha:
         raise HTTPException(status_code=409, detail="agent PR is not verified")
     pr_number = run.pr_url.rsplit("/", 1)[-1]
@@ -129,12 +130,20 @@ async def _verify_deployment(run: AgentRun, sha: str) -> None:
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub PR verification failed")
     pr = response.json()
+    head = pr.get("head") or {}
+    head_sha = head.get("sha", "")
     if (
         not pr.get("merged")
         or pr.get("merge_commit_sha") != sha
-        or pr["head"]["sha"] != run.head_sha
+        or (pr.get("base") or {}).get("ref") != run.base_branch
+        or head.get("ref") != f"codex/task-{run.task_id}-{run.run_id}"
+        or (head.get("repo") or {}).get("full_name", "").lower() != run.repo_full_name.lower()
+        or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
     ):
         raise HTTPException(status_code=409, detail="deployed SHA does not match merged PR")
+    # A reviewer may push fixes after the agent opens the PR. The merge commit,
+    # PR branch and source repo are verified above; record the final reviewed head.
+    return head_sha
 
 
 async def _cancel_github(run: AgentRun) -> None:
@@ -410,7 +419,7 @@ async def agent_run_deployed(
     suffix = payload.github_run_url.removeprefix(expected_url)
     if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
         raise HTTPException(status_code=400, detail="invalid deploy run URL")
-    await _verify_deployment(run, payload.sha)
+    run.head_sha = await _verify_deployment(run, payload.sha)
     run.status = "deployed"
     run.deployed_sha = payload.sha
     run.github_run_url = payload.github_run_url
