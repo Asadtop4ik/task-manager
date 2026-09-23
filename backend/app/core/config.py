@@ -130,7 +130,7 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     # Required values arrive from environment variables; mypy only sees the
     # generated BaseSettings constructor and asks for positional call arguments.
-    return Settings()  # type: ignore[call-arg]
+    return Settings()  # type: ignore[call-arg,unused-ignore]
 
 
 settings = get_settings()

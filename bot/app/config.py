@@ -55,7 +55,7 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     # REDIS_URL is provided through the environment at runtime.
-    return Settings()  # type: ignore[call-arg]
+    return Settings()  # type: ignore[call-arg,unused-ignore]
 
 
 settings = get_settings()
