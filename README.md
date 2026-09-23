@@ -19,6 +19,10 @@ parsed task; the bot creates it and starts one Codex run. `/agent 42` delegates
 an existing task. The task detail page shows the current run and PR link, and
 the bot reports PR-ready or failed runs through the worker's notification queue.
 
+Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
+yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
+veb boarddagi shu task sahifasida ko'rinadi.
+
 The project repository and default branch are manager-only settings. The backend
 also requires the repository in `GITHUB_AGENT_ALLOWED_REPOS` and verifies it is
 private before dispatch. Only `Asadtop4ik/task-manager` is allowlisted by default.
