@@ -348,6 +348,29 @@ class TestReorder:
         )
         assert response.status_code == 404
 
+    async def test_executor_cannot_reorder_another_persons_completed_task(
+        self, client: AsyncClient, manager: User, executor: User, project: Project
+    ) -> None:
+        first = (await _create(client, manager, project, title="finished first")).json()
+        second = (await _create(client, manager, project, title="finished second")).json()
+        for task in (first, second):
+            for status in ("in_progress", "done"):
+                response = await client.post(
+                    f"/api/v1/tasks/{task['id']}/transition",
+                    json={"status": status},
+                    headers=auth(manager),
+                )
+                assert response.status_code == 200
+
+        response = await client.post(
+            f"/api/v1/tasks/{second['id']}/reorder",
+            json={"next_id": first["id"]},
+            headers=auth(executor),
+        )
+        assert response.status_code == 403
+        unchanged = await client.get(f"/api/v1/tasks/{second['id']}", headers=auth(manager))
+        assert unchanged.json()["position"] == second["position"]
+
     async def test_a_neighbour_you_cannot_see_is_ignored(
         self, client: AsyncClient, manager: User, executor: User, session: AsyncSession
     ) -> None:
@@ -366,6 +389,7 @@ class TestReorder:
                         await client.get("/api/v1/projects", headers=auth(executor))
                     ).json()[0]["id"],
                     "title": "mine",
+                    "assignee_id": executor.id,
                 },
                 headers=auth(executor),
             )
