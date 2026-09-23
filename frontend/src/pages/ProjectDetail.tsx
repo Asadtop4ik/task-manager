@@ -38,6 +38,8 @@ export default function ProjectDetail() {
   const late = tasks.filter(isOverdue).length;
 
   const [name, setName] = useState<string | null>(null);
+  const [repo, setRepo] = useState<string | null>(null);
+  const [branch, setBranch] = useState<string | null>(null);
   const [adding, setAdding] = useState<number | "">("");
 
   if (projects.isPending) return <p className="p-4 text-muted">yuklanmoqda…</p>;
@@ -165,6 +167,35 @@ export default function ProjectDetail() {
                 const next = (name ?? "").trim();
                 if (next && next !== project.name) update.mutate({ id: projectId, name: next });
                 setName(null);
+              }}
+              className={fieldClass}
+            />
+          </label>
+
+          <label className={`mt-4 ${labelClass}`}>
+            Agent repositorysi (owner/repo)
+            <input
+              value={repo ?? project.repo_full_name ?? ""}
+              onChange={(event) => setRepo(event.target.value)}
+              onBlur={() => {
+                if (repo !== null && repo.trim() !== (project.repo_full_name ?? "")) {
+                  update.mutate({ id: projectId, repo_full_name: repo.trim() || null });
+                }
+                setRepo(null);
+              }}
+              className={fieldClass}
+            />
+          </label>
+          <label className={`mt-4 ${labelClass}`}>
+            Asosiy branch
+            <input
+              value={branch ?? project.default_branch ?? ""}
+              onChange={(event) => setBranch(event.target.value)}
+              onBlur={() => {
+                if (branch !== null && branch.trim() !== (project.default_branch ?? "")) {
+                  update.mutate({ id: projectId, default_branch: branch.trim() || null });
+                }
+                setBranch(null);
               }}
               className={fieldClass}
             />

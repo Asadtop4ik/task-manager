@@ -19,6 +19,10 @@ class Project(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     color: Mapped[str] = mapped_column(String(16), default="#64748b", nullable=False)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Set by a manager after repository access has been verified. Task text
+    # cannot choose where an agent gets write access.
+    repo_full_name: Mapped[str | None] = mapped_column(String(200))
+    default_branch: Mapped[str | None] = mapped_column(String(120))
 
     memberships: Mapped[list["Membership"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"

@@ -11,6 +11,35 @@ tasks with a real status machine, comments, an activity log, permissions, the
 bot's full command set, and the web app are done. Reminders and digests are
 milestone 5.
 
+## Coding agent integration
+
+After an operator configures a private project repository and the agent credentials,
+send `task-manager: update the task view @codex` to the Telegram bot. Confirm the
+parsed task; the bot creates it and starts one Codex run. `/agent 42` delegates
+an existing task. The task detail page shows the current run and PR link, and
+the bot reports PR-ready or failed runs through the worker's notification queue.
+
+The project repository and default branch are manager-only settings. The backend
+also requires the repository in `GITHUB_AGENT_ALLOWED_REPOS` and verifies it is
+private before dispatch. Only `Asadtop4ik/task-manager` is allowlisted by default.
+The worker uses a GitHub `repository_dispatch` event; its workflow runs on a
+private `codex-agent` self-hosted runner. The repository needs these credentials:
+
+- Server env: `GITHUB_AGENT_TOKEN` for repository metadata, dispatch and PR
+  verification; `AGENT_CALLBACK_TOKEN` for workflow callbacks.
+- GitHub Actions secrets: `AGENT_REPO_TOKEN` for the PR push/create step;
+  `AGENT_CALLBACK_TOKEN` matching the server value.
+- Runner: Codex CLI logged in under its dedicated account, plus `gh` and Python 3.
+  Do not expose the Codex auth cache to a public repository or a general runner.
+
+The workflow keeps GitHub write credentials out of the Codex step. Protected
+paths (CI, agent instructions, migrations and auth code) stop before PR creation.
+The default-branch auto-merge workflow accepts only README, Markdown docs and
+frontend CSS changes after the latest commit's backend, bot, frontend and policy
+checks pass. Other PRs need review. A coding task is done only after CI, a real
+SSH deploy, the exact running image tag and both `/ready` endpoints pass; the
+deployment callback then records the deployed SHA and notifies Telegram.
+
 ## The web app
 
 - **Bugun** — the first screen answers one question, am I behind, so the count of
