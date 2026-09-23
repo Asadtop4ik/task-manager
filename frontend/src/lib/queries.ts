@@ -227,16 +227,20 @@ export function useReorder() {
     onMutate: async ({ id, previous_id, next_id }) => {
       await client.cancelQueries({ queryKey: ["tasks"] });
       const snapshot = client.getQueriesData<TaskList>({ queryKey: ["tasks"] });
+      // Board columns may come from separate API pages. Look up neighbours
+      // across all cached task lists before changing the dragged card's rank.
+      const byId = new Map(
+        snapshot.flatMap(([, value]) => (value?.items ?? []).map((task) => [task.id, task] as const)),
+      );
+      const previous = previous_id ? byId.get(previous_id) : undefined;
+      const following = next_id ? byId.get(next_id) : undefined;
+      let position: number | undefined;
+      if (previous && following) position = (previous.position + following.position) / 2;
+      else if (previous) position = previous.position + 1024;
+      else if (following) position = following.position - 1024;
+      if (position === undefined) return { snapshot };
       for (const [key, value] of snapshot) {
         if (!value) continue;
-        const byId = new Map(value.items.map((task) => [task.id, task]));
-        const previous = previous_id ? byId.get(previous_id) : undefined;
-        const following = next_id ? byId.get(next_id) : undefined;
-        let position: number | undefined;
-        if (previous && following) position = (previous.position + following.position) / 2;
-        else if (previous) position = previous.position + 1024;
-        else if (following) position = following.position - 1024;
-        if (position === undefined) continue;
         client.setQueryData<TaskList>(key, {
           ...value,
           items: value.items.map((task) => (task.id === id ? { ...task, position } : task)),
