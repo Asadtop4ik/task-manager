@@ -21,7 +21,11 @@ def _credentials(monkeypatch) -> None:
 
 
 async def test_delegation_is_idempotent_and_visible(
-    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
 ) -> None:
     await _ready_project(session, project)
     _credentials(monkeypatch)
@@ -40,13 +44,19 @@ async def test_delegation_is_idempotent_and_visible(
         headers=auth(manager),
     )
     task_id = created.json()["id"]
-    first = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
-    second = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    first = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
+    )
+    second = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
+    )
     assert first.status_code == 201
     assert first.json()["status"] == "dispatched"
     assert second.json()["run_id"] == first.json()["run_id"]
     assert calls == [first.json()["run_id"]]
-    listed = await client.get(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    listed = await client.get(
+        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
+    )
     assert [run["run_id"] for run in listed.json()] == calls
 
 
@@ -66,7 +76,9 @@ async def test_only_task_owner_can_delegate(
         headers=auth(manager),
     )
     task_id = created.json()["id"]
-    response = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(executor))
+    response = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(executor)
+    )
     assert response.status_code == 403
 
 
@@ -80,14 +92,22 @@ async def test_missing_repo_or_credentials_does_not_dispatch(
         headers=auth(manager),
     )
     task_id = created.json()["id"]
-    response = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    response = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
+    )
     assert response.status_code == 409
-    listed = await client.get(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    listed = await client.get(
+        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
+    )
     assert listed.json() == []
 
 
 async def test_pr_callback_requires_token_and_matching_pr(
-    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
 ) -> None:
     await _ready_project(session, project)
     _credentials(monkeypatch)
@@ -123,7 +143,9 @@ async def test_pr_callback_requires_token_and_matching_pr(
     bad_repo = payload | {"pr_url": "https://github.com/other/repo/pull/17"}
     assert (
         await client.post(
-            url, json=bad_repo, headers={"X-Agent-Callback-Token": "test-callback-token"}
+            url,
+            json=bad_repo,
+            headers={"X-Agent-Callback-Token": "test-callback-token"},
         )
     ).status_code == 400
     accepted = await client.post(
@@ -135,7 +157,11 @@ async def test_pr_callback_requires_token_and_matching_pr(
 
 
 async def test_dispatch_network_error_can_retry_once(
-    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
 ) -> None:
     await _ready_project(session, project)
     _credentials(monkeypatch)
@@ -173,7 +199,13 @@ async def test_verified_pr_rejects_wrong_branch_or_sha(monkeypatch) -> None:
         async def get(self, *args, **kwargs):
             return httpx.Response(
                 200,
-                json={"head": {"ref": "unrelated-branch", "sha": "a" * 40}},
+                json={
+                    "head": {
+                        "ref": "unrelated-branch",
+                        "sha": "a" * 40,
+                        "repo": {"full_name": "Asadtop4ik/task-manager"},
+                    }
+                },
                 request=httpx.Request("GET", "https://api.github.com/example"),
             )
 

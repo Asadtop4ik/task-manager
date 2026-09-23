@@ -106,6 +106,8 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         response.status_code != 200
         or response.json()["head"]["ref"] != expected_branch
         or response.json()["head"]["sha"] != sha
+        or (response.json()["head"].get("repo") or {}).get("full_name", "").lower()
+        != run.repo_full_name.lower()
     ):
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
@@ -139,7 +141,9 @@ async def pending_notifications(
 
 @router.post("/{run_id}/notified", status_code=204)
 async def mark_notified(
-    run_id: str, session: DbSession, x_agent_worker_token: str | None = Header(default=None)
+    run_id: str,
+    session: DbSession,
+    x_agent_worker_token: str | None = Header(default=None),
 ) -> None:
     _worker_auth(x_agent_worker_token)
     run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
@@ -309,7 +313,11 @@ async def agent_run_callback(
             task_id=run.task_id,
             actor=None,
             kind=ActivityKind.STATUS_CHANGED,
-            payload={"from": old, "to": TaskStatus.REVIEW.value, "agent_run_id": run_id},
+            payload={
+                "from": old,
+                "to": TaskStatus.REVIEW.value,
+                "agent_run_id": run_id,
+            },
         )
     await session.commit()
     return AgentRunOut.model_validate(run)

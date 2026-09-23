@@ -98,8 +98,17 @@ def check_diff() -> None:
     blocked = [
         path
         for path in paths
-        if path.startswith((".github/", "backend/alembic/", ".codex/", ".agents/"))
-        or path in {"AGENTS.md", "backend/app/core/security.py"}
+        if path.startswith(
+            (".github/", "backend/alembic/", ".codex/", ".agents/", "scripts/")
+        )
+        or path
+        in {
+            "AGENTS.md",
+            "backend/app/core/security.py",
+            "backend/app/core/config.py",
+            "backend/app/api/v1/agent_runs.py",
+            "backend/app/db/models/agent_run.py",
+        }
         or path.endswith((".env", "auth.json"))
     ]
     if blocked:

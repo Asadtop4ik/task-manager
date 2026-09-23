@@ -49,13 +49,19 @@ jobs:
         if: steps.guard.outputs.exists != 'true'
         run: |
           set -euo pipefail
-          codex exec --sandbox workspace-write --ask-for-approval never \
+          codex exec --sandbox workspace-write -c approval_policy=never \
+            --model gpt-6-sol --ephemeral \
             --output-last-message "$RUNNER_TEMP/agent-result.txt" \
             - < "$RUNNER_TEMP/agent-prompt.txt"
 
       - name: Check changed paths
         if: steps.guard.outputs.exists != 'true'
-        run: python3 scripts/agent_task.py check-diff
+        run: |
+          set -euo pipefail
+          # Take the validator from the trusted dispatch commit. The agent may
+          # edit files in the checkout, including its copy of this script.
+          git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent-validator.py"
+          python3 "$RUNNER_TEMP/agent-validator.py" check-diff
 
       - name: Open pull request
         if: steps.guard.outputs.exists != 'true'
@@ -88,4 +94,5 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$AGENT_CALLBACK_TOKEN"
-          python3 scripts/agent_task.py callback
+          git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent-validator.py"
+          python3 "$RUNNER_TEMP/agent-validator.py" callback
