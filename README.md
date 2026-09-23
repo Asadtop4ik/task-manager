@@ -51,6 +51,10 @@ SSH deploy, the exact running image tag and both `/ready` endpoints pass; the
 deployment callback then records the deployed SHA and notifies Telegram.
 Completed Codex runs also store input, cached-input and output token counts;
 these are usage measurements, not a dollar invoice for a ChatGPT subscription.
+For automatic review of human and agent PRs, connect this repository to Codex
+Cloud and enable Code review plus Automatic reviews in Codex settings. The
+repository's `AGENTS.md` includes the review rules. This is a separate, one-time
+account setting from the self-hosted task runner.
 
 ## The web app
 
