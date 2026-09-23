@@ -44,19 +44,13 @@ async def test_delegation_is_idempotent_and_visible(
         headers=auth(manager),
     )
     task_id = created.json()["id"]
-    first = await client.post(
-        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
-    )
-    second = await client.post(
-        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
-    )
+    first = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    second = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
     assert first.status_code == 201
     assert first.json()["status"] == "dispatched"
     assert second.json()["run_id"] == first.json()["run_id"]
     assert calls == [first.json()["run_id"]]
-    listed = await client.get(
-        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
-    )
+    listed = await client.get(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
     assert [run["run_id"] for run in listed.json()] == calls
 
 
@@ -76,9 +70,7 @@ async def test_only_task_owner_can_delegate(
         headers=auth(manager),
     )
     task_id = created.json()["id"]
-    response = await client.post(
-        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(executor)
-    )
+    response = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(executor))
     assert response.status_code == 403
 
 
@@ -92,13 +84,9 @@ async def test_missing_repo_or_credentials_does_not_dispatch(
         headers=auth(manager),
     )
     task_id = created.json()["id"]
-    response = await client.post(
-        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
-    )
+    response = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
     assert response.status_code == 409
-    listed = await client.get(
-        f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager)
-    )
+    listed = await client.get(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
     assert listed.json() == []
 
 
