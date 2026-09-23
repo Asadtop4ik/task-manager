@@ -28,7 +28,7 @@ export const OPEN_STATUSES: TaskStatus[] = [
 // The board's columns. Backlog is deliberately absent: it is a holding pen, not
 // a stage of work, and a fifth column of things nobody is doing makes the four
 // that matter narrower.
-export const BOARD_COLUMNS: TaskStatus[] = ["todo", "in_progress", "blocked", "review"];
+export const BOARD_COLUMNS: TaskStatus[] = ["todo", "in_progress", "done", "review"];
 
 // Mirrors the API's transition table (app/db/enums.py). The UI must not offer a
 // move the server will refuse.

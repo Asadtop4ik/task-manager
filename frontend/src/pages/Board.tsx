@@ -29,13 +29,24 @@ export default function Board() {
   const transition = useTransition();
   const reorder = useReorder();
 
-  const { data, isPending } = useTasks({
-    open_only: true,
+  const activeTasks = useTasks({
+    status: BOARD_COLUMNS.filter((status) => status !== "done"),
+    project_id: projectId === "all" ? undefined : projectId,
+    assignee_id: assigneeId === "all" ? undefined : assigneeId,
+  });
+  const completedTasks = useTasks({
+    status: ["done"],
     project_id: projectId === "all" ? undefined : projectId,
     assignee_id: assigneeId === "all" ? undefined : assigneeId,
   });
 
-  const tasks = (data?.items ?? []).filter((task) => !onlyLate || isOverdue(task));
+  // Completed history has its own page so it cannot crowd active work out of
+  // the board's 100-task API limit.
+  const tasks = [
+    ...(activeTasks.data?.items ?? []),
+    ...(completedTasks.data?.items ?? []),
+  ].filter((task) => !onlyLate || isOverdue(task));
+  const isPending = activeTasks.isPending || completedTasks.isPending;
   // Hand order, set by dragging. The API returns whatever order suits its own
   // query; the column is the thing people arrange.
   const inColumn = (status: TaskStatus) =>

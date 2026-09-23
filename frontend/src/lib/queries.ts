@@ -100,7 +100,11 @@ export function useTasks(filters: TaskFilters) {
   return useQuery({
     queryKey: ["tasks", filters],
     queryFn: async () =>
-      (await api.get<TaskList>("/tasks", { params: { limit: 100, ...filters } })).data,
+      (await api.get<TaskList>("/tasks", {
+        params: { limit: 100, ...filters },
+        // FastAPI expects repeated `status` keys for a list, without brackets.
+        paramsSerializer: { indexes: null },
+      })).data,
   });
 }
 
