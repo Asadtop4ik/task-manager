@@ -1,0 +1,91 @@
+name: Agent task
+
+on:
+  repository_dispatch:
+    types: [agent_task]
+
+# One private runner owns the ChatGPT auth file. Never use it concurrently.
+concurrency:
+  group: agent-task-manager
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    runs-on: [self-hosted, linux, x64, codex-agent]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TASK_JSON: ${{ toJSON(github.event.client_payload) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare task
+        run: |
+          set -euo pipefail
+          python3 scripts/agent_task.py prepare
+
+      - name: Create branch
+        run: |
+          set -euo pipefail
+          git switch -c "$AGENT_BRANCH" "$AGENT_BASE"
+
+      - name: Check for an existing run branch
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$AGENT_BRANCH" --jq .ref >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Implement with Codex
+        if: steps.guard.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          codex exec --sandbox workspace-write --ask-for-approval never \
+            --output-last-message "$RUNNER_TEMP/agent-result.txt" \
+            - < "$RUNNER_TEMP/agent-prompt.txt"
+
+      - name: Check changed paths
+        if: steps.guard.outputs.exists != 'true'
+        run: python3 scripts/agent_task.py check-diff
+
+      - name: Open pull request
+        if: steps.guard.outputs.exists != 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh auth setup-git
+          git add -A
+          git -c user.name='Business AI Codex' \
+              -c user.email='codex@users.noreply.github.com' \
+              commit -m "feat(agent): work on task $AGENT_TASK_ID"
+          git push origin "HEAD:$AGENT_BRANCH"
+          pr_url=$(gh pr create \
+            --base "$AGENT_BASE" --head "$AGENT_BRANCH" \
+            --title "Task #$AGENT_TASK_ID: Codex change" \
+            --body-file "$RUNNER_TEMP/agent-pr-body.md")
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report result to Task Manager
+        if: always() && steps.guard.outputs.exists != 'true'
+        env:
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$AGENT_CALLBACK_TOKEN"
+          python3 scripts/agent_task.py callback

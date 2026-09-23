@@ -7,6 +7,7 @@ import {
 import { api } from "@/lib/api";
 import type {
   Activity,
+  AgentRun,
   Comment,
   Member,
   Project,
@@ -107,6 +108,28 @@ export function useTask(id: number) {
   return useQuery({
     queryKey: ["task", id],
     queryFn: async () => (await api.get<Task>(`/tasks/${id}`)).data,
+  });
+}
+
+export function useAgentRuns(taskId: number) {
+  return useQuery({
+    queryKey: ["agent-runs", taskId],
+    queryFn: async () =>
+      (await api.get<AgentRun[]>(`/agent-runs/tasks/${taskId}`)).data,
+    refetchInterval: (query) =>
+      query.state.data?.some((run) => ["pending", "dispatching", "dispatched", "running"].includes(run.status))
+        ? 10_000
+        : false,
+  });
+}
+
+export function useStartAgentRun() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (taskId: number) =>
+      (await api.post<AgentRun>(`/agent-runs/tasks/${taskId}`)).data,
+    onSettled: (_data, _error, taskId) =>
+      void client.invalidateQueries({ queryKey: ["agent-runs", taskId] }),
   });
 }
 

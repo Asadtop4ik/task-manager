@@ -66,13 +66,15 @@ jobs:
           KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The server side is wired up after the first push (DNS, env file, the
-          # ci-deploy-shell allowlist). Until the secrets exist, skip rather than
-          # fail — a permanently red main teaches everyone to ignore CI.
-          if [ -z "$SSH_HOST" ]; then
-            echo "::warning::DEPLOY_* secrets are not set — images were pushed to GHCR, deploy skipped."
-            exit 0
-          fi
+          set -euo pipefail
+          # A green deploy must mean the image reached production. A missing
+          # secret used to skip SSH and still report success.
+          for required in SSH_KEY SSH_HOST SSH_USER KNOWN_HOSTS GHCR_TOKEN; do
+            if [ -z "${!required}" ]; then
+              echo "::error::Required deploy credential $required is missing"
+              exit 1
+            fi
+          done
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
@@ -84,3 +86,13 @@ jobs:
           printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
             "$SSH_USER@$SSH_HOST" \
             "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }}"
+
+      - name: Verify public readiness after deploy
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 \
+            https://tasks.standart-eko.uz/ready \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["status"] == "ok" and d["checks"] == {"postgres":"ok","redis":"ok"}'
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 \
+            https://tasks.standart-eko.uz/bot/ready \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["status"] == "ok" and d["checks"]["redis"] == "ok"'

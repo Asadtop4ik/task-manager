@@ -81,6 +81,12 @@ class TaskApi:
     async def task(self, task_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/tasks/{task_id}")
 
+    async def start_agent_run(self, task_id: int) -> dict[str, Any]:
+        return await self._request("POST", f"/agent-runs/tasks/{task_id}")
+
+    async def agent_runs(self, task_id: int) -> list[dict[str, Any]]:
+        return await self._request("GET", f"/agent-runs/tasks/{task_id}")
+
     async def tasks(self, **params: Any) -> dict[str, Any]:
         clean = {k: v for k, v in params.items() if v is not None}
         return await self._request("GET", "/tasks", params=clean)

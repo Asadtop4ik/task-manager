@@ -42,7 +42,9 @@ def _confirmation(
     )
     if parsed.priority:
         lines.append(f"⚡️ {PRIORITY_LABEL.get(parsed.priority, parsed.priority)}")
-    if assignee_name:
+    if (parsed.assignee_username or "").lower() == "codex":
+        lines.append("🤖 Codex ishga tushadi")
+    elif assignee_name:
         lines.append(f"👤 {escape(assignee_name)}")
     elif parsed.assignee_username:
         lines.append(f"👤 <i>@{escape(parsed.assignee_username)} topilmadi</i>")
@@ -69,7 +71,7 @@ async def _resolve(api: TaskApi, parsed: ParsedTask) -> tuple[dict | None, dict 
         project = projects[0]
 
     assignee = None
-    if parsed.assignee_username:
+    if parsed.assignee_username and parsed.assignee_username.lower() != "codex":
         users = await api.users()
         wanted = parsed.assignee_username.lower()
         assignee = next(
@@ -175,12 +177,25 @@ async def create(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         return
 
     api = api_for(query)
+    agent_requested = (draft.get("assignee_username") or "").lower() == "codex"
+    assignee_id = data.get("assignee_id")
+    if agent_requested:
+        # An executor may delegate their own work to Codex while remaining the
+        # human owner. Managers can leave the task unassigned.
+        try:
+            actor = await api.me()
+        except ApiError as error:
+            await explain_api_error(query, error)
+            return
+        if actor["role"] == "executor":
+            assignee_id = actor["id"]
+
     payload = {
         "project_id": data["project_id"],
         "title": draft["title"],
         "priority": draft.get("priority") or "normal",
         "due_at": draft.get("due_at"),
-        "assignee_id": data.get("assignee_id"),
+        "assignee_id": assignee_id,
         "source": "bot",
         "source_chat_id": query.message.chat.id if query.message else None,
     }
@@ -200,6 +215,34 @@ async def create(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     chat_id = query.message.chat.id if query.message else query.from_user.id
     await send_card(bot, chat_id, task, api)
     await notify_assignee(bot, task, query.from_user.id, api)
+    if agent_requested:
+        try:
+            run = await api.start_agent_run(task["id"])
+        except ApiError as error:
+            await bot.send_message(
+                chat_id,
+                f"#{task['id']} yaratildi. Codex ishga tushmadi: {escape(error.detail)}",
+            )
+        else:
+            await bot.send_message(
+                chat_id, f"🤖 #{task['id']} Codexga yuborildi ({run['status']})."
+            )
+
+
+@router.message(Command("agent"))
+async def delegate_existing(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Masalan: /agent 42")
+        return
+    task_id = int(parts[1])
+    api = api_for(message)
+    try:
+        run = await api.start_agent_run(task_id)
+    except ApiError as error:
+        await explain_api_error(message, error)
+        return
+    await message.answer(f"🤖 #{task_id} Codexga yuborildi ({run['status']}).")
 
 
 # Registered last in this router so every command and FSM state above wins first.

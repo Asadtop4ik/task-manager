@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     # landing in the pending queue. Without at least one, nobody can approve anybody.
     admin_telegram_ids: str = Field(default="", alias="ADMIN_TELEGRAM_IDS")
 
+    # GitHub dispatch is disabled until these are provisioned. A manager binds
+    # each project to a repo, but that repo must also be on this server allowlist.
+    github_agent_token: str = Field(default="", alias="GITHUB_AGENT_TOKEN")
+    github_agent_allowed_repos: str = Field(
+        default="Asadtop4ik/task-manager", alias="GITHUB_AGENT_ALLOWED_REPOS"
+    )
+    agent_callback_token: str = Field(default="", alias="AGENT_CALLBACK_TOKEN")
+
     # --- Web ---
     public_url: str = Field(default="http://localhost:5173", alias="PUBLIC_URL")
 
@@ -120,7 +128,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # Required values arrive from environment variables; mypy only sees the
+    # generated BaseSettings constructor and asks for positional call arguments.
+    return Settings()  # type: ignore[call-arg]
 
 
 settings = get_settings()

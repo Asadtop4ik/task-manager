@@ -2,12 +2,14 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import {
+  useAgentRuns,
   useActivity,
   useAddComment,
   useAssign,
   useComments,
   useLogTime,
   useTask,
+  useStartAgentRun,
   useTransition,
   useUpdateTask,
   useUsers,
@@ -57,6 +59,8 @@ export default function TaskDetail() {
   const task = useTask(taskId);
   const comments = useComments(taskId);
   const activity = useActivity(taskId);
+  const agentRuns = useAgentRuns(taskId);
+  const startAgent = useStartAgentRun();
   const users = useUsers();
 
   const transition = useTransition();
@@ -85,6 +89,9 @@ export default function TaskDetail() {
 
   const item = task.data;
   const late = isOverdue(item);
+  const canDelegate =
+    state.status === "authenticated" &&
+    (state.user.role === "manager" || item.assignee?.id === state.user.id);
 
   return (
     <Page>
@@ -170,6 +177,49 @@ export default function TaskDetail() {
           </p>
         )}
       </header>
+
+      {canDelegate && (
+        <section className="border-b border-hairline px-4 py-5">
+          <h2 className="text-sm font-semibold">Codex</h2>
+          <p className="mt-1 text-sm text-muted">
+            {item.project.repo_full_name
+              ? `${item.project.repo_full_name} · ${item.project.default_branch ?? "branch tanlanmagan"}`
+              : "Avval loyiha sozlamalarida repositoryni ko‘rsating."}
+          </p>
+          <button
+            type="button"
+            disabled={
+              !item.project.repo_full_name ||
+              !item.project.default_branch ||
+              ["done", "cancelled"].includes(item.status) ||
+              startAgent.isPending
+            }
+            onClick={() => startAgent.mutate(item.id)}
+            className="mt-3 rounded-lg border border-hairline px-3 py-2 text-sm font-medium disabled:opacity-40"
+          >
+            {startAgent.isPending ? "Yuborilmoqda…" : "Codexga berish"}
+          </button>
+          {startAgent.isError && (
+            <p className="mt-2 text-sm text-late">Codex ishga tushmadi. Repo va ulanishni tekshiring.</p>
+          )}
+          {agentRuns.data?.map((run) => (
+            <div key={run.run_id} className="mt-3 text-sm">
+              <span className="font-medium">{run.status}</span>
+              {run.pr_url && (
+                <a className="ml-3 underline" href={run.pr_url} target="_blank" rel="noreferrer">
+                  PRni ochish
+                </a>
+              )}
+              {run.github_run_url && (
+                <a className="ml-3 underline" href={run.github_run_url} target="_blank" rel="noreferrer">
+                  Jarayon
+                </a>
+              )}
+              {run.error && <p className="text-late">{run.error}</p>}
+            </div>
+          ))}
+        </section>
+      )}
 
       <section className="border-b border-hairline px-4 py-5">
         <InlineText
