@@ -91,15 +91,14 @@ jobs:
             "$SSH_USER@$SSH_HOST" \
             "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }}"
 
-      - name: Verify public readiness after deploy
+      - name: Verify public API readiness after deploy
         run: |
           set -euo pipefail
           curl --fail --silent --show-error --retry 5 --retry-delay 3 \
             https://tasks.standart-eko.uz/ready \
             | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["status"] == "ok" and d["checks"] == {"postgres":"ok","redis":"ok"}'
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 \
-            https://tasks.standart-eko.uz/bot/ready \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["status"] == "ok" and d["checks"]["redis"] == "ok"'
+          # The bot's /ready is internal. deploy.sh's Compose --wait already
+          # checks its container health; Caddy sends /bot/ready to the SPA.
 
       - name: Mark an agent PR deployed
         env:
