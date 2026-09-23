@@ -23,6 +23,8 @@ Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
 veb boarddagi shu task sahifasida ko'rinadi.
 
+Agar `@codex` ishga tushmasa, loyiha repoga ulanganini, repo private ekanini va runner online ekanini tekshiring.
+
 The project repository and default branch are manager-only settings. The backend
 also requires the repository in `GITHUB_AGENT_ALLOWED_REPOS` and verifies it is
 private before dispatch. Only `Asadtop4ik/task-manager` is allowlisted by default.
