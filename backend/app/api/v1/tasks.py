@@ -317,6 +317,11 @@ async def reorder_task(
     column may be seconds out of date.
     """
     task = await _visible_or_404(session, user, await _load(session, task_id))
+    if not is_manager(user) and task.assignee_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only the assignee or a manager can reorder this task",
+        )
 
     async def neighbour(other_id: int | None) -> Task | None:
         if other_id is None:

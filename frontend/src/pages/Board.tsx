@@ -223,7 +223,7 @@ export default function Board() {
                       <TaskRow
                         task={task}
                         tz={tz}
-                        draggable
+                        draggable={user?.role === "manager" || task.assignee?.id === user?.id}
                         card
                         onDragStart={() => setDragging(task)}
                         onDragEnd={() => {
