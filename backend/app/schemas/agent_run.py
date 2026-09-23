@@ -16,6 +16,7 @@ class AgentRunOut(BaseModel):
     deployed_sha: str | None
     error: str | None
     attempts: int
+    attempt_index: int
     input_tokens: int | None
     cached_input_tokens: int | None
     output_tokens: int | None
@@ -50,3 +51,4 @@ class AgentNotificationOut(BaseModel):
     status: str
     pr_url: str | None
     github_run_url: str | None
+    error: str | None

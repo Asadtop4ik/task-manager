@@ -18,6 +18,10 @@ send `task-manager: update the task view @codex` to the Telegram bot. Confirm th
 parsed task; the bot creates it and starts one Codex run. `/agent 42` delegates
 an existing task. The task detail page shows the current run and PR link, and
 the bot reports PR-ready or failed runs through the worker's notification queue.
+Use `/stopagent 42` or the task page to cancel a running job. A ready PR is
+closed when cancelled, so it cannot auto-merge later. A failed or cancelled job
+can be retried once on the same task; change its description when the agent
+needs new information. Failure notices include the agent's question or error.
 
 Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi

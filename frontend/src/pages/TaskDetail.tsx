@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import {
   useAgentRuns,
+  useCancelAgentRun,
   useActivity,
   useAddComment,
   useAssign,
@@ -61,6 +62,7 @@ export default function TaskDetail() {
   const activity = useActivity(taskId);
   const agentRuns = useAgentRuns(taskId);
   const startAgent = useStartAgentRun();
+  const cancelAgent = useCancelAgentRun();
   const users = useUsers();
 
   const transition = useTransition();
@@ -197,7 +199,11 @@ export default function TaskDetail() {
             onClick={() => startAgent.mutate(item.id)}
             className="mt-3 rounded-lg border border-hairline px-3 py-2 text-sm font-medium disabled:opacity-40"
           >
-            {startAgent.isPending ? "Yuborilmoqda…" : "Codexga berish"}
+            {startAgent.isPending
+              ? "Yuborilmoqda…"
+              : agentRuns.data?.[0]?.status === "failed"
+                ? "Qayta urinish"
+                : "Codexga berish"}
           </button>
           {startAgent.isError && (
             <p className="mt-2 text-sm text-late">Codex ishga tushmadi. Repo va ulanishni tekshiring.</p>
@@ -216,6 +222,16 @@ export default function TaskDetail() {
                 </a>
               )}
               {run.error && <p className="text-late">{run.error}</p>}
+              {["pending", "dispatching", "dispatched", "running", "pr_ready"].includes(run.status) && (
+                <button
+                  type="button"
+                  disabled={cancelAgent.isPending}
+                  onClick={() => cancelAgent.mutate({ taskId: item.id, runId: run.run_id })}
+                  className="ml-3 text-late underline disabled:opacity-40"
+                >
+                  To‘xtatish
+                </button>
+              )}
               {run.input_tokens !== null && run.output_tokens !== null && (
                 <p className="text-muted">
                   Codex: {run.input_tokens.toLocaleString()} kirish, {run.output_tokens.toLocaleString()} chiqish tokeni

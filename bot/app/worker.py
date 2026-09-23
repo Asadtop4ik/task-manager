@@ -45,6 +45,7 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                     else:
                         text = (
                             f"⚠️ #{notice['task_id']} Codex ishi to‘xtadi. "
+                            f"Sabab: {(notice['error'] or 'nomaʼlum')[:500]}. "
                             f"Jarayon: {notice['github_run_url']}"
                         )
                     try:

@@ -133,6 +133,16 @@ export function useStartAgentRun() {
   });
 }
 
+export function useCancelAgentRun() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ runId }: { taskId: number; runId: string }) =>
+      (await api.post<AgentRun>(`/agent-runs/${runId}/cancel`)).data,
+    onSettled: (_data, _error, variables) =>
+      void client.invalidateQueries({ queryKey: ["agent-runs", variables.taskId] }),
+  });
+}
+
 export function useComments(id: number) {
   return useQuery({
     queryKey: ["comments", id],

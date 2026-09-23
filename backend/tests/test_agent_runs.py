@@ -214,6 +214,160 @@ async def test_dispatch_network_error_can_retry_once(
     assert calls == 2
 
 
+async def test_failed_job_reports_reason_then_retries_once_and_can_be_cancelled(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    dispatches: list[str] = []
+
+    async def fake_dispatch(run, task) -> int:
+        dispatches.append(run.run_id)
+        return 204
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    created = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix menu"},
+        headers=auth(manager),
+    )
+    task_id = created.json()["id"]
+    start_url = f"/api/v1/agent-runs/tasks/{task_id}"
+    first = (await client.post(start_url, headers=auth(manager))).json()
+    callback = await client.post(
+        f"/api/v1/agent-runs/{first['run_id']}/callback",
+        json={
+            "run_id": first["run_id"],
+            "status": "failed",
+            "error": "Need an exact menu label",
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert callback.status_code == 200
+    assert callback.json()["error"] == "Need an exact menu label"
+    task = await client.get(f"/api/v1/tasks/{task_id}", headers=auth(manager))
+    assert task.json()["status"] == "blocked"
+    notices = await client.get(
+        "/api/v1/agent-runs/notifications",
+        headers={"X-Agent-Worker-Token": settings.service_token},
+    )
+    assert notices.json()[0]["error"] == "Need an exact menu label"
+
+    second = await client.post(start_url, headers=auth(manager))
+    assert second.status_code == 201
+    assert second.json()["attempt_index"] == 2
+    assert second.json()["run_id"] != first["run_id"]
+    assert dispatches == [first["run_id"], second.json()["run_id"]]
+    cancelled = await client.post(
+        f"/api/v1/agent-runs/{second.json()['run_id']}/cancel", headers=auth(manager)
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert (await client.post(start_url, headers=auth(manager))).status_code == 409
+
+
+async def test_running_job_cancel_calls_github(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+
+    async def fake_dispatch(run, task) -> int:
+        return 204
+
+    cancelled_ids: list[str] = []
+
+    async def fake_cancel(run) -> None:
+        cancelled_ids.append(run.run_id)
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    monkeypatch.setattr(agent_runs, "_cancel_github", fake_cancel)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix menu"},
+        headers=auth(manager),
+    )
+    run = (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{task.json()['id']}", headers=auth(manager)
+        )
+    ).json()
+    reported = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/callback",
+        json={
+            "run_id": run["run_id"],
+            "status": "running",
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/42",
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert reported.status_code == 200
+    stopped = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/cancel", headers=auth(manager)
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "cancelled"
+    assert cancelled_ids == [run["run_id"]]
+
+
+async def test_ready_pr_is_closed_before_cancellation(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+
+    async def fake_dispatch(run, task) -> int:
+        return 204
+
+    async def fake_verify(run, number: str, sha: str) -> None:
+        assert number == "17"
+
+    closed: list[str] = []
+
+    async def fake_close(run) -> None:
+        closed.append(run.pr_url)
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify)
+    monkeypatch.setattr(agent_runs, "_close_pr", fake_close)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix menu"},
+        headers=auth(manager),
+    )
+    run = (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{task.json()['id']}", headers=auth(manager)
+        )
+    ).json()
+    pr_url = "https://github.com/Asadtop4ik/task-manager/pull/17"
+    ready = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/callback",
+        json={
+            "run_id": run["run_id"],
+            "status": "pr_ready",
+            "pr_url": pr_url,
+            "head_sha": "a" * 40,
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert ready.status_code == 200
+    stopped = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/cancel", headers=auth(manager)
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "cancelled"
+    assert closed == [pr_url]
+    task_after = await client.get(f"/api/v1/tasks/{task.json()['id']}", headers=auth(manager))
+    assert task_after.json()["status"] == "todo"
+    status = await client.get(
+        f"/api/v1/agent-runs/{run['run_id']}/status",
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert status.status_code == 200
+    assert status.json()["status"] == "cancelled"
+
+
 async def test_verified_pr_rejects_wrong_branch_or_sha(monkeypatch) -> None:
     """Verification uses GitHub's PR data, not the runner's claim alone."""
     _credentials(monkeypatch)

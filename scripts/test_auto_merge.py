@@ -1,6 +1,12 @@
 import unittest
 
-from auto_merge import allowed_files, current_pr, latest_checks_pass
+from auto_merge import (
+    agent_ready,
+    agent_run_id,
+    allowed_files,
+    current_pr,
+    latest_checks_pass,
+)
 
 
 class PolicyTests(unittest.TestCase):
@@ -51,6 +57,22 @@ class PolicyTests(unittest.TestCase):
             latest_checks_pass(
                 checks + [{"name": "backend", "id": 9, "conclusion": "failure"}]
             )
+        )
+
+    def test_cancelled_agent_pr_cannot_auto_merge(self) -> None:
+        run_id = "00000000-0000-0000-0000-000000000007"
+        url = "https://github.com/Asadtop4ik/task-manager/pull/7"
+        pr = {
+            "html_url": url,
+            "head": {"ref": f"codex/task-7-{run_id}", "sha": "a" * 40},
+        }
+        self.assertEqual(agent_run_id(pr), run_id)
+        ready = {"status": "pr_ready", "pr_url": url, "head_sha": "a" * 40}
+        self.assertTrue(agent_ready(pr, ready))
+        self.assertFalse(agent_ready(pr, ready | {"status": "cancelled"}))
+        self.assertFalse(agent_ready(pr, ready | {"head_sha": "b" * 40}))
+        self.assertEqual(
+            agent_run_id({"head": {"ref": "codex/task-7-invalid"}}), "invalid"
         )
 
 

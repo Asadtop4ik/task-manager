@@ -37,13 +37,14 @@ export type AgentRun = {
   run_id: string;
   task_id: number;
   repo_full_name: string;
-  status: "pending" | "dispatching" | "dispatched" | "running" | "pr_ready" | "failed" | "deployed";
+  status: "pending" | "dispatching" | "dispatched" | "running" | "pr_ready" | "failed" | "deployed" | "cancelled";
   github_run_url: string | null;
   pr_url: string | null;
   head_sha: string | null;
   deployed_sha: string | null;
   error: string | null;
   attempts: number;
+  attempt_index: number;
   input_tokens: number | null;
   cached_input_tokens: number | null;
   output_tokens: number | null;
