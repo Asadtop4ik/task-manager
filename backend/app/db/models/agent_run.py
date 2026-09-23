@@ -13,7 +13,9 @@ if TYPE_CHECKING:
 class AgentRun(Base, TimestampMixin):
     __tablename__ = "agent_runs"
     __table_args__ = (
-        UniqueConstraint("task_id", "task_revision", name="uq_agent_run_task_revision"),
+        UniqueConstraint(
+            "task_id", "task_revision", "attempt_index", name="uq_agent_run_task_attempt"
+        ),
         Index("ix_agent_runs_status_created", "status", "created_at"),
     )
 
@@ -23,6 +25,9 @@ class AgentRun(Base, TimestampMixin):
         ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
     )
     task_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_index: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
     repo_full_name: Mapped[str] = mapped_column(String(200), nullable=False)
     base_branch: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)

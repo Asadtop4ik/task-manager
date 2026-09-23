@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -50,6 +51,36 @@ def latest_checks_pass(checks: list[dict]) -> bool:
     return set(latest) == REQUIRED_CHECKS and all(
         check.get("conclusion") == "success" for check in latest.values()
     )
+
+
+def agent_run_id(pr: dict) -> str | None:
+    branch = (pr.get("head") or {}).get("ref") or ""
+    if not branch.startswith("codex/task-"):
+        return None
+    match = re.fullmatch(r"codex/task-[1-9][0-9]*-([0-9a-f-]{36})", branch)
+    return match.group(1) if match else "invalid"
+
+
+def agent_ready(pr: dict, run: dict) -> bool:
+    return bool(
+        run.get("status") == "pr_ready"
+        and run.get("pr_url") == pr.get("html_url")
+        and run.get("head_sha") == (pr.get("head") or {}).get("sha")
+    )
+
+
+def _agent_allows_merge(pr: dict) -> bool:
+    run_id = agent_run_id(pr)
+    if run_id is None:
+        return True  # A human's README/CSS PR can use the same small-change rule.
+    if run_id == "invalid":
+        return False
+    request = urllib.request.Request(
+        f"https://tasks.standart-eko.uz/api/v1/agent-runs/{run_id}/status",
+        headers={"X-Agent-Callback-Token": os.environ["AGENT_CALLBACK_TOKEN"]},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return agent_ready(pr, json.load(response))
 
 
 def _github(path: str) -> object:
@@ -97,6 +128,8 @@ def main() -> None:
     if not current_pr(pr, run, repo):
         return
     if not allowed_files(_files(repo, number)):
+        return
+    if not _agent_allows_merge(pr):
         return
     checks = _github(f"repos/{repo}/commits/{run['head_sha']}/check-runs?per_page=100")
     assert isinstance(checks, dict)

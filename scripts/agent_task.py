@@ -146,6 +146,36 @@ def usage() -> dict[str, int]:
     return last
 
 
+def _send_status(payload: dict[str, object]) -> dict[str, object]:
+    task = _task()
+    url = f"https://tasks.standart-eko.uz/api/v1/agent-runs/{task['run_id']}/callback"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Agent-Callback-Token": os.environ["AGENT_CALLBACK_TOKEN"],
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        if response.status != 200:
+            raise RuntimeError(f"agent callback returned HTTP {response.status}")
+        return json.load(response)
+
+
+def started() -> None:
+    task = _task()
+    repo = os.environ["GITHUB_REPOSITORY"]
+    run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+    result = _send_status(
+        {"run_id": task["run_id"], "status": "running", "github_run_url": run_url}
+    )
+    if result.get("status") == "cancelled":
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+            output.write("cancelled=true\n")
+
+
 def callback() -> None:
     task = _task()
     repo = os.environ["GITHUB_REPOSITORY"]
@@ -160,28 +190,27 @@ def callback() -> None:
         payload["pr_url"] = os.environ["PR_URL"]
         payload["head_sha"] = os.environ["HEAD_SHA"]
     else:
-        payload["error"] = "Agent workflow failed; inspect the GitHub run."
+        result_file = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
+        reason = (
+            result_file.read_text(encoding="utf-8").strip()
+            if result_file.exists()
+            else ""
+        )
+        payload["error"] = (
+            reason[:900] or "Agent workflow failed; inspect the GitHub run."
+        )
     payload.update(usage())
-    url = f"https://tasks.standart-eko.uz/api/v1/agent-runs/{task['run_id']}/callback"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "X-Agent-Callback-Token": os.environ["AGENT_CALLBACK_TOKEN"],
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        if response.status != 200:
-            raise RuntimeError(f"agent callback returned HTTP {response.status}")
+    _send_status(payload)
 
 
 if __name__ == "__main__":
     try:
-        {"prepare": prepare, "check-diff": check_diff, "callback": callback}[
-            sys.argv[1]
-        ]()
+        {
+            "prepare": prepare,
+            "started": started,
+            "check-diff": check_diff,
+            "callback": callback,
+        }[sys.argv[1]]()
     except (
         KeyError,
         TypeError,

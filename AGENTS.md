@@ -37,3 +37,12 @@ for the original design; verify old deployment notes against the live workflows.
   commit `.env`, login caches, SSH keys or other credentials.
 - A task is done only when its stated behavior is verified. Deployment tasks also
   require the deployed commit and `/ready` checks to match.
+
+## Code Review Rules
+
+- Flag any bot or frontend change that lets an executor alter a task or project
+  outside the backend's permission checks or status transition table.
+- Flag any agent/CI/deploy change that can mark a task done without proving the
+  same commit passed checks, runs in production, and passed readiness probes.
+- Flag writes to money, permissions, customer messages or production data that
+  can happen from a test or an unapproved agent task.

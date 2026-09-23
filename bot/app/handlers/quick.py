@@ -245,6 +245,35 @@ async def delegate_existing(message: Message) -> None:
     await message.answer(f"🤖 #{task_id} Codexga yuborildi ({run['status']}).")
 
 
+@router.message(Command("stopagent"))
+async def stop_agent(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Masalan: /stopagent 42")
+        return
+    task_id = int(parts[1])
+    api = api_for(message)
+    try:
+        runs = await api.agent_runs(task_id)
+        active = next(
+            (
+                r
+                for r in runs
+                if r["status"]
+                in {"pending", "dispatching", "dispatched", "running", "pr_ready"}
+            ),
+            None,
+        )
+        if active is None:
+            await message.answer(f"#{task_id} uchun faol Codex ishi yo‘q.")
+            return
+        await api.cancel_agent_run(active["run_id"])
+    except ApiError as error:
+        await explain_api_error(message, error)
+        return
+    await message.answer(f"⏹ #{task_id} Codex ishi to‘xtatildi.")
+
+
 # Registered last in this router so every command and FSM state above wins first.
 @router.message(F.text & ~F.text.startswith("/"))
 async def quick_capture(message: Message, state: FSMContext) -> None:
