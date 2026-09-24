@@ -6,10 +6,10 @@ manager assigns todos from a Telegram bot; the work happens on the web at
 
 Design and milestones: **[PLAN.md](PLAN.md)**.
 
-Status: **milestone 4 — usable.** Telegram login, the approval queue, projects,
-tasks with a real status machine, comments, an activity log, permissions, the
-bot's full command set, and the web app are done. Reminders and digests are
-milestone 5.
+Status: the private Task Manager pilot is live. Invite-only team access,
+one-time bot login links, projects, task history, the board, and the Codex
+PR/owner `!fast` workflows are available. Scheduled reminders and digests
+remain planned work.
 
 ## Coding agent integration
 
@@ -23,8 +23,13 @@ closed when cancelled, so it cannot auto-merge later. A failed or cancelled job
 can be retried once on the same task; change its description when the agent
 needs new information. Failure notices include the agent's question or error.
 
-Ordinary `@codex` tasks create a PR. Owner-only `!fast` tasks publish to `main`
-after the exact commit passes CI.
+Ordinary `@codex` tasks create a PR. Owner-only `!fast` tasks in the Task Manager
+pilot publish to `main` only after the exact commit passes independent GitHub
+CI. Sensitive changes fall back to a PR. A failed or missing CI run blocks the
+task without publishing or opening a PR. Deployment marks the task done only
+after the requested image passes readiness checks; a failed release rolls back.
+During this first pilot, direct publication is limited to existing CSS styling
+and literal JSX tooltip/accessibility attributes; other code changes use a PR.
 
 Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
@@ -45,8 +50,10 @@ private `codex-agent` self-hosted runner. The repository needs these credentials
 - Runner: Codex CLI logged in under its dedicated account, plus `gh` and Python 3.
   Do not expose the Codex auth cache to a public repository or a general runner.
 
-The workflow keeps GitHub write credentials out of the Codex step. Protected
-paths (CI, agent instructions, migrations and auth code) stop before PR creation.
+The workflow keeps GitHub write credentials out of the Codex runner. Its patch
+is applied in a separate clean GitHub-hosted publisher job. Protected paths
+(authentication, permissions, customer messages, money, migrations, CI/deploy
+and agent control) take the PR route even when the owner requested `!fast`.
 The default-branch auto-merge workflow accepts only README, Markdown docs and
 frontend CSS changes after the latest commit's backend, bot, frontend and policy
 checks pass. Other PRs need review. A coding task is done only after CI, a real
@@ -68,6 +75,8 @@ account setting from the self-hosted task runner.
 - **Task detail** — status, assignee and priority inline; comments; time log; the
   full history. The title and description are edited where they sit: click, type,
   Enter to save, Escape to abandon.
+- **O‘chirilganlar** — owner-only task trash with restore. Hiding a task keeps
+  comments, agent runs and audit history; an active agent must be stopped first.
 
 Keyboard: **⌘K / Ctrl+K** opens search — it looks through open tasks and the
 pages, arrow keys move, Enter opens. **n** starts a new task. A bare letter never
@@ -99,20 +108,31 @@ deadline is worse than no parsing at all.
 / Block / Comment / Snooze / Open and are **edited in place**, so a task keeps one
 card instead of filling the chat.
 
+The owner runs `/invite` to create a seven-day, one-use invitation. A teammate
+opens it with the bot, then the owner approves or rejects the request and chooses
+visible projects. An ordinary `/start` without an invite grants no access. An
+approved teammate runs `/login` to receive a five-minute, one-use HTTPS link in
+their private chat; the browser that opens it gets the session. Request a new
+link for another browser. The owner and at most one other active teammate can
+use Codex; only the owner can request `!fast`.
+
 ## API
 
-`/api/v1` — `auth/{config,telegram,telegram/miniapp,refresh,logout,me}`,
-`users`, `users/pending`, `projects`, `projects/{id}/members`, `tasks`,
-`tasks/{id}/{transition,assign,time,comments,activity}`. Plus `/health`
+`/api/v1` — `auth/{config,telegram,telegram/miniapp,magic/request,magic/redeem,refresh,logout,me}`,
+`team/{invites,join-requests,members}`, `users`, `projects`,
+`projects/{id}/members`, `tasks`, `tasks/trash`, and
+`tasks/{id}/{transition,assign,time,comments,activity,restore}`. Plus `/health`
 (liveness) and `/ready` (Postgres + Redis, used by the container healthcheck).
 
 Two ways in, one identity: a browser sends a Bearer access token; the bot sends
 `X-Service-Token` plus `X-Acting-User`, so its actions are attributed to the real
 person and run through exactly the same permission checks.
 
-A first-time Telegram login creates an **inactive** account that waits in
-`users/pending` for a manager. `ADMIN_TELEGRAM_IDS` bootstraps the first one —
-without it nobody could ever approve anybody.
+The browser login page uses only the bot's one-time link. Legacy Telegram auth
+endpoints can refresh an existing approved account, but cannot create an
+uninvited one. The owner is pinned by `OWNER_TELEGRAM_ID`; invitation approval
+and Codex-seat grants require that Telegram identity, not a mutable name or
+username.
 
 ## Layout
 

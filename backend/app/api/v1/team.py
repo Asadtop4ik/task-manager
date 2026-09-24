@@ -245,6 +245,7 @@ async def set_codex_access(
     other = await session.scalar(
         select(User).where(
             User.can_use_codex.is_(True),
+            User.is_active.is_(True),
             User.telegram_id != settings.owner_telegram_id,
             User.id != user_id,
         )

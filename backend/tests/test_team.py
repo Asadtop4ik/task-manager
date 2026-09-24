@@ -115,7 +115,7 @@ async def test_rejected_invite_does_not_create_an_active_user(
 
 
 async def test_only_one_non_owner_gets_codex_access(
-    client: AsyncClient, manager: User, executor: User, outsider: User
+    client: AsyncClient, session: AsyncSession, manager: User, executor: User, outsider: User
 ) -> None:
     grant = await client.put(
         f"/api/v1/team/members/{executor.id}/codex-access",
@@ -145,6 +145,10 @@ async def test_only_one_non_owner_gets_codex_access(
             headers=auth(manager),
         )
     ).status_code == 200
+    # A stale grant on an inactive account must not occupy the active seat.
+    await session.refresh(executor)
+    executor.can_use_codex = True
+    await session.commit()
     replacement = await client.put(
         f"/api/v1/team/members/{outsider.id}/codex-access",
         json={"enabled": True},
