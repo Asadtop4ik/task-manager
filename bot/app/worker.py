@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from html import escape
 
 import httpx
 from aiogram import Bot
@@ -9,6 +10,7 @@ from arq.connections import RedisSettings
 from app.cards import build_card
 from app.config import settings
 from app.handlers.agent_intake import notification_message
+from app.handlers.project_discussion import discussion_keyboard
 from app.loader import create_bot
 from app.logging import configure_logging, get_logger
 
@@ -116,6 +118,43 @@ async def notify_agent_intakes(ctx: dict[str, object]) -> None:
             await bot.session.close()
 
 
+async def notify_project_discussions(ctx: dict[str, object]) -> None:
+    """Deliver one answer per conversation revision, then acknowledge it."""
+    if not settings.agent_intake_enabled:
+        return
+    headers = {"X-Agent-Worker-Token": settings.service_token}
+    base = f"{settings.api_base_url.rstrip('/')}/api/v1/project-discussions"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{base}/notifications", headers=headers)
+        response.raise_for_status()
+        bot = create_bot()
+        try:
+            for notice in response.json():
+                if notice["status"] == "idle":
+                    text = "💬 " + escape(str(notice.get("response") or "")[:3500])
+                    markup = discussion_keyboard(notice["id"])
+                else:
+                    text = "⚠️ " + escape(str(notice.get("error") or "Suhbat xatosi")[:500])
+                    markup = None
+                try:
+                    await bot.send_message(notice["chat_id"], text, reply_markup=markup)
+                except (TelegramAPIError, OSError) as exc:
+                    log.error(
+                        "discussion_notice_failed",
+                        discussion_id=notice["id"],
+                        error=type(exc).__name__,
+                    )
+                    continue
+                ack = await client.post(
+                    f"{base}/{notice['id']}/notified",
+                    headers=headers,
+                    params={"revision": notice["revision"]},
+                )
+                ack.raise_for_status()
+        finally:
+            await bot.session.close()
+
+
 async def sync_deleted_task_cards(ctx: dict[str, object]) -> None:
     """Reflect delete/restore on old Telegram cards without blocking the web API."""
     headers = {"X-Agent-Worker-Token": settings.service_token}
@@ -182,11 +221,13 @@ class WorkerSettings:
         ping,
         notify_agent_runs,
         notify_agent_intakes,
+        notify_project_discussions,
         sync_deleted_task_cards,
     ]
     cron_jobs = [  # noqa: RUF012
         cron(notify_agent_runs, minute=set(range(60))),
         cron(notify_agent_intakes, minute=set(range(60)), second=set(range(0, 60, 10))),
+        cron(notify_project_discussions, minute=set(range(60)), second=set(range(0, 60, 10))),
         cron(sync_deleted_task_cards, minute=set(range(60))),
     ]
     on_startup = startup

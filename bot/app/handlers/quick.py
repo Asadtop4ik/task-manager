@@ -27,6 +27,7 @@ from app.handlers.helpers import (
     notify_assignee,
     send_card,
 )
+from app.handlers.project_discussion import route_discussion_text
 from app.parsing import ParsedTask, parse
 from app.states import QuickCapture
 from app.texts import PRIORITY_LABEL
@@ -150,6 +151,8 @@ async def task_from_reply(message: Message, state: FSMContext) -> None:
 
 @router.message(QuickCapture.editing_title, F.text)
 async def retype_title(message: Message, state: FSMContext) -> None:
+    if await route_discussion_text(message, state, message.text or ""):
+        return
     if await route_intake_text(message, state, message.text or ""):
         return
     data = await state.get_data()
@@ -304,6 +307,8 @@ async def stop_agent(message: Message) -> None:
 # Registered last in this router so every command and FSM state above wins first.
 @router.message(F.text & ~F.text.startswith("/"))
 async def quick_capture(message: Message, state: FSMContext) -> None:
+    if await route_discussion_text(message, state, message.text or ""):
+        return
     if await route_intake_text(message, state, message.text or ""):
         return
     await _offer(message, state, message.text or "")

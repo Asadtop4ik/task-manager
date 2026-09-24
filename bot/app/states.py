@@ -25,6 +25,12 @@ class AgentIntake(StatesGroup):
     revising = State()
 
 
+class ProjectDiscussionState(StatesGroup):
+    """Route private messages to one persisted project conversation."""
+
+    active = State()
+
+
 class CardAction(StatesGroup):
     """Text the card asked for: a comment body, or a new deadline."""
 

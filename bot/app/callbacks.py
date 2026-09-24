@@ -28,6 +28,11 @@ class AgentIntakeAction(CallbackData, prefix="ai"):
     intake_id: int
 
 
+class DiscussionAction(CallbackData, prefix="pd"):
+    action: str  # task | reset
+    discussion_id: int
+
+
 class JoinAction(CallbackData, prefix="j"):
     action: str  # approve | reject | project | confirm | cancel
     request_id: int

@@ -222,6 +222,10 @@ async def _create_intake(
 async def receive_image(message: Message, state: FSMContext) -> None:
     if not _private(message):
         return
+    from app.handlers.project_discussion import route_discussion_image
+
+    if await route_discussion_image(message, state):
+        return
     if not settings.agent_intake_enabled:
         await message.answer("Rasmli Codex intake hozircha yoqilmagan.")
         return
