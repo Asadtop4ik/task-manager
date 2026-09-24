@@ -12,6 +12,29 @@ loyihalarda faqat `@codex` → PR bor; `!fast` faqat Task Manager pilotida qolad
 | `kans-shop` | `muradjanov-dev/kans-shop` | `main` |
 | `ketoshop` | `muradjanov-dev/ketoshop` | `master` |
 
+## Yangi loyiha ulash
+
+Repo, asosiy branch, CI job nomlari va production image/container juftliklari
+uchun yagona kod manbasi
+[`backend/app/services/agent_repos.py`](../backend/app/services/agent_repos.py).
+Botdagi suhbat worker’i, public PR publisher va tashqi deploy kuzatuvchisi shu
+katalogdan o‘qiydi. Noma’lum repo yoki branch rad etiladi; public repo uchun
+CI job va sog‘lom image tekshiruvi ko‘rsatilmasa katalog yuklanmaydi.
+
+Yangi mijoz uchun katalogga bitta aniq yozuv qo‘shing, uning repo/branch
+ma’lumotini Task Manager loyihasiga bog‘lang va GitHub tokeniga aynan shu repo
+huquqini bering. `GITHUB_AGENT_ALLOWED_REPOS` ham deploy paytida yangilanishi
+kerak: katalogdagi yozuv o‘zi kirish huquqini bermaydi. Yangi loyiha avval PR
+rejimida sinaladi; `!fast` Task Manager’dan tashqariga avtomatik kengaymaydi.
+
+CI va Task Manager deploy’i reviewed `main` commitida tugagach, shu commitning
+toza lokal `main` checkoutidan `bash ops/install_project_catalog.sh`ni ishga
+tushiring. Skript production API image SHA’sini tekshiradi, katalogning ayni
+nusxasini root-owned server xizmatlariga o‘rnatadi va intake worker’ni qayta
+ishga tushiradi. Keyin kichik haqiqiy bot taski bilan PR → CI → merge → exact
+SHA deploy → bot xabarini sinang. Eski to‘rt loyiha ushbu yangilanishdan keyin
+ham ishlashi kerak.
+
 Botdagi draft suhbat va 3 tagacha rasm ham shu repolarni ko‘radi. Tasdiqdan
 oldin task ochilmaydi. Keyin agent PR havolasi botga keladi. Merge bo‘lgach bot
 alohida xabar beradi; deploy faqat GitHub `Deploy` workflow’i aynan merge

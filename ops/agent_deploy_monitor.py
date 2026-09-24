@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import UUID
 
+from project_catalog import public_projects
+
 API = "https://tasks.standart-eko.uz/api/v1/agent-runs"
 GITHUB = "https://api.github.com"
 MAX_RESPONSE = 1024 * 1024
@@ -26,27 +28,8 @@ class Target:
 
 
 TARGETS = {
-    "muradjanov-dev/qurbot": Target(
-        "master",
-        {
-            "qurbot-web": "ghcr.io/muradjanov-dev/qurbot",
-            "qurbot-worker": "ghcr.io/muradjanov-dev/qurbot",
-        },
-        frozenset({"ci / check"}),
-    ),
-    "muradjanov-dev/kans-shop": Target(
-        "main",
-        {
-            "kans-api": "ghcr.io/muradjanov-dev/kans-shop-api",
-            "kans-frontend": "ghcr.io/muradjanov-dev/kans-shop-frontend",
-        },
-        frozenset({"ci / backend", "ci / frontend"}),
-    ),
-    "muradjanov-dev/ketoshop": Target(
-        "master",
-        {"ketoshop": "ghcr.io/muradjanov-dev/ketoshop"},
-        frozenset({"ci / check"}),
-    ),
+    item.full_name: Target(item.branch, dict(item.images), frozenset(item.ci_jobs))
+    for item in public_projects()
 }
 
 

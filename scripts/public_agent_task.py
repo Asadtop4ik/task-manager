@@ -14,13 +14,12 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend" / "app" / "services"))
+from agent_repos import public_catalog  # noqa: E402
+
 from agent_task import check_diff as check_base_diff
 
-APPROVED_REPOS = {
-    "muradjanov-dev/qurbot": "master",
-    "muradjanov-dev/kans-shop": "main",
-    "muradjanov-dev/ketoshop": "master",
-}
+APPROVED_REPOS = {item.full_name: item.branch for item in public_catalog()}
 BLOCKED_EXACT = {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}
 BLOCKED_PREFIXES = (".github/", ".codex/", ".agents/")
 

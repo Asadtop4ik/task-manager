@@ -29,6 +29,7 @@ jobs:
           set -euo pipefail
           python3 scripts/public_agent_task.py prepare
           cp scripts/public_agent_task.py scripts/agent_task.py scripts/agent_images.py "$RUNNER_TEMP/"
+          cp backend/app/services/agent_repos.py "$RUNNER_TEMP/"
 
       - name: Check out approved public repository
         uses: actions/checkout@v4
@@ -143,6 +144,7 @@ jobs:
           set -euo pipefail
           python3 scripts/public_agent_task.py prepare
           cp scripts/public_agent_task.py scripts/agent_task.py "$RUNNER_TEMP/"
+          cp backend/app/services/agent_repos.py "$RUNNER_TEMP/"
 
       - name: Check out the same approved public repository
         uses: actions/checkout@v4

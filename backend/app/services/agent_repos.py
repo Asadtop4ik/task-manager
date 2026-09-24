@@ -1,4 +1,10 @@
-"""The small, explicit set of repositories trusted for Codex dispatch."""
+"""Versioned, trusted project catalog for Codex dispatch and deploy checks.
+
+The API image carries this module. The private GitHub workflow imports it from
+the trusted checkout; the server-side intake and monitor services use a
+root-owned copy of this same file. Project DB settings still have to match an
+entry here before dispatch. Tokens and enablement flags remain separate gates.
+"""
 
 from dataclasses import dataclass
 
@@ -12,13 +18,43 @@ class AgentRepository:
     branch: str
     private: bool
     fast_enabled: bool = False
+    # Public-repo deploy verification. Keep these empty for private projects.
+    ci_jobs: tuple[str, ...] = ()
+    images: tuple[tuple[str, str], ...] = ()
 
 
 REPOSITORIES = (
     AgentRepository("task-manager", DISPATCH_REPOSITORY, "main", True, True),
-    AgentRepository("qurbot", "muradjanov-dev/qurbot", "master", False),
-    AgentRepository("kans-shop", "muradjanov-dev/kans-shop", "main", False),
-    AgentRepository("ketoshop", "muradjanov-dev/ketoshop", "master", False),
+    AgentRepository(
+        "qurbot",
+        "muradjanov-dev/qurbot",
+        "master",
+        False,
+        ci_jobs=("ci / check",),
+        images=(
+            ("qurbot-web", "ghcr.io/muradjanov-dev/qurbot"),
+            ("qurbot-worker", "ghcr.io/muradjanov-dev/qurbot"),
+        ),
+    ),
+    AgentRepository(
+        "kans-shop",
+        "muradjanov-dev/kans-shop",
+        "main",
+        False,
+        ci_jobs=("ci / backend", "ci / frontend"),
+        images=(
+            ("kans-api", "ghcr.io/muradjanov-dev/kans-shop-api"),
+            ("kans-frontend", "ghcr.io/muradjanov-dev/kans-shop-frontend"),
+        ),
+    ),
+    AgentRepository(
+        "ketoshop",
+        "muradjanov-dev/ketoshop",
+        "master",
+        False,
+        ci_jobs=("ci / check",),
+        images=(("ketoshop", "ghcr.io/muradjanov-dev/ketoshop"),),
+    ),
 )
 PUBLIC_REPOSITORIES = frozenset(
     repository.full_name for repository in REPOSITORIES if not repository.private
@@ -26,9 +62,12 @@ PUBLIC_REPOSITORIES = frozenset(
 
 
 def repository_for(
-    project_key: str, full_name: str | None, branch: str | None
+    project_key: str,
+    full_name: str | None,
+    branch: str | None,
+    repositories: tuple[AgentRepository, ...] = REPOSITORIES,
 ) -> AgentRepository | None:
-    for repository in REPOSITORIES:
+    for repository in repositories:
         if (
             project_key == repository.project_key
             and full_name == repository.full_name
@@ -36,3 +75,29 @@ def repository_for(
         ):
             return repository
     return None
+
+
+def public_catalog(
+    repositories: tuple[AgentRepository, ...] = REPOSITORIES,
+) -> tuple[AgentRepository, ...]:
+    """Only explicitly approved public projects, all with verifiable deploys."""
+    public = tuple(repository for repository in repositories if not repository.private)
+    for repository in public:
+        if not repository.ci_jobs or not repository.images:
+            raise ValueError(
+                f"public project lacks deploy verification: {repository.full_name}"
+            )
+    return public
+
+
+def validate_catalog(
+    repositories: tuple[AgentRepository, ...] = REPOSITORIES,
+) -> None:
+    keys = [item.project_key for item in repositories]
+    names = [item.full_name for item in repositories]
+    if len(keys) != len(set(keys)) or len(names) != len(set(names)):
+        raise ValueError("duplicate agent project or repository")
+    public_catalog(repositories)
+
+
+validate_catalog()
