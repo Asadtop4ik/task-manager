@@ -128,7 +128,8 @@ def fast_needs_pr(paths: list[str], changed_fragments: list[str] | None = None) 
         "payment", "billing", "price", "money", "secret", "auth", "permission",
         "security", "migration", "deploy", "workflow", "broadcast",
         "checkout", "purchase", "order", "cart", "invoice", "customer",
-        "profile", "account", "member", "access",
+        "profile", "account", "member", "access", "login", "invite",
+        "role", "owner", "admin", "token", "credential", "session",
     )
     for path in paths:
         lowered = path.lower()

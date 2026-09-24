@@ -58,6 +58,7 @@ class UsageTests(unittest.TestCase):
             "bot/app/handlers/new.py",
             "bot/app/worker.py",
             "frontend/src/components/Checkout.tsx",
+            "frontend/src/pages/login.tsx",
             "frontend/src/lib/format.ts",
             "README.md",
             "docs/pilot.md",
