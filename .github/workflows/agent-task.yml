@@ -127,10 +127,12 @@ jobs:
           name: agent-patch
           path: ${{ runner.temp }}
 
-      - name: Prepare clean publication checkout
+      - name: Prepare publication metadata
+        run: python3 scripts/agent_task.py prepare
+
+      - name: Apply patch in a clean publication checkout
         run: |
           set -euo pipefail
-          python3 scripts/agent_task.py prepare
           git switch -c "$AGENT_BRANCH" "$GITHUB_SHA"
           git apply --index "$RUNNER_TEMP/agent.patch"
           git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent-validator.py"
