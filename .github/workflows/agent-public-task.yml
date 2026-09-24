@@ -100,7 +100,7 @@ jobs:
           retention-days: 1
 
       - name: Report failed implementation
-        if: failure() && steps.start.outcome == 'success'
+        if: failure()
         env:
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
           JOB_STATUS: failure

@@ -22,7 +22,7 @@ TIMEOUT = 15
 class Target:
     branch: str
     images: dict[str, str]
-    healthy: frozenset[str]
+    ci_jobs: frozenset[str]
 
 
 TARGETS = {
@@ -32,7 +32,7 @@ TARGETS = {
             "qurbot-web": "ghcr.io/muradjanov-dev/qurbot",
             "qurbot-worker": "ghcr.io/muradjanov-dev/qurbot",
         },
-        frozenset({"qurbot-web"}),
+        frozenset({"ci / check"}),
     ),
     "muradjanov-dev/kans-shop": Target(
         "main",
@@ -40,12 +40,12 @@ TARGETS = {
             "kans-api": "ghcr.io/muradjanov-dev/kans-shop-api",
             "kans-frontend": "ghcr.io/muradjanov-dev/kans-shop-frontend",
         },
-        frozenset({"kans-api"}),
+        frozenset({"ci / backend", "ci / frontend"}),
     ),
     "muradjanov-dev/ketoshop": Target(
         "master",
         {"ketoshop": "ghcr.io/muradjanov-dev/ketoshop"},
-        frozenset({"ketoshop"}),
+        frozenset({"ci / check"}),
     ),
 }
 
@@ -77,6 +77,9 @@ def _valid_sha(value: Any) -> bool:
 def _record(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("invalid pending run")
+    row_id = raw.get("id")
+    if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 1:
+        raise ValueError("invalid pending run ID")
     repo = raw.get("repo_full_name")
     target = TARGETS.get(repo)
     if target is None or raw.get("base_branch") != target.branch:
@@ -93,7 +96,7 @@ def _record(raw: Any) -> dict[str, Any]:
     sha = raw.get("merged_sha")
     if raw["status"] == "merged" and not _valid_sha(sha):
         raise ValueError("merged run lacks its commit")
-    return {"run_id": run_id, "repo": repo, "target": target, "pr_number": pr_url[len(prefix):],
+    return {"id": row_id, "run_id": run_id, "repo": repo, "target": target, "pr_number": pr_url[len(prefix):],
             "status": raw["status"], "sha": sha, "notified": raw["notified"]}
 
 
@@ -139,20 +142,29 @@ class ExternalDeployMonitor:
             )
         )
 
-    def _successful_deploy_run(self, repo: str, branch: str, sha: str) -> str | None:
+    def _successful_deploy_run(self, repo: str, target: Target, sha: str) -> str | None:
         result = self._github(
             f"/repos/{repo}/actions/workflows/deploy.yml/runs?event=push&per_page=20&head_sha={sha}"
         )
         for run in result.get("workflow_runs", []):
             if (
                 run.get("head_sha") == sha
-                and run.get("head_branch") == branch
+                and run.get("head_branch") == target.branch
                 and run.get("event") == "push"
                 and run.get("status") == "completed"
                 and run.get("conclusion") == "success"
                 and isinstance(run.get("id"), int)
             ):
-                return f"https://github.com/{repo}/actions/runs/{run['id']}"
+                jobs = self._github(
+                    f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"
+                )
+                succeeded = {
+                    job.get("name")
+                    for job in jobs.get("jobs", [])
+                    if job.get("conclusion") == "success"
+                }
+                if target.ci_jobs.issubset(succeeded) and "deploy" in succeeded:
+                    return f"https://github.com/{repo}/actions/runs/{run['id']}"
         return None
 
     def _production_matches(self, target: Target, sha: str) -> bool:
@@ -172,37 +184,44 @@ class ExternalDeployMonitor:
                 return False
             if state.get("Running") is not True:
                 return False
-            if container in target.healthy and (state.get("Health") or {}).get("Status") != "healthy":
+            if (state.get("Health") or {}).get("Status") != "healthy":
                 return False
         return True
 
     def run_once(self) -> tuple[int, int]:
-        pending = self._internal("/external-pending")
-        if not isinstance(pending, list):
-            raise ValueError("invalid pending run list")
         merged = deployed = 0
-        for raw in pending[:50]:
-            record = _record(raw)
-            if not record["notified"]:
-                # Deliver the PR/merge notice before advancing to the next state.
-                continue
-            repo = record["repo"]
-            target = record["target"]
-            if record["status"] == "pr_ready":
-                pr = self._github(f"/repos/{repo}/pulls/{record['pr_number']}")
-                sha = pr.get("merge_commit_sha")
-                if pr.get("merged") and _valid_sha(sha):
-                    self._internal(f"/{record['run_id']}/merged", {"sha": sha})
-                    merged += 1
-                continue
-            sha = record["sha"]
-            run_url = self._successful_deploy_run(repo, target.branch, sha)
-            if run_url and self._production_matches(target, sha):
-                self._internal(
-                    f"/{record['run_id']}/deployed",
-                    {"sha": sha, "github_run_url": run_url},
-                )
-                deployed += 1
+        after_id = 0
+        while True:
+            pending = self._internal(f"/external-pending?after_id={after_id}")
+            if not isinstance(pending, list):
+                raise ValueError("invalid pending run list")
+            for raw in pending:
+                record = _record(raw)
+                if record["id"] <= after_id:
+                    raise ValueError("pending run cursor did not advance")
+                after_id = record["id"]
+                if not record["notified"]:
+                    # Deliver the PR/merge notice before advancing to the next state.
+                    continue
+                repo = record["repo"]
+                target = record["target"]
+                if record["status"] == "pr_ready":
+                    pr = self._github(f"/repos/{repo}/pulls/{record['pr_number']}")
+                    sha = pr.get("merge_commit_sha")
+                    if pr.get("merged") and _valid_sha(sha):
+                        self._internal(f"/{record['run_id']}/merged", {"sha": sha})
+                        merged += 1
+                    continue
+                sha = record["sha"]
+                run_url = self._successful_deploy_run(repo, target, sha)
+                if run_url and self._production_matches(target, sha):
+                    self._internal(
+                        f"/{record['run_id']}/deployed",
+                        {"sha": sha, "github_run_url": run_url},
+                    )
+                    deployed += 1
+            if len(pending) < 50:
+                break
         return merged, deployed
 
 

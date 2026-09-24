@@ -51,6 +51,7 @@ class AgentMerge(BaseModel):
 
 
 class ExternalAgentPending(BaseModel):
+    id: int
     run_id: str
     repo_full_name: str
     base_branch: str

@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     # GitHub dispatch is disabled until these are provisioned. A manager binds
     # each project to a repo, but that repo must also be on this server allowlist.
     github_agent_token: str = Field(default="", alias="GITHUB_AGENT_TOKEN")
+    github_public_agent_token: str = Field(default="", alias="GITHUB_PUBLIC_AGENT_TOKEN")
     github_agent_allowed_repos: str = Field(
         default="Asadtop4ik/task-manager", alias="GITHUB_AGENT_ALLOWED_REPOS"
     )
@@ -128,6 +129,10 @@ class Settings(BaseSettings):
         if self.agent_intake_enabled and len(self.intake_worker_token) < 32:
             raise ValueError(
                 "INTAKE_WORKER_TOKEN must be at least 32 characters when intake is enabled"
+            )
+        if self.agent_public_enabled and len(self.github_public_agent_token) < 20:
+            raise ValueError(
+                "GITHUB_PUBLIC_AGENT_TOKEN is required when public agents are enabled"
             )
         return self
 

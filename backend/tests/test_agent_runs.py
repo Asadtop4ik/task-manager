@@ -120,6 +120,39 @@ async def test_public_dispatch_uses_the_private_control_repository(monkeypatch) 
     assert requests[1][1]["client_payload"]["repo_full_name"] == "muradjanov-dev/qurbot"
 
 
+async def test_public_pr_cancellation_uses_only_the_public_repo_token(monkeypatch) -> None:
+    from app.db.models import AgentRun
+
+    monkeypatch.setattr(settings, "github_agent_token", "task-manager-only")
+    monkeypatch.setattr(settings, "github_public_agent_token", "three-public-repos-only")
+    seen: list[str] = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def patch(self, url, **kwargs):
+            seen.append(kwargs["headers"]["Authorization"])
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: Client())
+    run = AgentRun(
+        run_id="00000000-0000-0000-0000-000000000098",
+        task_id=1,
+        task_revision="a" * 64,
+        repo_full_name="muradjanov-dev/qurbot",
+        base_branch="master",
+        mode="pr",
+        status="pr_ready",
+        pr_url="https://github.com/muradjanov-dev/qurbot/pull/7",
+    )
+    await agent_runs._close_pr(run)
+    assert seen == ["Bearer three-public-repos-only"]
+
+
 async def test_external_merge_notice_does_not_mark_task_done_before_deploy(
     client: AsyncClient,
     session: AsyncSession,
@@ -172,6 +205,7 @@ async def test_external_merge_notice_does_not_mark_task_done_before_deploy(
     assert (await client.get("/api/v1/agent-runs/external-pending")).status_code == 401
     pending = await client.get("/api/v1/agent-runs/external-pending", headers=headers)
     assert pending.status_code == 200 and pending.json()[0]["run_id"] == run_id
+    assert pending.json()[0]["id"] > 0 and pending.json()[0]["notified"] is False
     merged = await client.post(
         f"/api/v1/agent-runs/{run_id}/merged",
         json={"sha": "c" * 40},

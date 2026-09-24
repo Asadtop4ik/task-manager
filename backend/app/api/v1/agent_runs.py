@@ -223,10 +223,17 @@ async def _close_pr(run: AgentRun) -> None:
     pr_number = run.pr_url.removeprefix(expected)
     if not run.pr_url.startswith(expected) or not pr_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
+    token = (
+        settings.github_public_agent_token
+        if run.repo_full_name in PUBLIC_REPOSITORIES
+        else settings.github_agent_token
+    )
+    if not token:
+        raise HTTPException(status_code=503, detail="PR close token is not configured")
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.patch(
             f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
-            headers=_headers(),
+            headers={**_headers(), "Authorization": f"Bearer {token}"},
             json={"state": "closed"},
         )
     if response.status_code != 200:
@@ -286,20 +293,25 @@ async def mark_notified(
 async def external_pending(
     session: DbSession,
     x_agent_callback_token: str | None = Header(default=None),
+    after_id: int = 0,
 ) -> list[ExternalAgentPending]:
     _image_callback_auth(x_agent_callback_token)
+    if after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid cursor")
     rows = await session.scalars(
         select(AgentRun)
         .where(
             AgentRun.repo_full_name.in_(PUBLIC_REPOSITORIES),
             AgentRun.status.in_(["pr_ready", "merged"]),
             AgentRun.pr_url.is_not(None),
+            AgentRun.id > after_id,
         )
         .order_by(AgentRun.id)
         .limit(50)
     )
     return [
         ExternalAgentPending(
+            id=run.id,
             run_id=run.run_id,
             repo_full_name=run.repo_full_name,
             base_branch=run.base_branch,

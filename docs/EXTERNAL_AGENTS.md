@@ -22,18 +22,26 @@ ochilgan, Task Manager agent runiga bog‘lanmagan PRlar bu oqimga kirmaydi.
 ## Bir martalik yoqish
 
 1. Uch repo egasi bilan AGENTS ko‘rsatma PRlarini merge qiling: [Qurbot](https://github.com/muradjanov-dev/qurbot/pull/3), [Kans Shop](https://github.com/muradjanov-dev/kans-shop/pull/1), [Ketoshop](https://github.com/muradjanov-dev/ketoshop/pull/2). Bu PRlar majburiy texnik dependency emas, lekin agent ularning qoidalarini default branch’dan o‘qishi uchun kerak.
-2. GitHub’da faqat shu uch repo uchun muddati cheklangan fine-grained PAT
-   yarating. Repository permissions: **Contents: Read and write** va
-   **Pull requests: Read and write**. Tokenni chatga, kodga yoki logga
-   yozmang. Private `Asadtop4ik/task-manager` reponing Actions secretiga
-   `AGENT_PUBLIC_REPO_TOKEN` nomi bilan kiriting. Task Manager’ning mavjud
-   `AGENT_REPO_TOKEN` secretini almashtirmang.
-3. Netcup’da `ops/agent_deploy_monitor.py`ni root-owned/read-only
-   `/opt/task-manager/ops/agent_deploy_monitor.py`ga, service/timer unitlarini
+2. Netcup’da `ops/agent_deploy_monitor.py` va
+   `ops/update_public_agent_token.py`ni root-owned/read-only
+   `/opt/task-manager/ops/`ga, service/timer unitlarini
    `/etc/systemd/system/`ga o‘rnating. `/etc/task-manager/external-monitor.env`
    root-owned 0600 bo‘lsin va mavjud server env’dagi `GITHUB_AGENT_TOKEN` hamda
    `AGENT_CALLBACK_TOKEN` qiymatlarini o‘z ichiga olsin. `systemd-analyze verify`
    va `systemctl enable --now task-manager-external-monitor.timer`ni bajaring.
+   Server Compose’da `qurbot-worker` uchun `arq --check
+   app.workers.main.WorkerSettings`, `kans-frontend` uchun esa localhost HTTP
+   healthcheck qo‘shing. Monitor **har bir** container healthy bo‘lmaguncha
+   deployni tasdiqlamaydi.
+3. GitHub’da faqat shu uch repo uchun muddati cheklangan fine-grained PAT
+   yarating. Repository permissions: **Contents: Read and write** va
+   **Pull requests: Read and write**. Tokenni chatga, kodga yoki logga
+   yozmang. Mac terminalida `bash scripts/set-public-agent-token.sh`ni
+   bajaring. Skript tokenni yashirin qabul qilib, private
+   `Asadtop4ik/task-manager` Actions secretiga `AGENT_PUBLIC_REPO_TOKEN` va
+   server API env’iga `GITHUB_PUBLIC_AGENT_TOKEN` qilib saqlaydi. Ikkinchisi
+   faqat bekor qilingan public PRni yopish uchun ishlatiladi; model uni
+   olmaydi. Task Manager’ning mavjud `AGENT_REPO_TOKEN` secretini almashtirmang.
 4. Task Manager’dagi uch loyiha uchun yuqoridagi repo va branch’ni manager
    API/UI orqali saqlang. Server env’da
    `GITHUB_AGENT_ALLOWED_REPOS=Asadtop4ik/task-manager,muradjanov-dev/qurbot,muradjanov-dev/kans-shop,muradjanov-dev/ketoshop`

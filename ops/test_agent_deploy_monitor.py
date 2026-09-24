@@ -26,6 +26,7 @@ class FakeResponse:
 
 def pending(status="pr_ready", *, notified=True):
     return {
+        "id": 1,
         "run_id": RUN_ID,
         "repo_full_name": "muradjanov-dev/ketoshop",
         "base_branch": "master",
@@ -64,7 +65,7 @@ class ExternalDeployMonitorTests(unittest.TestCase):
 
         def opener(request, timeout):
             requests.append((request.full_url, request.data))
-            if request.full_url.endswith("/external-pending"):
+            if "/external-pending?" in request.full_url:
                 return FakeResponse([pending()])
             if request.full_url.endswith("/pulls/7"):
                 return FakeResponse({"merged": True, "merge_commit_sha": SHA})
@@ -79,6 +80,29 @@ class ExternalDeployMonitorTests(unittest.TestCase):
         self.assertEqual(monitor.run_once(), (1, 0))
         self.assertFalse(any("/deployed" in url for url, _ in requests))
 
+    def test_stale_first_page_does_not_hide_newer_merged_pr(self):
+        pages = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "/external-pending?after_id=0" in url:
+                pages.append(0)
+                return FakeResponse([pending(notified=False) | {"id": index} for index in range(1, 51)])
+            if "/external-pending?after_id=50" in url:
+                pages.append(50)
+                return FakeResponse([pending() | {"id": 51}])
+            if url.endswith("/pulls/7"):
+                return FakeResponse({"merged": True, "merge_commit_sha": SHA})
+            if url.endswith("/merged"):
+                return FakeResponse({"status": "merged"})
+            raise AssertionError(url)
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback", github_token="github", opener=opener
+        )
+        self.assertEqual(monitor.run_once(), (1, 0))
+        self.assertEqual(pages, [0, 50])
+
     def test_exact_image_and_successful_workflow_are_both_required(self):
         for image_sha, expected in (("b" * 40, (0, 0)), (SHA, (0, 1))):
             with self.subTest(image_sha=image_sha):
@@ -86,7 +110,7 @@ class ExternalDeployMonitorTests(unittest.TestCase):
 
                 def opener(request, timeout):
                     requests.append((request.full_url, request.data))
-                    if request.full_url.endswith("/external-pending"):
+                    if "/external-pending?" in request.full_url:
                         return FakeResponse([pending("merged")])
                     if "/workflows/deploy.yml/runs?" in request.full_url:
                         return FakeResponse(
@@ -99,6 +123,11 @@ class ExternalDeployMonitorTests(unittest.TestCase):
                                 "conclusion": "success",
                             }]}
                         )
+                    if request.full_url.endswith("/actions/runs/123/jobs?per_page=100"):
+                        return FakeResponse({"jobs": [
+                            {"name": "ci / check", "conclusion": "success"},
+                            {"name": "deploy", "conclusion": "success"},
+                        ]})
                     if request.full_url.endswith("/deployed"):
                         self.assertEqual(json.loads(request.data)["sha"], SHA)
                         return FakeResponse({"status": "deployed"})
@@ -148,6 +177,28 @@ class ExternalDeployMonitorTests(unittest.TestCase):
         from agent_deploy_monitor import TARGETS
 
         self.assertFalse(monitor._production_matches(TARGETS["muradjanov-dev/qurbot"], SHA))
+
+    def test_green_deploy_without_required_ci_job_does_not_count(self):
+        def opener(request, timeout):
+            if "/workflows/deploy.yml/runs?" in request.full_url:
+                return FakeResponse({"workflow_runs": [{
+                    "id": 123, "head_sha": SHA, "head_branch": "master",
+                    "event": "push", "status": "completed", "conclusion": "success",
+                }]})
+            if request.full_url.endswith("/actions/runs/123/jobs?per_page=100"):
+                return FakeResponse({"jobs": [{"name": "deploy", "conclusion": "success"}]})
+            raise AssertionError(request.full_url)
+
+        from agent_deploy_monitor import TARGETS
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback", github_token="github", opener=opener
+        )
+        self.assertIsNone(
+            monitor._successful_deploy_run(
+                "muradjanov-dev/ketoshop", TARGETS["muradjanov-dev/ketoshop"], SHA
+            )
+        )
 
 
 if __name__ == "__main__":

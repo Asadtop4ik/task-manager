@@ -9,6 +9,7 @@ User=deploy
 SupplementaryGroups=docker
 EnvironmentFile=/etc/task-manager/external-monitor.env
 ExecStart=/usr/bin/python3 /opt/task-manager/ops/agent_deploy_monitor.py
+TimeoutStartSec=180s
 CPUQuota=20%
 MemoryMax=128M
 NoNewPrivileges=yes
@@ -20,4 +21,3 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-
