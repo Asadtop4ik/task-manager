@@ -112,6 +112,7 @@ class UsageTests(unittest.TestCase):
                 "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
                 "GITHUB_RUN_ID": "42",
                 "JOB_STATUS": "failure",
+                "FAILURE_PHASE": "implement",
                 "RUNNER_TEMP": temp,
             }
             with patch.dict(os.environ, environment), patch(
@@ -120,6 +121,33 @@ class UsageTests(unittest.TestCase):
                 callback()
             self.assertEqual(
                 sent.call_args.args[0]["error"], "Which menu label should I use?"
+            )
+
+    def test_publisher_failure_does_not_report_successful_agent_summary(self) -> None:
+        task = {
+            "task_id": 7,
+            "run_id": "00000000-0000-0000-0000-000000000007",
+            "title": "Fix menu",
+            "description": "",
+            "base_branch": "main",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "agent-result.txt").write_text("README change complete")
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                "GITHUB_RUN_ID": "42",
+                "JOB_STATUS": "failure",
+                "FAILURE_PHASE": "publish",
+                "RUNNER_TEMP": temp,
+            }
+            with patch.dict(os.environ, environment), patch(
+                "agent_task._send_status", return_value={"status": "failed"}
+            ) as sent:
+                callback()
+            self.assertEqual(
+                sent.call_args.args[0]["error"],
+                "Publisher failed before PR/deploy; inspect the GitHub run.",
             )
 
     def test_extracts_last_completed_turn_and_ignores_partial_line(self) -> None:
