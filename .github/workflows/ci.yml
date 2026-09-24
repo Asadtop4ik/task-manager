@@ -3,11 +3,26 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
-  # Lets deploy.yml gate on the exact same checks instead of duplicating them.
+    branches: [codex/fast/**]
+  schedule:
+    - cron: '0 20 * * *'
   workflow_call:
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.select.outputs.backend }}
+      bot: ${{ steps.select.outputs.bot }}
+      frontend: ${{ steps.select.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select changed services
+        id: select
+        run: python3 scripts/ci_changed.py
+
   agent-policy:
     runs-on: ubuntu-latest
     steps:
@@ -15,6 +30,8 @@ jobs:
       - run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
   backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -79,6 +96,8 @@ jobs:
         run: pytest -q
 
   bot:
+    needs: changes
+    if: needs.changes.outputs.bot == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -106,6 +125,8 @@ jobs:
         run: pytest -q
 
   frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -122,3 +143,31 @@ jobs:
       # Build here too: a type-clean project can still fail `vite build`, and
       # finding that out in the deploy job wastes a round trip.
       - run: npm run build
+
+  gate:
+    if: always()
+    needs: [changes, agent-policy, backend, bot, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every selected check
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          POLICY: ${{ needs.agent-policy.result }}
+          BACKEND: ${{ needs.backend.result }}
+          BOT: ${{ needs.bot.result }}
+          FRONTEND: ${{ needs.frontend.result }}
+          RUN_BACKEND: ${{ needs.changes.outputs.backend }}
+          RUN_BOT: ${{ needs.changes.outputs.bot }}
+          RUN_FRONTEND: ${{ needs.changes.outputs.frontend }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES" = success
+          test "$POLICY" = success
+          for service in BACKEND BOT FRONTEND; do
+            selected="RUN_${service}"
+            if [ "${!selected}" = true ]; then
+              test "${!service}" = success
+            else
+              test "${!service}" = skipped
+            fi
+          done

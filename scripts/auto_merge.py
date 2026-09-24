@@ -14,7 +14,7 @@ import sys
 import time
 import urllib.request
 
-REQUIRED_CHECKS = {"backend", "bot", "frontend", "agent-policy"}
+REQUIRED_CHECKS = {"gate", "agent-policy"}
 
 
 def allowed_files(paths: list[str]) -> bool:
