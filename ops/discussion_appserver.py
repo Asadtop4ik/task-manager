@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
 import subprocess
 import threading
@@ -14,6 +13,13 @@ from typing import Any
 
 class DiscussionError(RuntimeError):
     pass
+
+
+CODEX_BINARY = "/home/codex-runner/.local/bin/codex"
+CODEX_PATH = (
+    "/home/codex-runner/actions-runner/externals/node24/bin:"
+    "/home/codex-runner/.local/bin:/usr/local/bin:/usr/bin:/bin"
+)
 
 
 def _messages(stdout: Any, output: queue.Queue[Any]) -> None:
@@ -41,11 +47,11 @@ def run_turn(
     env = {
         "HOME": "/home/codex-runner",
         "CODEX_HOME": "/home/codex-runner/.codex",
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PATH": CODEX_PATH,
         "LANG": "C.UTF-8",
     }
     process = subprocess.Popen(
-        ["codex", "app-server", "--stdio"],
+        [CODEX_BINARY, "app-server", "--stdio"],
         cwd=snapshot,
         env=env,
         stdin=subprocess.PIPE,

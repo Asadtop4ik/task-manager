@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from discussion_appserver import DiscussionError, run_turn
+from discussion_appserver import CODEX_BINARY, DiscussionError, run_turn
 
 
 class FakeProcess:
@@ -34,7 +34,7 @@ class AppServerTests(unittest.TestCase):
         ])
         with tempfile.TemporaryDirectory() as directory, patch(
             "discussion_appserver.subprocess.Popen", return_value=process
-        ):
+        ) as popen:
             thread, answer = run_turn(
                 snapshot=Path(directory), thread_id="thr_saved", prompt="Savol", images=[]
             )
@@ -44,6 +44,8 @@ class AppServerTests(unittest.TestCase):
             "initialize", "initialized", "thread/resume", "turn/start"
         ])
         self.assertEqual(sent[-1]["params"]["sandboxPolicy"]["type"], "readOnly")
+        self.assertEqual(popen.call_args.args[0][0], CODEX_BINARY)
+        self.assertIn("node24/bin", popen.call_args.kwargs["env"]["PATH"])
         self.assertTrue(process.terminated)
 
     def test_approval_request_is_never_granted(self):
