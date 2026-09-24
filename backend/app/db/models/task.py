@@ -66,6 +66,10 @@ class Task(Base, TimestampMixin):
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    deleted_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
 
     estimate_minutes: Mapped[int | None] = mapped_column(Integer)
     spent_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

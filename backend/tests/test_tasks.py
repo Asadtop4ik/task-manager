@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db.models import Project, User
 from tests.conftest import auth
 
@@ -265,7 +266,10 @@ class TestCard:
         response = await client.post(
             f"/api/v1/tasks/{task_id}/card",
             json={"chat_id": 555, "message_id": 12},
-            headers=auth(manager),
+            headers={
+                "X-Service-Token": settings.service_token,
+                "X-Acting-User": str(manager.telegram_id),
+            },
         )
         assert response.status_code == 200
 

@@ -89,6 +89,8 @@ class ActivityKind(StrEnum):
     COMMENTED = "commented"
     TIME_LOGGED = "time_logged"
     ATTACHED = "attached"
+    DELETED = "deleted"
+    RESTORED = "restored"
 
 
 class ReminderKind(StrEnum):

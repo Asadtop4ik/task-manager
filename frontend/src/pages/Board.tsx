@@ -1,6 +1,8 @@
 import { Fragment, useRef, useState } from "react";
+import { AxiosError } from "axios";
+import { Link } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
-import { useProjects, useReorder, useTasks, useTransition, useUsers } from "@/lib/queries";
+import { useDeleteTask, useProjects, useReorder, useTasks, useTransition, useUsers } from "@/lib/queries";
 import { BOARD_COLUMNS, STATUS_LABEL, TRANSITIONS, isOverdue } from "@/lib/format";
 import TaskRow from "@/components/TaskRow";
 import Empty from "@/components/Empty";
@@ -28,6 +30,12 @@ export default function Board() {
   const users = useUsers();
   const transition = useTransition();
   const reorder = useReorder();
+  const deleteTask = useDeleteTask();
+
+  function deleteCard(task: Task) {
+    if (!window.confirm(`“${task.title}” vazifasi o‘chirilsinmi? Uni keyin tiklash mumkin.`)) return;
+    deleteTask.mutate(task.id);
+  }
 
   const activeTasks = useTasks({
     status: BOARD_COLUMNS.filter((status) => status !== "done"),
@@ -106,7 +114,15 @@ export default function Board() {
     <Page wide>
       <div className="pb-20 sm:pb-6">
         <header className="px-4 pt-8 pb-4">
-          <h1 className="text-page font-semibold">Doska</h1>
+          <div className="flex items-center justify-between gap-3">
+            <h1 className="text-page font-semibold">Doska</h1>
+            {user?.is_owner && <Link to="/trash" className="text-sm text-muted underline">O‘chirilganlar</Link>}
+          </div>
+          {deleteTask.isError && <p role="alert" className="mt-2 text-sm text-late">
+            {deleteTask.error instanceof AxiosError && deleteTask.error.response?.status === 409
+              ? "Avval faol Codex ishini to‘xtating, keyin vazifani o‘chiring."
+              : "Vazifani o‘chirib bo‘lmadi."}
+          </p>}
         </header>
 
         <div className="flex flex-wrap gap-2 px-4 pb-4">
@@ -174,7 +190,8 @@ export default function Board() {
           </div>
           <ul className="divide-y divide-hairline border-y border-hairline bg-card pl-4">
             {inColumn(column).map((task) => (
-              <TaskRow key={task.id} task={task} tz={tz} />
+              <TaskRow key={task.id} task={task} tz={tz}
+                onDelete={user?.is_owner ? () => deleteCard(task) : undefined} />
             ))}
           </ul>
           {!isPending && !inColumn(column).length && (
@@ -225,6 +242,7 @@ export default function Board() {
                         tz={tz}
                         draggable={user?.role === "manager" || task.assignee?.id === user?.id}
                         card
+                        onDelete={user?.is_owner ? () => deleteCard(task) : undefined}
                         onDragStart={() => setDragging(task)}
                         onDragEnd={() => {
                           setDragging(null);

@@ -21,6 +21,7 @@ class TaskOut(BaseModel):
     due_at: datetime | None
     started_at: datetime | None
     done_at: datetime | None
+    deleted_at: datetime | None
     estimate_minutes: int | None
     spent_minutes: int
     source: TaskSource
@@ -80,6 +81,14 @@ class TaskListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class TaskCardSyncOut(BaseModel):
+    event_id: int
+    kind: str
+    chat_id: int
+    message_id: int
+    task: TaskOut
 
 
 class TaskCard(BaseModel):

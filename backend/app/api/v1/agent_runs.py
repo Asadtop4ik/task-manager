@@ -37,11 +37,14 @@ def _worker_auth(token: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid worker token")
 
 
-async def _task(session: DbSession, task_id: int) -> Task:
+async def _task(session: DbSession, task_id: int, *, lock: bool = False) -> Task:
+    query = select(Task).where(Task.id == task_id).options(selectinload(Task.project))
     task = await session.scalar(
-        select(Task).where(Task.id == task_id).options(selectinload(Task.project))
+        query.with_for_update().execution_options(populate_existing=True) if lock else query
     )
     if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.deleted_at is not None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
 
@@ -260,7 +263,7 @@ async def agent_run_status(
     "/tasks/{task_id}", response_model=AgentRunOut, status_code=status.HTTP_201_CREATED
 )
 async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -> AgentRunOut:
-    task = await _task(session, task_id)
+    task = await _task(session, task_id, lock=True)
     if not (
         user.can_use_codex
         or (settings.owner_telegram_id and user.telegram_id == settings.owner_telegram_id)

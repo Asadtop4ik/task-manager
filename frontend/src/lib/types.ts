@@ -66,6 +66,7 @@ export type Task = {
   due_at: string | null;
   started_at: string | null;
   done_at: string | null;
+  deleted_at: string | null;
   estimate_minutes: number | null;
   spent_minutes: number;
   source: "bot" | "web";
