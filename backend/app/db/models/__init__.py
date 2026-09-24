@@ -9,6 +9,7 @@ from app.db.models.agent_run import AgentRun
 from app.db.models.misc import Activity, Attachment, Comment, Reminder
 from app.db.models.project import Membership, Project
 from app.db.models.task import Task
+from app.db.models.team import JoinRequest, TeamInvite
 from app.db.models.user import User
 
 __all__ = [
@@ -17,9 +18,11 @@ __all__ = [
     "Attachment",
     "Base",
     "Comment",
+    "JoinRequest",
     "Membership",
     "Project",
     "Reminder",
     "Task",
+    "TeamInvite",
     "User",
 ]

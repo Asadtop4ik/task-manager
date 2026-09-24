@@ -1,5 +1,5 @@
 from aiogram import Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
@@ -8,20 +8,6 @@ from app.handlers.helpers import api_for, explain_api_error
 from app.texts import HELP
 
 router = Router(name="common")
-
-
-@router.message(CommandStart())
-async def start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    try:
-        me = await api_for(message).me()
-    except ApiError as error:
-        await explain_api_error(message, error)
-        return
-
-    await message.answer(
-        f"Salom, {me['full_name']}!\n\n{HELP}",
-    )
 
 
 @router.message(Command("help"))

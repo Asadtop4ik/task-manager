@@ -26,6 +26,15 @@ class MiniAppLogin(BaseModel):
     init_data: str = Field(min_length=1)
 
 
+class MagicLinkRedeem(BaseModel):
+    token: str = Field(min_length=20, max_length=128)
+
+
+class MagicLinkOut(BaseModel):
+    url: str
+    expires_in: int
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"

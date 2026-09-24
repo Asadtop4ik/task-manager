@@ -16,6 +16,8 @@ class UserOut(BaseModel):
     lang: str
     tz: str
     is_active: bool
+    can_use_codex: bool
+    is_owner: bool = False
     created_at: datetime
 
 

@@ -12,8 +12,10 @@ from app.handlers.common import router as common_router
 from app.handlers.lists import router as lists_router
 from app.handlers.new import router as new_router
 from app.handlers.quick import router as quick_router
+from app.handlers.team import router as team_router
 
 router = Router(name="root")
+router.include_router(team_router)
 router.include_router(common_router)
 router.include_router(lists_router)
 router.include_router(new_router)

@@ -17,18 +17,16 @@ async def _login(client: AsyncClient, telegram_id: int, name: str = "Asad"):
     return await client.post("/api/v1/auth/telegram", json=payload)
 
 
-async def test_first_login_creates_a_pending_account(
+async def test_unknown_telegram_login_requires_an_invite(
     client: AsyncClient, session: AsyncSession
 ) -> None:
-    """An open Telegram login on a public domain must not be an open door."""
+    """The legacy widget cannot bypass invite-only onboarding."""
     response = await _login(client, 555)
     assert response.status_code == 403
-    assert "not approved" in response.json()["detail"]
+    assert "invitation required" in response.json()["detail"]
 
     user = await session.scalar(select(User).where(User.telegram_id == 555))
-    assert user is not None
-    assert user.is_active is False
-    assert user.role == UserRole.EXECUTOR
+    assert user is None
 
 
 async def test_bootstrap_admin_is_approved_immediately(

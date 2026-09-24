@@ -7,6 +7,7 @@ import MyDay from "@/pages/MyDay";
 import ProjectDetail from "@/pages/ProjectDetail";
 import Projects from "@/pages/Projects";
 import TaskDetail from "@/pages/TaskDetail";
+import Team from "@/pages/Team";
 
 export default function App() {
   const { state } = useAuth();
@@ -32,6 +33,7 @@ export default function App() {
           <Route path="projects" element={<Projects />} />
           <Route path="projects/:id" element={<ProjectDetail />} />
           <Route path="tasks/:id" element={<TaskDetail />} />
+          <Route path="team" element={<Team />} />
           {/* Deep links from the bot's "Ochish" button land here if the id is
               gone; send them somewhere useful rather than a blank screen. */}
           <Route path="*" element={<Navigate to="/" replace />} />

@@ -20,6 +20,8 @@ export type User = {
   lang: string;
   tz: string;
   is_active: boolean;
+  can_use_codex: boolean;
+  is_owner: boolean;
   created_at: string;
 };
 

@@ -36,6 +36,9 @@ COMMANDS = [
     BotCommand(command="my", description="Mening ochiq vazifalarim"),
     BotCommand(command="today", description="Bugungi va muddati o‘tganlari"),
     BotCommand(command="projects", description="Loyihalar"),
+    BotCommand(command="login", description="Brauzer uchun kirish havolasi"),
+    BotCommand(command="invite", description="Jamoaga taklif (egasi uchun)"),
+    BotCommand(command="pending", description="A’zo so‘rovlarini ko‘rish"),
     BotCommand(command="cancel", description="Amalni bekor qilish"),
     BotCommand(command="help", description="Yordam"),
 ]

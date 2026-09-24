@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, String
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, String, false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -33,6 +33,9 @@ class User(Base, TimestampMixin):
     # A first-time telegram_id is stored inactive and waits for a manager. An open
     # Telegram login on a public domain is otherwise an open door.
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_use_codex: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     memberships: Mapped[list["Membership"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
