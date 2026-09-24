@@ -35,7 +35,9 @@ RestrictSUIDSGID=no
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ProtectProc=invisible
 ProcSubset=pid
-ReadWritePaths=/run/task-manager-intake
+# Codex CLI needs to update its own auth/session state even for --ephemeral
+# read-only analysis. The model's shell sandbox remains read-only.
+ReadWritePaths=/run/task-manager-intake /home/codex-runner/.codex
 
 [Install]
 WantedBy=multi-user.target
