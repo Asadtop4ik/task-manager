@@ -62,7 +62,8 @@ def prepare() -> None:
     prompt = (
         "Work on the Task Manager repository. Follow AGENTS.md.\n"
         "Implement only the requested behavior. On this 1 CPU runner, do not install "
-        "dependencies or run full suites/builds; independent GitHub-hosted CI will do that. "
+        "dependencies solely for checks or run full suites/builds; independent GitHub-hosted "
+        "CI will do that. Dependency-management tasks may install packages to update lockfiles. "
         "Run git diff --check and quick targeted checks if existing dependencies allow, "
         "then state which checks were deferred to CI.\n"
         "Sensitive paths require human review and will become a PR instead of direct deployment.\n"
