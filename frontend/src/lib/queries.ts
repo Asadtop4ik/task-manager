@@ -108,6 +108,37 @@ export function useTasks(filters: TaskFilters) {
   });
 }
 
+export function useTrash() {
+  return useQuery({
+    queryKey: ["trash"],
+    queryFn: async () => (await api.get<Task[]>("/tasks/trash")).data,
+  });
+}
+
+export function useDeleteTask() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: number) => (await api.delete<Task>(`/tasks/${id}`)).data,
+    onSuccess: (_task, id) => {
+      void client.invalidateQueries({ queryKey: ["tasks"] });
+      void client.invalidateQueries({ queryKey: ["trash"] });
+      void client.invalidateQueries({ queryKey: ["task", id] });
+    },
+  });
+}
+
+export function useRestoreTask() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: number) => (await api.post<Task>(`/tasks/${id}/restore`)).data,
+    onSuccess: (_task, id) => {
+      void client.invalidateQueries({ queryKey: ["tasks"] });
+      void client.invalidateQueries({ queryKey: ["trash"] });
+      void client.invalidateQueries({ queryKey: ["task", id] });
+    },
+  });
+}
+
 export function useTask(id: number) {
   return useQuery({
     queryKey: ["task", id],

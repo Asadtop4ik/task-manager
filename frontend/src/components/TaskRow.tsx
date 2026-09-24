@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { formatDue, isOverdue, lateness, STATUS_LABEL } from "@/lib/format";
 import type { Task } from "@/lib/types";
@@ -14,6 +15,7 @@ type Props = {
   card?: boolean;
   /** Briefly lifts the row after it moves, so a drag shows you what changed. */
   settling?: boolean;
+  onDelete?: () => void;
 };
 
 /**
@@ -38,7 +40,9 @@ export default function TaskRow({
   onDragEnd,
   card,
   settling,
+  onDelete,
 }: Props) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const late = isOverdue(task);
   const due = formatDue(task.due_at, tz);
   const urgent = task.priority === "urgent";
@@ -46,14 +50,14 @@ export default function TaskRow({
   return (
     <li
       data-card={card ? "1" : undefined}
-      className={[late ? "bg-late-wash" : "", settling ? "settle" : ""].join(" ").trim() || undefined}
+      className={["relative", late ? "bg-late-wash" : "", settling ? "settle" : ""].join(" ").trim()}
     >
       <Link
         to={`/tasks/${task.id}`}
         draggable={draggable}
         onDragStart={onDragStart}
         onDragEnd={onDragEnd}
-        className="flex gap-3 py-3 pr-3 hover:bg-ink/[0.03] dark:hover:bg-ink/[0.06]"
+        className={`flex gap-3 py-3 ${onDelete ? "pr-10" : "pr-3"} hover:bg-ink/[0.03] dark:hover:bg-ink/[0.06]`}
       >
         <span
           aria-hidden
@@ -91,6 +95,24 @@ export default function TaskRow({
           </span>
         </span>
       </Link>
+      {onDelete && <div className="absolute right-1 top-2 z-10">
+        <button
+          type="button"
+          aria-label={`${task.title} — amallar`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((open) => !open)}
+          className="rounded px-2 py-1 text-muted hover:bg-ink/10"
+        >⋯</button>
+        {menuOpen && <div role="menu" className="absolute right-0 top-8 min-w-28 rounded-lg border border-hairline bg-card p-1 shadow-lg">
+          <button
+            type="button"
+            role="menuitem"
+            className="w-full rounded px-3 py-2 text-left text-sm text-late hover:bg-ink/10"
+            onClick={() => { setMenuOpen(false); onDelete(); }}
+          >O‘chirish</button>
+        </div>}
+      </div>}
     </li>
   );
 }

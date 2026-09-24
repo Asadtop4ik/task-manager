@@ -43,6 +43,8 @@ async def _task(session: DbSession, task_id: int) -> Task:
     )
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    if task.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="task not found")
     return task
 
 

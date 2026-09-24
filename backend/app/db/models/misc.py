@@ -78,6 +78,8 @@ class Activity(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # Only delete/restore events use this as a durable Telegram card outbox.
+    card_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     task: Mapped["Task"] = relationship(back_populates="activity")
     actor: Mapped["User | None"] = relationship()

@@ -1,20 +1,23 @@
+import hmac
 import time
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, OwnerUser
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.enums import OPEN_STATUSES, ActivityKind, TaskPriority, TaskStatus, can_transition
-from app.db.models import Activity, Comment, Task, User
+from app.db.models import Activity, AgentRun, Comment, Task, User
 from app.schemas.activity import ActivityOut
 from app.schemas.comment import CommentCreate, CommentOut
 from app.schemas.task import (
     TaskAssign,
     TaskCard,
+    TaskCardSyncOut,
     TaskCreate,
     TaskListResponse,
     TaskOut,
@@ -52,7 +55,9 @@ async def _visible_or_404(session: DbSession, user: User, task: Task) -> Task:
     Telling someone "this exists but is not yours" leaks the id space and how
     busy other projects are.
     """
-    if not await can_see_project(session, user, task.project_id):
+    if task.deleted_at is not None or not await can_see_project(
+        session, user, task.project_id
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
     return task
 
@@ -75,7 +80,7 @@ async def list_tasks(
     count_query = select(func.count()).select_from(Task)
 
     allowed = await visible_project_ids(session, user)
-    conditions: list[ColumnElement[bool]] = []
+    conditions: list[ColumnElement[bool]] = [Task.deleted_at.is_(None)]
     if allowed is not None:
         conditions.append(Task.project_id.in_(allowed))
     if project_id is not None:
@@ -113,6 +118,18 @@ async def list_tasks(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/trash", response_model=list[TaskOut])
+async def list_trash(session: DbSession, owner: OwnerUser) -> list[TaskOut]:
+    rows = await session.scalars(
+        select(Task)
+        .where(Task.deleted_at.is_not(None))
+        .options(*_RELATIONS)
+        .order_by(Task.deleted_at.desc(), Task.id.desc())
+        .limit(200)
+    )
+    return [TaskOut.model_validate(row) for row in rows]
 
 
 @router.post("", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
@@ -153,6 +170,102 @@ async def create_task(payload: TaskCreate, session: DbSession, user: CurrentUser
 async def get_task(task_id: int, session: DbSession, user: CurrentUser) -> TaskOut:
     task = await _visible_or_404(session, user, await _load(session, task_id))
     return TaskOut.model_validate(task)
+
+
+@router.delete("/{task_id}", response_model=TaskOut)
+async def delete_task(task_id: int, session: DbSession, owner: OwnerUser) -> TaskOut:
+    task = await session.scalar(
+        select(Task).where(Task.id == task_id).options(*_RELATIONS).with_for_update()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.deleted_at is not None:
+        return TaskOut.model_validate(task)
+    active_run = await session.scalar(
+        select(AgentRun).where(
+            AgentRun.task_id == task_id,
+            AgentRun.status.in_(
+                ("pending", "dispatching", "dispatched", "running", "pr_ready")
+            ),
+        )
+    )
+    if active_run is not None:
+        raise HTTPException(
+            status_code=409, detail="stop the active agent run before deleting"
+        )
+    task.deleted_at = datetime.now(UTC)
+    task.deleted_by_id = owner.id
+    activity.record(session, task_id=task.id, actor=owner, kind=ActivityKind.DELETED)
+    await session.commit()
+    return TaskOut.model_validate(await _load(session, task.id))
+
+
+@router.post("/{task_id}/restore", response_model=TaskOut)
+async def restore_task(task_id: int, session: DbSession, owner: OwnerUser) -> TaskOut:
+    task = await session.scalar(
+        select(Task).where(Task.id == task_id).options(*_RELATIONS).with_for_update()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.deleted_at is None:
+        return TaskOut.model_validate(task)
+    task.deleted_at = None
+    task.deleted_by_id = None
+    activity.record(session, task_id=task.id, actor=owner, kind=ActivityKind.RESTORED)
+    await session.commit()
+    return TaskOut.model_validate(await _load(session, task.id))
+
+
+def _card_worker_auth(token: str | None) -> None:
+    if not token or not hmac.compare_digest(token, settings.service_token):
+        raise HTTPException(status_code=401, detail="worker authentication required")
+
+
+@router.get("/card-sync/pending", response_model=list[TaskCardSyncOut])
+async def pending_card_sync(
+    session: DbSession, x_agent_worker_token: Annotated[str | None, Header()] = None
+) -> list[TaskCardSyncOut]:
+    _card_worker_auth(x_agent_worker_token)
+    rows = await session.scalars(
+        select(Activity)
+        .join(Task, Task.id == Activity.task_id)
+        .where(
+            Activity.kind.in_([ActivityKind.DELETED, ActivityKind.RESTORED]),
+            Activity.card_synced_at.is_(None),
+            Task.source_chat_id.is_not(None),
+            Task.source_message_id.is_not(None),
+        )
+        .order_by(Activity.id)
+        .limit(50)
+    )
+    notices: list[TaskCardSyncOut] = []
+    for row in rows:
+        task = await _load(session, row.task_id)
+        assert task.source_chat_id is not None and task.source_message_id is not None
+        notices.append(
+            TaskCardSyncOut(
+                event_id=row.id,
+                kind=row.kind,
+                chat_id=task.source_chat_id,
+                message_id=task.source_message_id,
+                task=TaskOut.model_validate(task),
+            )
+        )
+    return notices
+
+
+@router.post("/card-sync/{event_id}/notified", status_code=204)
+async def mark_card_synced(
+    event_id: int,
+    session: DbSession,
+    x_agent_worker_token: Annotated[str | None, Header()] = None,
+) -> None:
+    _card_worker_auth(x_agent_worker_token)
+    row = await session.get(Activity, event_id)
+    if row is None or row.kind not in {ActivityKind.DELETED, ActivityKind.RESTORED}:
+        raise HTTPException(status_code=404, detail="card event not found")
+    row.card_synced_at = datetime.now(UTC)
+    await session.commit()
 
 
 @router.patch("/{task_id}", response_model=TaskOut)
