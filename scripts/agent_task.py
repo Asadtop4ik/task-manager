@@ -13,6 +13,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from difflib import SequenceMatcher
 from pathlib import Path
 from uuid import UUID
 
@@ -86,12 +87,26 @@ def prepare() -> None:
     _write_env("AGENT_MODE", str(task["mode"]))
 
 
-def fast_needs_pr(paths: list[str]) -> bool:
-    """Fail closed to a PR for permissions, infra, data and unknown paths."""
+_SENSITIVE_CHANGE = re.compile(
+    r"\b(?:auth|authorize|permission|privilege|grant|revoke|role|owner|isOwner|"
+    r"manager|executor|member|access|accessToken|apiKey|token|secret|"
+    r"credential|password|login|invite|session|jwt|payment|billing|price|money|"
+    r"discount|invoice|checkout|order|purchase|broadcast|bulk|mass|recipient|"
+    r"send_message|sendMessage|send_photo|sendPhoto|send_media|sendMedia|"
+    r"chat_id|message_id|webhook|deploy|migration|agent|codex|github|delete|"
+    r"restore|is_owner|can_use_codex|canUseCodex)\b",
+    re.IGNORECASE,
+)
+_PRESENTATION_ATTRIBUTE = re.compile(r'\s*(?:title|aria-label)="[^"]*"')
+
+
+def fast_needs_pr(paths: list[str], changed_fragments: list[str] | None = None) -> bool:
+    """Fail closed to a PR for sensitive paths and changed code, not file count."""
     protected_prefixes = (
         ".github/", ".codex/", ".agents/", "scripts/", "backend/alembic/",
         "backend/app/core/", "backend/app/db/", "backend/app/api/",
         "backend/app/services/", "backend/app/schemas/", "bot/app/handlers/",
+        "frontend/src/lib/",
     )
     protected_exact = {
         "AGENTS.md", "backend/app/api/deps.py", "backend/app/api/v1/auth.py",
@@ -99,17 +114,21 @@ def fast_needs_pr(paths: list[str]) -> bool:
         "backend/app/api/v1/users.py", "backend/app/api/v1/tasks.py",
         "bot/app/main.py", "bot/app/worker.py", "bot/app/loader.py",
         "bot/app/api.py", "bot/app/texts.py", "bot/app/config.py",
-        "bot/app/callbacks.py", "backend/app/main.py",
+        "bot/app/callbacks.py", "bot/app/cards.py", "bot/app/parsing.py",
+        "backend/app/main.py", "frontend/src/App.tsx",
         "frontend/src/lib/auth.tsx", "frontend/src/lib/api.ts",
         "frontend/src/pages/Login.tsx", "frontend/src/pages/Team.tsx",
+        "frontend/src/pages/TaskDetail.tsx", "frontend/src/components/TaskRow.tsx",
     }
     fast_prefixes = (
         "backend/app/", "backend/tests/", "bot/app/", "bot/tests/",
-        "frontend/src/", "frontend/public/", "docs/",
+        "frontend/src/", "frontend/public/",
     )
     protected_words = (
         "payment", "billing", "price", "money", "secret", "auth", "permission",
         "security", "migration", "deploy", "workflow", "broadcast",
+        "checkout", "purchase", "order", "cart", "invoice", "customer",
+        "profile", "account", "member", "access",
     )
     for path in paths:
         lowered = path.lower()
@@ -117,10 +136,81 @@ def fast_needs_pr(paths: list[str]) -> bool:
             path in protected_exact or path.startswith(protected_prefixes)
             or any(word in lowered for word in protected_words)
             or path.endswith((".toml", ".lock", ".yml", ".yaml"))
-            or not (path == "README.md" or path.startswith(fast_prefixes))
+            or not path.startswith(fast_prefixes)
         ):
             return True
-    return False
+    return any(_SENSITIVE_CHANGE.search(fragment) for fragment in changed_fragments or [])
+
+
+def _changed_fragments(patch: str) -> list[str]:
+    """Inspect changed tokens; unchanged context on a modified line is not a change."""
+    fragments: list[str] = []
+    removed: list[str] = []
+    added: list[str] = []
+
+    def flush() -> None:
+        if len(removed) == len(added) == 1:
+            before, after = removed[0], added[0]
+            changes: list[tuple[str, str]] = []
+            for operation, left_start, left_end, right_start, right_end in SequenceMatcher(
+                None, before, after, autojunk=False
+            ).get_opcodes():
+                if operation != "equal":
+                    changes.append((before[left_start:left_end], after[right_start:right_end]))
+            if _SENSITIVE_CHANGE.search(before + after) and not (
+                changes
+                and all(
+                    not old and _PRESENTATION_ATTRIBUTE.fullmatch(new)
+                    for old, new in changes
+                )
+            ):
+                # A changed boolean/operator beside an unchanged permission
+                # check is still a permission change. Only literal tooltip
+                # attributes are inert enough to remain fast.
+                fragments.extend((before, after))
+            else:
+                for old, new in changes:
+                    fragments.extend((old, new))
+        else:
+            fragments.extend(removed + added)
+        removed.clear()
+        added.clear()
+
+    for line in patch.splitlines():
+        if line.startswith(("diff --git ", "@@")):
+            flush()
+        elif line.startswith(("--- ", "+++ ")):
+            continue
+        elif line.startswith("-"):
+            removed.append(line[1:])
+        elif line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith(("GIT binary patch", "Binary files ")):
+            fragments.append("credential")  # Unknown binary content needs review.
+        elif line.startswith(("new file mode 120000", "old mode 120000", "new mode 120000")):
+            fragments.append("credential")  # Symlinks need manual inspection.
+    flush()
+    return fragments
+
+
+def _changed_code(*, cwd: str | None, untracked: list[str]) -> list[str]:
+    patch = subprocess.check_output(
+        ["git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", "--binary", "HEAD"],
+        cwd=cwd,
+    ).decode("utf-8", errors="replace")
+    fragments = _changed_fragments(patch)
+    root = Path(cwd or os.getcwd())
+    for relative in untracked:
+        path = root / relative
+        if path.is_symlink():
+            fragments.append("credential")
+            continue
+        data = path.read_bytes()
+        if b"\0" in data:
+            fragments.append("credential")
+        else:
+            fragments.extend(data.decode("utf-8", errors="replace").splitlines())
+    return fragments
 
 
 def check_diff(*, cwd: str | None = None) -> None:
@@ -157,9 +247,14 @@ def check_diff(*, cwd: str | None = None) -> None:
             f"credential files cannot be committed: {', '.join(credential_paths)}"
         )
     task = _task()
+    fallback = task["mode"] == "fast" and fast_needs_pr(paths)
+    if task["mode"] == "fast" and not fallback:
+        fallback = fast_needs_pr(
+            paths, _changed_code(cwd=cwd, untracked=[path for path in untracked if path])
+        )
     _write_env(
         "FAST_FALLBACK",
-        "true" if task["mode"] == "fast" and fast_needs_pr(paths) else "false",
+        "true" if fallback else "false",
     )
     result = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
     if result.exists():
