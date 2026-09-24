@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import auth as auth_routes
 from app.core.config import settings
-from app.db.models import JoinRequest, Project, User
+from app.db.enums import UserRole
+from app.db.models import JoinRequest, Membership, Project, User
 from tests.conftest import auth
 
 
@@ -137,6 +138,70 @@ async def test_only_one_non_owner_gets_codex_access(
             headers=auth(outsider),
         )
     ).status_code == 403
+    assert (
+        await client.patch(
+            f"/api/v1/users/{executor.id}",
+            json={"is_active": False},
+            headers=auth(manager),
+        )
+    ).status_code == 200
+    replacement = await client.put(
+        f"/api/v1/team/members/{outsider.id}/codex-access",
+        json={"enabled": True},
+        headers=auth(manager),
+    )
+    assert replacement.status_code == 200
+
+
+async def test_reapproval_replaces_old_role_codex_and_projects(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "bot_username", "mn_taskmanagerbot")
+    old_project = Project(key="old-client", name="Old Client")
+    session.add(old_project)
+    await session.flush()
+    former = User(
+        telegram_id=7654,
+        full_name="Former manager",
+        role=UserRole.MANAGER,
+        is_active=False,
+        can_use_codex=True,
+    )
+    session.add(former)
+    await session.flush()
+    session.add(
+        Membership(
+            user_id=former.id,
+            project_id=old_project.id,
+            role_in_project=UserRole.MANAGER,
+        )
+    )
+    await session.commit()
+
+    invite = await client.post("/api/v1/team/invites", headers=auth(manager))
+    token = invite.json()["url"].split("invite_", 1)[1]
+    requested = await client.post(
+        "/api/v1/team/join-requests",
+        json={
+            "invite_token": token,
+            "telegram_id": former.telegram_id,
+            "first_name": "Former",
+        },
+        headers=bot_headers(former.telegram_id),
+    )
+    approved = await client.post(
+        f"/api/v1/team/join-requests/{requested.json()['id']}/approve",
+        json={"project_ids": [project.id]},
+        headers=auth(manager),
+    )
+    assert approved.status_code == 200
+    await session.refresh(former)
+    assert former.role == UserRole.EXECUTOR
+    assert former.can_use_codex is False
+    memberships = (
+        await session.scalars(select(Membership).where(Membership.user_id == former.id))
+    ).all()
+    assert [membership.project_id for membership in memberships] == [project.id]
 
 
 async def test_magic_link_is_single_use_and_requires_an_active_member(

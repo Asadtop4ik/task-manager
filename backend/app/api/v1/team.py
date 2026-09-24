@@ -182,16 +182,21 @@ async def approve_request(
         session.add(user)
         await session.flush()
     else:
+        if user.telegram_id == settings.owner_telegram_id:
+            raise HTTPException(status_code=409, detail="owner cannot join as a teammate")
         user.is_active = True
         user.full_name = " ".join(part for part in (row.first_name, row.last_name) if part)
         user.username = row.username
-    existing = set(
-        (
-            await session.scalars(
-                select(Membership.project_id).where(Membership.user_id == user.id)
-            )
-        ).all()
-    )
+        # A new invite replaces old project and Codex grants on reactivation.
+        user.role = UserRole.EXECUTOR
+        user.can_use_codex = False
+    memberships = (
+        await session.scalars(select(Membership).where(Membership.user_id == user.id))
+    ).all()
+    existing = {membership.project_id for membership in memberships}
+    for membership in memberships:
+        if membership.project_id not in project_ids:
+            await session.delete(membership)
     for project_id in project_ids - existing:
         session.add(
             Membership(
