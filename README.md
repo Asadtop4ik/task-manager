@@ -13,6 +13,19 @@ remain planned work.
 
 ## Coding agent integration
 
+In a private Telegram chat, send `task-manager: @codex ...` or owner-only
+`task-manager: !fast ...`. The bot keeps this as a draft while a separate
+read-only Codex worker checks the repository and up to three reference images.
+If the request is clear, the bot sends a short goal and acceptance summary;
+otherwise it asks at most three necessary questions. Answer in the chat, then
+press **Bajarish** to create the task and start the coding run. **Tuzatish**
+requests a new summary, and **Bekor qilish** discards the draft. No task or
+implementation run exists before confirmation. Use `/cancel` to discard a
+pending draft. A picture with the task as its caption works, as does a picture
+followed by the task text within ten minutes. PNG, JPEG and WebP are supported,
+up to three images of at most 20 MB each. This pilot is enabled only for the
+Task Manager project and for members with Codex access.
+
 After an operator configures a private project repository and the agent credentials,
 send `task-manager: update the task view @codex` to the Telegram bot. Confirm the
 parsed task; the bot creates it and starts one Codex run. `/agent 42` delegates
@@ -49,6 +62,11 @@ private `codex-agent` self-hosted runner. The repository needs these credentials
   `AGENT_CALLBACK_TOKEN` matching the server value.
 - Runner: Codex CLI logged in under its dedicated account, plus `gh` and Python 3.
   Do not expose the Codex auth cache to a public repository or a general runner.
+- Intake host worker: a separate read-only Codex process and
+  `INTAKE_WORKER_TOKEN` matching the API server environment. Leave
+  `AGENT_INTAKE_ENABLED=false` until the host worker is installed. Intake
+  questions do not create GitHub Actions jobs; implementation still uses the
+  existing dispatch workflow after confirmation.
 
 The workflow keeps GitHub write credentials out of the Codex runner. Its patch
 is applied in a separate clean GitHub-hosted publisher job. Protected paths

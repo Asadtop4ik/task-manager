@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from app.api import ApiError
+from app.config import settings
 from app.handlers.helpers import api_for, explain_api_error
 from app.texts import HELP
 
@@ -17,11 +18,27 @@ async def help_command(message: Message) -> None:
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is None:
+    current = None
+    intake_cancelled = False
+    if settings.agent_intake_enabled and message.chat.type == "private":
+        api = api_for(message)
+        try:
+            current = await api.current_agent_intake()
+            if current and current["status"] not in {"confirmed", "cancelled"}:
+                await api.cancel_agent_intake(int(current["id"]))
+                intake_cancelled = True
+        except ApiError as error:
+            await explain_api_error(message, error)
+            # A local photo/title draft can still be discarded if the API is down.
+            if await state.get_state() is None:
+                return
+    if await state.get_state() is None and not intake_cancelled:
         await message.answer("Bekor qilinadigan amal yo‘q.")
         return
     await state.clear()
-    await message.answer("Bekor qilindi.")
+    await message.answer(
+        "Codex intake bekor qilindi." if intake_cancelled else "Bekor qilindi."
+    )
 
 
 @router.message(Command("projects"))

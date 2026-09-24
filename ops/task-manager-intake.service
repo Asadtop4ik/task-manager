@@ -1,0 +1,41 @@
+[Unit]
+Description=Task Manager local Codex intake worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Provision a sudoers rule for deploy limited to this exact command:
+# deploy ALL=(codex-runner) NOPASSWD: /usr/bin/python3 /opt/task-manager/ops/intake_worker.py codex-child
+Type=simple
+User=deploy
+Group=codex-runner
+EnvironmentFile=/etc/task-manager/intake-worker.env
+Environment=INTAKE_TEMP_DIR=/run/task-manager-intake
+Environment=PATH=/home/codex-runner/actions-runner/externals/node24/bin:/home/codex-runner/.local/bin:/home/codex-runner/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+RuntimeDirectory=task-manager-intake
+RuntimeDirectoryMode=0770
+UMask=0007
+WorkingDirectory=/opt/task-manager
+ExecStart=/usr/bin/python3 /opt/task-manager/ops/intake_worker.py
+Restart=on-failure
+RestartSec=3
+CPUQuota=50%
+MemoryMax=768M
+# sudo may switch only the Codex child to the unprivileged codex-runner account.
+NoNewPrivileges=no
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/task-manager-intake
+
+[Install]
+WantedBy=multi-user.target

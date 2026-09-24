@@ -23,6 +23,11 @@ class QuickConfirm(CallbackData, prefix="q"):
     action: str  # create | cancel | edit
 
 
+class AgentIntakeAction(CallbackData, prefix="ai"):
+    action: str  # confirm | edit | cancel | retry | fallback
+    intake_id: int
+
+
 class JoinAction(CallbackData, prefix="j"):
     action: str  # approve | reject | project | confirm | cancel
     request_id: int

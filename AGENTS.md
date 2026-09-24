@@ -34,6 +34,12 @@ for the original design; verify old deployment notes against the live workflows.
 
 ## Agent tasks
 
+- If the request leaves a decision that changes behavior, ask a specific question
+  before coding. When it is clear, proceed without a planning ceremony.
+- Choose the simplest solution that meets the stated behavior. Keep the diff
+  limited to the task; do not refactor unrelated code while implementing it.
+- Verify the result with checks that exercise the changed behavior and report
+  any check that could not run.
 - Keep one task on one branch. Link its PR to the task ID, or, for owner-only
   `!fast`, record the exact CI-validated main commit and deploy run. State the
   expected behavior and verification performed.

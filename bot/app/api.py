@@ -111,6 +111,39 @@ class TaskApi:
     async def cancel_agent_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("POST", f"/agent-runs/{run_id}/cancel")
 
+    # --- agent intake ---------------------------------------------------
+
+    async def create_agent_intake(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", "/agent-intakes", json=payload)
+
+    async def current_agent_intake(self) -> dict[str, Any] | None:
+        return await self._request("GET", "/agent-intakes/current")
+
+    async def answer_agent_intake(self, intake_id: int, text: str) -> dict[str, Any]:
+        return await self._request(
+            "POST", f"/agent-intakes/{intake_id}/answer", json={"text": text}
+        )
+
+    async def revise_agent_intake(self, intake_id: int, text: str) -> dict[str, Any]:
+        return await self._request(
+            "POST", f"/agent-intakes/{intake_id}/revise", json={"text": text}
+        )
+
+    async def confirm_agent_intake(
+        self, intake_id: int, *, fallback_pr: bool = False
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/agent-intakes/{intake_id}/confirm",
+            json={"fallback_pr": fallback_pr},
+        )
+
+    async def cancel_agent_intake(self, intake_id: int) -> dict[str, Any] | None:
+        return await self._request("POST", f"/agent-intakes/{intake_id}/cancel")
+
+    async def retry_agent_intake(self, intake_id: int) -> dict[str, Any]:
+        return await self._request("POST", f"/agent-intakes/{intake_id}/retry")
+
     async def tasks(self, **params: Any) -> dict[str, Any]:
         clean = {k: v for k, v in params.items() if v is not None}
         return await self._request("GET", "/tasks", params=clean)

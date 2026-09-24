@@ -49,6 +49,12 @@ class AgentRunStart(BaseModel):
     mode: Literal["pr", "fast"] = "pr"
 
 
+class AgentImageOut(BaseModel):
+    id: int
+    mime: Literal["image/jpeg", "image/png", "image/webp"]
+    size: int | None
+
+
 class AgentNotificationOut(BaseModel):
     run_id: str
     task_id: int

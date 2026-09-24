@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
@@ -17,9 +17,10 @@ from app.api.deps import CurrentUser, DbSession
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.enums import ActivityKind, TaskStatus, can_transition
-from app.db.models import AgentRun, Task
+from app.db.models import AgentRun, Attachment, Task
 from app.schemas.agent_run import (
     AgentDeployment,
+    AgentImageOut,
     AgentNotificationOut,
     AgentRunCallback,
     AgentRunOut,
@@ -27,6 +28,7 @@ from app.schemas.agent_run import (
 )
 from app.services import activity
 from app.services.access import can_edit_task, can_see_task
+from app.services.telegram_media import IMAGE_MIMES, telegram_image
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -292,6 +294,61 @@ async def agent_run_status(
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return AgentRunOut.model_validate(run)
+
+
+def _image_callback_auth(token: str | None) -> None:
+    if (
+        not settings.agent_callback_token
+        or not token
+        or not hmac.compare_digest(token, settings.agent_callback_token)
+    ):
+        raise HTTPException(status_code=401, detail="invalid callback token")
+
+
+@router.get("/{run_id}/images", response_model=list[AgentImageOut])
+async def list_run_images(
+    run_id: str,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> list[AgentImageOut]:
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    rows = await session.scalars(
+        select(Attachment)
+        .where(Attachment.task_id == run.task_id)
+        .order_by(Attachment.id)
+        .limit(3)
+    )
+    return [
+        AgentImageOut(id=row.id, mime=row.mime, size=row.size)
+        for row in rows
+        if row.mime in IMAGE_MIMES
+    ]
+
+
+@router.get("/{run_id}/images/{attachment_id}")
+async def download_run_image(
+    run_id: str,
+    attachment_id: int,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> Response:
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    image = await session.scalar(
+        select(Attachment).where(
+            Attachment.id == attachment_id,
+            Attachment.task_id == run.task_id,
+        )
+    )
+    if image is None or image.mime not in IMAGE_MIMES:
+        raise HTTPException(status_code=404, detail="image not found")
+    data = await telegram_image(image.tg_file_id, image.mime, image.size)
+    return Response(content=data, media_type=image.mime)
 
 
 @router.post(
