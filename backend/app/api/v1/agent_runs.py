@@ -23,6 +23,7 @@ from app.schemas.agent_run import (
     AgentNotificationOut,
     AgentRunCallback,
     AgentRunOut,
+    AgentRunStart,
 )
 from app.services import activity
 from app.services.access import can_edit_task, can_see_task
@@ -49,7 +50,7 @@ async def _task(session: DbSession, task_id: int, *, lock: bool = False) -> Task
     return task
 
 
-def _revision(task: Task) -> str:
+def _revision(task: Task, mode: str = "pr") -> str:
     payload = json.dumps(
         {
             "title": task.title,
@@ -57,6 +58,7 @@ def _revision(task: Task) -> str:
             "project_id": task.project_id,
             "repo": task.project.repo_full_name,
             "branch": task.project.default_branch,
+            "mode": mode,
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -98,6 +100,7 @@ async def _dispatch(run: AgentRun, task: Task) -> int:
                     "description": task.description or "",
                     "base_branch": run.base_branch,
                     "task_revision": run.task_revision,
+                    "mode": run.mode,
                 },
             },
         )
@@ -110,7 +113,7 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
             f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
             headers=_headers(),
         )
-    expected_branch = f"codex/task-{run.task_id}-{run.run_id}"
+    expected_branch = _run_branch(run)
     if (
         response.status_code != 200
         or response.json()["head"]["ref"] != expected_branch
@@ -139,7 +142,7 @@ async def _verify_deployment(run: AgentRun, sha: str) -> str:
         not pr.get("merged")
         or pr.get("merge_commit_sha") != sha
         or (pr.get("base") or {}).get("ref") != run.base_branch
-        or head.get("ref") != f"codex/task-{run.task_id}-{run.run_id}"
+        or head.get("ref") != _run_branch(run)
         or (head.get("repo") or {}).get("full_name", "").lower() != run.repo_full_name.lower()
         or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
     ):
@@ -147,6 +150,37 @@ async def _verify_deployment(run: AgentRun, sha: str) -> str:
     # A reviewer may push fixes after the agent opens the PR. The merge commit,
     # PR branch and source repo are verified above; record the final reviewed head.
     return head_sha
+
+
+def _run_branch(run: AgentRun) -> str:
+    prefix = "codex/fast" if run.mode == "fast" else "codex"
+    return f"{prefix}/task-{run.task_id}-{run.run_id}"
+
+
+async def _verify_fast_branch(run: AgentRun, sha: str) -> None:
+    if run.mode != "fast":
+        raise HTTPException(status_code=409, detail="run is not in fast mode")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{run.repo_full_name}/git/ref/heads/{_run_branch(run)}",
+            headers=_headers(),
+        )
+    if response.status_code != 200 or (response.json().get("object") or {}).get("sha") != sha:
+        raise HTTPException(status_code=409, detail="fast branch does not match this run")
+
+
+async def _verify_fast_commit(run: AgentRun, sha: str) -> None:
+    if run.mode != "fast" or run.head_sha != sha:
+        raise HTTPException(status_code=409, detail="deployed SHA does not match fast run")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{run.repo_full_name}/commits/{sha}", headers=_headers()
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="fast commit verification failed")
+    message = (response.json().get("commit") or {}).get("message", "")
+    if f"Agent-Run-ID: {run.run_id}" not in message.splitlines():
+        raise HTTPException(status_code=409, detail="commit is not owned by this fast run")
 
 
 async def _cancel_github(run: AgentRun) -> None:
@@ -205,6 +239,7 @@ async def pending_notifications(
             chat_id=run.task.source_chat_id
             or (run.task.created_by.telegram_id if run.task.created_by else None),
             status=run.status,
+            mode=run.mode,
             pr_url=run.pr_url,
             github_run_url=run.github_run_url,
             error=run.error,
@@ -262,8 +297,15 @@ async def agent_run_status(
 @router.post(
     "/tasks/{task_id}", response_model=AgentRunOut, status_code=status.HTTP_201_CREATED
 )
-async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -> AgentRunOut:
+async def start_agent_run(
+    task_id: int, session: DbSession, user: CurrentUser, payload: AgentRunStart | None = None
+) -> AgentRunOut:
     task = await _task(session, task_id, lock=True)
+    mode = payload.mode if payload else "pr"
+    if mode == "fast" and not settings.agent_fast_enabled:
+        raise HTTPException(status_code=503, detail="fast mode is not enabled")
+    if mode == "fast" and user.telegram_id != settings.owner_telegram_id:
+        raise HTTPException(status_code=403, detail="fast mode is owner-only")
     if not (
         user.can_use_codex
         or (settings.owner_telegram_id and user.telegram_id == settings.owner_telegram_id)
@@ -275,6 +317,8 @@ async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -
         raise HTTPException(status_code=409, detail="task is closed")
     repo = task.project.repo_full_name
     branch = task.project.default_branch
+    if mode == "fast" and branch != "main":
+        raise HTTPException(status_code=409, detail="fast mode requires the main branch")
     allowlist = {
         name.strip().lower() for name in settings.github_agent_allowed_repos.split(",")
     }
@@ -289,7 +333,7 @@ async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -
             status_code=422, detail="task description is too long for an agent run"
         )
 
-    revision = _revision(task)
+    revision = _revision(task, mode)
     run = await session.scalar(
         select(AgentRun)
         .where(AgentRun.task_id == task_id, AgentRun.task_revision == revision)
@@ -313,6 +357,7 @@ async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -
             attempt_index=next_attempt,
             repo_full_name=repo,
             base_branch=branch,
+            mode=mode,
             status="pending",
             attempts=0,
         )
@@ -379,7 +424,14 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         raise HTTPException(status_code=403, detail="not allowed to cancel this run")
     if run.status == "cancelled":
         return AgentRunOut.model_validate(run)
-    if run.status not in {"pending", "dispatching", "dispatched", "running", "pr_ready"}:
+    if run.status not in {
+        "pending",
+        "dispatching",
+        "dispatched",
+        "running",
+        "validating",
+        "pr_ready",
+    }:
         raise HTTPException(status_code=409, detail="agent run is already finished")
     if run.status == "pr_ready":
         await _close_pr(run)
@@ -421,19 +473,29 @@ async def agent_run_deployed(
         raise HTTPException(status_code=404, detail="run not found")
     if run.status == "deployed" and run.deployed_sha == payload.sha:
         return AgentRunOut.model_validate(run)
-    if run.status != "pr_ready":
-        raise HTTPException(status_code=409, detail="agent PR is not ready")
+    if run.pr_url:
+        if run.status != "pr_ready":
+            raise HTTPException(status_code=409, detail="agent PR is not ready")
+        run.head_sha = await _verify_deployment(run, payload.sha)
+    else:
+        if run.status not in {"validating", "publishing", "deploying", "failed"}:
+            raise HTTPException(status_code=409, detail="fast run is not deploying")
+        await _verify_fast_commit(run, payload.sha)
     expected_url = f"https://github.com/{run.repo_full_name}/actions/runs/"
     suffix = payload.github_run_url.removeprefix(expected_url)
     if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
         raise HTTPException(status_code=400, detail="invalid deploy run URL")
-    run.head_sha = await _verify_deployment(run, payload.sha)
     run.status = "deployed"
     run.deployed_sha = payload.sha
     run.github_run_url = payload.github_run_url
     run.finished_at = datetime.now(UTC)
     run.notified_at = None
-    if can_transition(TaskStatus(run.task.status), TaskStatus.DONE):
+    if can_transition(TaskStatus(run.task.status), TaskStatus.DONE) or (
+        run.mode == "fast" and run.task.status == TaskStatus.BLOCKED
+    ):
+        # A publisher callback can fail after the validated main push and mark
+        # the task blocked. The verified production deploy is the final source
+        # of truth for this exact commit.
         old = run.task.status
         run.task.status = TaskStatus.DONE
         run.task.done_at = datetime.now(UTC)
@@ -468,8 +530,24 @@ async def agent_run_callback(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status in {"pr_ready", "deployed", "cancelled"}:
+    if run.status in {"pr_ready", "deployed", "cancelled", "failed"}:
         return AgentRunOut.model_validate(run)
+
+    if payload.status in {"validating", "publishing", "deploying"}:
+        if not payload.head_sha:
+            raise HTTPException(status_code=400, detail="fast branch SHA is required")
+        if payload.status == "validating" and run.status not in {
+            "running",
+            "validating",
+            "publishing",
+        }:
+            raise HTTPException(status_code=409, detail="run cannot start fast validation")
+        if payload.status == "publishing" and run.status != "validating":
+            raise HTTPException(status_code=409, detail="fast run has not passed validation")
+        if payload.status == "deploying" and run.status != "publishing":
+            raise HTTPException(status_code=409, detail="fast run has not been validated")
+        await _verify_fast_branch(run, payload.head_sha)
+        run.head_sha = payload.head_sha
 
     if payload.status == "pr_ready":
         if not payload.pr_url or not payload.head_sha or not settings.github_agent_token:
@@ -511,6 +589,19 @@ async def agent_run_callback(
             actor=None,
             kind=ActivityKind.STATUS_CHANGED,
             payload={"from": old, "to": TaskStatus.BLOCKED.value, "agent_run_id": run_id},
+        )
+    if payload.status == "running" and can_transition(
+        TaskStatus(run.task.status), TaskStatus.IN_PROGRESS
+    ):
+        old = run.task.status
+        run.task.status = TaskStatus.IN_PROGRESS
+        run.task.started_at = run.task.started_at or datetime.now(UTC)
+        activity.record(
+            session,
+            task_id=run.task_id,
+            actor=None,
+            kind=ActivityKind.STATUS_CHANGED,
+            payload={"from": old, "to": TaskStatus.IN_PROGRESS.value, "agent_run_id": run_id},
         )
     if payload.status == "pr_ready" and can_transition(
         TaskStatus(run.task.status), TaskStatus.REVIEW

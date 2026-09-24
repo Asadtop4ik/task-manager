@@ -67,6 +67,9 @@ class PolicyTests(unittest.TestCase):
             "head": {"ref": f"codex/task-7-{run_id}", "sha": "a" * 40},
         }
         self.assertEqual(agent_run_id(pr), run_id)
+        self.assertEqual(
+            agent_run_id({"head": {"ref": f"codex/fast/task-7-{run_id}"}}), run_id
+        )
         ready = {"status": "pr_ready", "pr_url": url, "head_sha": "a" * 40}
         self.assertTrue(agent_ready(pr, ready))
         self.assertFalse(agent_ready(pr, ready | {"status": "cancelled"}))

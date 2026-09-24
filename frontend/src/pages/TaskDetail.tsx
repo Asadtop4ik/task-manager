@@ -213,7 +213,7 @@ export default function TaskDetail() {
           )}
           {agentRuns.data?.map((run) => (
             <div key={run.run_id} className="mt-3 text-sm">
-              <span className="font-medium">{run.status}</span>
+              <span className="font-medium">{run.mode === "fast" ? "⚡ Fast · " : ""}{run.status}</span>
               {run.pr_url && (
                 <a className="ml-3 underline" href={run.pr_url} target="_blank" rel="noreferrer">
                   PRni ochish
@@ -225,7 +225,7 @@ export default function TaskDetail() {
                 </a>
               )}
               {run.error && <p className="text-late">{run.error}</p>}
-              {["pending", "dispatching", "dispatched", "running", "pr_ready"].includes(run.status) && (
+              {["pending", "dispatching", "dispatched", "running", "validating", "pr_ready"].includes(run.status) && (
                 <button
                   type="button"
                   disabled={cancelAgent.isPending}

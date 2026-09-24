@@ -76,6 +76,7 @@ class Settings(BaseSettings):
         default="Asadtop4ik/task-manager", alias="GITHUB_AGENT_ALLOWED_REPOS"
     )
     agent_callback_token: str = Field(default="", alias="AGENT_CALLBACK_TOKEN")
+    agent_fast_enabled: bool = Field(default=False, alias="AGENT_FAST_ENABLED")
 
     # --- Web ---
     public_url: str = Field(default="http://localhost:5173", alias="PUBLIC_URL")

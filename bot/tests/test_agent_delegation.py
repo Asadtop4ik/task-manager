@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.handlers import quick
+from app.parsing import parse
 
 
 @pytest.mark.parametrize("role,expected_assignee", [("manager", None), ("executor", 7)])
@@ -65,3 +66,45 @@ async def test_stopagent_cancels_latest_active_run(monkeypatch) -> None:
 
     api.cancel_agent_run.assert_awaited_once_with("active")
     message.answer.assert_awaited_once()
+
+
+def test_fast_token_is_removed_from_title_and_implies_codex() -> None:
+    parsed = parse("task-manager: Fix the board !fast", known_keys={"task-manager"})
+    assert parsed.project_key == "task-manager"
+    assert parsed.title == "Fix the board"
+    assert parsed.fast_requested is True
+
+
+async def test_owner_fast_task_dispatches_without_a_pr_request(monkeypatch) -> None:
+    state = MagicMock()
+    state.get_data = AsyncMock(
+        return_value={
+            "project_id": 4,
+            "draft": {
+                "title": "Fix the board",
+                "assignee_username": None,
+                "fast_requested": True,
+            },
+        }
+    )
+    state.clear = AsyncMock()
+    query = MagicMock()
+    query.message.chat.id = 123
+    query.from_user.id = 456
+    query.answer = AsyncMock()
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    api = MagicMock()
+    api.me = AsyncMock(return_value={"id": 7, "role": "manager", "is_owner": True})
+    api.create_task = AsyncMock(return_value={"id": 42, "status": "todo"})
+    api.start_agent_run = AsyncMock(return_value={"status": "dispatched"})
+    prompt = MagicMock()
+    prompt.delete = AsyncMock()
+    monkeypatch.setattr(quick, "api_for", lambda _: api)
+    monkeypatch.setattr(quick, "editable", lambda _: prompt)
+    monkeypatch.setattr(quick, "send_card", AsyncMock())
+    monkeypatch.setattr(quick, "notify_assignee", AsyncMock())
+
+    await quick.create(query, state, bot)
+
+    api.start_agent_run.assert_awaited_once_with(42, mode="fast")

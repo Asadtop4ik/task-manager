@@ -47,6 +47,7 @@ class ChangedJobsTests(unittest.TestCase):
             git("add", ".")
             git("commit", "-m", "base")
             base = git("rev-parse", "HEAD")
+            git("update-ref", "refs/remotes/origin/main", base)
             (root / "docs").mkdir()
             git("mv", "backend/old.py", "docs/old.py")
             git("commit", "-m", "move")
@@ -55,6 +56,13 @@ class ChangedJobsTests(unittest.TestCase):
             paths = changed_paths({"before": base}, "push", head, cwd=directory)
             self.assertEqual(paths, ["backend/old.py", "docs/old.py"])
             self.assertTrue(selected_jobs(paths)["backend"])
+            fast_paths = changed_paths(
+                {"ref": "refs/heads/codex/fast/task-1-example", "before": head},
+                "push",
+                head,
+                cwd=directory,
+            )
+            self.assertEqual(fast_paths, paths)
 
 
 if __name__ == "__main__":

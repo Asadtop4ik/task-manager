@@ -4,6 +4,8 @@ Task text is always data. The workflow reads generated files and environment
 values; it never interpolates the task text into shell source.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -26,6 +28,7 @@ def _task() -> dict[str, object]:
     title = raw.get("title")
     description = raw.get("description")
     base = raw.get("base_branch")
+    mode = raw.get("mode", "pr")
     if not isinstance(title, str) or not title.strip() or len(title) > 255:
         raise ValueError("invalid title")
     if not isinstance(description, str) or len(description) > 12000:
@@ -34,12 +37,15 @@ def _task() -> dict[str, object]:
         raise ValueError("invalid base branch")
     if base.startswith("-") or ".." in base or base.endswith("/"):
         raise ValueError("invalid base branch")
+    if mode not in {"pr", "fast"}:
+        raise ValueError("invalid agent mode")
     return {
         "task_id": task_id,
         "run_id": run_id,
         "title": title.strip(),
         "description": description.strip(),
         "base_branch": base,
+        "mode": mode,
     }
 
 
@@ -50,12 +56,13 @@ def _write_env(name: str, value: str) -> None:
 
 def prepare() -> None:
     task = _task()
-    branch = f"codex/task-{task['task_id']}-{task['run_id']}"
+    prefix = "codex/fast" if task["mode"] == "fast" else "codex"
+    branch = f"{prefix}/task-{task['task_id']}-{task['run_id']}"
     temp = Path(os.environ["RUNNER_TEMP"])
     prompt = (
         "Work on the Task Manager repository. Follow AGENTS.md.\n"
         "Implement only the requested behavior and run relevant checks.\n"
-        "Do not edit AGENTS.md, .github/, authentication, migrations, or deploy files.\n"
+        "Sensitive paths require human review and will become a PR instead of direct deployment.\n"
         "If the task needs a business decision, explain exactly what is missing.\n"
         "Do not push, open a PR, deploy, or read credentials. A later workflow step handles GitHub.\n"
         f"Task #{task['task_id']}: {task['title']}\n"
@@ -72,22 +79,60 @@ def prepare() -> None:
     _write_env("AGENT_BASE", str(task["base_branch"]))
     _write_env("AGENT_TASK_ID", str(task["task_id"]))
     _write_env("AGENT_RUN_ID", str(task["run_id"]))
+    _write_env("AGENT_MODE", str(task["mode"]))
 
 
-def check_diff() -> None:
+def fast_needs_pr(paths: list[str]) -> bool:
+    """Fail closed to a PR for permissions, infra, data and unknown paths."""
+    protected_prefixes = (
+        ".github/", ".codex/", ".agents/", "scripts/", "backend/alembic/",
+        "backend/app/core/", "backend/app/db/", "backend/app/api/",
+        "backend/app/services/", "backend/app/schemas/", "bot/app/handlers/",
+    )
+    protected_exact = {
+        "AGENTS.md", "backend/app/api/deps.py", "backend/app/api/v1/auth.py",
+        "backend/app/api/v1/agent_runs.py", "backend/app/api/v1/team.py",
+        "backend/app/api/v1/users.py", "backend/app/api/v1/tasks.py",
+        "bot/app/main.py", "bot/app/worker.py", "bot/app/loader.py",
+        "bot/app/api.py", "bot/app/texts.py", "bot/app/config.py",
+        "bot/app/callbacks.py", "backend/app/main.py",
+        "frontend/src/lib/auth.tsx", "frontend/src/lib/api.ts",
+        "frontend/src/pages/Login.tsx", "frontend/src/pages/Team.tsx",
+    }
+    fast_prefixes = (
+        "backend/app/", "backend/tests/", "bot/app/", "bot/tests/",
+        "frontend/src/", "frontend/public/", "docs/",
+    )
+    protected_words = (
+        "payment", "billing", "price", "money", "secret", "auth", "permission",
+        "security", "migration", "deploy", "workflow", "broadcast",
+    )
+    for path in paths:
+        lowered = path.lower()
+        if (
+            path in protected_exact or path.startswith(protected_prefixes)
+            or any(word in lowered for word in protected_words)
+            or path.endswith((".toml", ".lock", ".yml", ".yaml"))
+            or not (path == "README.md" or path.startswith(fast_prefixes))
+        ):
+            return True
+    return False
+
+
+def check_diff(*, cwd: str | None = None) -> None:
     tracked = (
-        subprocess.check_output(["git", "diff", "--name-only", "-z"])
+        subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z"], cwd=cwd)
         .decode()
         .split("\0")
     )
     staged = (
-        subprocess.check_output(["git", "diff", "--cached", "--name-only", "-z"])
+        subprocess.check_output(["git", "diff", "--cached", "--no-renames", "--name-only", "-z"], cwd=cwd)
         .decode()
         .split("\0")
     )
     untracked = (
         subprocess.check_output(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"]
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=cwd
         )
         .decode()
         .split("\0")
@@ -95,26 +140,23 @@ def check_diff() -> None:
     paths = [path for path in tracked + staged + untracked if path]
     if not paths:
         raise ValueError("agent produced no file changes")
-    blocked = [
+    credential_paths = [
         path
         for path in paths
-        if path.startswith(
-            (".github/", "backend/alembic/", ".codex/", ".agents/", "scripts/")
-        )
-        or path
-        in {
-            "AGENTS.md",
-            "backend/app/core/security.py",
-            "backend/app/core/config.py",
-            "backend/app/api/v1/agent_runs.py",
-            "backend/app/db/models/agent_run.py",
-        }
-        or path.endswith((".env", "auth.json"))
+        if any(part.startswith(".env") for part in Path(path).parts)
+        or Path(path).name in {"auth.json", "credentials.json", "id_rsa", "id_ed25519"}
+        or path.endswith((".pem", ".key"))
+        or path.startswith((".ssh/", ".codex/auth/"))
     ]
-    if blocked:
+    if credential_paths:
         raise ValueError(
-            f"owner review required for protected paths: {', '.join(blocked)}"
+            f"credential files cannot be committed: {', '.join(credential_paths)}"
         )
+    task = _task()
+    _write_env(
+        "FAST_FALLBACK",
+        "true" if task["mode"] == "fast" and fast_needs_pr(paths) else "false",
+    )
     result = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
     if result.exists():
         summary = result.read_text(encoding="utf-8").strip()[:3000]
@@ -181,6 +223,10 @@ def callback() -> None:
     repo = os.environ["GITHUB_REPOSITORY"]
     run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
     success = os.environ["JOB_STATUS"] == "success"
+    if success and task["mode"] == "fast" and os.environ.get("FAST_FALLBACK") == "false":
+        # The fast publisher already reported the exact branch SHA. Deployment
+        # reports the final result after the image and readiness checks pass.
+        return
     payload: dict[str, object] = {
         "run_id": task["run_id"],
         "status": "pr_ready" if success else "failed",
@@ -191,7 +237,12 @@ def callback() -> None:
         payload["head_sha"] = os.environ["HEAD_SHA"]
     else:
         result_file = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
+        fast_error = Path(os.environ["RUNNER_TEMP"]) / "fast-error.txt"
         reason = (
+            fast_error.read_text(encoding="utf-8").strip()
+            if fast_error.exists()
+            else ""
+        ) or (
             result_file.read_text(encoding="utf-8").strip()
             if result_file.exists()
             else ""
