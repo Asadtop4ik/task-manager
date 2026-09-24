@@ -238,17 +238,13 @@ def callback() -> None:
     else:
         result_file = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
         fast_error = Path(os.environ["RUNNER_TEMP"]) / "fast-error.txt"
-        reason = (
-            fast_error.read_text(encoding="utf-8").strip()
-            if fast_error.exists()
-            else ""
-        ) or (
-            result_file.read_text(encoding="utf-8").strip()
-            if result_file.exists()
-            else ""
-        )
-        payload["error"] = (
-            reason[:900] or "Agent workflow failed; inspect the GitHub run."
+        reason = fast_error.read_text(encoding="utf-8").strip() if fast_error.exists() else ""
+        if not reason and os.environ.get("FAILURE_PHASE") == "implement" and result_file.exists():
+            reason = result_file.read_text(encoding="utf-8").strip()
+        payload["error"] = reason[:900] or (
+            "Publisher failed before PR/deploy; inspect the GitHub run."
+            if os.environ.get("FAILURE_PHASE") == "publish"
+            else "Agent workflow failed; inspect the GitHub run."
         )
     payload.update(usage())
     _send_status(payload)

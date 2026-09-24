@@ -99,6 +99,7 @@ jobs:
         env:
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
           JOB_STATUS: failure
+          FAILURE_PHASE: implement
           PR_URL: ''
           HEAD_SHA: ''
         run: |
@@ -127,10 +128,12 @@ jobs:
           name: agent-patch
           path: ${{ runner.temp }}
 
-      - name: Prepare clean publication checkout
+      - name: Prepare publication metadata
+        run: python3 scripts/agent_task.py prepare
+
+      - name: Apply patch in a clean publication checkout
         run: |
           set -euo pipefail
-          python3 scripts/agent_task.py prepare
           git switch -c "$AGENT_BRANCH" "$GITHUB_SHA"
           git apply --index "$RUNNER_TEMP/agent.patch"
           git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent-validator.py"
@@ -185,6 +188,7 @@ jobs:
         env:
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
           JOB_STATUS: ${{ job.status }}
+          FAILURE_PHASE: publish
           PR_URL: ${{ steps.pr.outputs.pr_url }}
           HEAD_SHA: ${{ steps.branch.outputs.head_sha }}
         run: |
