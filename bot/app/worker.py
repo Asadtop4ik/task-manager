@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import httpx
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from arq import cron
 from arq.connections import RedisSettings
 
@@ -89,7 +89,7 @@ async def sync_deleted_task_cards(ctx: dict[str, object]) -> None:
                         text=text,
                         reply_markup=markup,
                     )
-                except TelegramBadRequest as exc:
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
                     # Missing/old cards cannot be repaired; keep the API's audit
                     # record and stop retrying this one permanently.
                     log.warning(

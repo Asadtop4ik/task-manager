@@ -1,5 +1,8 @@
 from unittest.mock import AsyncMock, MagicMock
 
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.methods import EditMessageText
+
 from app import worker
 
 
@@ -44,3 +47,9 @@ async def test_deleted_card_is_disabled_and_acknowledged(monkeypatch) -> None:
         chat_id=1001, message_id=7, text="🗑 Vazifa #42 o‘chirildi.", reply_markup=None
     )
     assert client.posts[0].endswith("/card-sync/9/notified")
+
+    bot.edit_message_text.side_effect = TelegramForbiddenError(
+        EditMessageText(chat_id=1001, message_id=7, text="deleted"), "bot was blocked"
+    )
+    await worker.sync_deleted_task_cards({})
+    assert len(client.posts) == 2  # Permanent failures do not clog the outbox.
