@@ -261,6 +261,11 @@ async def agent_run_status(
 )
 async def start_agent_run(task_id: int, session: DbSession, user: CurrentUser) -> AgentRunOut:
     task = await _task(session, task_id)
+    if not (
+        user.can_use_codex
+        or (settings.owner_telegram_id and user.telegram_id == settings.owner_telegram_id)
+    ):
+        raise HTTPException(status_code=403, detail="Codex access is not enabled")
     if not await can_edit_task(session, user, task):
         raise HTTPException(status_code=403, detail="not allowed to delegate this task")
     if task.status in {"done", "cancelled"}:

@@ -23,3 +23,7 @@ class CardAction(StatesGroup):
 
     comment = State()
     snooze = State()
+
+
+class JoinApproval(StatesGroup):
+    selecting_projects = State()

@@ -94,6 +94,9 @@ export default function TaskDetail() {
   const canDelegate =
     state.status === "authenticated" &&
     (state.user.role === "manager" || item.assignee?.id === state.user.id);
+  const canUseCodex =
+    state.status === "authenticated" &&
+    (state.user.can_use_codex || state.user.is_owner);
 
   return (
     <Page>
@@ -188,7 +191,7 @@ export default function TaskDetail() {
               ? `${item.project.repo_full_name} · ${item.project.default_branch ?? "branch tanlanmagan"}`
               : "Avval loyiha sozlamalarida repositoryni ko‘rsating."}
           </p>
-          <button
+          {canUseCodex && <button
             type="button"
             disabled={
               !item.project.repo_full_name ||
@@ -204,7 +207,7 @@ export default function TaskDetail() {
               : agentRuns.data?.[0]?.status === "failed"
                 ? "Qayta urinish"
                 : "Codexga berish"}
-          </button>
+          </button>}
           {startAgent.isError && (
             <p className="mt-2 text-sm text-late">Codex ishga tushmadi. Repo va ulanishni tekshiring.</p>
           )}

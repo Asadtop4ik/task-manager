@@ -1,12 +1,10 @@
-import { useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import type { AuthConfig, TelegramWidgetUser } from "@/lib/types";
-import TelegramLoginButton from "@/components/TelegramLoginButton";
+import type { AuthConfig } from "@/lib/types";
 
 export default function Login() {
-  const { state, loginWithWidget } = useAuth();
+  const { state, magicError } = useAuth();
 
   const { data: config, isPending } = useQuery({
     queryKey: ["auth-config"],
@@ -14,33 +12,32 @@ export default function Login() {
     staleTime: Infinity,
   });
 
-  const onAuth = useCallback(
-    (user: TelegramWidgetUser) => {
-      void loginWithWidget(user);
-    },
-    [loginWithWidget],
-  );
-
   return (
     <main className="mx-auto flex min-h-full max-w-md flex-col justify-center gap-8 px-4 py-16">
       <header>
         <h1 className="text-3xl font-semibold tracking-tight">Vazifalar</h1>
-        <p className="mt-2 text-muted">Ketoshop, QurBot va Kans Shop uchun.</p>
+        <p className="mt-2 text-muted">Jamoaning ichki vazifalar doskasi.</p>
       </header>
 
       {state.status === "pending" ? (
         <section className="rounded-lg border border-hairline bg-card p-4">
           <p className="font-medium">Hisobingiz hali tasdiqlanmagan.</p>
           <p className="mt-1 text-sm text-muted">
-            Kirdingiz, lekin menejer tasdiqlashi kerak. Tasdiqlangach sahifani yangilang.
+            Egasi botdagi so‘rovingizni tasdiqlashi kerak.
           </p>
         </section>
       ) : (
         <section className="flex flex-col gap-3">
           {isPending && <p className="text-sm text-muted">yuklanmoqda…</p>}
-          {config?.login_enabled && (
-            <TelegramLoginButton botUsername={config.bot_username} onAuth={onAuth} />
+          {magicError && (
+            <p className="text-sm text-late">Havola ishlatilgan yoki muddati tugagan. Botdan /login yozib yangisini oling.</p>
           )}
+          {config?.login_enabled && <>
+            <p className="text-muted">Botga /login yozing va u yuborgan bir martalik havolani oching.</p>
+            <a className="rounded-lg bg-ink px-4 py-3 text-center font-semibold text-paper" href={`https://t.me/${config.bot_username}?start=login`}>
+              Botni ochish
+            </a>
+          </>}
           {config && !config.login_enabled && (
             <p className="text-sm text-muted">
               Bot hali ulanmagan. Serverdagi env faylga BOT_USERNAME ni yozing.

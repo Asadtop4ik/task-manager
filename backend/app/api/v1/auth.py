@@ -1,8 +1,15 @@
-from fastapi import APIRouter, Cookie, HTTPException, Response, status
+import hashlib
+import secrets
+from typing import Annotated
+
+from fastapi import APIRouter, Cookie, Header, HTTPException, Response, status
+from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DbSession
+from app.api.v1.team import _bot_auth
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.redis import get_redis
 from app.core.security import (
     TelegramAuthError,
     TokenError,
@@ -13,7 +20,14 @@ from app.core.security import (
     verify_login_widget,
 )
 from app.db.models import User
-from app.schemas.auth import AuthConfig, MiniAppLogin, TelegramWidgetLogin, TokenResponse
+from app.schemas.auth import (
+    AuthConfig,
+    MagicLinkOut,
+    MagicLinkRedeem,
+    MiniAppLogin,
+    TelegramWidgetLogin,
+    TokenResponse,
+)
 from app.schemas.user import UserOut
 from app.services.auth_service import resolve_user
 
@@ -22,6 +36,7 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 REFRESH_COOKIE = "refresh_token"
+MAGIC_LINK_TTL = 5 * 60
 
 
 def _issue(response: Response, user_id: int) -> TokenResponse:
@@ -72,6 +87,9 @@ async def login_widget(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="telegram verification failed"
         ) from exc
 
+    user = await session.scalar(select(User).where(User.telegram_id == int(data["id"])))
+    if user is None and int(data["id"]) not in settings.admin_ids:
+        raise HTTPException(status_code=403, detail="invitation required")
     user = await resolve_user(session, data)
     await session.commit()
 
@@ -96,6 +114,9 @@ async def login_miniapp(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="telegram verification failed"
         ) from exc
 
+    user = await session.scalar(select(User).where(User.telegram_id == int(data["id"])))
+    if user is None and int(data["id"]) not in settings.admin_ids:
+        raise HTTPException(status_code=403, detail="invitation required")
     user = await resolve_user(session, data)
     await session.commit()
 
@@ -132,6 +153,40 @@ async def refresh(
     return _issue(response, user.id)
 
 
+@router.post("/magic/request", response_model=MagicLinkOut)
+async def request_magic_link(
+    session: DbSession,
+    x_service_token: Annotated[str | None, Header()] = None,
+    x_acting_user: Annotated[int | None, Header()] = None,
+) -> MagicLinkOut:
+    """The bot requests a link only for an approved Telegram user."""
+    telegram_id = _bot_auth(x_service_token, x_acting_user)
+    user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=403, detail="account is not approved yet")
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    await get_redis().set(f"taskmgr:login:{digest}", str(user.id), ex=MAGIC_LINK_TTL)
+    return MagicLinkOut(
+        url=f"{settings.public_url.rstrip('/')}/login#token={token}",
+        expires_in=MAGIC_LINK_TTL,
+    )
+
+
+@router.post("/magic/redeem", response_model=TokenResponse)
+async def redeem_magic_link(
+    payload: MagicLinkRedeem, response: Response, session: DbSession
+) -> TokenResponse:
+    digest = hashlib.sha256(payload.token.encode()).hexdigest()
+    user_id = await get_redis().getdel(f"taskmgr:login:{digest}")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="login link expired or used")
+    user = await session.get(User, int(user_id))
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=403, detail="account is not active")
+    return _issue(response, user.id)
+
+
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(response: Response) -> None:
     response.delete_cookie(REFRESH_COOKIE, path="/api/v1/auth")
@@ -139,4 +194,10 @@ async def logout(response: Response) -> None:
 
 @router.get("/me", response_model=UserOut)
 async def me(user: CurrentUser) -> UserOut:
-    return UserOut.model_validate(user)
+    return UserOut.model_validate(user).model_copy(
+        update={
+            "is_owner": bool(
+                settings.owner_telegram_id and user.telegram_id == settings.owner_telegram_id
+            )
+        }
+    )

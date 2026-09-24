@@ -68,6 +68,27 @@ class TaskApi:
     async def users(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/users")
 
+    async def create_invite(self) -> dict[str, Any]:
+        return await self._request("POST", "/team/invites")
+
+    async def join_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", "/team/join-requests", json=payload)
+
+    async def pending_join_requests(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/team/join-requests/pending")
+
+    async def decide_join_request(
+        self, request_id: int, decision: str, project_ids: list[int] | None = None
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/team/join-requests/{request_id}/{decision}",
+            json={"project_ids": project_ids} if project_ids is not None else None,
+        )
+
+    async def magic_link(self) -> dict[str, Any]:
+        return await self._request("POST", "/auth/magic/request")
+
     # --- projects -------------------------------------------------------
 
     async def projects(self) -> list[dict[str, Any]]:

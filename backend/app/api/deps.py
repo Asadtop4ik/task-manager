@@ -97,3 +97,14 @@ async def manager_user(user: CurrentUser) -> User:
 
 
 ManagerUser = Annotated[User, Depends(manager_user)]
+
+
+async def owner_user(user: CurrentUser) -> User:
+    if not settings.owner_telegram_id or user.telegram_id != settings.owner_telegram_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="owner access required"
+        )
+    return user
+
+
+OwnerUser = Annotated[User, Depends(owner_user)]

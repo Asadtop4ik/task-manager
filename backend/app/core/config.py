@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     # Bootstrap admins: these telegram ids are approved on first login instead of
     # landing in the pending queue. Without at least one, nobody can approve anybody.
     admin_telegram_ids: str = Field(default="", alias="ADMIN_TELEGRAM_IDS")
+    # The sole owner may approve invites, manage Codex access and delete tasks.
+    owner_telegram_id: int = Field(default=0, alias="OWNER_TELEGRAM_ID")
 
     # GitHub dispatch is disabled until these are provisioned. A manager binds
     # each project to a repo, but that repo must also be on this server allowlist.

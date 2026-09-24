@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
-from app.api.deps import CurrentUser, DbSession, ManagerUser
+from app.api.deps import CurrentUser, DbSession, OwnerUser
 from app.core.logging import get_logger
 from app.db.models import User
 from app.schemas.user import UserOut, UserUpdate
@@ -19,7 +19,7 @@ async def list_users(session: DbSession, user: CurrentUser) -> list[UserOut]:
 
 
 @router.get("/pending", response_model=list[UserOut])
-async def list_pending(session: DbSession, manager: ManagerUser) -> list[UserOut]:
+async def list_pending(session: DbSession, owner: OwnerUser) -> list[UserOut]:
     """The approval queue: anyone who logged in via Telegram and is still waiting."""
     rows = await session.scalars(
         select(User).where(User.is_active.is_(False)).order_by(User.created_at)
@@ -29,22 +29,25 @@ async def list_pending(session: DbSession, manager: ManagerUser) -> list[UserOut
 
 @router.patch("/{user_id}", response_model=UserOut)
 async def update_user(
-    user_id: int, payload: UserUpdate, session: DbSession, manager: ManagerUser
+    user_id: int, payload: UserUpdate, session: DbSession, owner: OwnerUser
 ) -> UserOut:
     target = await session.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
-    if target.id == manager.id and payload.is_active is False:
+    if target.id == owner.id and payload.is_active is False:
         # Deactivating yourself as the only manager locks everyone out of the
         # approval queue, so refuse the obvious version of it.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="you cannot deactivate yourself"
         )
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("is_active") is False:
+        target.can_use_codex = False
+    for field, value in changes.items():
         setattr(target, field, value)
     await session.commit()
     await session.refresh(target)
-    log.info("user_updated", user_id=target.id, by=manager.id)
+    log.info("user_updated", user_id=target.id, by=owner.id)
     return UserOut.model_validate(target)

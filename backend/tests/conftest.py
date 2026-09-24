@@ -128,6 +128,7 @@ async def _make_user(
         full_name=f"User {telegram_id}",
         role=role,
         is_active=True,
+        can_use_codex=role == UserRole.MANAGER,
     )
     session.add(user)
     await session.flush()
@@ -138,8 +139,10 @@ async def _make_user(
 
 
 @pytest_asyncio.fixture
-async def manager(session: AsyncSession, project: Project) -> User:
-    return await _make_user(session, 1001, UserRole.MANAGER, [project])
+async def manager(session: AsyncSession, project: Project, monkeypatch) -> User:
+    user = await _make_user(session, 1001, UserRole.MANAGER, [project])
+    monkeypatch.setattr(settings, "owner_telegram_id", user.telegram_id)
+    return user
 
 
 @pytest_asyncio.fixture

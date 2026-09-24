@@ -21,3 +21,9 @@ class NewTaskChoice(CallbackData, prefix="n"):
 
 class QuickConfirm(CallbackData, prefix="q"):
     action: str  # create | cancel | edit
+
+
+class JoinAction(CallbackData, prefix="j"):
+    action: str  # approve | reject | project | confirm | cancel
+    request_id: int
+    project_id: int = 0

@@ -24,6 +24,9 @@ const TABS = [
 export default function Shell() {
   const { state, logout } = useAuth();
   const user = state.status === "authenticated" ? state.user : null;
+  const tabs = user?.is_owner
+    ? [...TABS, { to: "/team", label: "Jamoa", end: false }]
+    : TABS;
   const [composing, setComposing] = useState(false);
   const [searching, setSearching] = useState(false);
 
@@ -50,7 +53,7 @@ export default function Shell() {
         </div>
 
         <ul className="flex sm:mt-1 sm:flex-col">
-          {TABS.map((tab) => (
+          {tabs.map((tab) => (
             <li key={tab.to} className="flex-1">
               <NavLink
                 to={tab.to}
