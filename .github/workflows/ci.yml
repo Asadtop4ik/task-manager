@@ -28,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - run: PYTHONPATH=ops python3 -m unittest discover -s ops -p 'test_*.py' -v
 
   backend:
     needs: changes

@@ -540,7 +540,7 @@ class IntakeWorker:
         if completed.returncode == 124:
             raise subprocess.TimeoutExpired(command, CODEX_TIMEOUT_SECONDS)
         if completed.returncode != 0:
-            raise IntakeError("Codex analysis failed")
+            raise IntakeError(f"Codex analysis process exited {completed.returncode}")
         raw = result_path.read_bytes()
         if len(raw) > MAX_RESULT_BYTES:
             raise IntakeError("Codex result is too large")
@@ -606,6 +606,8 @@ class IntakeWorker:
                     }
         except subprocess.TimeoutExpired:
             result = {"status": "failed", "error": "Task analysis timed out."}
+        except IntakeError as exc:
+            result = {"status": "failed", "error": str(exc)}
         except Exception:
             result = {"status": "failed", "error": "Task analysis could not be completed."}
         self._post_result(identity, result)
