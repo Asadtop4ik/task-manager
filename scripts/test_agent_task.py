@@ -46,11 +46,15 @@ class UsageTests(unittest.TestCase):
             self.assertIn("FAST_FALLBACK=true", (root / "github-env").read_text())
 
     def test_fast_policy_allows_app_code_but_escalates_sensitive_paths(self) -> None:
-        self.assertFalse(fast_needs_pr(["frontend/src/pages/Board.tsx", "bot/app/texts.py"]))
+        self.assertFalse(fast_needs_pr(["frontend/src/pages/Board.tsx", "bot/app/parsing.py"]))
         for path in (
             "backend/app/api/v1/auth.py",
+            "backend/app/api/v1/projects.py",
+            "backend/app/schemas/project.py",
             "backend/alembic/versions/0010.py",
             ".github/workflows/deploy.yml",
+            "bot/app/texts.py",
+            "bot/app/handlers/new.py",
             "bot/app/worker.py",
             "frontend/package-lock.json",
             "billing/invoices.py",

@@ -86,12 +86,16 @@ jobs:
           # Pinned host key, not StrictHostKeyChecking=no: without it this job
           # would happily hand the deploy key to whoever answers on that IP.
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The forced SSH command rejects an old or unreviewed server helper.
+          # Without this check a healthy stale image could be mistaken for the
+          # requested release after a failed pull.
+          helper_sha=$(sha256sum ops/deploy.sh | cut -d' ' -f1)
           # The token goes in on stdin, never on the command line: an argv is
           # readable by every other process on the runner.
           set +e
           deploy_output=$(printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
             "$SSH_USER@$SSH_HOST" \
-            "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }}" 2>&1)
+            "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }} $helper_sha" 2>&1)
           deploy_status=$?
           set -e
           printf '%s\n' "$deploy_output"
@@ -124,8 +128,9 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          helper_sha=$(sha256sum ops/deploy.sh | cut -d' ' -f1)
           printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
-            "$SSH_USER@$SSH_HOST" "/srv/stack/scripts/deploy.sh task-manager $PREVIOUS_SHA"
+            "$SSH_USER@$SSH_HOST" "/srv/stack/scripts/deploy.sh task-manager $PREVIOUS_SHA $helper_sha"
 
       - name: Mark an agent PR deployed
         env:

@@ -86,14 +86,16 @@ def fast_needs_pr(paths: list[str]) -> bool:
     """Fail closed to a PR for permissions, infra, data and unknown paths."""
     protected_prefixes = (
         ".github/", ".codex/", ".agents/", "scripts/", "backend/alembic/",
-        "backend/app/core/", "backend/app/db/models/",
+        "backend/app/core/", "backend/app/db/", "backend/app/api/",
+        "backend/app/services/", "backend/app/schemas/", "bot/app/handlers/",
     )
     protected_exact = {
         "AGENTS.md", "backend/app/api/deps.py", "backend/app/api/v1/auth.py",
         "backend/app/api/v1/agent_runs.py", "backend/app/api/v1/team.py",
         "backend/app/api/v1/users.py", "backend/app/api/v1/tasks.py",
-        "backend/app/services/access.py", "bot/app/main.py", "bot/app/worker.py",
-        "bot/app/loader.py", "bot/app/handlers/team.py", "bot/app/handlers/quick.py",
+        "bot/app/main.py", "bot/app/worker.py", "bot/app/loader.py",
+        "bot/app/api.py", "bot/app/texts.py", "bot/app/config.py",
+        "bot/app/callbacks.py", "backend/app/main.py",
         "frontend/src/lib/auth.tsx", "frontend/src/lib/api.ts",
         "frontend/src/pages/Login.tsx", "frontend/src/pages/Team.tsx",
     }
