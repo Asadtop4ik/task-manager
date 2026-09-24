@@ -17,13 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from project_catalog import intake_pairs
+
 API_BASE_URL = "https://tasks.standart-eko.uz/api/v1"
-INTAKE_REPOSITORIES = {
-    "Asadtop4ik/task-manager": "main",
-    "muradjanov-dev/qurbot": "master",
-    "muradjanov-dev/kans-shop": "main",
-    "muradjanov-dev/ketoshop": "master",
-}
+INTAKE_REPOSITORIES = intake_pairs()
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
