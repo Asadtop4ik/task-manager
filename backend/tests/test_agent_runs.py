@@ -376,7 +376,9 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert notices.status_code == 200
     assert notices.json()[0]["status"] == "pr_ready"
     acknowledged = await client.post(
-        f"/api/v1/agent-runs/{run['run_id']}/notified", headers=worker_headers
+        f"/api/v1/agent-runs/{run['run_id']}/notified",
+        json={"message_id": 42},
+        headers=worker_headers,
     )
     assert acknowledged.status_code == 204
 
@@ -404,6 +406,8 @@ async def test_pr_callback_requires_token_and_matching_pr(
     ).json()["status"] == "done"
     notices = await client.get("/api/v1/agent-runs/notifications", headers=worker_headers)
     assert notices.json()[0]["status"] == "deployed"
+    assert notices.json()[0]["telegram_message_id"] == 42
+    assert notices.json()[0]["deployed_sha"] == "b" * 40
 
 
 async def test_dispatch_network_error_can_retry_once(
