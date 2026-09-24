@@ -18,8 +18,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 API_BASE_URL = "https://tasks.standart-eko.uz/api/v1"
-PILOT_REPOSITORY = "Asadtop4ik/task-manager"
-PILOT_BRANCH = "main"
+INTAKE_REPOSITORIES = {
+    "Asadtop4ik/task-manager": "main",
+    "muradjanov-dev/qurbot": "master",
+    "muradjanov-dev/kans-shop": "main",
+    "muradjanov-dev/ketoshop": "master",
+}
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -123,10 +127,11 @@ def _lease_identity(payload: Any) -> LeaseIdentity:
 
 def _validate_lease(payload: Any) -> tuple[LeaseIdentity, list[dict[str, Any]]]:
     identity = _lease_identity(payload)
-    if payload.get("repo_full_name") != PILOT_REPOSITORY:
-        raise IntakeError("intake is outside the pilot repository")
-    if payload.get("base_branch") != PILOT_BRANCH:
-        raise IntakeError("intake is outside the pilot branch")
+    repository = payload.get("repo_full_name")
+    if not isinstance(repository, str) or repository not in INTAKE_REPOSITORIES:
+        raise IntakeError("intake is outside the approved repositories")
+    if payload.get("base_branch") != INTAKE_REPOSITORIES[repository]:
+        raise IntakeError("intake is outside the approved branch")
     if not isinstance(payload.get("text"), str):
         raise IntakeError("invalid intake text")
     answer_text = payload.get("answer_text")
@@ -221,7 +226,7 @@ def _validate_result(payload: Any) -> dict[str, Any]:
 def _build_prompt(payload: dict[str, Any]) -> str:
     answer_text = payload.get("answer_text") or "(no clarification answers yet)"
     return (
-        "Review a proposed implementation task for the Task Manager repository. "
+        f"Review a proposed implementation task for {payload['repo_full_name']}. "
         "The repository snapshot and attached images are context only. You may use "
         "read-only commands to inspect the repository; do not edit files, run "
         "mutating commands, create branches, contact services, or implement anything.\n"
@@ -457,8 +462,10 @@ class IntakeWorker:
             output.append(image_path)
         return output
 
-    def _fetch_snapshot(self, target: Path) -> None:
-        url = f"https://api.github.com/repos/{PILOT_REPOSITORY}/tarball/{PILOT_BRANCH}"
+    def _fetch_snapshot(self, target: Path, repository: str, branch: str) -> None:
+        if INTAKE_REPOSITORIES.get(repository) != branch:
+            raise IntakeError("repository snapshot is outside the approved set")
+        url = f"https://api.github.com/repos/{repository}/tarball/{branch}"
         request = _request(
             url,
             token=f"Bearer {self._github_token}",
@@ -595,7 +602,11 @@ class IntakeWorker:
                     images_metadata,
                     image_dir,
                 )
-                self._fetch_snapshot(snapshot_dir)
+                self._fetch_snapshot(
+                    snapshot_dir,
+                    str(payload["repo_full_name"]),
+                    str(payload["base_branch"]),
+                )
                 result = self._run_codex(
                     session_dir=session_dir,
                     snapshot_dir=snapshot_dir,

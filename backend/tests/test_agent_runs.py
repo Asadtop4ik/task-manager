@@ -10,9 +10,193 @@ from tests.conftest import auth
 
 
 async def _ready_project(session: AsyncSession, project: Project) -> None:
+    project.key = "task-manager"
     project.repo_full_name = "Asadtop4ik/task-manager"
     project.default_branch = "main"
     await session.commit()
+
+
+async def test_public_project_can_dispatch_pr_but_not_fast(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    project.key = "qurbot"
+    project.repo_full_name = "muradjanov-dev/qurbot"
+    project.default_branch = "master"
+    await session.commit()
+    _credentials(monkeypatch)
+    monkeypatch.setattr(
+        settings,
+        "github_agent_allowed_repos",
+        "Asadtop4ik/task-manager,muradjanov-dev/qurbot",
+    )
+
+    async def fake_dispatch(run, task) -> int:
+        assert run.repo_full_name == "muradjanov-dev/qurbot"
+        assert run.base_branch == "master"
+        assert task.project.key == "qurbot"
+        return 204
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    task_id = (
+        await client.post(
+            "/api/v1/tasks",
+            json={"project_id": project.id, "title": "Clarify catalog"},
+            headers=auth(manager),
+        )
+    ).json()["id"]
+    start_url = f"/api/v1/agent-runs/tasks/{task_id}"
+    disabled = await client.post(start_url, json={"mode": "pr"}, headers=auth(manager))
+    assert disabled.status_code == 503
+    monkeypatch.setattr(settings, "agent_public_enabled", True)
+    fast = await client.post(start_url, json={"mode": "fast"}, headers=auth(manager))
+    assert fast.status_code == 409
+    pr = await client.post(start_url, json={"mode": "pr"}, headers=auth(manager))
+    assert pr.status_code == 201 and pr.json()["repo_full_name"] == "muradjanov-dev/qurbot"
+    run_id = pr.json()["run_id"]
+    started = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json={
+            "run_id": run_id,
+            "status": "running",
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/123",
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert started.status_code == 200 and started.json()["status"] == "running"
+
+
+async def test_public_dispatch_uses_the_private_control_repository(monkeypatch) -> None:
+    from app.db.models import AgentRun, Task
+
+    requests: list[tuple[str, dict]] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        def json(self):
+            return {"private": False}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            requests.append((url, {}))
+            return FakeResponse(200)
+
+        async def post(self, url, **kwargs):
+            requests.append((url, kwargs["json"]))
+            return FakeResponse(204)
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    project = Project(
+        key="qurbot",
+        name="Qurbot",
+        repo_full_name="muradjanov-dev/qurbot",
+        default_branch="master",
+    )
+    task = Task(id=17, project=project, title="Update catalog", description="Clarify labels")
+    run = AgentRun(
+        run_id="00000000-0000-0000-0000-000000000017",
+        task_id=17,
+        task_revision="a" * 64,
+        repo_full_name="muradjanov-dev/qurbot",
+        base_branch="master",
+        mode="pr",
+        status="pending",
+    )
+    assert await agent_runs._dispatch(run, task) == 204
+    assert requests[0][0].endswith("/repos/muradjanov-dev/qurbot")
+    assert requests[1][0].endswith("/repos/Asadtop4ik/task-manager/dispatches")
+    assert requests[1][1]["event_type"] == "agent_public_task"
+    assert requests[1][1]["client_payload"]["repo_full_name"] == "muradjanov-dev/qurbot"
+
+
+async def test_external_merge_notice_does_not_mark_task_done_before_deploy(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    from app.db.enums import TaskStatus
+    from app.db.models import AgentRun, Task
+
+    project.key = "qurbot"
+    project.repo_full_name = "muradjanov-dev/qurbot"
+    project.default_branch = "master"
+    await session.commit()
+    _credentials(monkeypatch)
+    task_id = (
+        await client.post(
+            "/api/v1/tasks",
+            json={"project_id": project.id, "title": "Public agent task"},
+            headers=auth(manager),
+        )
+    ).json()["id"]
+    task = await session.get(Task, task_id)
+    assert task is not None
+    task.status = TaskStatus.REVIEW
+    run_id = "00000000-0000-0000-0000-000000000099"
+    session.add(
+        AgentRun(
+            run_id=run_id,
+            task_id=task_id,
+            task_revision="a" * 64,
+            repo_full_name="muradjanov-dev/qurbot",
+            base_branch="master",
+            mode="pr",
+            status="pr_ready",
+            pr_url="https://github.com/muradjanov-dev/qurbot/pull/7",
+            head_sha="b" * 40,
+            notified_at=None,
+        )
+    )
+    await session.commit()
+
+    async def fake_verify(run, sha: str) -> str:
+        assert run.repo_full_name == "muradjanov-dev/qurbot"
+        assert sha == "c" * 40
+        return "b" * 40
+
+    monkeypatch.setattr(agent_runs, "_verify_deployment", fake_verify)
+    headers = {"X-Agent-Callback-Token": "test-callback-token"}
+    assert (await client.get("/api/v1/agent-runs/external-pending")).status_code == 401
+    pending = await client.get("/api/v1/agent-runs/external-pending", headers=headers)
+    assert pending.status_code == 200 and pending.json()[0]["run_id"] == run_id
+    merged = await client.post(
+        f"/api/v1/agent-runs/{run_id}/merged",
+        json={"sha": "c" * 40},
+        headers=headers,
+    )
+    assert merged.status_code == 200
+    assert merged.json()["status"] == "merged" and merged.json()["merged_sha"] == "c" * 40
+    await session.refresh(task)
+    assert task.status == TaskStatus.REVIEW
+    notices = await client.get(
+        "/api/v1/agent-runs/notifications",
+        headers={"X-Agent-Worker-Token": settings.service_token},
+    )
+    assert notices.json()[0]["status"] == "merged"
+    deployed = await client.post(
+        f"/api/v1/agent-runs/{run_id}/deployed",
+        json={
+            "sha": "c" * 40,
+            "github_run_url": "https://github.com/muradjanov-dev/qurbot/actions/runs/123",
+        },
+        headers=headers,
+    )
+    assert deployed.status_code == 200 and deployed.json()["status"] == "deployed"
+    await session.refresh(task)
+    assert task.status == TaskStatus.DONE
 
 
 def _credentials(monkeypatch) -> None:

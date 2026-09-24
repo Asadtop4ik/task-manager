@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     agent_callback_token: str = Field(default="", alias="AGENT_CALLBACK_TOKEN")
     agent_fast_enabled: bool = Field(default=False, alias="AGENT_FAST_ENABLED")
     agent_intake_enabled: bool = Field(default=False, alias="AGENT_INTAKE_ENABLED")
+    agent_public_enabled: bool = Field(default=False, alias="AGENT_PUBLIC_ENABLED")
     intake_worker_token: str = Field(default="", alias="INTAKE_WORKER_TOKEN")
 
     # --- Web ---

@@ -29,12 +29,12 @@ from app.schemas.agent_intake import (
 from app.schemas.task import TaskOut
 from app.services import activity
 from app.services.access import can_see_project, is_manager
+from app.services.agent_repos import repository_for
 from app.services.telegram_media import telegram_image
 
 router = APIRouter(prefix="/agent-intakes", tags=["agent-intakes"])
 _ACTIVE = ("queued", "analyzing", "needs_answers", "ready", "failed")
 _FINISHED = ("confirmed", "cancelled")
-_TASK_MANAGER_REPO = "Asadtop4ik/task-manager"
 
 
 def _now() -> datetime:
@@ -98,13 +98,20 @@ async def create_intake(
     if not await can_see_project(session, user, payload.project_id):
         raise HTTPException(status_code=404, detail="project not found")
     project = await session.get(Project, payload.project_id)
-    if (
-        project is None
-        or project.key != "task-manager"
-        or project.repo_full_name != _TASK_MANAGER_REPO
-        or project.default_branch != "main"
-    ):
-        raise HTTPException(status_code=409, detail="intake pilot is limited to Task Manager")
+    repository = (
+        repository_for(project.key, project.repo_full_name, project.default_branch)
+        if project is not None
+        else None
+    )
+    if repository is None:
+        raise HTTPException(
+            status_code=409, detail="project repository is not enabled for Codex"
+        )
+    if not repository.private and not settings.agent_public_enabled:
+        raise HTTPException(status_code=503, detail="public project agents are not enabled")
+    if payload.mode == "fast" and not repository.fast_enabled:
+        raise HTTPException(status_code=409, detail="fast mode is limited to Task Manager")
+    assert project is not None
     # The user lock makes two Telegram messages arriving together choose one draft.
     await session.scalar(select(User).where(User.id == user.id).with_for_update())
     existing = await session.scalar(

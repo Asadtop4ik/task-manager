@@ -37,6 +37,7 @@ class AgentRun(Base, TimestampMixin):
     github_run_url: Mapped[str | None] = mapped_column(Text)
     pr_url: Mapped[str | None] = mapped_column(Text)
     head_sha: Mapped[str | None] = mapped_column(String(40))
+    merged_sha: Mapped[str | None] = mapped_column(String(40))
     deployed_sha: Mapped[str | None] = mapped_column(String(40))
     error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

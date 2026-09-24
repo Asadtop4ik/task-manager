@@ -15,6 +15,7 @@ class AgentRunOut(BaseModel):
     github_run_url: str | None
     pr_url: str | None
     head_sha: str | None
+    merged_sha: str | None
     deployed_sha: str | None
     error: str | None
     attempts: int
@@ -43,6 +44,20 @@ class AgentDeployment(BaseModel):
     github_run_url: str = Field(
         pattern=r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$"
     )
+
+
+class AgentMerge(BaseModel):
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class ExternalAgentPending(BaseModel):
+    run_id: str
+    repo_full_name: str
+    base_branch: str
+    pr_url: str
+    status: Literal["pr_ready", "merged"]
+    merged_sha: str | None
+    notified: bool
 
 
 class AgentRunStart(BaseModel):

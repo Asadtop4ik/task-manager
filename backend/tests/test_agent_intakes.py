@@ -27,6 +27,39 @@ async def ready_project(session: AsyncSession, project: Project, monkeypatch) ->
     monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
 
 
+async def test_public_project_can_clarify_pr_but_not_fast(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "kans-shop"
+    project.repo_full_name = "muradjanov-dev/kans-shop"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_public_enabled", True)
+    payload = {
+        "project_id": project.id,
+        "text": "kans-shop: @codex Show the empty catalog message",
+        "chat_id": manager.telegram_id,
+    }
+    fast = await client.post(
+        "/api/v1/agent-intakes",
+        json=payload | {"mode": "fast"},
+        headers=bot_headers(manager),
+    )
+    assert fast.status_code == 409
+    pr = await client.post(
+        "/api/v1/agent-intakes",
+        json=payload | {"mode": "pr"},
+        headers=bot_headers(manager),
+    )
+    assert pr.status_code == 201 and pr.json()["status"] == "queued"
+    assert (await session.scalars(select(Task))).all() == []
+
+
 async def test_only_approved_bot_actor_can_start_one_intake(
     client: AsyncClient,
     session: AsyncSession,
