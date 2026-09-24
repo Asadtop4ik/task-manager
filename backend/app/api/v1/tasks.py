@@ -279,7 +279,16 @@ async def delete_task(task_id: int, session: DbSession, owner: OwnerUser) -> Tas
         select(AgentRun).where(
             AgentRun.task_id == task_id,
             AgentRun.status.in_(
-                ("pending", "dispatching", "dispatched", "running", "pr_ready")
+                (
+                    "pending",
+                    "dispatching",
+                    "dispatched",
+                    "running",
+                    "validating",
+                    "publishing",
+                    "deploying",
+                    "pr_ready",
+                )
             ),
         )
     )

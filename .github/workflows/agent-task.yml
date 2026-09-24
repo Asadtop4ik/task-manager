@@ -74,9 +74,9 @@ jobs:
           git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent-validator.py"
           python3 "$RUNNER_TEMP/agent-validator.py" check-diff
 
-      - name: Open pull request
+      - name: Commit and push isolated branch
         if: steps.guard.outputs.exists != 'true' && steps.start.outputs.cancelled != 'true'
-        id: pr
+        id: branch
         env:
           GH_TOKEN: ${{ secrets.AGENT_REPO_TOKEN }}
         run: |
@@ -86,14 +86,42 @@ jobs:
           git add -A
           git -c user.name='Business AI Codex' \
               -c user.email='codex@users.noreply.github.com' \
-              commit -m "feat(agent): work on task $AGENT_TASK_ID"
+              commit -m "feat(agent): work on task $AGENT_TASK_ID" \
+                     -m "Agent-Run-ID: $AGENT_RUN_ID"
           git push origin "HEAD:$AGENT_BRANCH"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: >-
+          steps.guard.outputs.exists != 'true' &&
+          steps.start.outputs.cancelled != 'true' &&
+          (env.AGENT_MODE != 'fast' || env.FAST_FALLBACK == 'true')
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
           pr_url=$(gh pr create \
             --base "$AGENT_BASE" --head "$AGENT_BRANCH" \
             --title "Task #$AGENT_TASK_ID: Codex change" \
             --body-file "$RUNNER_TEMP/agent-pr-body.md")
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate fast branch and publish main
+        if: >-
+          steps.guard.outputs.exists != 'true' &&
+          steps.start.outputs.cancelled != 'true' &&
+          env.AGENT_MODE == 'fast' && env.FAST_FALLBACK == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_REPO_TOKEN }}
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" && test -n "$AGENT_CALLBACK_TOKEN"
+          git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent_task.py"
+          git show "$GITHUB_SHA:scripts/fast_publish.py" > "$RUNNER_TEMP/fast_publish.py"
+          PYTHONPATH="$RUNNER_TEMP" python3 "$RUNNER_TEMP/fast_publish.py"
 
       - name: Report result to Task Manager
         if: always() && steps.guard.outputs.exists != 'true' && steps.start.outputs.cancelled != 'true'
@@ -101,7 +129,7 @@ jobs:
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
           JOB_STATUS: ${{ job.status }}
           PR_URL: ${{ steps.pr.outputs.pr_url }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_SHA: ${{ steps.branch.outputs.head_sha }}
         run: |
           set -euo pipefail
           test -n "$AGENT_CALLBACK_TOKEN"

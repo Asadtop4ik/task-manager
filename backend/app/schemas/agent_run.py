@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -10,6 +11,7 @@ class AgentRunOut(BaseModel):
     task_id: int
     repo_full_name: str
     status: str
+    mode: str
     github_run_url: str | None
     pr_url: str | None
     head_sha: str | None
@@ -26,7 +28,7 @@ class AgentRunOut(BaseModel):
 
 class AgentRunCallback(BaseModel):
     run_id: str
-    status: str = Field(pattern=r"^(running|pr_ready|failed)$")
+    status: str = Field(pattern=r"^(running|validating|publishing|deploying|pr_ready|failed)$")
     github_run_url: str | None = None
     pr_url: str | None = None
     head_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
@@ -43,12 +45,17 @@ class AgentDeployment(BaseModel):
     )
 
 
+class AgentRunStart(BaseModel):
+    mode: Literal["pr", "fast"] = "pr"
+
+
 class AgentNotificationOut(BaseModel):
     run_id: str
     task_id: int
     title: str
     chat_id: int | None
     status: str
+    mode: str
     pr_url: str | None
     github_run_url: str | None
     error: str | None

@@ -30,6 +30,9 @@ class AgentRun(Base, TimestampMixin):
     )
     repo_full_name: Mapped[str] = mapped_column(String(200), nullable=False)
     base_branch: Mapped[str] = mapped_column(String(120), nullable=False)
+    mode: Mapped[str] = mapped_column(
+        String(8), default="pr", server_default="pr", nullable=False
+    )
     status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
     github_run_url: Mapped[str | None] = mapped_column(Text)
     pr_url: Mapped[str | None] = mapped_column(Text)

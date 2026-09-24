@@ -55,9 +55,9 @@ def latest_checks_pass(checks: list[dict]) -> bool:
 
 def agent_run_id(pr: dict) -> str | None:
     branch = (pr.get("head") or {}).get("ref") or ""
-    if not branch.startswith("codex/task-"):
+    if not (branch.startswith("codex/task-") or branch.startswith("codex/fast/task-")):
         return None
-    match = re.fullmatch(r"codex/task-[1-9][0-9]*-([0-9a-f-]{36})", branch)
+    match = re.fullmatch(r"codex/(?:fast/)?task-[1-9][0-9]*-([0-9a-f-]{36})", branch)
     return match.group(1) if match else "invalid"
 
 

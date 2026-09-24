@@ -18,6 +18,7 @@ async def _ready_project(session: AsyncSession, project: Project) -> None:
 def _credentials(monkeypatch) -> None:
     monkeypatch.setattr(settings, "github_agent_token", "test-github-token")
     monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+    monkeypatch.setattr(settings, "agent_fast_enabled", True)
 
 
 async def test_delegation_is_idempotent_and_visible(
@@ -454,3 +455,297 @@ async def test_deployment_accepts_review_fix_only_on_original_pr_branch(monkeypa
         assert exc.status_code == 409
     else:
         raise AssertionError("wrong PR branch was accepted")
+
+
+async def test_only_owner_can_request_fast_mode(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    executor: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    monkeypatch.setattr(agent_runs, "_dispatch", lambda run, task: _accepted_dispatch())
+    manager.can_use_codex = False  # Owner access comes from the immutable Telegram ID.
+    await session.commit()
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fast copy"},
+        headers=auth(manager),
+    )
+    started = await client.post(
+        f"/api/v1/agent-runs/tasks/{task.json()['id']}",
+        json={"mode": "fast"},
+        headers=auth(manager),
+    )
+    assert started.status_code == 201 and started.json()["mode"] == "fast"
+    own = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Not owner", "assignee_id": executor.id},
+        headers=auth(manager),
+    )
+    assert (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{own.json()['id']}",
+            json={"mode": "fast"},
+            headers=auth(executor),
+        )
+    ).status_code == 403
+    executor.can_use_codex = True
+    await session.commit()
+    ordinary = await client.post(
+        f"/api/v1/agent-runs/tasks/{own.json()['id']}",
+        json={"mode": "pr"},
+        headers=auth(executor),
+    )
+    assert ordinary.status_code == 201 and ordinary.json()["mode"] == "pr"
+
+
+async def _accepted_dispatch() -> int:
+    return 204
+
+
+async def test_fast_run_completes_only_after_exact_deployed_sha(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    monkeypatch.setattr(agent_runs, "_dispatch", lambda run, task: _accepted_dispatch())
+
+    async def verify_branch(run, sha: str) -> None:
+        assert run.mode == "fast" and sha == "c" * 40
+
+    async def verify_commit(run, sha: str) -> None:
+        if sha != "c" * 40:
+            raise HTTPException(status_code=409, detail="wrong SHA")
+        assert run.mode == "fast" and run.head_sha == sha
+
+    monkeypatch.setattr(agent_runs, "_verify_fast_branch", verify_branch)
+    monkeypatch.setattr(agent_runs, "_verify_fast_commit", verify_commit)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fast copy"},
+        headers=auth(manager),
+    )
+    task_id = task.json()["id"]
+    run = (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{task_id}",
+            json={"mode": "fast"},
+            headers=auth(manager),
+        )
+    ).json()
+    callback = f"/api/v1/agent-runs/{run['run_id']}/callback"
+    headers = {"X-Agent-Callback-Token": "test-callback-token"}
+    for status in ("running", "validating", "publishing", "deploying"):
+        body = {"run_id": run["run_id"], "status": status}
+        if status != "running":
+            body["head_sha"] = "c" * 40
+        response = await client.post(callback, json=body, headers=headers)
+        assert response.status_code == 200 and response.json()["status"] == status
+    assert (await client.get(f"/api/v1/tasks/{task_id}", headers=auth(manager))).json()[
+        "status"
+    ] == "in_progress"
+    wrong = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/deployed",
+        json={
+            "sha": "d" * 40,
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/123",
+        },
+        headers=headers,
+    )
+    assert wrong.status_code == 409
+    deployed = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/deployed",
+        json={
+            "sha": "c" * 40,
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/123",
+        },
+        headers=headers,
+    )
+    assert deployed.status_code == 200 and deployed.json()["status"] == "deployed"
+    assert (await client.get(f"/api/v1/tasks/{task_id}", headers=auth(manager))).json()[
+        "status"
+    ] == "done"
+
+
+async def test_verified_deploy_reconciles_a_failed_publisher_callback(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    monkeypatch.setattr(agent_runs, "_dispatch", lambda run, task: _accepted_dispatch())
+
+    async def verify_branch(run, sha: str) -> None:
+        assert sha == "c" * 40
+
+    async def verify_commit(run, sha: str) -> None:
+        assert run.head_sha == sha == "c" * 40
+
+    monkeypatch.setattr(agent_runs, "_verify_fast_branch", verify_branch)
+    monkeypatch.setattr(agent_runs, "_verify_fast_commit", verify_commit)
+    task_id = (
+        await client.post(
+            "/api/v1/tasks",
+            json={"project_id": project.id, "title": "Fast callback race"},
+            headers=auth(manager),
+        )
+    ).json()["id"]
+    run = (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{task_id}",
+            json={"mode": "fast"},
+            headers=auth(manager),
+        )
+    ).json()
+    callback = f"/api/v1/agent-runs/{run['run_id']}/callback"
+    headers = {"X-Agent-Callback-Token": "test-callback-token"}
+    for state in ("running", "validating", "publishing"):
+        body = {"run_id": run["run_id"], "status": state}
+        if state != "running":
+            body["head_sha"] = "c" * 40
+        assert (await client.post(callback, json=body, headers=headers)).status_code == 200
+    failed = await client.post(
+        callback,
+        json={
+            "run_id": run["run_id"],
+            "status": "failed",
+            "error": "publisher callback timed out",
+        },
+        headers=headers,
+    )
+    assert failed.json()["status"] == "failed"
+    deployed = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/deployed",
+        json={
+            "sha": "c" * 40,
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/123",
+        },
+        headers=headers,
+    )
+    assert deployed.status_code == 200 and deployed.json()["status"] == "deployed"
+    assert (await client.get(f"/api/v1/tasks/{task_id}", headers=auth(manager))).json()[
+        "status"
+    ] == "done"
+
+
+async def test_fast_commit_verification_rejects_a_foreign_trailer(monkeypatch) -> None:
+    _credentials(monkeypatch)
+    run = agent_runs.AgentRun(
+        task_id=11,
+        run_id="00000000-0000-0000-0000-000000000011",
+        repo_full_name="Asadtop4ik/task-manager",
+        base_branch="main",
+        mode="fast",
+        head_sha="c" * 40,
+    )
+    commit = {"commit": {"message": "feat: change\n\nAgent-Run-ID: unrelated"}}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return httpx.Response(
+                200,
+                json=commit,
+                request=httpx.Request("GET", "https://api.github.com/example"),
+            )
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    try:
+        await agent_runs._verify_fast_commit(run, "c" * 40)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("foreign fast commit was accepted")
+    commit["commit"]["message"] = f"feat: change\n\nAgent-Run-ID: {run.run_id}"
+    await agent_runs._verify_fast_commit(run, "c" * 40)
+
+
+async def test_fast_branch_verification_requires_the_exact_remote_head(monkeypatch) -> None:
+    _credentials(monkeypatch)
+    run = agent_runs.AgentRun(
+        task_id=11,
+        run_id="00000000-0000-0000-0000-000000000011",
+        repo_full_name="Asadtop4ik/task-manager",
+        base_branch="main",
+        mode="fast",
+    )
+    remote = {"object": {"sha": "b" * 40}}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url: str, **kwargs):
+            assert url.endswith(f"/git/ref/heads/codex/fast/task-11-{run.run_id}")
+            return httpx.Response(200, json=remote, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    try:
+        await agent_runs._verify_fast_branch(run, "c" * 40)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("stale remote fast branch was accepted")
+    remote["object"]["sha"] = "c" * 40
+    await agent_runs._verify_fast_branch(run, "c" * 40)
+
+
+async def test_failed_fast_validation_blocks_task_without_a_pr(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    monkeypatch.setattr(agent_runs, "_dispatch", lambda run, task: _accepted_dispatch())
+
+    async def verify_branch(run, sha: str) -> None:
+        assert run.mode == "fast" and sha == "c" * 40
+
+    monkeypatch.setattr(agent_runs, "_verify_fast_branch", verify_branch)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fast failure"},
+        headers=auth(manager),
+    )
+    task_id = task.json()["id"]
+    run = (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{task_id}",
+            json={"mode": "fast"},
+            headers=auth(manager),
+        )
+    ).json()
+    url = f"/api/v1/agent-runs/{run['run_id']}/callback"
+    headers = {"X-Agent-Callback-Token": "test-callback-token"}
+    assert (
+        await client.post(
+            url, json={"run_id": run["run_id"], "status": "running"}, headers=headers
+        )
+    ).status_code == 200
+    assert (
+        await client.post(
+            url,
+            json={"run_id": run["run_id"], "status": "validating", "head_sha": "c" * 40},
+            headers=headers,
+        )
+    ).status_code == 200
+    failed = await client.post(
+        url,
+        json={"run_id": run["run_id"], "status": "failed", "error": "short CI failed"},
+        headers=headers,
+    )
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "failed" and failed.json()["pr_url"] is None
+    assert (await client.get(f"/api/v1/tasks/{task_id}", headers=auth(manager))).json()[
+        "status"
+    ] == "blocked"

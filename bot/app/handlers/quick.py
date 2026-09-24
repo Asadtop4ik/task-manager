@@ -42,7 +42,9 @@ def _confirmation(
     )
     if parsed.priority:
         lines.append(f"⚡️ {PRIORITY_LABEL.get(parsed.priority, parsed.priority)}")
-    if (parsed.assignee_username or "").lower() == "codex":
+    if parsed.fast_requested:
+        lines.append("🤖 Codex · ⚡ PRsiz prod (!fast)")
+    elif (parsed.assignee_username or "").lower() == "codex":
         lines.append("🤖 Codex ishga tushadi")
     elif assignee_name:
         lines.append(f"👤 {escape(assignee_name)}")
@@ -90,6 +92,15 @@ async def _offer(message: Message, state: FSMContext, text: str) -> None:
 
     known = {p["key"] for p in projects}
     parsed = parse(text, known_keys=known)
+    if parsed.fast_requested:
+        try:
+            actor = await api.me()
+        except ApiError as error:
+            await explain_api_error(message, error)
+            return
+        if not actor.get("is_owner"):
+            await message.answer("!fast faqat jamoa egasi uchun.")
+            return
 
     if not parsed.is_usable:
         await state.set_state(QuickCapture.editing_title)
@@ -121,6 +132,7 @@ def _dump(parsed: ParsedTask) -> dict[str, Any]:
         "due_at": parsed.due_at.isoformat() if parsed.due_at else None,
         "project_key": parsed.project_key,
         "assignee_username": parsed.assignee_username,
+        "fast_requested": parsed.fast_requested,
     }
 
 
@@ -177,7 +189,9 @@ async def create(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         return
 
     api = api_for(query)
-    agent_requested = (draft.get("assignee_username") or "").lower() == "codex"
+    agent_requested = (draft.get("assignee_username") or "").lower() == "codex" or bool(
+        draft.get("fast_requested")
+    )
     assignee_id = data.get("assignee_id")
     if agent_requested:
         # An executor may delegate their own work to Codex while remaining the
@@ -217,7 +231,10 @@ async def create(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await notify_assignee(bot, task, query.from_user.id, api)
     if agent_requested:
         try:
-            run = await api.start_agent_run(task["id"])
+            if draft.get("fast_requested"):
+                run = await api.start_agent_run(task["id"], mode="fast")
+            else:
+                run = await api.start_agent_run(task["id"])
         except ApiError as error:
             await bot.send_message(
                 chat_id,
@@ -260,7 +277,14 @@ async def stop_agent(message: Message) -> None:
                 r
                 for r in runs
                 if r["status"]
-                in {"pending", "dispatching", "dispatched", "running", "pr_ready"}
+                in {
+                    "pending",
+                    "dispatching",
+                    "dispatched",
+                    "running",
+                    "validating",
+                    "pr_ready",
+                }
             ),
             None,
         )

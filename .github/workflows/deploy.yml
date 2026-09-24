@@ -63,6 +63,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Deploy over SSH
+        id: release
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SSH_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -87,9 +88,17 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           # The token goes in on stdin, never on the command line: an argv is
           # readable by every other process on the runner.
-          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
+          set +e
+          deploy_output=$(printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
             "$SSH_USER@$SSH_HOST" \
-            "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }}"
+            "/srv/stack/scripts/deploy.sh task-manager ${{ github.sha }}" 2>&1)
+          deploy_status=$?
+          set -e
+          printf '%s\n' "$deploy_output"
+          previous_sha=$(printf '%s\n' "$deploy_output" \
+            | sed -n 's/^PREVIOUS_SHA=\([0-9a-f]\{40\}\)$/\1/p' | head -1)
+          echo "previous_sha=$previous_sha" >> "$GITHUB_OUTPUT"
+          exit "$deploy_status"
 
       - name: Verify public API readiness after deploy
         run: |
@@ -100,6 +109,24 @@ jobs:
           # The bot's /ready is internal. deploy.sh's Compose --wait already
           # checks its container health; Caddy sends /bot/ready to the SPA.
 
+      - name: Roll back failed Task Manager release
+        if: failure() && steps.release.outputs.previous_sha != '' && steps.release.outputs.previous_sha != github.sha
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREVIOUS_SHA: ${{ steps.release.outputs.previous_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/id_ed25519 \
+            "$SSH_USER@$SSH_HOST" "/srv/stack/scripts/deploy.sh task-manager $PREVIOUS_SHA"
+
       - name: Mark an agent PR deployed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -107,8 +134,10 @@ jobs:
         run: |
           set -euo pipefail
           associated_prs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls")
+          git show -s --format=%B "$GITHUB_SHA" > "$RUNNER_TEMP/deployed-commit-message"
           agent_run_id=$(printf '%s' "$associated_prs" \
-            | python3 scripts/find_deployed_agent.py "$GITHUB_SHA" "$GITHUB_REPOSITORY")
+            | python3 scripts/find_deployed_agent.py "$GITHUB_SHA" "$GITHUB_REPOSITORY" \
+                "$RUNNER_TEMP/deployed-commit-message")
           if [ -z "$agent_run_id" ]; then
             echo 'This commit is not an agent PR.'
             exit 0
@@ -122,3 +151,33 @@ jobs:
                 -H 'Content-Type: application/json' \
                 --data-binary @- \
                 "https://tasks.standart-eko.uz/api/v1/agent-runs/$agent_run_id/deployed"
+
+  report-failed-fast:
+    if: >-
+      always() &&
+      (needs.ci.result != 'success' || needs.build.result != 'success' || needs.deploy.result != 'success')
+    needs: [ci, build, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify Task Manager if this was a fast commit
+        env:
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+        run: |
+          set -euo pipefail
+          git show -s --format=%B "$GITHUB_SHA" > "$RUNNER_TEMP/deployed-commit-message"
+          agent_run_id=$(printf '[]' | python3 scripts/find_deployed_agent.py \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$RUNNER_TEMP/deployed-commit-message")
+          if [ -z "$agent_run_id" ]; then exit 0; fi
+          status_url="https://tasks.standart-eko.uz/api/v1/agent-runs/$agent_run_id/status"
+          run_state=$(curl --fail --silent --show-error \
+            -H "X-Agent-Callback-Token: $AGENT_CALLBACK_TOKEN" "$status_url")
+          if [ "$(printf '%s' "$run_state" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mode"])')" != fast ]; then exit 0; fi
+          printf '{"run_id":"%s","status":"failed","error":"Deploy failed; prior release was restored or rollback also failed.","github_run_url":"https://github.com/%s/actions/runs/%s"}' \
+            "$agent_run_id" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" \
+            | curl --fail --silent --show-error \
+                -H "X-Agent-Callback-Token: $AGENT_CALLBACK_TOKEN" \
+                -H 'Content-Type: application/json' --data-binary @- \
+                "https://tasks.standart-eko.uz/api/v1/agent-runs/$agent_run_id/callback" >/dev/null

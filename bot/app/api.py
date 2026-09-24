@@ -102,8 +102,8 @@ class TaskApi:
     async def task(self, task_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/tasks/{task_id}")
 
-    async def start_agent_run(self, task_id: int) -> dict[str, Any]:
-        return await self._request("POST", f"/agent-runs/tasks/{task_id}")
+    async def start_agent_run(self, task_id: int, mode: str = "pr") -> dict[str, Any]:
+        return await self._request("POST", f"/agent-runs/tasks/{task_id}", json={"mode": mode})
 
     async def agent_runs(self, task_id: int) -> list[dict[str, Any]]:
         return await self._request("GET", f"/agent-runs/tasks/{task_id}")

@@ -66,6 +66,7 @@ DEFAULT_DUE_TIME = time(18, 0)
 _PROJECT_RE = re.compile(r"^\s*([a-z0-9][a-z0-9-]{1,31})\s*:\s*", re.IGNORECASE)
 _HASH_PROJECT_RE = re.compile(r"(?:^|\s)#([a-z0-9][a-z0-9-]{1,31})\b", re.IGNORECASE)
 _PRIORITY_RE = re.compile(r"(?:^|\s)!([a-zA-Zа-яА-Я]+)")
+_FAST_RE = re.compile(r"(?:^|\s)!fast\b", re.IGNORECASE)
 _ASSIGNEE_RE = re.compile(r"(?:^|\s)@([a-zA-Z0-9_]{3,32})\b")
 _TIME_RE = re.compile(r"(?:^|\s)(\d{1,2})[:.](\d{2})(?=\s|$)")
 _DATE_RE = re.compile(r"(?:^|\s)(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?=\s|$)")
@@ -80,6 +81,7 @@ class ParsedTask:
     project_key: str | None = None
     priority: str | None = None
     assignee_username: str | None = None
+    fast_requested: bool = False
     due_at: datetime | None = None
     # What the parser thinks it recognised, for the confirmation card. The user
     # sees this before anything is written.
@@ -137,6 +139,11 @@ def parse(
             if key:
                 result.project_key = key
                 rest = _strip(rest, match)
+
+    match = _FAST_RE.search(rest)
+    if match:
+        result.fast_requested = True
+        rest = _strip(rest, match)
 
     # --- priority: !urgent ---
     match = _PRIORITY_RE.search(rest)

@@ -27,8 +27,9 @@ for the original design; verify old deployment notes against the live workflows.
 
 ## Agent tasks
 
-- Keep one task on one branch and link its PR to the task ID. State the expected
-  behavior and the verification performed.
+- Keep one task on one branch. Link its PR to the task ID, or, for owner-only
+  `!fast`, record the exact CI-validated main commit and deploy run. State the
+  expected behavior and verification performed.
 - Ask for one specific decision when a business rule is missing. Do not invent
   prices, payment behavior, authorization rules, customer messages or deadlines.
 - Treat changes to authentication, roles, money, database migrations, mass
@@ -42,8 +43,9 @@ for the original design; verify old deployment notes against the live workflows.
 
 - Flag any bot or frontend change that lets an executor alter a task or project
   outside the backend's permission checks or status transition table.
-- Flag agent/CI/deploy changes that can merge a cancelled run's PR, or mark a
-  task done without proving the same commit passed checks, runs in production,
-  and passed readiness probes.
+- Flag agent/CI/deploy changes that can merge a cancelled run's PR, publish a
+  fast commit without the exact GitHub CI result, or mark a task done without
+  proving the same commit passed checks, runs in production, and passed
+  readiness probes.
 - Flag writes to money, permissions, customer messages or production data that
   can happen from a test or an unapproved agent task.
