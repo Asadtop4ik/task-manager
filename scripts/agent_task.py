@@ -61,7 +61,11 @@ def prepare() -> None:
     temp = Path(os.environ["RUNNER_TEMP"])
     prompt = (
         "Work on the Task Manager repository. Follow AGENTS.md.\n"
-        "Implement only the requested behavior and run relevant checks.\n"
+        "Implement only the requested behavior. On this 1 CPU runner, do not install "
+        "dependencies solely for checks or run full suites/builds; independent GitHub-hosted "
+        "CI will do that. Dependency-management tasks may install packages to update lockfiles. "
+        "Run git diff --check and quick targeted checks if existing dependencies allow, "
+        "then state which checks were deferred to CI.\n"
         "Sensitive paths require human review and will become a PR instead of direct deployment.\n"
         "If the task needs a business decision, explain exactly what is missing.\n"
         "Do not push, open a PR, deploy, or read credentials. A later workflow step handles GitHub.\n"
