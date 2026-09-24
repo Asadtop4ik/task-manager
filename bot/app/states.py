@@ -18,6 +18,13 @@ class QuickCapture(StatesGroup):
     editing_title = State()
 
 
+class AgentIntake(StatesGroup):
+    """Telegram-side draft states for private Codex intakes."""
+
+    photo_pending = State()
+    revising = State()
+
+
 class CardAction(StatesGroup):
     """Text the card asked for: a comment body, or a new deadline."""
 

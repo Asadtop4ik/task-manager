@@ -8,6 +8,7 @@ from arq.connections import RedisSettings
 
 from app.cards import build_card
 from app.config import settings
+from app.handlers.agent_intake import notification_message
 from app.loader import create_bot
 from app.logging import configure_logging, get_logger
 
@@ -68,6 +69,42 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                         )
                         continue
                 ack = await client.post(f"{base}/{notice['run_id']}/notified", headers=headers)
+                ack.raise_for_status()
+        finally:
+            await bot.session.close()
+
+
+async def notify_agent_intakes(ctx: dict[str, object]) -> None:
+    """Deliver intake questions, summaries and failures, then ack their revision."""
+    if not settings.agent_intake_enabled:
+        return
+    headers = {"X-Agent-Worker-Token": settings.service_token}
+    base = f"{settings.api_base_url.rstrip('/')}/api/v1/agent-intakes"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{base}/notifications", headers=headers)
+        response.raise_for_status()
+        bot = create_bot()
+        try:
+            for notice in response.json():
+                chat_id = notice.get("chat_id")
+                if not chat_id:
+                    log.warning("agent_intake_notice_without_chat", intake_id=notice["id"])
+                    continue
+                text, markup = notification_message(notice)
+                try:
+                    sent = await bot.send_message(chat_id, text, reply_markup=markup)
+                except (TelegramAPIError, OSError) as exc:
+                    log.error(
+                        "agent_intake_notice_failed",
+                        intake_id=notice["id"],
+                        error=type(exc).__name__,
+                    )
+                    continue
+                ack = await client.post(
+                    f"{base}/{notice['id']}/notified",
+                    headers=headers,
+                    json={"message_id": sent.message_id, "revision": notice["revision"]},
+                )
                 ack.raise_for_status()
         finally:
             await bot.session.close()
@@ -135,9 +172,15 @@ class WorkerSettings:
     than bolted on later.
     """
 
-    functions = [ping, notify_agent_runs, sync_deleted_task_cards]  # noqa: RUF012
+    functions = [  # noqa: RUF012
+        ping,
+        notify_agent_runs,
+        notify_agent_intakes,
+        sync_deleted_task_cards,
+    ]
     cron_jobs = [  # noqa: RUF012
         cron(notify_agent_runs, minute=set(range(60))),
+        cron(notify_agent_intakes, minute=set(range(60))),
         cron(sync_deleted_task_cards, minute=set(range(60))),
     ]
     on_startup = startup

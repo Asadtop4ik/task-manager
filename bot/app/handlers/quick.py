@@ -19,6 +19,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.api import ApiError, TaskApi
 from app.callbacks import QuickConfirm
 from app.cards import format_due
+from app.handlers.agent_intake import route_intake_text
 from app.handlers.helpers import (
     api_for,
     editable,
@@ -149,6 +150,8 @@ async def task_from_reply(message: Message, state: FSMContext) -> None:
 
 @router.message(QuickCapture.editing_title, F.text)
 async def retype_title(message: Message, state: FSMContext) -> None:
+    if await route_intake_text(message, state, message.text or ""):
+        return
     data = await state.get_data()
     draft = data.get("draft", {})
     # Keep the project, priority and deadline already understood; only the words
@@ -301,4 +304,6 @@ async def stop_agent(message: Message) -> None:
 # Registered last in this router so every command and FSM state above wins first.
 @router.message(F.text & ~F.text.startswith("/"))
 async def quick_capture(message: Message, state: FSMContext) -> None:
+    if await route_intake_text(message, state, message.text or ""):
+        return
     await _offer(message, state, message.text or "")
