@@ -8,6 +8,7 @@ import { api } from "@/lib/api";
 import type {
   Activity,
   AgentRun,
+  AgentMetrics,
   Comment,
   Member,
   Project,
@@ -26,6 +27,15 @@ export type TaskFilters = {
   q?: string;
   limit?: number;
 };
+
+export function useAgentMetrics(enabled: boolean) {
+  return useQuery({
+    queryKey: ["agent-metrics"],
+    queryFn: async () => (await api.get<AgentMetrics>("/agent-runs/metrics")).data,
+    enabled,
+    refetchInterval: 60_000,
+  });
+}
 
 export function useProjects(includeArchived = false) {
   return useQuery({

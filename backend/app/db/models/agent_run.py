@@ -56,5 +56,9 @@ class AgentRun(Base, TimestampMixin):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    runner_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pr_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     task: Mapped["Task"] = relationship()

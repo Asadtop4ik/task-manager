@@ -5,15 +5,16 @@ import hmac
 import json
 import re
 from datetime import UTC, datetime
+from math import ceil
 from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, OwnerUser
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.enums import ActivityKind, TaskStatus, can_transition
@@ -22,12 +23,14 @@ from app.schemas.agent_run import (
     AgentDeployment,
     AgentImageOut,
     AgentMerge,
+    AgentMetricsOut,
     AgentNoticeAck,
     AgentNotificationOut,
     AgentRunCallback,
     AgentRunOut,
     AgentRunStart,
     ExternalAgentPending,
+    MetricDuration,
 )
 from app.services import activity
 from app.services.access import can_edit_task, can_see_task
@@ -41,6 +44,18 @@ from app.services.telegram_media import IMAGE_MIMES, telegram_image
 log = get_logger(__name__)
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
 _GITHUB = "https://api.github.com"
+_METRICS_PILOT_START = datetime(2026, 9, 24, 18, 0, tzinfo=UTC)
+
+
+def _duration_summary(values: list[float]) -> MetricDuration:
+    seconds = sorted(round(value) for value in values if value >= 0)
+    if not seconds:
+        return MetricDuration(samples=0, p50_seconds=None, p90_seconds=None)
+    return MetricDuration(
+        samples=len(seconds),
+        p50_seconds=seconds[ceil(len(seconds) * 0.5) - 1],
+        p90_seconds=seconds[ceil(len(seconds) * 0.9) - 1],
+    )
 
 
 def _worker_auth(token: str | None) -> None:
@@ -276,6 +291,77 @@ async def pending_notifications(
         )
         for run in runs
     ]
+
+
+@router.get("/metrics", response_model=AgentMetricsOut)
+async def agent_metrics(
+    session: DbSession, owner: OwnerUser, since: datetime | None = None
+) -> AgentMetricsOut:
+    """Measure the first 20 distinct tasks after an owner-selected start time."""
+    effective_since = since or _METRICS_PILOT_START
+    if effective_since.tzinfo is None:
+        raise HTTPException(status_code=422, detail="since must include a timezone")
+    task_ids = (
+        await session.scalars(
+            select(AgentRun.task_id)
+            .where(AgentRun.created_at >= effective_since)
+            .group_by(AgentRun.task_id)
+            .order_by(func.min(AgentRun.created_at), AgentRun.task_id)
+            .limit(20)
+        )
+    ).all()
+    attempts = (
+        await session.scalars(
+            select(AgentRun)
+            .where(AgentRun.created_at >= effective_since, AgentRun.task_id.in_(task_ids))
+            .order_by(AgentRun.created_at, AgentRun.id)
+        )
+    ).all()
+    selected: dict[int, AgentRun] = {}
+    first_created: dict[int, datetime] = {}
+    for run in attempts:
+        first_created.setdefault(run.task_id, run.created_at)
+        selected[run.task_id] = run
+    included = attempts
+    current = list(selected.values())
+    queue = [
+        (run.runner_started_at - run.created_at).total_seconds()
+        for run in current
+        if run.runner_started_at
+    ]
+    implementation = [
+        (run.pr_ready_at - run.runner_started_at).total_seconds()
+        for run in current
+        if run.pr_ready_at and run.runner_started_at
+    ]
+    human_review = [
+        (run.merged_at - run.pr_ready_at).total_seconds()
+        for run in current
+        if run.merged_at and run.pr_ready_at
+    ]
+    end_to_end = [
+        (run.deployed_at - first_created[run.task_id]).total_seconds()
+        for run in current
+        if run.deployed_at
+    ]
+    return AgentMetricsOut(
+        since=effective_since,
+        target_tasks=20,
+        sampled_runs=len(current),
+        enough_data=len(current) == 20
+        and all(run.status in {"deployed", "failed", "cancelled"} for run in current),
+        deployed=sum(run.status == "deployed" for run in current),
+        failed_attempts=sum(run.status == "failed" for run in included),
+        cancelled_attempts=sum(run.status == "cancelled" for run in included),
+        retried=sum(run.attempt_index > 1 for run in current),
+        queue=_duration_summary(queue),
+        implementation=_duration_summary(implementation),
+        human_review=_duration_summary(human_review),
+        end_to_end=_duration_summary(end_to_end),
+        input_tokens=sum(run.input_tokens or 0 for run in included),
+        cached_input_tokens=sum(run.cached_input_tokens or 0 for run in included),
+        output_tokens=sum(run.output_tokens or 0 for run in included),
+    )
 
 
 @router.post("/{run_id}/notified", status_code=204)
@@ -601,6 +687,7 @@ async def agent_run_merged(
         raise HTTPException(status_code=409, detail="agent PR is not ready for merge tracking")
     run.head_sha = await _verify_deployment(run, payload.sha)
     run.merged_sha = payload.sha
+    run.merged_at = run.merged_at or datetime.now(UTC)
     run.status = "merged"
     run.notified_at = None
     await session.commit()
@@ -643,6 +730,7 @@ async def agent_run_deployed(
         raise HTTPException(status_code=400, detail="invalid deploy run URL")
     run.status = "deployed"
     run.deployed_sha = payload.sha
+    run.deployed_at = run.deployed_at or datetime.now(UTC)
     run.github_run_url = payload.github_run_url
     run.finished_at = datetime.now(UTC)
     run.notified_at = None
@@ -719,6 +807,10 @@ async def agent_run_callback(
         run.head_sha = payload.head_sha
 
     run.status = payload.status
+    if payload.status == "running" and run.runner_started_at is None:
+        run.runner_started_at = datetime.now(UTC)
+    if payload.status == "pr_ready" and run.pr_ready_at is None:
+        run.pr_ready_at = datetime.now(UTC)
     if payload.github_run_url:
         expected_url = f"https://github.com/{DISPATCH_REPOSITORY}/actions/runs/"
         suffix = payload.github_run_url.removeprefix(expected_url)
