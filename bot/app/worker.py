@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 import httpx
+from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from arq import cron
 from arq.connections import RedisSettings
@@ -31,7 +32,8 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
         response = await client.get(f"{base}/notifications", headers=headers)
         response.raise_for_status()
         notices = response.json()
-        bot = create_bot()
+        # Agent error text is untrusted plain text, not Telegram HTML.
+        bot = Bot(token=settings.bot_token)
         try:
             for notice in notices:
                 chat_id = notice["chat_id"]
