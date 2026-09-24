@@ -36,7 +36,7 @@ async def test_deleted_card_is_disabled_and_acknowledged(monkeypatch) -> None:
     bot.edit_message_text = AsyncMock()
     bot.session.close = AsyncMock()
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: client)
-    monkeypatch.setattr(worker, "Bot", lambda **kwargs: bot)
+    monkeypatch.setattr(worker, "create_bot", lambda: bot)
 
     await worker.sync_deleted_task_cards({})
 

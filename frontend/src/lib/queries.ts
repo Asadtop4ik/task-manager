@@ -108,10 +108,11 @@ export function useTasks(filters: TaskFilters) {
   });
 }
 
-export function useTrash() {
+export function useTrash(offset = 0, limit = 50) {
   return useQuery({
-    queryKey: ["trash"],
-    queryFn: async () => (await api.get<Task[]>("/tasks/trash")).data,
+    queryKey: ["trash", offset, limit],
+    queryFn: async () =>
+      (await api.get<TaskList>("/tasks/trash", { params: { offset, limit } })).data,
   });
 }
 

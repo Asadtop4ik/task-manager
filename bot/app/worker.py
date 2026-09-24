@@ -1,13 +1,13 @@
 from datetime import UTC, datetime
 
 import httpx
-from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from arq import cron
 from arq.connections import RedisSettings
 
 from app.cards import build_card
 from app.config import settings
+from app.loader import create_bot
 from app.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -31,7 +31,7 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
         response = await client.get(f"{base}/notifications", headers=headers)
         response.raise_for_status()
         notices = response.json()
-        bot = Bot(token=settings.bot_token)
+        bot = create_bot()
         try:
             for notice in notices:
                 chat_id = notice["chat_id"]
@@ -71,7 +71,7 @@ async def sync_deleted_task_cards(ctx: dict[str, object]) -> None:
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{base}/pending", headers=headers)
         response.raise_for_status()
-        bot = Bot(token=settings.bot_token)
+        bot = create_bot()
         try:
             for notice in response.json():
                 task = notice["task"]

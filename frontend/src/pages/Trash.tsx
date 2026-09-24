@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import Page from "@/components/Page";
 import { useAuth } from "@/lib/auth";
@@ -5,7 +6,8 @@ import { useRestoreTask, useTrash } from "@/lib/queries";
 
 export default function Trash() {
   const { state } = useAuth();
-  const trash = useTrash();
+  const [offset, setOffset] = useState(0);
+  const trash = useTrash(offset);
   const restore = useRestoreTask();
 
   if (state.status !== "authenticated" || !state.user.is_owner) {
@@ -20,7 +22,7 @@ export default function Trash() {
     </header>
     {restore.isError && <p role="alert" className="px-4 text-sm text-late">Tiklab bo‘lmadi.</p>}
     <ul className="divide-y divide-hairline border-y border-hairline bg-card">
-      {trash.data?.map((task) => <li key={task.id} className="flex items-center justify-between gap-3 px-4 py-4">
+      {trash.data?.items.map((task) => <li key={task.id} className="flex items-center justify-between gap-3 px-4 py-4">
         <div>
           <p className="font-medium">{task.title}</p>
           <p className="mt-1 text-sm text-muted">{task.project.name} · #{task.id}</p>
@@ -33,6 +35,11 @@ export default function Trash() {
         >Tiklash</button>
       </li>)}
     </ul>
-    {trash.data?.length === 0 && <p className="px-4 py-8 text-muted">O‘chirilgan vazifa yo‘q.</p>}
+    {trash.data?.total === 0 && <p className="px-4 py-8 text-muted">O‘chirilgan vazifa yo‘q.</p>}
+    {trash.data && trash.data.total > 50 && <div className="flex items-center justify-between px-4 py-4 text-sm">
+      <button type="button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))} className="disabled:opacity-40">← Oldingi</button>
+      <span>{offset + 1}–{Math.min(offset + 50, trash.data.total)} / {trash.data.total}</span>
+      <button type="button" disabled={offset + 50 >= trash.data.total} onClick={() => setOffset(offset + 50)} className="disabled:opacity-40">Keyingi →</button>
+    </div>}
   </Page>;
 }

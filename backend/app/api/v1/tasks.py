@@ -120,16 +120,33 @@ async def list_tasks(
     )
 
 
-@router.get("/trash", response_model=list[TaskOut])
-async def list_trash(session: DbSession, owner: OwnerUser) -> list[TaskOut]:
+@router.get("/trash", response_model=TaskListResponse)
+async def list_trash(
+    session: DbSession,
+    owner: OwnerUser,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> TaskListResponse:
+    total = (
+        await session.scalar(
+            select(func.count()).select_from(Task).where(Task.deleted_at.is_not(None))
+        )
+        or 0
+    )
     rows = await session.scalars(
         select(Task)
         .where(Task.deleted_at.is_not(None))
         .options(*_RELATIONS)
         .order_by(Task.deleted_at.desc(), Task.id.desc())
-        .limit(200)
+        .limit(limit)
+        .offset(offset)
     )
-    return [TaskOut.model_validate(row) for row in rows]
+    return TaskListResponse(
+        items=[TaskOut.model_validate(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
@@ -175,7 +192,11 @@ async def get_task(task_id: int, session: DbSession, user: CurrentUser) -> TaskO
 @router.delete("/{task_id}", response_model=TaskOut)
 async def delete_task(task_id: int, session: DbSession, owner: OwnerUser) -> TaskOut:
     task = await session.scalar(
-        select(Task).where(Task.id == task_id).options(*_RELATIONS).with_for_update()
+        select(Task)
+        .where(Task.id == task_id)
+        .options(*_RELATIONS)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
@@ -203,7 +224,11 @@ async def delete_task(task_id: int, session: DbSession, owner: OwnerUser) -> Tas
 @router.post("/{task_id}/restore", response_model=TaskOut)
 async def restore_task(task_id: int, session: DbSession, owner: OwnerUser) -> TaskOut:
     task = await session.scalar(
-        select(Task).where(Task.id == task_id).options(*_RELATIONS).with_for_update()
+        select(Task)
+        .where(Task.id == task_id)
+        .options(*_RELATIONS)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")

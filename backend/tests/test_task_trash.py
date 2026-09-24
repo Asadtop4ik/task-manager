@@ -1,6 +1,9 @@
+import asyncio
+from datetime import UTC, datetime
+
 from httpx import AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import settings
 from app.db.models import Activity, AgentRun, Project, Task, User
@@ -32,10 +35,9 @@ async def test_only_owner_can_hide_and_restore_a_task_with_history(
         await client.get(f"/api/v1/tasks/{task_id}", headers=auth(manager))
     ).status_code == 404
     assert (await client.get("/api/v1/tasks", headers=auth(manager))).json()["total"] == 0
-    assert [
-        row["id"]
-        for row in (await client.get("/api/v1/tasks/trash", headers=auth(manager))).json()
-    ] == [task_id]
+    trash = (await client.get("/api/v1/tasks/trash", headers=auth(manager))).json()
+    assert trash["total"] == 1
+    assert [row["id"] for row in trash["items"]] == [task_id]
     assert (await client.get("/api/v1/tasks/trash", headers=auth(executor))).status_code == 403
     assert await session.get(Task, task_id) is not None
     events = (await session.scalars(select(Activity).where(Activity.task_id == task_id))).all()
@@ -82,3 +84,50 @@ async def test_active_agent_must_be_stopped_before_delete(
     response = await client.delete(f"/api/v1/tasks/{task_id}", headers=auth(manager))
     assert response.status_code == 409
     assert (await session.get(Task, task_id)).deleted_at is None
+
+
+async def test_delete_lock_prevents_a_concurrent_agent_dispatch(
+    client: AsyncClient, session: AsyncSession, engine, manager: User, project: Project
+) -> None:
+    task_id = (
+        await client.post(
+            "/api/v1/tasks",
+            json={"project_id": project.id, "title": "Delete race"},
+            headers=auth(manager),
+        )
+    ).json()["id"]
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as deleting:
+        task = await deleting.scalar(select(Task).where(Task.id == task_id).with_for_update())
+        assert task is not None
+        task.deleted_at = datetime.now(UTC)
+        pending = asyncio.create_task(
+            client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+        )
+        await asyncio.sleep(0.05)
+        assert not pending.done()
+        await deleting.commit()
+        response = await asyncio.wait_for(pending, timeout=2)
+    assert response.status_code == 404
+    assert (
+        await session.scalars(select(AgentRun).where(AgentRun.task_id == task_id))
+    ).all() == []
+
+
+async def test_trash_pages_remain_reachable(
+    client: AsyncClient, manager: User, project: Project
+) -> None:
+    for title in ("first", "second", "third"):
+        task = await client.post(
+            "/api/v1/tasks",
+            json={"project_id": project.id, "title": title},
+            headers=auth(manager),
+        )
+        assert (
+            await client.delete(f"/api/v1/tasks/{task.json()['id']}", headers=auth(manager))
+        ).status_code == 200
+    page = (
+        await client.get("/api/v1/tasks/trash?limit=1&offset=2", headers=auth(manager))
+    ).json()
+    assert page["total"] == 3 and page["offset"] == 2
+    assert len(page["items"]) == 1
