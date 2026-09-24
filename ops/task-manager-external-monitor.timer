@@ -1,0 +1,11 @@
+[Unit]
+Description=Check external Codex PRs and deployed images every 30 seconds
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+Persistent=true
+Unit=task-manager-external-monitor.service
+
+[Install]
+WantedBy=timers.target

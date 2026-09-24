@@ -23,8 +23,10 @@ requests a new summary, and **Bekor qilish** discards the draft. No task or
 implementation run exists before confirmation. Use `/cancel` to discard a
 pending draft. A picture with the task as its caption works, as does a picture
 followed by the task text within ten minutes. PNG, JPEG and WebP are supported,
-up to three images of at most 20 MB each. This pilot is enabled only for the
-Task Manager project and for members with Codex access.
+up to three images of at most 20 MB each. The Task Manager pilot is live for
+members with Codex access. Qurbot, Kans Shop and Ketoshop use the same intake
+after the separate public-repository rollout in
+[docs/EXTERNAL_AGENTS.md](docs/EXTERNAL_AGENTS.md).
 
 After an operator configures a private project repository and the agent credentials,
 send `task-manager: update the task view @codex` to the Telegram bot. Confirm the
@@ -48,11 +50,14 @@ Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
 veb boarddagi shu task sahifasida ko'rinadi.
 
-Agar `@codex` ishga tushmasa, loyiha repoga ulanganini, repo private ekanini va runner online ekanini tekshiring.
+Agar `@codex` ishga tushmasa, loyiha repo va to‘g‘ri branchga ulanganini,
+public loyiha flagi yoqilganini va yopiq runner online ekanini tekshiring.
 
 The project repository and default branch are manager-only settings. The backend
-also requires the repository in `GITHUB_AGENT_ALLOWED_REPOS` and verifies it is
-private before dispatch. Only `Asadtop4ik/task-manager` is allowlisted by default.
+also requires the repository in `GITHUB_AGENT_ALLOWED_REPOS` and checks its
+approved project key, branch and visibility before dispatch. Only the private
+`Asadtop4ik/task-manager` is allowlisted by default; the three approved public
+repos use the private Task Manager runner, not a runner registered to them.
 The worker uses a GitHub `repository_dispatch` event; its workflow runs on a
 private `codex-agent` self-hosted runner. The repository needs these credentials:
 

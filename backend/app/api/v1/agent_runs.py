@@ -21,13 +21,20 @@ from app.db.models import AgentRun, Attachment, Task
 from app.schemas.agent_run import (
     AgentDeployment,
     AgentImageOut,
+    AgentMerge,
     AgentNotificationOut,
     AgentRunCallback,
     AgentRunOut,
     AgentRunStart,
+    ExternalAgentPending,
 )
 from app.services import activity
 from app.services.access import can_edit_task, can_see_task
+from app.services.agent_repos import (
+    DISPATCH_REPOSITORY,
+    PUBLIC_REPOSITORIES,
+    repository_for,
+)
 from app.services.telegram_media import IMAGE_MIMES, telegram_image
 
 log = get_logger(__name__)
@@ -76,28 +83,36 @@ def _headers() -> dict[str, str]:
     }
 
 
-async def _ensure_private_repo(client: httpx.AsyncClient, repo: str) -> None:
+async def _ensure_repo_visibility(
+    client: httpx.AsyncClient, repo: str, *, private: bool
+) -> None:
     response = await client.get(f"{_GITHUB}/repos/{repo}", headers=_headers())
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub repository access failed")
-    if not response.json().get("private"):
+    if response.json().get("private") is not private:
         raise HTTPException(
             status_code=409,
-            detail="subscription runner is limited to private repositories",
+            detail="repository visibility differs from the approved agent policy",
         )
 
 
 async def _dispatch(run: AgentRun, task: Task) -> int:
+    repository = repository_for(task.project.key, run.repo_full_name, run.base_branch)
+    if repository is None:
+        raise HTTPException(
+            status_code=409, detail="project repository is not enabled for agents"
+        )
     async with httpx.AsyncClient(timeout=15.0) as client:
-        await _ensure_private_repo(client, run.repo_full_name)
+        await _ensure_repo_visibility(client, run.repo_full_name, private=repository.private)
         response = await client.post(
-            f"{_GITHUB}/repos/{run.repo_full_name}/dispatches",
+            f"{_GITHUB}/repos/{DISPATCH_REPOSITORY}/dispatches",
             headers=_headers(),
             json={
-                "event_type": "agent_task",
+                "event_type": ("agent_task" if repository.private else "agent_public_task"),
                 "client_payload": {
                     "run_id": run.run_id,
                     "task_id": task.id,
+                    "repo_full_name": run.repo_full_name,
                     "title": task.title,
                     "description": task.description or "",
                     "base_branch": run.base_branch,
@@ -188,13 +203,13 @@ async def _verify_fast_commit(run: AgentRun, sha: str) -> None:
 async def _cancel_github(run: AgentRun) -> None:
     if not run.github_run_url:
         return
-    expected = f"https://github.com/{run.repo_full_name}/actions/runs/"
+    expected = f"https://github.com/{DISPATCH_REPOSITORY}/actions/runs/"
     run_number = run.github_run_url.removeprefix(expected)
     if not run.github_run_url.startswith(expected) or not run_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid GitHub run reference")
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
-            f"{_GITHUB}/repos/{run.repo_full_name}/actions/runs/{run_number}/cancel",
+            f"{_GITHUB}/repos/{DISPATCH_REPOSITORY}/actions/runs/{run_number}/cancel",
             headers=_headers(),
         )
     if response.status_code not in {202, 204}:
@@ -208,10 +223,17 @@ async def _close_pr(run: AgentRun) -> None:
     pr_number = run.pr_url.removeprefix(expected)
     if not run.pr_url.startswith(expected) or not pr_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
+    token = (
+        settings.github_public_agent_token
+        if run.repo_full_name in PUBLIC_REPOSITORIES
+        else settings.github_agent_token
+    )
+    if not token:
+        raise HTTPException(status_code=503, detail="PR close token is not configured")
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.patch(
             f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
-            headers=_headers(),
+            headers={**_headers(), "Authorization": f"Bearer {token}"},
             json={"state": "closed"},
         )
     if response.status_code != 200:
@@ -226,7 +248,7 @@ async def pending_notifications(
     runs = await session.scalars(
         select(AgentRun)
         .where(
-            AgentRun.status.in_(["pr_ready", "failed", "deployed"]),
+            AgentRun.status.in_(["pr_ready", "merged", "failed", "deployed"]),
             AgentRun.notified_at.is_(None),
         )
         .options(selectinload(AgentRun.task).selectinload(Task.created_by))
@@ -260,11 +282,47 @@ async def mark_notified(
     run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status not in {"pr_ready", "failed", "deployed"}:
+    if run.status not in {"pr_ready", "merged", "failed", "deployed"}:
         raise HTTPException(status_code=409, detail="run is not finished")
     if run.notified_at is None:
         run.notified_at = datetime.now(UTC)
         await session.commit()
+
+
+@router.get("/external-pending", response_model=list[ExternalAgentPending])
+async def external_pending(
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+    after_id: int = 0,
+) -> list[ExternalAgentPending]:
+    _image_callback_auth(x_agent_callback_token)
+    if after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+    rows = await session.scalars(
+        select(AgentRun)
+        .where(
+            AgentRun.repo_full_name.in_(PUBLIC_REPOSITORIES),
+            AgentRun.status.in_(["pr_ready", "merged"]),
+            AgentRun.pr_url.is_not(None),
+            AgentRun.id > after_id,
+        )
+        .order_by(AgentRun.id)
+        .limit(50)
+    )
+    return [
+        ExternalAgentPending(
+            id=run.id,
+            run_id=run.run_id,
+            repo_full_name=run.repo_full_name,
+            base_branch=run.base_branch,
+            pr_url=run.pr_url,
+            status=run.status,
+            merged_sha=run.merged_sha,
+            notified=run.notified_at is not None,
+        )
+        for run in rows
+        if run.pr_url is not None
+    ]
 
 
 @router.get("/tasks/{task_id}", response_model=list[AgentRunOut])
@@ -374,12 +432,17 @@ async def start_agent_run(
         raise HTTPException(status_code=409, detail="task is closed")
     repo = task.project.repo_full_name
     branch = task.project.default_branch
+    repository = repository_for(task.project.key, repo, branch)
+    if repository is not None and not repository.private and not settings.agent_public_enabled:
+        raise HTTPException(status_code=503, detail="public project agents are not enabled")
+    if mode == "fast" and (repository is None or not repository.fast_enabled):
+        raise HTTPException(status_code=409, detail="fast mode is limited to Task Manager")
     if mode == "fast" and branch != "main":
         raise HTTPException(status_code=409, detail="fast mode requires the main branch")
     allowlist = {
         name.strip().lower() for name in settings.github_agent_allowed_repos.split(",")
     }
-    if not repo or not branch or repo.lower() not in allowlist:
+    if repository is None or repo is None or repo.lower() not in allowlist:
         raise HTTPException(
             status_code=409, detail="project repository is not enabled for agents"
         )
@@ -510,6 +573,31 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
     return AgentRunOut.model_validate(run)
 
 
+@router.post("/{run_id}/merged", response_model=AgentRunOut)
+async def agent_run_merged(
+    run_id: str,
+    payload: AgentMerge,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).with_for_update()
+    )
+    if run is None or run.repo_full_name not in PUBLIC_REPOSITORIES or not run.pr_url:
+        raise HTTPException(status_code=404, detail="external agent PR not found")
+    if run.status == "merged" and run.merged_sha == payload.sha:
+        return AgentRunOut.model_validate(run)
+    if run.status != "pr_ready":
+        raise HTTPException(status_code=409, detail="agent PR is not ready for merge tracking")
+    run.head_sha = await _verify_deployment(run, payload.sha)
+    run.merged_sha = payload.sha
+    run.status = "merged"
+    run.notified_at = None
+    await session.commit()
+    return AgentRunOut.model_validate(run)
+
+
 @router.post("/{run_id}/deployed", response_model=AgentRunOut)
 async def agent_run_deployed(
     run_id: str,
@@ -531,8 +619,10 @@ async def agent_run_deployed(
     if run.status == "deployed" and run.deployed_sha == payload.sha:
         return AgentRunOut.model_validate(run)
     if run.pr_url:
-        if run.status != "pr_ready":
+        if run.status not in {"pr_ready", "merged"}:
             raise HTTPException(status_code=409, detail="agent PR is not ready")
+        if run.status == "merged" and run.merged_sha != payload.sha:
+            raise HTTPException(status_code=409, detail="deployed SHA differs from merge")
         run.head_sha = await _verify_deployment(run, payload.sha)
     else:
         if run.status not in {"validating", "publishing", "deploying", "failed"}:
@@ -587,7 +677,7 @@ async def agent_run_callback(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status in {"pr_ready", "deployed", "cancelled", "failed"}:
+    if run.status in {"pr_ready", "merged", "deployed", "cancelled", "failed"}:
         return AgentRunOut.model_validate(run)
 
     if payload.status in {"validating", "publishing", "deploying"}:
@@ -621,7 +711,7 @@ async def agent_run_callback(
 
     run.status = payload.status
     if payload.github_run_url:
-        expected_url = f"https://github.com/{run.repo_full_name}/actions/runs/"
+        expected_url = f"https://github.com/{DISPATCH_REPOSITORY}/actions/runs/"
         suffix = payload.github_run_url.removeprefix(expected_url)
         if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
             raise HTTPException(status_code=400, detail="invalid GitHub run URL")

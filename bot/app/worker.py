@@ -53,6 +53,12 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                             f"✅ #{notice['task_id']} serverga chiqdi. "
                             f"Deploy: {notice['github_run_url']}"
                         )
+                    elif notice["status"] == "merged":
+                        text = (
+                            f"🔀 #{notice['task_id']} PR birlashtirildi. "
+                            "Serverga chiqishini tekshiryapman. "
+                            f"PR: {notice['pr_url']}"
+                        )
                     else:
                         text = (
                             f"⚠️ #{notice['task_id']} Codex ishi to‘xtadi. "

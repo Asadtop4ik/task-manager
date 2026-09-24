@@ -14,6 +14,7 @@ from intake_worker import (
     OUTPUT_SCHEMA,
     _build_prompt,
     _run_codex_child,
+    _validate_lease,
     _validate_result,
 )
 
@@ -88,6 +89,18 @@ def worker(temp: str, opener, command_runner=None) -> IntakeWorker:
 
 
 class IntakeWorkerTests(unittest.TestCase):
+    def test_public_project_lease_uses_its_approved_branch(self) -> None:
+        payload = lease()
+        payload["repo_full_name"] = "muradjanov-dev/ketoshop"
+        payload["base_branch"] = "master"
+        identity, images = _validate_lease(payload)
+        self.assertEqual(identity.intake_id, RUN_ID)
+        self.assertEqual(images, [])
+        self.assertIn("muradjanov-dev/ketoshop", _build_prompt(payload))
+        payload["base_branch"] = "main"
+        with self.assertRaisesRegex(ValueError, "approved branch"):
+            _validate_lease(payload)
+
     def test_clear_intake_reports_brief_without_task_or_token_in_logs(self) -> None:
         payload = lease(text="Private task text")
         responses = [
