@@ -173,7 +173,10 @@ def _validate_result(payload: Any) -> dict[str, Any]:
         if (
             not isinstance(questions, list)
             or not 1 <= len(questions) <= 3
-            or any(not isinstance(value, str) or not value.strip() for value in questions)
+            or any(
+                not isinstance(value, str) or not value.strip() or len(value) > 500
+                for value in questions
+            )
         ):
             raise IntakeError("Codex returned invalid questions")
         return {"status": status, "questions": [value.strip() for value in questions]}
@@ -188,13 +191,19 @@ def _validate_result(payload: Any) -> dict[str, Any]:
         if (
             not isinstance(title, str)
             or not title.strip()
+            or len(title) > 255
             or not isinstance(goal, str)
             or not goal.strip()
+            or len(goal) > 800
             or not isinstance(acceptance, list)
-            or not acceptance
-            or any(not isinstance(value, str) or not value.strip() for value in acceptance)
+            or not 1 <= len(acceptance) <= 5
+            or any(
+                not isinstance(value, str) or not value.strip() or len(value) > 250
+                for value in acceptance
+            )
             or not isinstance(assumptions, list)
-            or any(not isinstance(value, str) for value in assumptions)
+            or len(assumptions) > 5
+            or any(not isinstance(value, str) or len(value) > 150 for value in assumptions)
         ):
             raise IntakeError("Codex returned an invalid brief")
         return {
@@ -590,6 +599,11 @@ class IntakeWorker:
                     prompt=_build_prompt(payload),
                     images=images,
                 )
+                if payload["analysis_rounds"] > 0 and result["status"] == "needs_answers":
+                    result = {
+                        "status": "failed",
+                        "error": "The request still needs a decision. Edit the draft or continue as a PR.",
+                    }
         except subprocess.TimeoutExpired:
             result = {"status": "failed", "error": "Task analysis timed out."}
         except Exception:

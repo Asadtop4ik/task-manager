@@ -134,6 +134,7 @@ def notification_message(notice: dict[str, Any]) -> tuple[str, Any | None]:
             _action_keyboard(
                 intake_id,
                 ("🔁 Qayta urinish", "retry"),
+                ("✏️ Tuzatish", "edit"),
                 ("↪️ PR bilan davom etish", "fallback"),
                 ("✖️ Bekor qilish", "cancel"),
             ),
@@ -368,7 +369,11 @@ async def revise_from_button(message: Message, state: FSMContext) -> None:
     api = api_for(message)
     try:
         current = await api.current_agent_intake()
-        if not current or int(current["id"]) != int(intake_id) or current["status"] != "ready":
+        if (
+            not current
+            or int(current["id"]) != int(intake_id)
+            or current["status"] not in {"ready", "failed"}
+        ):
             await state.clear()
             await message.answer("Intake endi tahrirlanmaydi. Yangi taskni qaytadan yuboring.")
             return

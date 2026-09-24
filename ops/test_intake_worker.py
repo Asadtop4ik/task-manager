@@ -160,6 +160,37 @@ class IntakeWorkerTests(unittest.TestCase):
         self.assertEqual(result_request[0]["lease_id"], LEASE_ID)
         self.assertEqual(result_request[0]["questions"], ["Which screen?"])
 
+    def test_second_question_round_stops_for_user_edit_or_pr(self) -> None:
+        payload = lease()
+        payload["analysis_rounds"] = 1
+        payload["answer_text"] = "The board"
+        responses = [
+            FakeResponse(json.dumps(payload).encode()),
+            FakeResponse(tarball(), mime="application/gzip"),
+            FakeResponse(status=204),
+        ]
+        submitted = []
+
+        def run_command(args, **kwargs):
+            if args[-1] == "codex-child":
+                request = json.loads(kwargs["input"])
+                (Path(request["session_dir"]) / "codex-result.json").write_text(
+                    json.dumps({"status": "needs_answers", "questions": ["What next?"]})
+                )
+            return Mock(returncode=0)
+
+        def open_response(request, timeout):
+            if request.full_url.endswith("/result"):
+                submitted.append(json.loads(request.data))
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as temp:
+            outcome = worker(temp, open_response, run_command).poll_once()
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(submitted[0]["status"], "failed")
+        self.assertNotIn("questions", submitted[0])
+
     def test_timeout_reports_generic_failure_without_error_payload_leaks(self) -> None:
         from subprocess import TimeoutExpired
 
