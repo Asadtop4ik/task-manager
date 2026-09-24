@@ -10,7 +10,14 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import CurrentUser, DbSession, OwnerUser
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.db.enums import OPEN_STATUSES, ActivityKind, TaskPriority, TaskStatus, can_transition
+from app.db.enums import (
+    OPEN_STATUSES,
+    ActivityKind,
+    TaskPriority,
+    TaskSource,
+    TaskStatus,
+    can_transition,
+)
 from app.db.models import Activity, AgentRun, Comment, Task, User
 from app.schemas.activity import ActivityOut
 from app.schemas.comment import CommentCreate, CommentOut
@@ -42,8 +49,11 @@ _RELATIONS = (
 )
 
 
-async def _load(session: DbSession, task_id: int) -> Task:
-    task = await session.scalar(select(Task).where(Task.id == task_id).options(*_RELATIONS))
+async def _load(session: DbSession, task_id: int, *, lock: bool = False) -> Task:
+    query = select(Task).where(Task.id == task_id).options(*_RELATIONS)
+    task = await session.scalar(
+        query.with_for_update().execution_options(populate_existing=True) if lock else query
+    )
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
     return task
@@ -150,7 +160,18 @@ async def list_trash(
 
 
 @router.post("", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
-async def create_task(payload: TaskCreate, session: DbSession, user: CurrentUser) -> TaskOut:
+async def create_task(
+    payload: TaskCreate,
+    session: DbSession,
+    user: CurrentUser,
+    x_service_token: Annotated[str | None, Header()] = None,
+) -> TaskOut:
+    if (
+        payload.source == TaskSource.BOT
+        or payload.source_chat_id is not None
+        or payload.source_message_id is not None
+    ):
+        _card_worker_auth(x_service_token)
     if not await can_see_project(session, user, payload.project_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
 
@@ -297,7 +318,7 @@ async def restore_task(task_id: int, session: DbSession, owner: OwnerUser) -> Ta
 async def update_task(
     task_id: int, payload: TaskUpdate, session: DbSession, user: CurrentUser
 ) -> TaskOut:
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
     if not await can_edit_task(session, user, task):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="not allowed to edit"
@@ -349,7 +370,7 @@ async def transition_task(
     endpoint all have to agree; a stale Telegram card must not be able to reopen
     a task that was closed last week.
     """
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
 
     current = TaskStatus(task.status)
     target = payload.status
@@ -392,7 +413,7 @@ async def transition_task(
 async def assign_task(
     task_id: int, payload: TaskAssign, session: DbSession, user: CurrentUser
 ) -> TaskOut:
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
     if not is_manager(user) and payload.assignee_id != user.id:
         # An executor may pick up unassigned work; handing it elsewhere is not theirs.
         raise HTTPException(
@@ -421,7 +442,7 @@ async def assign_task(
 async def log_time(
     task_id: int, payload: TimeLog, session: DbSession, user: CurrentUser
 ) -> TaskOut:
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
     if not is_manager(user) and task.assignee_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="only the assignee can log time"
@@ -454,7 +475,7 @@ async def reorder_task(
     trusting a position the client computed, because the client's copy of the
     column may be seconds out of date.
     """
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
     if not is_manager(user) and task.assignee_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -489,7 +510,11 @@ async def reorder_task(
 
 @router.post("/{task_id}/card", response_model=TaskOut)
 async def set_card(
-    task_id: int, payload: TaskCard, session: DbSession, user: CurrentUser
+    task_id: int,
+    payload: TaskCard,
+    session: DbSession,
+    user: CurrentUser,
+    x_service_token: Annotated[str | None, Header()] = None,
 ) -> TaskOut:
     """Remember which Telegram message is this task's card.
 
@@ -497,7 +522,8 @@ async def set_card(
     messages, not a change to the task that anyone should see in the activity
     log.
     """
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
+    _card_worker_auth(x_service_token)
     task.source_chat_id = payload.chat_id
     task.source_message_id = payload.message_id
     await session.commit()
@@ -524,7 +550,7 @@ async def list_comments(
 async def add_comment(
     task_id: int, payload: CommentCreate, session: DbSession, user: CurrentUser
 ) -> CommentOut:
-    task = await _visible_or_404(session, user, await _load(session, task_id))
+    task = await _visible_or_404(session, user, await _load(session, task_id, lock=True))
     comment = Comment(task_id=task.id, author_id=user.id, body=payload.body)
     session.add(comment)
     await session.flush()

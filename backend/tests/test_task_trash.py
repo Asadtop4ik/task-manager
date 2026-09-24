@@ -22,7 +22,10 @@ async def test_only_owner_can_hide_and_restore_a_task_with_history(
             "source_chat_id": 111,
             "source_message_id": 222,
         },
-        headers=auth(manager),
+        headers={
+            "X-Service-Token": settings.service_token,
+            "X-Acting-User": str(manager.telegram_id),
+        },
     )
     task_id = created.json()["id"]
     assert (
@@ -112,6 +115,75 @@ async def test_delete_lock_prevents_a_concurrent_agent_dispatch(
     assert (
         await session.scalars(select(AgentRun).where(AgentRun.task_id == task_id))
     ).all() == []
+
+
+async def test_delete_lock_prevents_a_concurrent_task_update(
+    client: AsyncClient, session: AsyncSession, engine, manager: User, project: Project
+) -> None:
+    task_id = (
+        await client.post(
+            "/api/v1/tasks",
+            json={"project_id": project.id, "title": "Original"},
+            headers=auth(manager),
+        )
+    ).json()["id"]
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as deleting:
+        task = await deleting.scalar(select(Task).where(Task.id == task_id).with_for_update())
+        assert task is not None
+        task.deleted_at = datetime.now(UTC)
+        pending = asyncio.create_task(
+            client.patch(
+                f"/api/v1/tasks/{task_id}",
+                json={"title": "Changed after delete"},
+                headers=auth(manager),
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not pending.done()
+        await deleting.commit()
+        response = await asyncio.wait_for(pending, timeout=2)
+    assert response.status_code == 404
+    stored = await session.get(Task, task_id)
+    assert stored is not None
+    await session.refresh(stored)
+    assert stored.title == "Original"
+
+
+async def test_only_bot_service_can_set_telegram_card_coordinates(
+    client: AsyncClient, manager: User, project: Project
+) -> None:
+    create = {"project_id": project.id, "title": "Web task"}
+    for extra in (
+        {"source": "bot"},
+        {"source_chat_id": 123},
+        {"source_message_id": 456},
+    ):
+        response = await client.post(
+            "/api/v1/tasks", json=create | extra, headers=auth(manager)
+        )
+        assert response.status_code == 401
+    task_id = (await client.post("/api/v1/tasks", json=create, headers=auth(manager))).json()[
+        "id"
+    ]
+    assert (
+        await client.post(
+            f"/api/v1/tasks/{task_id}/card",
+            json={"chat_id": 123, "message_id": 456},
+            headers=auth(manager),
+        )
+    ).status_code == 401
+    service_headers = {
+        "X-Service-Token": settings.service_token,
+        "X-Acting-User": str(manager.telegram_id),
+    }
+    assert (
+        await client.post(
+            f"/api/v1/tasks/{task_id}/card",
+            json={"chat_id": 123, "message_id": 456},
+            headers=service_headers,
+        )
+    ).status_code == 200
 
 
 async def test_trash_pages_remain_reachable(
