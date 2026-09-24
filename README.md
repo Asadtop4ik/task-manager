@@ -23,6 +23,9 @@ closed when cancelled, so it cannot auto-merge later. A failed or cancelled job
 can be retried once on the same task; change its description when the agent
 needs new information. Failure notices include the agent's question or error.
 
+Ordinary `@codex` tasks create a PR. Owner-only `!fast` tasks publish to `main`
+after the exact commit passes CI.
+
 Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
 veb boarddagi shu task sahifasida ko'rinadi.
