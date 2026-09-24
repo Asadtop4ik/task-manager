@@ -183,6 +183,58 @@ async def create_task(payload: TaskCreate, session: DbSession, user: CurrentUser
     return TaskOut.model_validate(await _load(session, task.id))
 
 
+def _card_worker_auth(token: str | None) -> None:
+    if not token or not hmac.compare_digest(token, settings.service_token):
+        raise HTTPException(status_code=401, detail="worker authentication required")
+
+
+@router.get("/card-sync/pending", response_model=list[TaskCardSyncOut])
+async def pending_card_sync(
+    session: DbSession, x_agent_worker_token: Annotated[str | None, Header()] = None
+) -> list[TaskCardSyncOut]:
+    _card_worker_auth(x_agent_worker_token)
+    rows = await session.scalars(
+        select(Activity)
+        .join(Task, Task.id == Activity.task_id)
+        .where(
+            Activity.kind.in_([ActivityKind.DELETED, ActivityKind.RESTORED]),
+            Activity.card_synced_at.is_(None),
+            Task.source_chat_id.is_not(None),
+            Task.source_message_id.is_not(None),
+        )
+        .order_by(Activity.id)
+        .limit(50)
+    )
+    notices: list[TaskCardSyncOut] = []
+    for row in rows:
+        task = await _load(session, row.task_id)
+        assert task.source_chat_id is not None and task.source_message_id is not None
+        notices.append(
+            TaskCardSyncOut(
+                event_id=row.id,
+                kind=row.kind,
+                chat_id=task.source_chat_id,
+                message_id=task.source_message_id,
+                task=TaskOut.model_validate(task),
+            )
+        )
+    return notices
+
+
+@router.post("/card-sync/{event_id}/notified", status_code=204)
+async def mark_card_synced(
+    event_id: int,
+    session: DbSession,
+    x_agent_worker_token: Annotated[str | None, Header()] = None,
+) -> None:
+    _card_worker_auth(x_agent_worker_token)
+    row = await session.get(Activity, event_id)
+    if row is None or row.kind not in {ActivityKind.DELETED, ActivityKind.RESTORED}:
+        raise HTTPException(status_code=404, detail="card event not found")
+    row.card_synced_at = datetime.now(UTC)
+    await session.commit()
+
+
 @router.get("/{task_id}", response_model=TaskOut)
 async def get_task(task_id: int, session: DbSession, user: CurrentUser) -> TaskOut:
     task = await _visible_or_404(session, user, await _load(session, task_id))
@@ -239,58 +291,6 @@ async def restore_task(task_id: int, session: DbSession, owner: OwnerUser) -> Ta
     activity.record(session, task_id=task.id, actor=owner, kind=ActivityKind.RESTORED)
     await session.commit()
     return TaskOut.model_validate(await _load(session, task.id))
-
-
-def _card_worker_auth(token: str | None) -> None:
-    if not token or not hmac.compare_digest(token, settings.service_token):
-        raise HTTPException(status_code=401, detail="worker authentication required")
-
-
-@router.get("/card-sync/pending", response_model=list[TaskCardSyncOut])
-async def pending_card_sync(
-    session: DbSession, x_agent_worker_token: Annotated[str | None, Header()] = None
-) -> list[TaskCardSyncOut]:
-    _card_worker_auth(x_agent_worker_token)
-    rows = await session.scalars(
-        select(Activity)
-        .join(Task, Task.id == Activity.task_id)
-        .where(
-            Activity.kind.in_([ActivityKind.DELETED, ActivityKind.RESTORED]),
-            Activity.card_synced_at.is_(None),
-            Task.source_chat_id.is_not(None),
-            Task.source_message_id.is_not(None),
-        )
-        .order_by(Activity.id)
-        .limit(50)
-    )
-    notices: list[TaskCardSyncOut] = []
-    for row in rows:
-        task = await _load(session, row.task_id)
-        assert task.source_chat_id is not None and task.source_message_id is not None
-        notices.append(
-            TaskCardSyncOut(
-                event_id=row.id,
-                kind=row.kind,
-                chat_id=task.source_chat_id,
-                message_id=task.source_message_id,
-                task=TaskOut.model_validate(task),
-            )
-        )
-    return notices
-
-
-@router.post("/card-sync/{event_id}/notified", status_code=204)
-async def mark_card_synced(
-    event_id: int,
-    session: DbSession,
-    x_agent_worker_token: Annotated[str | None, Header()] = None,
-) -> None:
-    _card_worker_auth(x_agent_worker_token)
-    row = await session.get(Activity, event_id)
-    if row is None or row.kind not in {ActivityKind.DELETED, ActivityKind.RESTORED}:
-        raise HTTPException(status_code=404, detail="card event not found")
-    row.card_synced_at = datetime.now(UTC)
-    await session.commit()
 
 
 @router.patch("/{task_id}", response_model=TaskOut)
