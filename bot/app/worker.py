@@ -17,6 +17,36 @@ from app.logging import configure_logging, get_logger
 log = get_logger(__name__)
 
 
+def agent_result_card(notice: dict[str, object]) -> str:
+    """A concise, factual status card. PR-ready never claims CI has passed."""
+    task_id = notice["task_id"]
+    project = str(notice.get("repo_full_name") or "").split("/")[-1]
+    title = str(notice.get("title") or "Vazifa").replace("\n", " ")[:180]
+    status = notice["status"]
+    lines = [f"🤖 #{task_id} · {project}", f"Vazifa: {title}"]
+    if status == "pr_ready":
+        if notice.get("mode") == "fast":
+            lines.append("Holat: !fast himoyalangan o‘zgarish sabab PRga o‘tdi.")
+        else:
+            lines.append("Holat: PR tayyor. CI natijasini PR sahifasida ko‘ring.")
+        lines.append(f"PR: {notice.get('pr_url') or '—'}")
+    elif status == "merged":
+        lines.append("Holat: PR birlashtirildi; production deploy tekshirilmoqda.")
+        lines.append(f"PR: {notice.get('pr_url') or '—'}")
+    elif status == "deployed":
+        sha = str(notice.get("deployed_sha") or "")
+        lines.append("Holat: ✅ Production’da, tekshiruv va image SHA mos.")
+        if sha:
+            lines.append(f"Commit: {sha[:12]}")
+        lines.append(f"Deploy: {notice.get('github_run_url') or '—'}")
+    else:
+        lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
+        lines.append(f"Sabab: {str(notice.get('error') or 'noma’lum')[:350]}")
+        if notice.get("github_run_url"):
+            lines.append(f"Jarayon: {notice['github_run_url']}")
+    return "\n".join(lines)
+
+
 async def ping(ctx: dict[str, object]) -> str:
     """Round-trip check for the queue itself.
 
@@ -40,35 +70,22 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
         try:
             for notice in notices:
                 chat_id = notice["chat_id"]
+                message_id = notice.get("telegram_message_id")
                 if chat_id:
-                    if notice["status"] == "pr_ready":
-                        prefix = (
-                            "⚠️ !fast himoyalangan kodga tegdi; "
-                            if notice.get("mode") == "fast"
-                            else "🤖 "
-                        )
-                        text = (
-                            f"{prefix}#{notice['task_id']} uchun PR tayyor: {notice['pr_url']}"
-                        )
-                    elif notice["status"] == "deployed":
-                        text = (
-                            f"✅ #{notice['task_id']} serverga chiqdi. "
-                            f"Deploy: {notice['github_run_url']}"
-                        )
-                    elif notice["status"] == "merged":
-                        text = (
-                            f"🔀 #{notice['task_id']} PR birlashtirildi. "
-                            "Serverga chiqishini tekshiryapman. "
-                            f"PR: {notice['pr_url']}"
-                        )
-                    else:
-                        text = (
-                            f"⚠️ #{notice['task_id']} Codex ishi to‘xtadi. "
-                            f"Sabab: {(notice['error'] or 'nomaʼlum')[:500]}. "
-                            f"Jarayon: {notice['github_run_url']}"
-                        )
+                    text = agent_result_card(notice)
                     try:
-                        await bot.send_message(chat_id, text)
+                        if message_id:
+                            try:
+                                await bot.edit_message_text(
+                                    text, chat_id=chat_id, message_id=message_id
+                                )
+                            except TelegramBadRequest as exc:
+                                if "message is not modified" not in str(exc).lower():
+                                    sent = await bot.send_message(chat_id, text)
+                                    message_id = sent.message_id
+                        else:
+                            sent = await bot.send_message(chat_id, text)
+                            message_id = sent.message_id
                     except (TelegramAPIError, OSError) as exc:
                         log.error(
                             "agent_notice_failed",
@@ -76,7 +93,11 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                             error=type(exc).__name__,
                         )
                         continue
-                ack = await client.post(f"{base}/{notice['run_id']}/notified", headers=headers)
+                ack = await client.post(
+                    f"{base}/{notice['run_id']}/notified",
+                    headers=headers,
+                    json={"message_id": message_id},
+                )
                 ack.raise_for_status()
         finally:
             await bot.session.close()
@@ -131,7 +152,10 @@ async def notify_project_discussions(ctx: dict[str, object]) -> None:
         try:
             for notice in response.json():
                 if notice["status"] == "idle":
-                    text = "💬 " + escape(str(notice.get("response") or "")[:3500])
+                    plain = (
+                        str(notice.get("response") or "").replace("**", "").replace("`", "")
+                    )
+                    text = "💬 " + escape(plain[:3500])
                     markup = discussion_keyboard(notice["id"])
                 else:
                     text = "⚠️ " + escape(str(notice.get("error") or "Suhbat xatosi")[:500])

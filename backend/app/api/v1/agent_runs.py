@@ -22,6 +22,7 @@ from app.schemas.agent_run import (
     AgentDeployment,
     AgentImageOut,
     AgentMerge,
+    AgentNoticeAck,
     AgentNotificationOut,
     AgentRunCallback,
     AgentRunOut,
@@ -260,12 +261,17 @@ async def pending_notifications(
             run_id=run.run_id,
             task_id=run.task_id,
             title=run.task.title,
+            repo_full_name=run.repo_full_name,
             chat_id=run.task.source_chat_id
             or (run.task.created_by.telegram_id if run.task.created_by else None),
             status=run.status,
             mode=run.mode,
             pr_url=run.pr_url,
             github_run_url=run.github_run_url,
+            head_sha=run.head_sha,
+            merged_sha=run.merged_sha,
+            deployed_sha=run.deployed_sha,
+            telegram_message_id=run.telegram_message_id,
             error=run.error,
         )
         for run in runs
@@ -276,6 +282,7 @@ async def pending_notifications(
 async def mark_notified(
     run_id: str,
     session: DbSession,
+    payload: AgentNoticeAck | None = None,
     x_agent_worker_token: str | None = Header(default=None),
 ) -> None:
     _worker_auth(x_agent_worker_token)
@@ -285,6 +292,8 @@ async def mark_notified(
     if run.status not in {"pr_ready", "merged", "failed", "deployed"}:
         raise HTTPException(status_code=409, detail="run is not finished")
     if run.notified_at is None:
+        if payload is not None and payload.message_id is not None:
+            run.telegram_message_id = payload.message_id
         run.notified_at = datetime.now(UTC)
         await session.commit()
 

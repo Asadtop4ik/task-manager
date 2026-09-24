@@ -75,9 +75,18 @@ class AgentNotificationOut(BaseModel):
     run_id: str
     task_id: int
     title: str
+    repo_full_name: str
     chat_id: int | None
     status: str
     mode: str
     pr_url: str | None
     github_run_url: str | None
+    head_sha: str | None
+    merged_sha: str | None
+    deployed_sha: str | None
+    telegram_message_id: int | None
     error: str | None
+
+
+class AgentNoticeAck(BaseModel):
+    message_id: int | None = Field(default=None, ge=1)

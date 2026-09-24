@@ -751,6 +751,7 @@ class IntakeWorker:
                 prompt = (
                     f"Discuss the approved project {repository} using its current read-only snapshot. "
                     "Answer in natural Uzbek (Latin script), briefly and concretely. "
+                    "Use plain text for Telegram: no Markdown stars, backticks or headings. "
                     "Read relevant project files when needed. Do not change files, run mutating "
                     "commands, reveal credentials, start implementation or deploy. If the user "
                     "wants a change, help clarify it; the bot has a separate task button. "
