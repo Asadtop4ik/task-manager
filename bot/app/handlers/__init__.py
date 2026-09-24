@@ -12,6 +12,7 @@ from app.handlers.cards import router as cards_router
 from app.handlers.common import router as common_router
 from app.handlers.lists import router as lists_router
 from app.handlers.new import router as new_router
+from app.handlers.project_discussion import router as project_discussion_router
 from app.handlers.quick import router as quick_router
 from app.handlers.team import router as team_router
 
@@ -21,6 +22,7 @@ router.include_router(common_router)
 router.include_router(lists_router)
 router.include_router(new_router)
 router.include_router(cards_router)
+router.include_router(project_discussion_router)
 router.include_router(agent_intake_router)
 router.include_router(quick_router)
 

@@ -32,11 +32,13 @@ cleanup() { ssh -o BatchMode=yes netcup "rm -rf -- '$remote_dir'"; }
 trap cleanup EXIT
 
 scp -q backend/app/services/agent_repos.py ops/project_catalog.py \
-  ops/intake_worker.py ops/agent_deploy_monitor.py "netcup:$remote_dir/"
+  ops/intake_worker.py ops/discussion_appserver.py \
+  ops/agent_deploy_monitor.py "netcup:$remote_dir/"
 ssh -o BatchMode=yes netcup "
   sudo install -o root -g root -m 0644 '$remote_dir/agent_repos.py' /opt/task-manager/ops/agent_repos.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/project_catalog.py' /opt/task-manager/ops/project_catalog.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/intake_worker.py' /opt/task-manager/ops/intake_worker.py &&
+  sudo install -o root -g root -m 0644 '$remote_dir/discussion_appserver.py' /opt/task-manager/ops/discussion_appserver.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/agent_deploy_monitor.py' /opt/task-manager/ops/agent_deploy_monitor.py &&
   sudo systemctl restart task-manager-intake.service &&
   sudo systemctl start task-manager-external-monitor.service &&

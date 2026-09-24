@@ -13,6 +13,15 @@ remain planned work.
 
 ## Coding agent integration
 
+Codex huquqi bor a’zo botning shaxsiy chatida `/suhbat qurbot` (yoki boshqa
+loyiha kaliti) bilan loyiha haqida bir necha xabar davomida gaplasha oladi.
+Suhbat shu a’zo va loyiha uchun saqlanadi; matn va rasm yuborish mumkin. Javob
+ostidagi **Vazifa qilish** tugmasi mavjud task xulosasi va tasdiqlash oqimini
+ochadi. Task va kod ishi faqat xulosa tasdiqlangandan keyin yaratiladi. `/cancel`
+suhbatdan chiqadi, `/suhbat <loyiha>` uni davom ettiradi. **Yangi suhbat**
+tugmasi oldingi kontekstni tozalaydi. Suhbat Codex app-server orqali read-only
+rejimda, alohida `codex-runner` foydalanuvchisida bajariladi.
+
 In a private Telegram chat, send `task-manager: @codex ...` or owner-only
 `task-manager: !fast ...`. The bot keeps this as a draft while a separate
 read-only Codex worker checks the repository and up to three reference images.

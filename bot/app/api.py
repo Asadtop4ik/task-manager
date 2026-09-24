@@ -144,6 +144,30 @@ class TaskApi:
     async def retry_agent_intake(self, intake_id: int) -> dict[str, Any]:
         return await self._request("POST", f"/agent-intakes/{intake_id}/retry")
 
+    # --- project discussion -------------------------------------------
+
+    async def start_discussion(self, project_id: int, chat_id: int) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/project-discussions",
+            json={"project_id": project_id, "chat_id": chat_id},
+        )
+
+    async def discussion(self, discussion_id: int) -> dict[str, Any]:
+        return await self._request("GET", f"/project-discussions/{discussion_id}")
+
+    async def discussion_message(
+        self, discussion_id: int, text: str, images: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/project-discussions/{discussion_id}/messages",
+            json={"text": text, "images": images or []},
+        )
+
+    async def reset_discussion(self, discussion_id: int) -> dict[str, Any]:
+        return await self._request("POST", f"/project-discussions/{discussion_id}/reset")
+
     async def tasks(self, **params: Any) -> dict[str, Any]:
         clean = {k: v for k, v in params.items() if v is not None}
         return await self._request("GET", "/tasks", params=clean)

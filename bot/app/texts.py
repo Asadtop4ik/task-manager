@@ -57,6 +57,7 @@ HELP = (
     "/my — mening ochiq vazifalarim\n"
     "/today — bugungi va muddati o‘tganlari\n"
     "/projects — loyihalar ro‘yxati\n"
+    "/suhbat qurbot — loyiha haqida Codex bilan davomli suhbat\n"
     "/login — bir martalik brauzer havolasi\n"
     "/invite — jamoaga taklif (egasi uchun)\n"
     "/pending — tasdiqlash kutayotgan a’zolar\n"
