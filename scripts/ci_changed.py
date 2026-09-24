@@ -25,7 +25,9 @@ def selected_jobs(paths: list[str] | None) -> dict[str, bool]:
     return selected
 
 
-def changed_paths(event: dict, event_name: str, head: str) -> list[str] | None:
+def changed_paths(
+    event: dict, event_name: str, head: str, *, cwd: str | None = None
+) -> list[str] | None:
     if event_name == "pull_request":
         base = (event.get("pull_request") or {}).get("base", {}).get("sha")
     elif event_name == "push":
@@ -33,7 +35,7 @@ def changed_paths(event: dict, event_name: str, head: str) -> list[str] | None:
         if base == "0" * 40:
             try:
                 base = subprocess.check_output(
-                    ["git", "merge-base", "origin/main", head], text=True
+                    ["git", "merge-base", "origin/main", head], text=True, cwd=cwd
                 ).strip()
             except subprocess.CalledProcessError:
                 return None
@@ -42,7 +44,12 @@ def changed_paths(event: dict, event_name: str, head: str) -> list[str] | None:
     if not isinstance(base, str) or len(base) != 40:
         return None
     try:
-        raw = subprocess.check_output(["git", "diff", "--name-only", "-z", base, head])
+        # Rename detection reports only the destination. Treat a move as a
+        # deletion plus an addition so checks for both services run.
+        raw = subprocess.check_output(
+            ["git", "diff", "--no-renames", "--name-only", "-z", base, head],
+            cwd=cwd,
+        )
     except subprocess.CalledProcessError:
         return None
     return [path.decode() for path in raw.split(b"\0") if path]
