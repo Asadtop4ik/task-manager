@@ -14,6 +14,9 @@ def configure_logging() -> None:
     both read.
     """
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
+    # Telegram's download URL embeds the bot token. httpx's INFO request log
+    # includes URLs, so never let it print those requests.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     renderer: structlog.types.Processor = (
         structlog.dev.ConsoleRenderer()

@@ -109,7 +109,7 @@ async def test_photo_then_text_submits_image_and_text_together(monkeypatch) -> N
 
     payload = api.create_agent_intake.await_args.args[0]
     assert (
-        payload["text"] == "Please use this screenshot\ntask-manager: @codex fix this screen"
+        payload["text"] == "task-manager: @codex fix this screen\nPlease use this screenshot"
     )
     assert payload["images"] == images
     assert payload["mode"] == "pr"
@@ -135,7 +135,7 @@ async def test_photo_draft_expires_after_ten_minutes(monkeypatch) -> None:
 
 
 async def test_private_photo_starts_draft_and_group_photo_is_ignored(monkeypatch) -> None:
-    monkeypatch.setattr(agent_intake, "settings", SimpleNamespace(agent_intake_enabled=True))
+    _api(monkeypatch)
     image_message = _message()
     image_message.photo = [SimpleNamespace(file_id="photo", file_size=1500)]
     image_message.document = None
@@ -185,7 +185,7 @@ async def test_photo_caption_creates_an_intake_with_the_image(monkeypatch) -> No
 
 
 async def test_fourth_image_is_rejected_without_dropping_existing_draft(monkeypatch) -> None:
-    monkeypatch.setattr(agent_intake, "settings", SimpleNamespace(agent_intake_enabled=True))
+    _api(monkeypatch)
     now = datetime.now(UTC).timestamp()
     state = _state(
         {
@@ -215,6 +215,27 @@ def test_directive_match_does_not_trigger_on_mention_prefixes() -> None:
     assert not agent_intake._has_agent_directive("read !fastly logs")
 
 
+def test_ready_notice_shows_goal_criteria_assumptions_and_mode() -> None:
+    text, markup = agent_intake.notification_message(
+        {
+            "id": 9,
+            "status": "ready",
+            "title": "Board update",
+            "mode": "fast",
+            "brief": {
+                "goal": "Show the finished column",
+                "acceptance": ["Done tasks are visible"],
+                "assumptions": ["Blocked tasks stay hidden"],
+            },
+        }
+    )
+    assert "Show the finished column" in text
+    assert "Done tasks are visible" in text
+    assert "Blocked tasks stay hidden" in text
+    assert "PRsiz" in text
+    assert markup is not None
+
+
 async def test_needs_answers_routes_user_text_as_answer(monkeypatch) -> None:
     api = _api(monkeypatch, current={"id": 33, "status": "needs_answers"})
     message = _message(text="Only private users can see it")
@@ -229,7 +250,7 @@ async def test_needs_answers_routes_user_text_as_answer(monkeypatch) -> None:
     api.create_task.assert_not_awaited()
 
 
-async def test_ready_intake_routes_unprompted_text_as_revision(monkeypatch) -> None:
+async def test_ready_intake_requires_explicit_edit_button(monkeypatch) -> None:
     api = _api(monkeypatch, current={"id": 33, "status": "ready"})
     message = _message(text="Also handle the mobile layout")
 
@@ -238,8 +259,9 @@ async def test_ready_intake_routes_unprompted_text_as_revision(monkeypatch) -> N
     )
 
     assert handled is True
-    api.revise_agent_intake.assert_awaited_once_with(33, "Also handle the mobile layout")
+    api.revise_agent_intake.assert_not_awaited()
     api.create_agent_intake.assert_not_awaited()
+    assert "Tuzatish" in message.answer.await_args.args[0]
 
 
 def test_image_validation_enforces_types_size_and_count_boundary() -> None:

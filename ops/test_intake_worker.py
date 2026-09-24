@@ -203,6 +203,7 @@ class IntakeWorkerTests(unittest.TestCase):
         def run_command(args, **kwargs):
             if args[-1] == "codex-child":
                 request = json.loads(kwargs["input"])
+                self.assertTrue((Path(request["session_dir"]) / "codex-tmp").is_dir())
                 image_path = Path(request["images"][0])
                 captured_image_args.append((str(image_path), image_path.read_bytes()))
                 output_path = Path(request["session_dir"]) / "codex-result.json"

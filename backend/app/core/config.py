@@ -77,6 +77,8 @@ class Settings(BaseSettings):
     )
     agent_callback_token: str = Field(default="", alias="AGENT_CALLBACK_TOKEN")
     agent_fast_enabled: bool = Field(default=False, alias="AGENT_FAST_ENABLED")
+    agent_intake_enabled: bool = Field(default=False, alias="AGENT_INTAKE_ENABLED")
+    intake_worker_token: str = Field(default="", alias="INTAKE_WORKER_TOKEN")
 
     # --- Web ---
     public_url: str = Field(default="http://localhost:5173", alias="PUBLIC_URL")
@@ -121,6 +123,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"{', '.join(short)} must be at least 32 characters in production — "
                 "generate with `openssl rand -hex 32`"
+            )
+        if self.agent_intake_enabled and len(self.intake_worker_token) < 32:
+            raise ValueError(
+                "INTAKE_WORKER_TOKEN must be at least 32 characters when intake is enabled"
             )
         return self
 

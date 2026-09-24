@@ -19,6 +19,37 @@ from agent_task import (
 
 
 class UsageTests(unittest.TestCase):
+    def test_reference_image_cannot_be_committed_even_if_renamed(self) -> None:
+        task = {
+            "task_id": 7,
+            "run_id": "00000000-0000-0000-0000-000000000007",
+            "title": "Screenshot task",
+            "description": "",
+            "base_branch": "main",
+            "mode": "pr",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            image_dir = root / "agent-images"
+            image_dir.mkdir()
+            image = b"\x89PNG\r\n\x1a\nreference"
+            (image_dir / "source.png").write_bytes(image)
+            copied = repo / "frontend/public/renamed.png"
+            copied.parent.mkdir(parents=True)
+            copied.write_bytes(image)
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "RUNNER_TEMP": temp,
+                "GITHUB_ENV": str(root / "github-env"),
+            }
+            with patch.dict(os.environ, environment), self.assertRaisesRegex(
+                ValueError, "reference images"
+            ):
+                check_diff(cwd=str(repo))
+
     def test_renamed_security_file_forces_fast_pr(self) -> None:
         task = {
             "task_id": 7,

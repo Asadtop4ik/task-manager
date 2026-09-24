@@ -180,7 +180,7 @@ class WorkerSettings:
     ]
     cron_jobs = [  # noqa: RUF012
         cron(notify_agent_runs, minute=set(range(60))),
-        cron(notify_agent_intakes, minute=set(range(60))),
+        cron(notify_agent_intakes, minute=set(range(60)), second=set(range(0, 60, 10))),
         cron(sync_deleted_task_cards, minute=set(range(60))),
     ]
     on_startup = startup

@@ -71,9 +71,7 @@ def _image_payload(message: Message) -> tuple[dict[str, Any] | None, str | None]
 
     if mime_type not in _ALLOWED_MIME_TYPES:
         return None, "Faqat PNG, JPEG yoki WebP rasmlar qabul qilinadi."
-    if size is None:
-        return None, "Rasm hajmini aniqlab bo‘lmadi. Iltimos, qayta yuboring."
-    if size > MAX_IMAGE_BYTES:
+    if size is not None and size > MAX_IMAGE_BYTES:
         return None, "Rasm 20 MB dan katta. Kichikroq rasm yuboring."
     return {"file_id": file_id, "mime": mime_type, "size": size}, None
 
@@ -94,13 +92,12 @@ def notification_message(notice: dict[str, Any]) -> tuple[str, Any | None]:
     intake_id = int(notice["id"])
     status = notice["status"]
     title = escape(str(notice.get("title") or "Codex vazifasi")[:180])
-    brief = escape(str(notice.get("brief") or "")[:2800])
+    brief_data = notice.get("brief") or {}
+    brief = brief_data if isinstance(brief_data, dict) else {}
 
     if status == "needs_answers":
         questions = notice.get("questions") or []
         lines = [f"🤔 <b>{title}</b>", ""]
-        if brief:
-            lines.extend([brief, ""])
         lines.append("Quyidagi savollarga javob bering:")
         lines.extend(
             f"{index}. {escape(str(question)[:500])}"
@@ -110,7 +107,19 @@ def notification_message(notice: dict[str, Any]) -> tuple[str, Any | None]:
 
     if status == "ready":
         mode = "!fast · PRsiz" if notice.get("mode") == "fast" else "PR ochiladi"
-        text = f"🧭 <b>Task xulosasi</b>\n\n<b>{title}</b>\n{brief}\n\nRejim: {mode}"
+        lines = ["🧭 <b>Task xulosasi</b>", "", f"<b>{title}</b>"]
+        if brief.get("goal"):
+            lines.append(f"Maqsad: {escape(str(brief['goal'])[:800])}")
+        acceptance = brief.get("acceptance") or []
+        if acceptance:
+            lines.append("Qabul mezonlari:")
+            lines.extend(f"• {escape(str(item)[:250])}" for item in acceptance[:5])
+        assumptions = brief.get("assumptions") or []
+        if assumptions:
+            lines.append("Taxminlar:")
+            lines.extend(f"• {escape(str(item)[:150])}" for item in assumptions[:5])
+        lines.extend(["", f"Rejim: {mode}"])
+        text = "\n".join(lines)
         return text, _action_keyboard(
             intake_id,
             ("✅ Bajarish", "confirm"),
@@ -216,9 +225,23 @@ async def receive_image(message: Message, state: FSMContext) -> None:
         await message.answer("Rasmli Codex intake hozircha yoqilmagan.")
         return
 
-    image, error = _image_payload(message)
-    if error:
-        await message.answer(error)
+    api = api_for(message)
+    try:
+        actor = await api.me()
+        current = await api.current_agent_intake()
+    except ApiError as error:
+        await explain_api_error(message, error)
+        return
+    if not (actor.get("can_use_codex") or actor.get("is_owner")):
+        await message.answer("Rasmli Codex taski uchun sizga Codex huquqi kerak.")
+        return
+    if current:
+        await message.answer("Avval faol Codex xulosasini tasdiqlang yoki /cancel yozing.")
+        return
+
+    image, image_error = _image_payload(message)
+    if image_error:
+        await message.answer(image_error)
         return
     assert image is not None
 
@@ -288,8 +311,10 @@ async def route_intake_text(message: Message, state: FSMContext, text: str) -> b
                 await message.answer("Javob qabul qilindi. Codex xulosani yangilaydi.")
                 return True
             if status == "ready":
-                await api.revise_agent_intake(intake_id, text)
-                await message.answer("Tuzatish qabul qilindi. Yangilangan xulosani yuboraman.")
+                await message.answer(
+                    "Xulosani o‘zgartirish uchun undagi ✏️ Tuzatish tugmasini bosing; "
+                    "yoki ✅ Bajarish bilan tasdiqlang."
+                )
                 return True
         except ApiError as error:
             await explain_api_error(message, error)
@@ -306,7 +331,7 @@ async def route_intake_text(message: Message, state: FSMContext, text: str) -> b
             return True
 
     if draft_active:
-        full_text = "\n".join([*data.get("photo_draft_text_parts", []), text]).strip()
+        full_text = "\n".join([text, *data.get("photo_draft_text_parts", [])]).strip()
         return await _create_intake(message, state, full_text, draft_images)
 
     return (

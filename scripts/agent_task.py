@@ -6,6 +6,7 @@ values; it never interpolates the task text into shell source.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -323,6 +324,24 @@ def check_diff(*, cwd: str | None = None) -> None:
         raise ValueError(
             f"credential files cannot be committed: {', '.join(credential_paths)}"
         )
+    # Reference screenshots live outside the checkout and must not be copied
+    # into a commit or PR patch. Compare bytes rather than filenames because
+    # an agent could rename the source image before adding it.
+    image_dir = Path(os.environ["RUNNER_TEMP"]) / "agent-images"
+    if image_dir.is_dir():
+        def digest(path: Path) -> bytes:
+            hasher = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            return hasher.digest()
+
+        source_images = {digest(path) for path in image_dir.iterdir() if path.is_file()}
+        root = Path(cwd or os.getcwd())
+        for relative in paths:
+            candidate = root / relative
+            if candidate.is_file() and not candidate.is_symlink() and digest(candidate) in source_images:
+                raise ValueError("task reference images cannot be committed")
     task = _task()
     fallback = task["mode"] == "fast" and fast_needs_pr(paths)
     if task["mode"] == "fast" and not fallback:

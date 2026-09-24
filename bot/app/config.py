@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     service_token: str = Field(default="change-me", alias="SERVICE_TOKEN")
     redis_url: str = Field(alias="REDIS_URL")
     timezone: str = Field(default="Asia/Tashkent", alias="TIMEZONE")
+    agent_intake_enabled: bool = Field(default=False, alias="AGENT_INTAKE_ENABLED")
 
     @model_validator(mode="after")
     def _no_placeholder_secrets_in_production(self) -> "Settings":
