@@ -54,6 +54,34 @@ export type AgentRun = {
   output_tokens: number | null;
   created_at: string;
   finished_at: string | null;
+  runner_started_at: string | null;
+  pr_ready_at: string | null;
+  merged_at: string | null;
+  deployed_at: string | null;
+};
+
+export type MetricDuration = {
+  samples: number;
+  p50_seconds: number | null;
+  p90_seconds: number | null;
+};
+
+export type AgentMetrics = {
+  since: string;
+  target_tasks: number;
+  sampled_runs: number;
+  enough_data: boolean;
+  deployed: number;
+  failed_attempts: number;
+  cancelled_attempts: number;
+  retried: number;
+  queue: MetricDuration;
+  implementation: MetricDuration;
+  human_review: MetricDuration;
+  end_to_end: MetricDuration;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
 };
 
 export type Task = {

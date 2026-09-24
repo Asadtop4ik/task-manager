@@ -213,6 +213,7 @@ async def test_external_merge_notice_does_not_mark_task_done_before_deploy(
     )
     assert merged.status_code == 200
     assert merged.json()["status"] == "merged" and merged.json()["merged_sha"] == "c" * 40
+    assert merged.json()["merged_at"] is not None
     await session.refresh(task)
     assert task.status == TaskStatus.REVIEW
     notices = await client.get(
@@ -340,6 +341,12 @@ async def test_pr_callback_requires_token_and_matching_pr(
         )
     ).json()
     url = f"/api/v1/agent-runs/{run['run_id']}/callback"
+    started = await client.post(
+        url,
+        json={"run_id": run["run_id"], "status": "running"},
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert started.status_code == 200 and started.json()["runner_started_at"] is not None
     payload = {
         "run_id": run["run_id"],
         "status": "pr_ready",
@@ -367,6 +374,7 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert accepted.json()["input_tokens"] == 6194
     assert accepted.json()["cached_input_tokens"] == 4000
     assert accepted.json()["output_tokens"] == 280
+    assert accepted.json()["pr_ready_at"] is not None
     assert (
         await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
     ).json()["status"] == "review"
@@ -401,6 +409,7 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert deployed.json()["status"] == "deployed"
     assert deployed.json()["deployed_sha"] == "b" * 40
     assert deployed.json()["head_sha"] == "c" * 40
+    assert deployed.json()["deployed_at"] is not None
     assert (
         await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
     ).json()["status"] == "done"

@@ -116,7 +116,12 @@ export default function Board() {
         <header className="px-4 pt-8 pb-4">
           <div className="flex items-center justify-between gap-3">
             <h1 className="text-page font-semibold">Doska</h1>
-            {user?.is_owner && <Link to="/trash" className="text-sm text-muted underline" title="O‘chirilgan vazifalarni bu yerda tiklash mumkin">O‘chirilganlar</Link>}
+            {user?.is_owner && (
+              <div className="flex flex-wrap gap-3 text-sm text-muted">
+                <Link to="/metrics" className="underline">Agent tezligi</Link>
+                <Link to="/trash" className="underline" title="O‘chirilgan vazifalarni bu yerda tiklash mumkin">O‘chirilganlar</Link>
+              </div>
+            )}
           </div>
           {deleteTask.isError && <p role="alert" className="mt-2 text-sm text-late">
             {deleteTask.error instanceof AxiosError && deleteTask.error.response?.status === 409

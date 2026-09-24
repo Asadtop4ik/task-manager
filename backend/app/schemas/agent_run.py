@@ -25,6 +25,10 @@ class AgentRunOut(BaseModel):
     output_tokens: int | None
     created_at: datetime
     finished_at: datetime | None
+    runner_started_at: datetime | None
+    pr_ready_at: datetime | None
+    merged_at: datetime | None
+    deployed_at: datetime | None
 
 
 class AgentRunCallback(BaseModel):
@@ -90,3 +94,27 @@ class AgentNotificationOut(BaseModel):
 
 class AgentNoticeAck(BaseModel):
     message_id: int | None = Field(default=None, ge=1)
+
+
+class MetricDuration(BaseModel):
+    samples: int
+    p50_seconds: int | None
+    p90_seconds: int | None
+
+
+class AgentMetricsOut(BaseModel):
+    since: datetime
+    target_tasks: int
+    sampled_runs: int
+    enough_data: bool
+    deployed: int
+    failed_attempts: int
+    cancelled_attempts: int
+    retried: int
+    queue: MetricDuration
+    implementation: MetricDuration
+    human_review: MetricDuration
+    end_to_end: MetricDuration
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int

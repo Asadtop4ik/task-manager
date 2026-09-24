@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import Shell from "@/components/Shell";
 import Board from "@/pages/Board";
+import AgentMetricsPage from "@/pages/AgentMetrics";
 import Login from "@/pages/Login";
 import MyDay from "@/pages/MyDay";
 import ProjectDetail from "@/pages/ProjectDetail";
@@ -31,6 +32,7 @@ export default function App() {
         <Route element={<Shell />}>
           <Route index element={<MyDay />} />
           <Route path="board" element={<Board />} />
+          <Route path="metrics" element={<AgentMetricsPage />} />
           <Route path="projects" element={<Projects />} />
           <Route path="projects/:id" element={<ProjectDetail />} />
           <Route path="tasks/:id" element={<TaskDetail />} />
