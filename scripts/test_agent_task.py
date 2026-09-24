@@ -6,7 +6,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_task import _changed_fragments, _task, callback, check_diff, fast_needs_pr, started, usage
+from agent_task import (
+    _changed_fragments,
+    _safe_fast_patch,
+    _task,
+    callback,
+    check_diff,
+    fast_needs_pr,
+    started,
+    usage,
+)
 
 
 class UsageTests(unittest.TestCase):
@@ -122,6 +131,38 @@ class UsageTests(unittest.TestCase):
             with patch.dict(os.environ, environment):
                 check_diff(cwd=temp)
             self.assertIn("FAST_FALLBACK=true", (root / "github-env").read_text())
+
+    def test_positive_fast_gate_rejects_logic_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+            git("init")
+            git("config", "user.email", "ci@example.test")
+            git("config", "user.name", "CI Test")
+            board = root / "frontend/src/pages/Board.tsx"
+            board.parent.mkdir(parents=True)
+            board.write_text('const link = user.is_owner && <Link>Trash</Link>;\n')
+            git("add", ".")
+            git("commit", "-m", "base")
+
+            board.write_text('const link = user.is_owner && <Link title="Show hidden tasks">Trash</Link>;\n')
+            self.assertTrue(_safe_fast_patch(cwd=temp, untracked=[]))
+            board.write_text('const link = user.is_owner || <Link>Trash</Link>;\n')
+            self.assertFalse(_safe_fast_patch(cwd=temp, untracked=[]))
+            board.write_text('const amount = 1;\n')
+            self.assertFalse(_safe_fast_patch(cwd=temp, untracked=[]))
+            board.write_text('const link = user.is_owner && <Link>Trash</Link>;\n')
+            styles = root / "frontend/src/styles.css"
+            styles.write_text(".tag { color: red; }\n")
+            git("add", ".")
+            git("commit", "-m", "baseline styles")
+            styles.write_text(".tag { color: blue; }\n")
+            self.assertTrue(_safe_fast_patch(cwd=temp, untracked=[]))
+            styles.write_text('.tag { content: "$100"; }\n')
+            self.assertFalse(_safe_fast_patch(cwd=temp, untracked=[]))
 
     def test_fast_mode_is_validated_in_dispatch_payload(self) -> None:
         task = {

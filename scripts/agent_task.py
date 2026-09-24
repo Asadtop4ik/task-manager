@@ -97,7 +97,13 @@ _SENSITIVE_CHANGE = re.compile(
     r"restore|is_owner|can_use_codex|canUseCodex)\b",
     re.IGNORECASE,
 )
-_PRESENTATION_ATTRIBUTE = re.compile(r'\s*(?:title|aria-label)="[^"]*"')
+_PRESENTATION_ATTRIBUTE = re.compile(
+    r'\s*(?:title|aria-label|alt|placeholder|className)="[^"]*"'
+)
+_UNSAFE_CSS = re.compile(
+    r"(?:url\s*\(|@import|expression\s*\(|behavior\s*:|binding\s*:|data\s*:|content\s*:)",
+    re.IGNORECASE,
+)
 
 
 def fast_needs_pr(paths: list[str], changed_fragments: list[str] | None = None) -> bool:
@@ -214,6 +220,76 @@ def _changed_code(*, cwd: str | None, untracked: list[str]) -> list[str]:
     return fragments
 
 
+def _safe_fast_patch(*, cwd: str | None, untracked: list[str]) -> bool:
+    """Only unambiguous presentation edits can bypass the owner PR in the pilot.
+
+    A denylist cannot prove that a numeric or boolean edit is unrelated to
+    money or permissions. Unknown edits therefore fall back to review, with no
+    arbitrary cap on the number of CSS files or static attributes changed.
+    """
+    if untracked:
+        return False
+    patch = subprocess.check_output(
+        ["git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", "HEAD"],
+        cwd=cwd,
+        text=True,
+        errors="replace",
+    )
+    sections = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    if len(sections) < 2:
+        return False
+    for section in sections[1:]:
+        lines = section.splitlines()
+        if any(
+            line.startswith(("new file mode ", "deleted file mode ", "GIT binary patch"))
+            for line in lines
+        ):
+            return False
+        new_path = next((line[6:] for line in lines if line.startswith("+++ b/")), None)
+        if new_path is None:
+            return False
+        if new_path.endswith(".css"):
+            if _UNSAFE_CSS.search(section):
+                return False
+            continue
+        if not new_path.endswith(".tsx"):
+            return False
+        before: list[str] = []
+        after: list[str] = []
+        saw_hunk = False
+
+        def safe_hunk() -> bool:
+            if len(before) != 1 or len(after) != 1:
+                return False
+            changes = [
+                (before[0][left_start:left_end], after[0][right_start:right_end])
+                for operation, left_start, left_end, right_start, right_end in SequenceMatcher(
+                    None, before[0], after[0], autojunk=False
+                ).get_opcodes()
+                if operation != "equal"
+            ]
+            return bool(changes) and all(
+                (not old and _PRESENTATION_ATTRIBUTE.fullmatch(new))
+                or (_PRESENTATION_ATTRIBUTE.fullmatch(old) and _PRESENTATION_ATTRIBUTE.fullmatch(new))
+                for old, new in changes
+            )
+
+        for line in lines:
+            if line.startswith("@@"):
+                if saw_hunk and not safe_hunk():
+                    return False
+                before.clear()
+                after.clear()
+                saw_hunk = True
+            elif saw_hunk and line.startswith("-") and not line.startswith("--- "):
+                before.append(line[1:])
+            elif saw_hunk and line.startswith("+") and not line.startswith("+++ "):
+                after.append(line[1:])
+        if not saw_hunk or not safe_hunk():
+            return False
+    return True
+
+
 def check_diff(*, cwd: str | None = None) -> None:
     tracked = (
         subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z"], cwd=cwd)
@@ -253,6 +329,8 @@ def check_diff(*, cwd: str | None = None) -> None:
         fallback = fast_needs_pr(
             paths, _changed_code(cwd=cwd, untracked=[path for path in untracked if path])
         )
+    if task["mode"] == "fast" and not fallback:
+        fallback = not _safe_fast_patch(cwd=cwd, untracked=[path for path in untracked if path])
     _write_env(
         "FAST_FALLBACK",
         "true" if fallback else "false",

@@ -28,6 +28,8 @@ pilot publish to `main` only after the exact commit passes independent GitHub
 CI. Sensitive changes fall back to a PR. A failed or missing CI run blocks the
 task without publishing or opening a PR. Deployment marks the task done only
 after the requested image passes readiness checks; a failed release rolls back.
+During this first pilot, direct publication is limited to existing CSS styling
+and literal JSX tooltip/accessibility attributes; other code changes use a PR.
 
 Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
