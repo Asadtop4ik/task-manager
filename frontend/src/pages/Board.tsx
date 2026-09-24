@@ -195,7 +195,9 @@ export default function Board() {
             ))}
           </ul>
           {!isPending && !inColumn(column).length && (
-            <Empty title={`${STATUS_LABEL[column]} — bo‘sh.`} />
+            <Empty
+              title={column === "done" ? "Hozircha vazifa yo‘q" : `${STATUS_LABEL[column]} — bo‘sh.`}
+            />
           )}
         </div>
 
@@ -233,6 +235,9 @@ export default function Board() {
                   {STATUS_LABEL[status]}
                   <span className="text-muted">{rows.length}</span>
                 </h2>
+                {status === "done" && !isPending && rows.length === 0 && (
+                  <p className="px-1 text-sm text-muted">Hozircha vazifa yo‘q</p>
+                )}
                 <ul ref={(node) => void (columns.current[status] = node)}>
                   {rows.map((task, index) => (
                     <Fragment key={task.id}>
