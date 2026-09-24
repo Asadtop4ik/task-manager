@@ -113,6 +113,14 @@ class UsageTests(unittest.TestCase):
             with patch.dict(os.environ, environment):
                 check_diff(cwd=temp)
             self.assertIn("FAST_FALLBACK=true", (root / "github-env").read_text())
+            (root / "github-env").write_text("")
+            subprocess.run(
+                ["git", "add", str(source.relative_to(root))],
+                cwd=root, check=True, capture_output=True,
+            )
+            with patch.dict(os.environ, environment):
+                check_diff(cwd=temp)
+            self.assertIn("FAST_FALLBACK=true", (root / "github-env").read_text())
 
     def test_fast_mode_is_validated_in_dispatch_payload(self) -> None:
         task = {
