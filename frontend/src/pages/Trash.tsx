@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import Page from "@/components/Page";
 import { useAuth } from "@/lib/auth";
@@ -9,6 +9,12 @@ export default function Trash() {
   const [offset, setOffset] = useState(0);
   const trash = useTrash(offset);
   const restore = useRestoreTask();
+
+  useEffect(() => {
+    if (trash.data && offset > 0 && offset >= trash.data.total) {
+      setOffset(Math.max(0, offset - 50));
+    }
+  }, [offset, trash.data]);
 
   if (state.status !== "authenticated" || !state.user.is_owner) {
     return <Page><p className="p-4">Bunga ruxsatingiz yo‘q.</p></Page>;
@@ -36,7 +42,7 @@ export default function Trash() {
       </li>)}
     </ul>
     {trash.data?.total === 0 && <p className="px-4 py-8 text-muted">O‘chirilgan vazifa yo‘q.</p>}
-    {trash.data && trash.data.total > 50 && <div className="flex items-center justify-between px-4 py-4 text-sm">
+    {trash.data && (trash.data.total > 50 || offset > 0) && <div className="flex items-center justify-between px-4 py-4 text-sm">
       <button type="button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))} className="disabled:opacity-40">← Oldingi</button>
       <span>{offset + 1}–{Math.min(offset + 50, trash.data.total)} / {trash.data.total}</span>
       <button type="button" disabled={offset + 50 >= trash.data.total} onClick={() => setOffset(offset + 50)} className="disabled:opacity-40">Keyingi →</button>
