@@ -48,14 +48,14 @@ class PolicyTests(unittest.TestCase):
         checks = [
             {"name": name, "id": index, "conclusion": "success"}
             for index, name in enumerate(
-                ("backend", "bot", "frontend", "agent-policy"), 1
+                ("gate", "agent-policy"), 1
             )
         ]
         self.assertTrue(latest_checks_pass(checks))
         self.assertFalse(latest_checks_pass(checks[:-1]))
         self.assertFalse(
             latest_checks_pass(
-                checks + [{"name": "backend", "id": 9, "conclusion": "failure"}]
+                checks + [{"name": "gate", "id": 9, "conclusion": "failure"}]
             )
         )
 
