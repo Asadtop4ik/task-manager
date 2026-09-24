@@ -24,6 +24,11 @@ for the original design; verify old deployment notes against the live workflows.
 - Frontend: from `frontend/`, run `npm ci`, `npm run typecheck`, `npm run build`.
 - A backend model change requires an Alembic migration in the same change. CI
   applies migrations to an empty PostgreSQL database and checks schema drift.
+- The self-hosted Codex task runner has 1 CPU / 2 GiB RAM. On that runner, do
+  not reinstall dependencies or run the full suites/build for each task. Check
+  the diff and run only quick targeted checks with dependencies already present;
+  state what was not run. Independent GitHub-hosted CI performs the full
+  relevant checks before a PR merge or `!fast` publication.
 
 ## Agent tasks
 
