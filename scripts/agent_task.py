@@ -439,6 +439,12 @@ def callback() -> None:
         reason = fast_error.read_text(encoding="utf-8").strip() if fast_error.exists() else ""
         if not reason and policy_error.exists():
             reason = policy_error.read_text(encoding="utf-8").strip()
+        if reason.endswith("agent produced no file changes") and result_file.exists():
+            # The validator is authoritative; the model's last message is only
+            # context for why it chose not to edit. Keep both, distinctly.
+            explanation = " ".join(result_file.read_text(encoding="utf-8").split())
+            if explanation:
+                reason += "\nCodex izohi (tasdiqlanmagan): " + explanation[:650]
         if (
             not reason
             and os.environ.get("FAILURE_PHASE") == "implement"
@@ -470,5 +476,9 @@ if __name__ == "__main__":
         urllib.error.URLError,
         subprocess.CalledProcessError,
     ) as exc:
+        if len(sys.argv) > 1 and sys.argv[1] == "check-diff" and os.environ.get("RUNNER_TEMP"):
+            (Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt").write_text(
+                f"agent task failed: {exc}", encoding="utf-8"
+            )
         print(f"agent task failed: {exc}", file=sys.stderr)
         sys.exit(1)

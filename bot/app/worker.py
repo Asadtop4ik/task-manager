@@ -41,7 +41,7 @@ def agent_result_card(notice: dict[str, object]) -> str:
         lines.append(f"Deploy: {notice.get('github_run_url') or '—'}")
     else:
         lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
-        lines.append(f"Sabab: {str(notice.get('error') or 'noma’lum')[:350]}")
+        lines.append(f"Sabab: {str(notice.get('error') or 'noma’lum')[:800]}")
         if notice.get("github_run_url"):
             lines.append(f"Jarayon: {notice['github_run_url']}")
     return "\n".join(lines)

@@ -61,6 +61,7 @@ class PublicAgentTaskTests(unittest.TestCase):
             self.assertNotIn("Show the selected material", environment)
             self.assertIn("Show the selected material", prompt)
             self.assertIn(".env.example", prompt)
+            self.assertIn("already approved implementation", prompt)
 
     def test_rejected_sample_env_path_writes_the_actual_callback_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
