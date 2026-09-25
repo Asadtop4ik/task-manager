@@ -738,7 +738,10 @@ class IntakeWorker:
             raise IntakeError("invalid discussion identity")
         result: dict[str, Any]
         try:
-            if not isinstance(repository, str) or intake_pairs().get(repository) != branch:
+            if (
+                not isinstance(repository, str)
+                or INTAKE_REPOSITORIES.get(repository) != branch
+            ):
                 raise IntakeError("discussion repository is not approved")
             if not isinstance(payload.get("text"), str):
                 raise IntakeError("invalid discussion text")
@@ -764,7 +767,11 @@ class IntakeWorker:
                 session_dir = Path(raw_session_dir)
                 session_dir.chmod(0o770)
                 snapshot = session_dir / "snapshot"
-                self._fetch_snapshot(snapshot, repository, branch)
+                self._fetch_snapshot(
+                    snapshot,
+                    repository,
+                    branch,
+                )
                 image_dir = session_dir / "images"
                 image_dir.mkdir(mode=0o770)
                 result_path = session_dir / "discussion-result.json"

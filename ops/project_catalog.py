@@ -10,7 +10,12 @@ if (_source / "agent_repos.py").is_file():
     sys.path.insert(0, str(_source))
 
 # On netcup the same root-owned agent_repos.py is installed next to this file.
-from agent_repos import AgentRepository, REPOSITORIES, public_catalog  # noqa: E402
+from agent_repos import (  # noqa: E402
+    AgentRepository,
+    QA_REPOSITORY,
+    REPOSITORIES,
+    public_catalog,
+)
 
 
 def public_projects(
@@ -28,4 +33,7 @@ def approved_pairs(
 def intake_pairs(
     repositories: tuple[AgentRepository, ...] = REPOSITORIES,
 ) -> dict[str, str]:
-    return {item.full_name: item.branch for item in repositories}
+    """Allow QA snapshots only in worker flows gated by the API owner/flag checks."""
+    return {
+        item.full_name: item.branch for item in (*repositories, QA_REPOSITORY)
+    }

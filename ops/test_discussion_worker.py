@@ -26,6 +26,93 @@ class Response:
 
 
 class DiscussionWorkerTests(unittest.TestCase):
+    def test_owner_qa_discussion_uses_qa_snapshot_allowlist(self):
+        lease = {
+            "id": 28,
+            "revision": 1,
+            "lease_id": "lease-id",
+            "repo_full_name": "Asadtop4ik/agent-qa",
+            "base_branch": "main",
+            "project_key": "agent-qa",
+            "diagnostics_enabled": False,
+            "thread_id": None,
+            "text": "Summarize the README.",
+            "images": [],
+        }
+        posted = []
+        snapshots = []
+
+        def opener(request, timeout):
+            if request.full_url.endswith("/lease"):
+                return Response(lease)
+            if request.full_url.endswith("/result"):
+                posted.append(json.loads(request.data))
+                return Response({})
+            raise AssertionError(request.full_url)
+
+        def child(command, **kwargs):
+            payload = json.loads(kwargs["input"])
+            (Path(payload["session_dir"]) / "discussion-result.json").write_text(
+                json.dumps({"thread_id": "thr_qa", "response": "README qisqacha."})
+            )
+            return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = IntakeWorker(
+                intake_token="test-worker-secret",
+                github_token="test-github-secret",
+                temp_root=directory,
+                opener=opener,
+                command_runner=child,
+            )
+            def fetch_snapshot(target, repository, branch):
+                snapshots.append((repository, branch))
+                target.mkdir()
+
+            with patch.object(worker, "_fetch_snapshot", side_effect=fetch_snapshot):
+                self.assertEqual(worker.poll_discussion_once(), "answered")
+
+        repository, branch = snapshots[0]
+        self.assertEqual((repository, branch), ("Asadtop4ik/agent-qa", "main"))
+        self.assertEqual(posted[0]["response"], "README qisqacha.")
+
+    def test_unknown_private_repository_is_rejected_before_snapshot_or_codex(self):
+        lease = {
+            "id": 29,
+            "revision": 1,
+            "lease_id": "lease-id",
+            "repo_full_name": "example/private-repo",
+            "base_branch": "main",
+            "project_key": "unknown",
+            "diagnostics_enabled": False,
+            "thread_id": None,
+            "text": "Savol",
+            "images": [],
+        }
+        posted = []
+
+        def opener(request, timeout):
+            if request.full_url.endswith("/lease"):
+                return Response(lease)
+            posted.append(json.loads(request.data))
+            return Response({})
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = IntakeWorker(
+                intake_token="test-worker-secret",
+                github_token="test-github-secret",
+                temp_root=directory,
+                opener=opener,
+                command_runner=lambda *_args, **_kwargs: self.fail(
+                    "Codex was started for an unapproved repository"
+                ),
+            )
+            with patch.object(
+                worker, "_fetch_snapshot", side_effect=AssertionError("snapshot fetched")
+            ):
+                self.assertEqual(worker.poll_discussion_once(), "failed")
+        self.assertIn("error", posted[0])
+
     def test_private_lease_uses_tokenless_child_and_posts_answer(self):
         lease = {
             "id": 8,
@@ -70,7 +157,9 @@ class DiscussionWorkerTests(unittest.TestCase):
                 command_runner=child,
             )
             with patch.object(
-                worker, "_fetch_snapshot", side_effect=lambda target, *_: target.mkdir()
+                worker,
+                "_fetch_snapshot",
+                side_effect=lambda target, *_: target.mkdir(),
             ):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
         self.assertEqual(posted[0]["response"], "Javob.")
@@ -115,7 +204,9 @@ class DiscussionWorkerTests(unittest.TestCase):
                 command_runner=child,
             )
             with patch.object(
-                worker, "_fetch_snapshot", side_effect=lambda target, *_: target.mkdir()
+                worker,
+                "_fetch_snapshot",
+                side_effect=lambda target, *_: target.mkdir(),
             ):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
         self.assertEqual(child_requests[0]["diagnostics_discussion_id"], 18)

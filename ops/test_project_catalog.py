@@ -6,7 +6,11 @@ from pathlib import Path
 
 from agent_deploy_monitor import CI_TARGETS, TARGETS
 from intake_worker import INTAKE_REPOSITORIES
-from project_catalog import approved_pairs, intake_pairs, public_projects
+from project_catalog import (
+    approved_pairs,
+    intake_pairs,
+    public_projects,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from public_agent_task import APPROVED_REPOS  # noqa: E402
@@ -45,6 +49,11 @@ class ProjectCatalogTests(unittest.TestCase):
         self.assertEqual(approved_pairs(catalog)[demo.full_name], "main")
         self.assertEqual(repository_for("demo", demo.full_name, "main", catalog), demo)
         self.assertIsNone(repository_for("demo", demo.full_name, "master", catalog))
+
+    def test_private_qa_repo_is_fixed_in_worker_allowlist_but_unknown_is_not(self) -> None:
+        pairs = intake_pairs()
+        self.assertEqual(pairs["Asadtop4ik/agent-qa"], "main")
+        self.assertNotIn("example/private-repo", pairs)
 
     def test_public_project_without_deploy_evidence_fails_closed(self) -> None:
         incomplete = AgentRepository("bad", "example/bad", "main", False)
