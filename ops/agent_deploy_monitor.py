@@ -183,6 +183,7 @@ class ExternalDeployMonitor:
         self.opener = opener or urllib.request.urlopen
         self.command_runner = command_runner or subprocess.run
         self.ci_targets = ci_targets(qa_enabled=qa_enabled)
+        self.qa_enabled = QA_REPOSITORY.full_name in self.ci_targets
         self.qa_github_token = (qa_github_token or "").strip()
         if "Asadtop4ik/agent-qa" in self.ci_targets and not self.qa_github_token:
             raise ValueError("QA monitor requires its repository-scoped GitHub token")
@@ -267,6 +268,20 @@ class ExternalDeployMonitor:
             if not isinstance(pending, list):
                 raise ValueError("invalid pending CI list")
             for raw in pending:
+                if (
+                    isinstance(raw, dict)
+                    and raw.get("repo_full_name") == QA_REPOSITORY.full_name
+                    and not self.qa_enabled
+                ):
+                    row_id = raw.get("id")
+                    if (
+                        isinstance(row_id, bool)
+                        or not isinstance(row_id, int)
+                        or row_id <= after_id
+                    ):
+                        raise ValueError("pending CI cursor did not advance")
+                    after_id = row_id
+                    continue
                 record = _ci_record(raw, self.ci_targets)
                 if record["id"] <= after_id:
                     raise ValueError("pending CI cursor did not advance")

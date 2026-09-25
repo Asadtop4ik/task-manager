@@ -43,9 +43,9 @@ def pending(status="pr_ready", *, notified=True):
     }
 
 
-def ci_pending(*, sha=SHA, conclusion="pending"):
+def ci_pending(*, row_id=1, sha=SHA, conclusion="pending"):
     return {
-        "id": 1,
+        "id": row_id,
         "run_id": RUN_ID,
         "repo_full_name": "muradjanov-dev/qurbot",
         "base_branch": "master",
@@ -77,6 +77,61 @@ class ExternalDeployMonitorTests(unittest.TestCase):
     def test_ci_catalog_rejects_unknown_repository(self):
         with self.assertRaises(ValueError):
             _ci_record(ci_pending() | {"repo_full_name": "other/repo"})
+
+    def test_disabled_qa_row_does_not_block_existing_ci_targets(self):
+        posts = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "/ci-pending?after_id=0" in url:
+                return FakeResponse(
+                    [qa_ci_pending(), ci_pending(row_id=2, conclusion="pending")]
+                )
+            if url.endswith("/pulls/8"):
+                return FakeResponse(
+                    {
+                        "head": {
+                            "sha": SHA,
+                            "ref": "codex/task-28-demo",
+                            "repo": {"full_name": "muradjanov-dev/qurbot"},
+                        }
+                    }
+                )
+            if "/workflows/ci.yml/runs?" in url:
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 122,
+                                "head_sha": SHA,
+                                "head_branch": "codex/task-28-demo",
+                                "event": "pull_request",
+                                "path": ".github/workflows/ci.yml",
+                                "status": "completed",
+                                "conclusion": "failure",
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/ci-result"):
+                posts.append(json.loads(request.data))
+                return FakeResponse({"status": "pr_opened"})
+            raise AssertionError(url)
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback", github_token="github", opener=opener
+        )
+        self.assertEqual(monitor.check_ci_once(), 1)
+        self.assertEqual(
+            posts,
+            [
+                {
+                    "sha": SHA,
+                    "conclusion": "failure",
+                    "github_run_url": "https://github.com/muradjanov-dev/qurbot/actions/runs/122",
+                }
+            ],
+        )
 
     def test_qa_ci_catalog_is_enabled_only_by_flag_and_uses_its_workflow(self):
         self.assertNotIn("Asadtop4ik/agent-qa", ci_targets(qa_enabled=False))
