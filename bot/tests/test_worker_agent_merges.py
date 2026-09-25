@@ -8,6 +8,7 @@ async def test_merged_agent_run_notifies_bot_without_claiming_deploy(monkeypatch
     notice = {
         "run_id": "run-1",
         "task_id": 17,
+        "title": "<billing> migration",
         "status": "merged",
         "chat_id": 1001,
         "pr_url": "https://github.com/muradjanov-dev/qurbot/pull/7",
@@ -39,8 +40,14 @@ async def test_merged_agent_run_notifies_bot_without_claiming_deploy(monkeypatch
     bot = MagicMock()
     bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
     bot.session.close = AsyncMock()
+    bot_options = {}
+
+    def create_test_bot(**kwargs):
+        bot_options.update(kwargs)
+        return bot
+
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: client)
-    monkeypatch.setattr(worker, "Bot", lambda **kwargs: bot)
+    monkeypatch.setattr(worker, "Bot", create_test_bot)
     monkeypatch.setattr(
         worker,
         "settings",
@@ -53,7 +60,9 @@ async def test_merged_agent_run_notifies_bot_without_claiming_deploy(monkeypatch
 
     message = bot.send_message.await_args.args[1]
     assert "PR birlashtirildi" in message
+    assert "&lt;billing&gt; migration" in message
     assert "serverga chiqdi" not in message
+    assert bot_options["default"].parse_mode == worker.ParseMode.HTML
     assert client.posts == ["http://api/api/v1/agent-runs/run-1/notified"]
 
 
@@ -230,7 +239,7 @@ async def test_owner_release_card_has_controls_and_uses_private_owner_chat(
     assert client.acks == [{"message_id": 43}]
 
 
-async def test_owner_deploy_notice_edits_same_private_card_and_removes_controls(
+async def test_owner_deploy_notice_edits_same_card_and_keeps_details(
     monkeypatch,
 ) -> None:
     notice = {
@@ -289,7 +298,8 @@ async def test_owner_deploy_notice_edits_same_private_card_and_removes_controls(
 
     bot.edit_message_text.assert_awaited_once()
     assert bot.edit_message_text.await_args.kwargs["chat_id"] == 1001
-    assert bot.edit_message_text.await_args.kwargs["reply_markup"] is None
+    markup = bot.edit_message_text.await_args.kwargs["reply_markup"]
+    assert [button.text for row in markup.inline_keyboard for button in row] == ["Batafsil"]
     bot.send_message.assert_not_awaited()
     assert client.acks == [{"message_id": 42}]
 
@@ -350,5 +360,7 @@ async def test_owner_failure_notice_edits_existing_card_with_escaped_reason(
     args = bot.edit_message_text.await_args
     assert args.kwargs["chat_id"] == 1001
     assert "&lt;review unavailable&gt; &amp; retry later" in args.args[0]
-    assert args.kwargs["reply_markup"] is None
+    assert [
+        button.text for row in args.kwargs["reply_markup"].inline_keyboard for button in row
+    ] == ["Batafsil"]
     bot.send_message.assert_not_awaited()

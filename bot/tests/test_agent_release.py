@@ -97,6 +97,20 @@ def test_review_block_shows_concise_finding_and_only_available_correction() -> N
     assert labels == ["Tuzatish so‘rash", "Batafsil"]
 
 
+def test_details_remain_available_when_release_actions_are_gated() -> None:
+    keyboard = agent_release.release_keyboard(
+        "12345678-1234-5678-1234-567812345678",
+        "f" * 40,
+        actions={
+            "merge": {"available": False},
+            "correction": {"available": False},
+        },
+    )
+
+    assert keyboard is not None
+    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["Batafsil"]
+
+
 async def test_stale_callback_refetches_and_never_merges(monkeypatch) -> None:
     api = MagicMock()
     api.me = AsyncMock(return_value={"is_owner": True})

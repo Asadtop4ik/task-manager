@@ -114,14 +114,11 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                     head_sha = str(notice.get("head_sha") or "")
                     if owner_chat_id and len(head_sha) == 40:
                         text = release_card(notice)
-                        markup = (
-                            release_keyboard(
-                                str(notice["run_id"]),
-                                head_sha,
-                                actions=notice.get("actions") or {},
-                            )
-                            if notice.get("owner_controls_available")
-                            else None
+                        actions = notice.get("actions") or {}
+                        if not notice.get("owner_controls_available"):
+                            actions = {}
+                        markup = release_keyboard(
+                            str(notice["run_id"]), head_sha, actions=actions
                         )
                     else:
                         text = agent_result_card(notice)

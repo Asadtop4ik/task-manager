@@ -209,7 +209,7 @@ def release_keyboard(
         callback_data=AgentReleaseAction(action="detail", run_id=run_id, sha12=sha12),
     )
     builder.adjust(1)
-    return builder.as_markup() if merge_available or correction_available else None
+    return builder.as_markup()
 
 
 def _action_id(run_id: str, action: str, sha: str, instruction: str = "") -> str:
