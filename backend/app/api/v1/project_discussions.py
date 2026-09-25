@@ -225,6 +225,7 @@ async def lease_discussion(
         agent_events.record(session, row, error=row.error)
         await session.commit()
         return Response(status_code=204)
+    project_key = project.key if project is not None else ""
     row.status = "running"
     agent_events.record(session, row)
     row.lease_id = str(uuid4())
@@ -236,10 +237,56 @@ async def lease_discussion(
         lease_id=row.lease_id,
         repo_full_name=repository.full_name,
         base_branch=repository.branch,
+        project_key=project_key,
+        diagnostics_enabled=bool(
+            settings.ketoshop_diagnostics_enabled
+            and project_key == "ketoshop"
+            and actor is not None
+            and actor.telegram_id == settings.owner_telegram_id
+            and settings.owner_telegram_id > 0
+        ),
         thread_id=row.thread_id,
         text=row.pending_text or "",
         images=row.pending_images,
     )
+
+
+@router.get("/{discussion_id:int}/diagnostic-context")
+async def diagnostic_context(
+    discussion_id: int,
+    session: DbSession,
+    x_intake_worker_token: Annotated[str | None, Header()] = None,
+) -> dict[str, bool | str | int]:
+    """Re-check owner, project and active lease before host diagnostics run."""
+    _worker_auth(x_intake_worker_token)
+    row = await session.get(ProjectDiscussion, discussion_id)
+    if (
+        row is None
+        or row.status != "running"
+        or not row.lease_id
+        or row.lease_until is None
+        or row.lease_until <= _now()
+    ):
+        raise HTTPException(status_code=404, detail="diagnostics are not available")
+    project = await session.get(Project, row.project_id)
+    actor = await session.get(User, row.user_id)
+    if actor is None or project is None:
+        raise HTTPException(status_code=404, detail="diagnostics are not available")
+    allowed = bool(
+        settings.ketoshop_diagnostics_enabled
+        and settings.owner_telegram_id > 0
+        and project.key == "ketoshop"
+        and actor.is_active
+        and actor.telegram_id == settings.owner_telegram_id
+    )
+    if not allowed or not await can_see_project(session, actor, row.project_id):
+        raise HTTPException(status_code=404, detail="diagnostics are not available")
+    return {
+        "authorized": True,
+        "project_key": "ketoshop",
+        "active": True,
+        "revision": row.revision,
+    }
 
 
 async def _leased(

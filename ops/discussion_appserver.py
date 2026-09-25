@@ -20,6 +20,26 @@ CODEX_PATH = (
     "/home/codex-runner/actions-runner/externals/node24/bin:"
     "/home/codex-runner/.local/bin:/usr/local/bin:/usr/bin:/bin"
 )
+DIAGNOSTIC_PROXY = "/opt/task-manager/ops/diagnostic_proxy.py"
+DIAGNOSTIC_SOCKET = "/run/task-manager-diagnostics/diagnostics.sock"
+
+
+def _app_server_command(diagnostics_discussion_id: int | None) -> list[str]:
+    command = [CODEX_BINARY, "app-server", "--stdio"]
+    if diagnostics_discussion_id is not None:
+        proxy_args = json.dumps([
+            DIAGNOSTIC_PROXY,
+            "--discussion-id",
+            str(diagnostics_discussion_id),
+            "--socket",
+            DIAGNOSTIC_SOCKET,
+        ], separators=(",", ":"))
+        command.extend([
+            "--config", 'mcp_servers.ketoshop_diagnostics.command="/usr/bin/python3"',
+            "--config",
+            f"mcp_servers.ketoshop_diagnostics.args={proxy_args}",
+        ])
+    return command
 
 
 def _messages(stdout: Any, output: queue.Queue[Any]) -> None:
@@ -39,6 +59,7 @@ def run_turn(
     thread_id: str | None,
     prompt: str,
     images: list[Path],
+    diagnostics_discussion_id: int | None = None,
     timeout: int = 150,
 ) -> tuple[str, str]:
     """Return the persisted thread id and final Uzbek answer, without logs."""
@@ -51,7 +72,7 @@ def run_turn(
         "LANG": "C.UTF-8",
     }
     process = subprocess.Popen(
-        [CODEX_BINARY, "app-server", "--stdio"],
+        _app_server_command(diagnostics_discussion_id),
         cwd=snapshot,
         env=env,
         stdin=subprocess.PIPE,

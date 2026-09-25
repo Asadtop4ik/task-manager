@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from discussion_appserver import CODEX_BINARY, DiscussionError, run_turn
+import tomllib
+from discussion_appserver import (
+    CODEX_BINARY,
+    DiscussionError,
+    _app_server_command,
+    run_turn,
+)
 
 
 class FakeProcess:
@@ -22,6 +28,21 @@ class FakeProcess:
 
 
 class AppServerTests(unittest.TestCase):
+    def test_diagnostics_mcp_is_added_only_with_an_authorized_discussion_scope(self):
+        plain = _app_server_command(None)
+        self.assertEqual(plain, [CODEX_BINARY, "app-server", "--stdio"])
+        configured = _app_server_command(83)
+        overrides = [configured[index + 1] for index, value in enumerate(configured) if value == "--config"]
+        self.assertEqual(len(overrides), 2)
+        settings = {}
+        for override in overrides:
+            key, value = override.split("=", 1)
+            settings[key] = tomllib.loads(f"value={value}")["value"]
+        self.assertEqual(settings["mcp_servers.ketoshop_diagnostics.command"], "/usr/bin/python3")
+        args = settings["mcp_servers.ketoshop_diagnostics.args"]
+        self.assertEqual(args[1:3], ["--discussion-id", "83"])
+        self.assertNotIn("TOKEN", str(configured))
+
     def test_resumes_a_read_only_thread_and_returns_final_answer(self):
         process = FakeProcess([
             {"id": 1, "result": {}},
@@ -56,8 +77,9 @@ class AppServerTests(unittest.TestCase):
             {"id": 3, "result": {"turn": {"id": "turn_1"}}},
             {"id": 77, "method": "item/commandExecution/requestApproval", "params": {}},
         ])
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "discussion_appserver.subprocess.Popen", return_value=process
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("discussion_appserver.subprocess.Popen", return_value=process),
+            self.assertRaisesRegex(DiscussionError, "ruxsat"),
         ):
-            with self.assertRaisesRegex(DiscussionError, "ruxsat"):
-                run_turn(snapshot=Path(directory), thread_id=None, prompt="Savol", images=[])
+            run_turn(snapshot=Path(directory), thread_id=None, prompt="Savol", images=[])
