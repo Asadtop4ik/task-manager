@@ -17,11 +17,21 @@ from uuid import UUID
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[1] / "backend" / "app" / "services")
 )
-from agent_repos import public_catalog  # noqa: E402
-
+from agent_repos import QA_REPOSITORY, public_catalog
 from agent_task import check_diff as check_base_diff
 
 APPROVED_REPOS = {item.full_name: item.branch for item in public_catalog()}
+
+
+def approved_repositories() -> dict[str, str]:
+    approved = dict(APPROVED_REPOS)
+    if (
+        os.environ.get("AGENT_QA_ENABLED", "").lower() == "true"
+        and os.environ.get("AGENT_QA_REPOSITORY", QA_REPOSITORY.full_name)
+        == QA_REPOSITORY.full_name
+    ):
+        approved[QA_REPOSITORY.full_name] = QA_REPOSITORY.branch
+    return approved
 BLOCKED_EXACT = {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}
 BLOCKED_PREFIXES = (".github/", ".codex/", ".agents/")
 
@@ -29,13 +39,14 @@ BLOCKED_PREFIXES = (".github/", ".codex/", ".agents/")
 def task() -> dict[str, object]:
     raw = json.loads(os.environ["TASK_JSON"])
     if not isinstance(raw, dict):
-        raise ValueError("agent payload must be an object")
+        raise TypeError("agent payload must be an object")
     repository = raw.get("repo_full_name")
     branch = raw.get("base_branch")
+    approved_repos = approved_repositories()
     if (
         not isinstance(repository, str)
-        or repository not in APPROVED_REPOS
-        or branch != APPROVED_REPOS[repository]
+        or repository not in approved_repos
+        or branch != approved_repos[repository]
     ):
         raise ValueError("repository or branch is not approved for the public pilot")
     if raw.get("mode") != "pr":

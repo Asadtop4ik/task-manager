@@ -4,6 +4,7 @@ from auto_merge import (
     agent_ready,
     agent_run_id,
     allowed_files,
+    clean_review_status,
     current_pr,
     latest_checks_pass,
 )
@@ -59,6 +60,15 @@ class PolicyTests(unittest.TestCase):
             )
         )
 
+    def test_review_status_must_be_latest_and_clean_on_exact_sha(self) -> None:
+        statuses = [
+            {"id": 1, "context": "codex-review", "sha": "a" * 40, "state": "success"},
+            {"id": 2, "context": "codex-review", "sha": "a" * 40, "state": "failure"},
+        ]
+        self.assertFalse(clean_review_status(statuses, "a" * 40))
+        self.assertFalse(clean_review_status(statuses[:1], "b" * 40))
+        self.assertTrue(clean_review_status(statuses[:1], "a" * 40))
+
     def test_cancelled_agent_pr_cannot_auto_merge(self) -> None:
         run_id = "00000000-0000-0000-0000-000000000007"
         url = "https://github.com/Asadtop4ik/task-manager/pull/7"
@@ -70,8 +80,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(
             agent_run_id({"head": {"ref": f"codex/fast/task-7-{run_id}"}}), run_id
         )
-        ready = {"status": "pr_opened", "pr_url": url, "head_sha": "a" * 40}
+        ready = {
+            "status": "pr_ready",
+            "pr_url": url,
+            "head_sha": "a" * 40,
+            "ci_status": "success",
+            "ci_verified_sha": "a" * 40,
+            "review_status": "clean",
+            "review_sha": "a" * 40,
+        }
         self.assertTrue(agent_ready(pr, ready))
+        self.assertTrue(agent_ready(pr, ready | {"review_status": "advisory"}))
         self.assertFalse(agent_ready(pr, ready | {"status": "cancelled"}))
         self.assertFalse(agent_ready(pr, ready | {"head_sha": "b" * 40}))
         self.assertEqual(

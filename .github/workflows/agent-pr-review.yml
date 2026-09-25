@@ -1,0 +1,74 @@
+name: Agent PR review
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  repository_dispatch:
+    types: [agent_pr_review]
+
+# The model runner reads only the PR diff; it never checks out or executes PR code.
+concurrency:
+  group: agent-pr-review-task-manager
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'repository_dispatch'
+    runs-on: [self-hosted, linux, x64, codex-agent]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Prepare trusted review input
+        env:
+          GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name != github.repository && secrets.AGENT_PUBLIC_REPO_TOKEN || secrets.AGENT_REPO_TOKEN }}
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+          AGENT_QA_ENABLED: ${{ vars.AGENT_QA_ENABLED }}
+          AGENT_QA_REPOSITORY: ${{ vars.AGENT_QA_REPOSITORY }}
+        run: python3 scripts/agent_pr_review.py prepare
+
+      - name: Review the exact PR diff with Codex
+        run: |
+          set -euo pipefail
+          codex exec --sandbox read-only -c approval_policy=never \
+            -c model_reasoning_effort=medium --model gpt-6-sol --ephemeral --json \
+            --output-last-message "$RUNNER_TEMP/agent-review-result.json" \
+            - < "$RUNNER_TEMP/agent-review-prompt.txt" \
+            > "$RUNNER_TEMP/agent-review-events.jsonl"
+
+      - name: Publish exact-head review result
+        env:
+          GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name != github.repository && secrets.AGENT_PUBLIC_REPO_TOKEN || secrets.AGENT_REPO_TOKEN }}
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+          AGENT_QA_ENABLED: ${{ vars.AGENT_QA_ENABLED }}
+          AGENT_QA_REPOSITORY: ${{ vars.AGENT_QA_REPOSITORY }}
+        run: python3 scripts/agent_pr_review.py finalize
+
+      - name: Record failed review as blocked
+        if: failure()
+        env:
+          GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name != github.repository && secrets.AGENT_PUBLIC_REPO_TOKEN || secrets.AGENT_REPO_TOKEN }}
+          AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
+          AGENT_QA_ENABLED: ${{ vars.AGENT_QA_ENABLED }}
+          AGENT_QA_REPOSITORY: ${{ vars.AGENT_QA_REPOSITORY }}
+        run: python3 scripts/agent_pr_review.py fail
+
+      - name: Remove review prompt and result
+        if: always()
+        run: |
+          rm -f -- "$RUNNER_TEMP/agent-review-prompt.txt" \
+            "$RUNNER_TEMP/agent-review-target.json" \
+            "$RUNNER_TEMP/agent-review-result.json" \
+            "$RUNNER_TEMP/agent-review-events.jsonl"

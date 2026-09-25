@@ -73,6 +73,17 @@ class Settings(BaseSettings):
     # each project to a repo, but that repo must also be on this server allowlist.
     github_agent_token: str = Field(default="", alias="GITHUB_AGENT_TOKEN")
     github_public_agent_token: str = Field(default="", alias="GITHUB_PUBLIC_AGENT_TOKEN")
+    # Isolated private repository used only for release lifecycle QA. It stays
+    # out of the approved runtime catalog until the explicit flag is enabled.
+    agent_qa_enabled: bool = Field(default=False, alias="AGENT_QA_ENABLED")
+    agent_qa_repository: str = Field(
+        default="Asadtop4ik/agent-qa", alias="AGENT_QA_REPOSITORY"
+    )
+    agent_qa_ready_url: str = Field(
+        default="http://127.0.0.1:18082/ready", alias="AGENT_QA_READY_URL"
+    )
+    github_agent_qa_token: str = Field(default="", alias="GITHUB_AGENT_QA_TOKEN")
+    agent_qa_callback_token: str = Field(default="", alias="AGENT_QA_CALLBACK_TOKEN")
     github_agent_allowed_repos: str = Field(
         default="Asadtop4ik/task-manager", alias="GITHUB_AGENT_ALLOWED_REPOS"
     )
@@ -137,6 +148,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 "GITHUB_PUBLIC_AGENT_TOKEN is required when public agents are enabled"
             )
+        if self.agent_qa_enabled:
+            if self.agent_qa_repository != "Asadtop4ik/agent-qa":
+                raise ValueError("AGENT_QA_REPOSITORY must name the isolated QA repository")
+            if len(self.github_agent_qa_token) < 20:
+                raise ValueError("GITHUB_AGENT_QA_TOKEN is required when agent QA is enabled")
+            if len(self.agent_qa_callback_token) < 32:
+                raise ValueError(
+                    "AGENT_QA_CALLBACK_TOKEN must be at least 32 characters when agent QA is enabled"
+                )
+            if not self.agent_qa_ready_url.startswith(
+                "http://127.0.0.1:"
+            ) or not self.agent_qa_ready_url.endswith("/ready"):
+                raise ValueError(
+                    "AGENT_QA_READY_URL must target the isolated loopback readiness route"
+                )
         return self
 
     @property

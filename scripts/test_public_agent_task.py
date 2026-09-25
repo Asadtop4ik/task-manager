@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 from public_agent_task import check_diff, prepare, task
 
-
 PAYLOAD = {
     "repo_full_name": "muradjanov-dev/qurbot",
     "base_branch": "master",
@@ -44,6 +43,26 @@ class PublicAgentTaskTests(unittest.TestCase):
                 os.environ, {"TASK_JSON": json.dumps(PAYLOAD | changed)}
             ), self.assertRaises(ValueError):
                 task()
+
+    def test_private_qa_repository_requires_explicit_runtime_flag(self) -> None:
+        qa_payload = PAYLOAD | {
+            "repo_full_name": "Asadtop4ik/agent-qa",
+            "base_branch": "main",
+        }
+        with patch.dict(
+            os.environ, {"TASK_JSON": json.dumps(qa_payload)}, clear=True
+        ), self.assertRaises(ValueError):
+            task()
+        with patch.dict(
+            os.environ,
+            {
+                "TASK_JSON": json.dumps(qa_payload),
+                "AGENT_QA_ENABLED": "true",
+                "AGENT_QA_REPOSITORY": "Asadtop4ik/agent-qa",
+            },
+            clear=True,
+        ):
+            self.assertEqual(task()["repo_full_name"], "Asadtop4ik/agent-qa")
 
     def test_prepare_keeps_task_text_out_of_shell_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(

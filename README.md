@@ -63,6 +63,16 @@ after the requested image passes readiness checks; a failed release rolls back.
 During this first pilot, direct publication is limited to existing CSS styling
 and literal JSX tooltip/accessibility attributes; other code changes use a PR.
 
+Agent PRs stay open until the configured CI jobs and an independent, read-only
+Codex review pass on the same full commit SHA. P1/P2 findings block readiness;
+P3 findings stay visible as advisories. The owner can merge a ready
+PR or send a correction through the private Telegram chat. A correction updates
+the existing PR branch with a fast-forward push; a new commit clears the prior
+CI and review evidence. A same-commit correction can ask Codex to reconsider a
+finding, but it still needs a fresh review with no P1/P2 findings before merge is enabled. The
+narrow README/docs/CSS auto-merge also requires the exact-head `codex-review`
+status.
+
 Masalan, 42-raqamli task allaqachon mavjud bo'lsa, Telegram botiga `/agent 42`
 yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
 veb boarddagi shu task sahifasida ko'rinadi.
@@ -79,9 +89,13 @@ The worker uses a GitHub `repository_dispatch` event; its workflow runs on a
 private `codex-agent` self-hosted runner. The repository needs these credentials:
 
 - Server env: `GITHUB_AGENT_TOKEN` for repository metadata, dispatch and PR
-  verification; `AGENT_CALLBACK_TOKEN` for workflow callbacks.
-- GitHub Actions secrets: `AGENT_REPO_TOKEN` for the PR push/create step;
-  `AGENT_CALLBACK_TOKEN` matching the server value.
+  verification and central workflow dispatch; `GITHUB_PUBLIC_AGENT_TOKEN` for
+  API verification against approved public repos; `AGENT_CALLBACK_TOKEN` for
+  workflow callbacks.
+- GitHub Actions secrets: `AGENT_REPO_TOKEN` for private Task Manager PR
+  publication, release and central review dispatch; `AGENT_PUBLIC_REPO_TOKEN`
+  for release/correction pushes and review statuses on the three approved public
+  repos; `AGENT_CALLBACK_TOKEN` matching the server value.
 - Runner: Codex CLI logged in under its dedicated account, plus `gh` and Python 3.
   Do not expose the Codex auth cache to a public repository or a general runner.
 - Intake host worker: a separate read-only Codex process and
@@ -89,6 +103,17 @@ private `codex-agent` self-hosted runner. The repository needs these credentials
   `AGENT_INTAKE_ENABLED=false` until the host worker is installed. Intake
   questions do not create GitHub Actions jobs; implementation still uses the
   existing dispatch workflow after confirmation.
+
+The isolated private QA target is opt-in. Keep `AGENT_QA_ENABLED=false` until
+the server's repository-scoped `GITHUB_AGENT_QA_TOKEN` (read-only API
+verification) and GitHub Actions secrets `AGENT_QA_READ_TOKEN` (private checkout)
+and `AGENT_QA_REPO_TOKEN` (PR/review writes and dispatching the QA deploy
+workflow) are provisioned. Store a separate `AGENT_QA_CALLBACK_TOKEN` on the
+server and QA deploy workflow; it only authorizes the exact QA run/SHA readiness
+callback. Set the central Task Manager workflow variables `AGENT_QA_ENABLED`,
+`AGENT_QA_REPOSITORY`, and `AGENT_QA_DEPLOY_WORKFLOW` (the checked-in workflow
+path). The server and workflow must both enable the flag; QA remains absent from
+the normal approved project catalog otherwise.
 
 The workflow keeps GitHub write credentials out of the Codex runner. Its patch
 is applied in a separate clean GitHub-hosted publisher job. Protected paths
