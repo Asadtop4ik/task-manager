@@ -237,6 +237,39 @@ async def test_nonowner_ketoshop_discussion_does_not_get_diagnostics(
     assert denied.status_code == 404
 
 
+async def test_other_project_discussion_does_not_get_diagnostics(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    await ready_project(session, project, monkeypatch)
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id)
+    created = await client.post(
+        "/api/v1/project-discussions",
+        json={"project_id": project.id, "chat_id": manager.telegram_id},
+        headers=bot_headers(manager),
+    )
+    discussion_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/project-discussions/{discussion_id}/messages",
+        json={"text": "Tekshiring"},
+        headers=bot_headers(manager),
+    )
+    work = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert work["project_key"] == "task-manager"
+    assert work["diagnostics_enabled"] is False
+    denied = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert denied.status_code == 404
+
+
 async def ready_project_flags(monkeypatch) -> None:
     monkeypatch.setattr(settings, "agent_intake_enabled", True)
     monkeypatch.setattr(settings, "agent_public_enabled", True)
