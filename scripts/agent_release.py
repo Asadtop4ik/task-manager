@@ -83,7 +83,9 @@ def _event() -> dict:
     return payload
 
 
-def _context() -> tuple[dict, dict, dict, str, int, str]:
+def _context(
+    *, allow_completed: bool = False, allow_merged: bool = False
+) -> tuple[dict, dict, dict, str, int, str]:
     payload = _event()
     run_id = str(UUID(str(payload.get("run_id"))))
     action_id = str(UUID(str(payload.get("action_id"))))
@@ -98,9 +100,12 @@ def _context() -> tuple[dict, dict, dict, str, int, str]:
     action = _request(f"{TASK_API}/{run_id}/actions/{action_id}", callback=True)
     if not isinstance(run, dict) or not isinstance(action, dict):
         raise TypeError("Task Manager release state is unavailable")
+    allowed_action_statuses = {"accepted", "in_progress"}
+    if allow_completed:
+        allowed_action_statuses.add("completed")
     if (
         action.get("action_id") != action_id
-        or action.get("status") not in {"accepted", "in_progress"}
+        or action.get("status") not in allowed_action_statuses
         or action.get("request", {}).get("expected_head_sha") != expected
     ):
         raise ValueError("owner action is not active for this expected head")
@@ -108,13 +113,20 @@ def _context() -> tuple[dict, dict, dict, str, int, str]:
     if kind not in {"merge", "correction"}:
         raise ValueError("unknown owner action")
     if kind == "merge":
-        ready = (
-            run.get("status") == "pr_ready"
-            and run.get("ci_status") == "success"
-            and run.get("ci_verified_sha") == expected
-            and run.get("review_status") == "clean"
-            and run.get("review_sha") == expected
-        )
+        if action.get("status") == "completed" and allow_completed:
+            ready = (
+                run.get("status") in {"merged", "deployed"}
+                and (action.get("result") or {}).get("head_sha") == expected
+                and bool((action.get("result") or {}).get("merge_sha"))
+            )
+        else:
+            ready = (
+                run.get("status") == "pr_ready"
+                and run.get("ci_status") == "success"
+                and run.get("ci_verified_sha") == expected
+                and run.get("review_status") in {"clean", "advisory"}
+                and run.get("review_sha") == expected
+            )
     else:
         ready = run.get("status") in {"pr_opened", "pr_ready", "correction_running"}
     if (
@@ -122,7 +134,11 @@ def _context() -> tuple[dict, dict, dict, str, int, str]:
         or run.get("repo_full_name") != repo
         or run.get("base_branch") != approved[repo]
         or run.get("head_sha") != expected
-        or run.get("status") in {"cancelled", "failed", "merged", "deployed"}
+        or run.get("status") in {"cancelled", "failed"}
+        or (
+            run.get("status") in {"merged", "deployed"}
+            and not (allow_merged and action.get("status") == "completed")
+        )
         or not ready
         or run.get("pr_url") is None
     ):
@@ -177,7 +193,22 @@ def _write_output(name: str, value: str) -> None:
 
 
 def verify_merge() -> None:
-    _payload, run, _action, _run_id, number, expected = _context()
+    _payload, run, action, _run_id, number, expected = _context(
+        allow_completed=True, allow_merged=True
+    )
+    if action.get("status") == "completed":
+        if (
+            run.get("status") not in {"merged", "deployed"}
+            or (action.get("result") or {}).get("head_sha") != expected
+            or not (action.get("result") or {}).get("merge_sha")
+        ):
+            raise ValueError("completed action does not match the merged PR")
+        _write_output("already_merged", "true")
+        _write_output("pull_number", str(number))
+        _write_output("head_sha", expected)
+        return
+    if run.get("status") in {"cancelled", "failed", "merged", "deployed"}:
+        raise ValueError("agent run is no longer eligible for a merge")
     token = os.environ["GH_TOKEN"]
     pr = _pr(run["repo_full_name"], number, token)
     _verify_pr(pr, run["repo_full_name"], run, expected, require_open=True)
@@ -271,56 +302,143 @@ def _task_callback(run_id: str, action_id: str, body: dict) -> object:
     )
 
 
+def _merge_report_context() -> tuple[dict, dict, dict, str, int, str]:
+    payload = _event()
+    run_id = str(UUID(str(payload.get("run_id"))))
+    action_id = str(UUID(str(payload.get("action_id"))))
+    repo = payload.get("repo_full_name")
+    approved = approved_branches()
+    expected = payload.get("expected_head_sha")
+    if (
+        repo not in approved
+        or not isinstance(expected, str)
+        or not SHA_RE.fullmatch(expected)
+    ):
+        raise ValueError("merge report target is invalid")
+    run = _request(f"{TASK_API}/{run_id}/status", callback=True)
+    action = _request(f"{TASK_API}/{run_id}/actions/{action_id}", callback=True)
+    if not isinstance(run, dict) or not isinstance(action, dict):
+        raise TypeError("Task Manager merge report state is unavailable")
+    if (
+        run.get("run_id") != run_id
+        or run.get("repo_full_name") != repo
+        or run.get("base_branch") != approved[repo]
+        or action.get("action_id") != action_id
+        or action.get("kind") != "merge"
+        or action.get("request", {}).get("expected_head_sha") != expected
+        or action.get("status") not in {"accepted", "in_progress", "completed"}
+    ):
+        raise ValueError("merge action no longer matches the current run")
+    if payload.get("branch") != f"codex/task-{run['task_id']}-{run_id}":
+        raise ValueError("merge report branch does not match the run")
+    pr_prefix = f"https://github.com/{repo}/pull/"
+    pr_url = str(run.get("pr_url") or "")
+    number = pr_url.removeprefix(pr_prefix)
+    if not pr_url.startswith(pr_prefix) or not number.isdecimal():
+        raise ValueError("agent run has an invalid PR URL")
+    return payload, run, action, run_id, int(number), expected
+
+
+def _qa_dispatch_result(
+    run_id: str, action_id: str, sha: str, status: str, message: str = ""
+) -> None:
+    _request(
+        f"{TASK_API}/{run_id}/qa-deploy-dispatch-result",
+        method="POST",
+        callback=True,
+        body={
+            "action_id": action_id,
+            "sha": sha,
+            "status": status,
+            "message": message[:1000] or None,
+        },
+    )
+
+
 def report_merge() -> None:
-    _payload, run, action, run_id, number, expected = _context()
+    _payload, run, action, run_id, number, expected = _merge_report_context()
     pr = _pr(run["repo_full_name"], number, os.environ["GH_TOKEN"])
     head = pr.get("head") or {}
-    merged = bool(pr.get("merged")) and head.get("sha") == expected
+    recorded_merge_sha = (action.get("result") or {}).get("merge_sha")
+    merged = bool(pr.get("merged")) and (
+        head.get("sha") == expected
+        or (
+            action.get("status") == "completed"
+            and run.get("merged_sha") == recorded_merge_sha
+            and pr.get("merge_commit_sha") == recorded_merge_sha
+        )
+    )
     if merged and isinstance(pr.get("merge_commit_sha"), str):
+        merge_sha = pr["merge_commit_sha"]
+        if action.get("status") == "completed":
+            if (action.get("result") or {}).get("merge_sha") != merge_sha:
+                raise ValueError("recorded merge SHA does not match GitHub")
+        else:
+            _task_callback(
+                run_id,
+                str(action["action_id"]),
+                {
+                    "status": "completed",
+                    "head_sha": expected,
+                    "merge_sha": merge_sha,
+                    "message": "PR merged after verified CI and review",
+                },
+            )
         if run["repo_full_name"] == "Asadtop4ik/agent-qa":
             if os.environ.get("AGENT_QA_ENABLED", "").lower() != "true":
                 raise ValueError("QA deployment dispatch is not explicitly enabled")
+            if (
+                run.get("qa_deploy_dispatch_status") == "dispatched"
+                or run.get("status") == "deployed"
+            ):
+                return
             workflow = os.environ.get(
                 "AGENT_QA_DEPLOY_WORKFLOW", ".github/workflows/agent-qa.yml"
             )
-            subprocess.run(
-                [
-                    "gh",
-                    "workflow",
-                    "run",
-                    workflow,
-                    "--repo",
-                    run["repo_full_name"],
-                    "--ref",
-                    run["base_branch"],
-                    "-f",
-                    f"agent_run_id={run_id}",
-                    "-f",
-                    f"expected_sha={expected}",
-                    "-f",
-                    f"merge_sha={pr['merge_commit_sha']}",
-                ],
-                check=True,
+            try:
+                subprocess.run(
+                    [
+                        "gh",
+                        "workflow",
+                        "run",
+                        workflow,
+                        "--repo",
+                        run["repo_full_name"],
+                        "--ref",
+                        run["base_branch"],
+                        "-f",
+                        f"agent_run_id={run_id}",
+                        "-f",
+                        f"action_id={action['action_id']}",
+                        "-f",
+                        f"expected_sha={expected}",
+                        "-f",
+                        f"merge_sha={merge_sha}",
+                    ],
+                    check=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                _qa_dispatch_result(
+                    run_id,
+                    str(action["action_id"]),
+                    merge_sha,
+                    "failed",
+                    f"GitHub did not accept QA deployment workflow dispatch: {exc}",
+                )
+                raise
+            _qa_dispatch_result(
+                run_id, str(action["action_id"]), merge_sha, "dispatched"
             )
+        return
+    if action.get("status") != "completed":
         _task_callback(
             run_id,
             str(action["action_id"]),
             {
-                "status": "completed",
-                "head_sha": expected,
-                "merge_sha": pr["merge_commit_sha"],
-                "message": "PR merged after verified CI and review",
+                "status": "rejected",
+                "message": "PR was not merged at the requested head SHA",
             },
         )
-        return
-    _task_callback(
-        run_id,
-        str(action["action_id"]),
-        {
-            "status": "rejected",
-            "message": "PR was not merged at the requested head SHA",
-        },
-    )
     raise ValueError("GitHub did not merge the exact requested PR head")
 
 

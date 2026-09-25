@@ -64,11 +64,12 @@ During this first pilot, direct publication is limited to existing CSS styling
 and literal JSX tooltip/accessibility attributes; other code changes use a PR.
 
 Agent PRs stay open until the configured CI jobs and an independent, read-only
-Codex review both pass on the same full commit SHA. The owner can merge a ready
+Codex review pass on the same full commit SHA. P1/P2 findings block readiness;
+P3 findings stay visible as advisories. The owner can merge a ready
 PR or send a correction through the private Telegram chat. A correction updates
 the existing PR branch with a fast-forward push; a new commit clears the prior
 CI and review evidence. A same-commit correction can ask Codex to reconsider a
-finding, but it still needs a fresh clean review before merge is enabled. The
+finding, but it still needs a fresh review with no P1/P2 findings before merge is enabled. The
 narrow README/docs/CSS auto-merge also requires the exact-head `codex-review`
 status.
 

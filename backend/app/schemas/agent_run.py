@@ -37,6 +37,9 @@ class AgentRunOut(BaseModel):
     qa_ready_url: str | None
     qa_ready_sha: str | None
     qa_ready_at: datetime | None
+    qa_deploy_dispatch_status: str | None
+    qa_deploy_dispatch_error: str | None
+    qa_deploy_dispatched_at: datetime | None
     review_status: str | None
     review_sha: str | None
     review_summary: str | None
@@ -73,6 +76,27 @@ class AgentQaDeployment(AgentDeployment):
     ready_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
+class AgentQaDeploymentAuthorization(BaseModel):
+    action_id: UUID
+    expected_head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    merge_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class AgentQaDeploymentAuthorizationOut(BaseModel):
+    authorized: Literal[True]
+    run_id: str
+    repo_full_name: str
+    expected_head_sha: str
+    merge_sha: str
+
+
+class AgentQaDeployDispatchResult(BaseModel):
+    action_id: UUID
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    status: Literal["dispatched", "failed"]
+    message: str | None = Field(default=None, max_length=1000)
+
+
 class AgentMerge(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -96,13 +120,13 @@ class AgentReviewFinding(BaseModel):
 
 class AgentReviewResult(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
-    state: Literal["clean", "findings", "error"] | None = None
+    state: Literal["clean", "advisory", "findings", "error"] | None = None
     summary: str = Field(max_length=2000)
     findings: list[AgentReviewFinding] = Field(max_length=40)
 
 
 class AgentReviewOut(BaseModel):
-    state: Literal["pending", "clean", "findings", "stale", "error"]
+    state: Literal["pending", "clean", "advisory", "findings", "stale", "error"]
     reviewed_head_sha: str | None
     summary: str | None
     findings: list[AgentReviewFinding]
@@ -131,7 +155,7 @@ class AgentRunDetailOut(BaseModel):
 
 class AgentActionOut(BaseModel):
     action_id: UUID
-    status: Literal["accepted", "in_progress", "completed", "rejected"]
+    status: Literal["accepted", "in_progress", "completed", "rejected", "retryable"]
     run_id: str
     head_sha: str | None
     message: str | None = None
@@ -148,7 +172,7 @@ class AgentActionResult(BaseModel):
 class AgentActionDetailOut(BaseModel):
     action_id: UUID
     kind: Literal["merge", "correction"]
-    status: Literal["accepted", "in_progress", "completed", "rejected"]
+    status: Literal["accepted", "in_progress", "completed", "rejected", "retryable"]
     request: dict[str, object]
     result: dict[str, object] | None
 
@@ -219,6 +243,8 @@ class AgentNotificationOut(BaseModel):
     review: AgentReviewOut | None = None
     ci_evidence: AgentCiEvidenceOut | None = None
     actions: dict[str, AgentActionAvailability] | None = None
+    qa_deploy_dispatch_status: str | None = None
+    qa_deploy_dispatch_error: str | None = None
 
 
 class AgentNoticeAck(BaseModel):

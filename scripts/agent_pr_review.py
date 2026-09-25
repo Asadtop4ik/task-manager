@@ -218,6 +218,15 @@ def _parse_result(path: Path) -> tuple[str, list[dict]]:
     return result["summary"][:2000], normalized
 
 
+def _review_decision(findings: list[dict]) -> tuple[str, bool, str]:
+    blocking = [finding for finding in findings if finding["severity"] in {"P1", "P2"}]
+    if blocking:
+        return "findings", False, f"{len(blocking)} blocking finding(s)"
+    if findings:
+        return "advisory", True, f"0 blocking, {len(findings)} advisory finding(s)"
+    return "clean", True, "Independent Codex review clean"
+
+
 def _set_review_status(repo: str, sha: str, state: str, description: str) -> None:
     token = os.environ["GH_TOKEN"]
     body = json.dumps(
@@ -258,6 +267,7 @@ def finalize() -> None:
     if not isinstance(pr, dict) or not _current_pr(pr, repo, sha):
         raise ValueError("pull request head changed during review")
     run_id = target["run_id"]
+    review_state, is_ready, review_description = _review_decision(findings)
     if run_id:
         run = _task_api("GET", f"{run_id}/status")
         if (
@@ -279,7 +289,7 @@ def finalize() -> None:
             f"{run_id}/review-result",
             body={
                 "sha": sha,
-                "state": "clean" if not findings else "findings",
+                "state": review_state,
                 "summary": summary,
                 "findings": findings,
             },
@@ -287,12 +297,8 @@ def finalize() -> None:
     _set_review_status(
         repo,
         sha,
-        "success" if not findings else "failure",
-        (
-            "Independent Codex review clean"
-            if not findings
-            else f"{len(findings)} finding(s)"
-        ),
+        "success" if is_ready else "failure",
+        review_description,
     )
     if repo != os.environ["GITHUB_REPOSITORY"]:
         return  # External approved repos never use Task Manager's narrow auto-merge.

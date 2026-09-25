@@ -44,7 +44,10 @@ from app.schemas.agent_run import (
     AgentMetricsOut,
     AgentNoticeAck,
     AgentNotificationOut,
+    AgentQaDeployDispatchResult,
     AgentQaDeployment,
+    AgentQaDeploymentAuthorization,
+    AgentQaDeploymentAuthorizationOut,
     AgentReleaseRequest,
     AgentReviewFinding,
     AgentReviewOut,
@@ -78,7 +81,7 @@ def _review_out(run: AgentRun) -> AgentReviewOut:
         AgentReviewFinding.model_validate(item) for item in (run.review_findings or [])
     ]
     state = cast(
-        Literal["pending", "clean", "findings", "stale", "error"],
+        Literal["pending", "clean", "advisory", "findings", "stale", "error"],
         run.review_status or "pending",
     )
     return AgentReviewOut(
@@ -108,7 +111,7 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
         and run.status == "pr_ready"
         and run.ci_status == "success"
         and run.ci_verified_sha == run.head_sha
-        and run.review_status == "clean"
+        and run.review_status in {"clean", "advisory"}
         and run.review_sha == run.head_sha
     )
     return AgentRunDetailOut(
@@ -143,7 +146,7 @@ def _refresh_pr_ready(run: AgentRun) -> bool:
         and run.head_sha
         and run.ci_status == "success"
         and run.ci_verified_sha == run.head_sha
-        and run.review_status == "clean"
+        and run.review_status in {"clean", "advisory"}
         and run.review_sha == run.head_sha
     )
     if ready:
@@ -169,11 +172,14 @@ def _action_error(
 
 
 def _action_response(action: AgentRunAction, run: AgentRun) -> AgentActionOut:
-    status_map: dict[str, Literal["accepted", "in_progress", "completed", "rejected"]] = {
+    status_map: dict[
+        str, Literal["accepted", "in_progress", "completed", "rejected", "retryable"]
+    ] = {
         "accepted": "accepted",
         "in_progress": "in_progress",
         "completed": "completed",
         "rejected": "rejected",
+        "retryable": "retryable",
     }
     message = (action.result or {}).get("message")
     if not isinstance(message, str):
@@ -212,7 +218,10 @@ async def _dispatch_release_action(
             },
         )
     if response.status_code != 204:
-        raise HTTPException(status_code=502, detail="GitHub did not accept release action")
+        raise HTTPException(
+            status_code=502 if response.status_code >= 500 else 409,
+            detail="GitHub did not accept release action",
+        )
 
 
 async def _dispatch_external_review(run: AgentRun, pr_number: str) -> None:
@@ -634,7 +643,7 @@ async def pending_notifications(
             if not is_open:
                 continue
             if run.status == "pr_ready" and (
-                run.review_status != "clean"
+                run.review_status not in {"clean", "advisory"}
                 or run.review_sha != run.head_sha
                 or run.ci_verified_sha != run.head_sha
             ):
@@ -680,6 +689,8 @@ async def pending_notifications(
                 url=run.ci_url,
             ),
             actions=_run_detail(run).actions,
+            qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
+            qa_deploy_dispatch_error=run.qa_deploy_dispatch_error,
         )
         for run in verified_runs
     ]
@@ -833,7 +844,7 @@ async def mark_notified(
     if run.status == "pr_ready" and (
         run.ci_status != "success"
         or run.ci_verified_sha != run.head_sha
-        or run.review_status != "clean"
+        or run.review_status not in {"clean", "advisory"}
         or run.review_sha != run.head_sha
     ):
         raise HTTPException(
@@ -1051,8 +1062,20 @@ async def agent_pr_review_result(
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
     await _verify_pr(run, pr_number, payload.sha)
     findings = [finding.model_dump() for finding in payload.findings]
-    review_state = payload.state or ("clean" if not findings else "findings")
-    if (review_state == "clean" and findings) or (review_state == "findings" and not findings):
+    blocking_findings = [
+        finding for finding in payload.findings if finding.severity in {"P1", "P2"}
+    ]
+    advisory_findings = [finding for finding in payload.findings if finding.severity == "P3"]
+    review_state = payload.state or (
+        "findings" if blocking_findings else "advisory" if advisory_findings else "clean"
+    )
+    invalid_state = (
+        (review_state == "clean" and findings)
+        or (review_state == "advisory" and (not advisory_findings or blocking_findings))
+        or (review_state == "findings" and not blocking_findings)
+        or (review_state == "error" and findings)
+    )
+    if invalid_state:
         raise HTTPException(status_code=422, detail="review state does not match findings")
     run.review_status = review_state
     run.review_sha = payload.sha
@@ -1069,8 +1092,16 @@ async def agent_pr_review_result(
             run,
             status=(
                 "review_findings"
-                if findings
-                else "review_error" if review_state == "error" else "review_passed_ci_pending"
+                if blocking_findings
+                else (
+                    "review_advisory"
+                    if advisory_findings
+                    else (
+                        "review_error"
+                        if review_state == "error"
+                        else "review_passed_ci_pending"
+                    )
+                )
             ),
             phase="review",
         )
@@ -1139,6 +1170,7 @@ async def _request_owner_action(
         json.dumps(action_payload, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
     action = await session.get(AgentRunAction, action_id)
+    retry_existing = False
     if action is not None:
         if (
             action.agent_run_id != run.id
@@ -1150,7 +1182,9 @@ async def _request_owner_action(
                 "action_id was already used for a different request",
                 status_code=409,
             )
-        return _action_response(action, run)
+        if action.status != "retryable":
+            return _action_response(action, run)
+        retry_existing = True
     if not _owner_release_supported(run) or not run.pr_url:
         return _action_error(
             "not_ready", "this run has no owner-controlled private PR", status_code=409
@@ -1186,15 +1220,21 @@ async def _request_owner_action(
     if not settings.github_agent_token or not target_token:
         raise HTTPException(status_code=503, detail="release workflow token is not configured")
 
-    action = AgentRunAction(
-        action_id=action_id,
-        agent_run_id=run.id,
-        kind=kind,
-        request_hash=request_hash,
-        request_data=action_payload,
-        status="accepted",
-    )
-    session.add(action)
+    if not retry_existing:
+        action = AgentRunAction(
+            action_id=action_id,
+            agent_run_id=run.id,
+            kind=kind,
+            request_hash=request_hash,
+            request_data=action_payload,
+            status="accepted",
+        )
+        session.add(action)
+    else:
+        assert action is not None
+        action.status = "accepted"
+        action.result = None
+    assert action is not None
     await session.commit()
     payload: dict[str, object] = {
         "expected_head_sha": expected_head_sha,
@@ -1205,8 +1245,15 @@ async def _request_owner_action(
     try:
         await _dispatch_release_action(run, action, payload)
     except (HTTPException, httpx.HTTPError) as exc:
-        action.status = "rejected"
-        action.result = {"message": "GitHub did not accept this action"}
+        is_permanent = isinstance(exc, HTTPException) and exc.status_code < 500
+        action.status = "rejected" if is_permanent else "retryable"
+        action.result = {
+            "message": (
+                "GitHub rejected this release action"
+                if is_permanent
+                else "GitHub dispatch failed; retry this action with the same action ID"
+            )
+        }
         await session.commit()
         if isinstance(exc, HTTPException):
             log.warning("agent_release_dispatch_rejected", run_id=run_id, action=kind)
@@ -1326,7 +1373,7 @@ async def agent_action_result(
         if (
             payload.head_sha != run.head_sha
             or action.request_data.get("expected_head_sha") != run.head_sha
-            or not _can_merge(run)
+            or not _owner_release_supported(run)
             or not payload.merge_sha
         ):
             raise HTTPException(
@@ -1339,6 +1386,10 @@ async def agent_action_result(
         run.merged_sha = payload.merge_sha
         run.merged_at = run.merged_at or datetime.now(UTC)
         run.notified_at = None
+        if settings.agent_qa_enabled and run.repo_full_name == settings.agent_qa_repository:
+            run.qa_deploy_dispatch_status = "pending"
+            run.qa_deploy_dispatch_error = None
+            run.qa_deploy_dispatched_at = None
         agent_events.record(session, run, phase="merge")
         action.result = {
             "head_sha": payload.head_sha,
@@ -1800,6 +1851,122 @@ async def agent_qa_run_deployed(
         )
     await session.commit()
     return AgentRunOut.model_validate(run)
+
+
+@router.post("/{run_id}/qa-deploy-dispatch-result", response_model=AgentRunOut)
+async def agent_qa_deploy_dispatch_result(
+    run_id: str,
+    payload: AgentQaDeployDispatchResult,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    """Record whether the trusted central workflow queued QA deployment."""
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+    if run is None or run.repo_full_name != settings.agent_qa_repository:
+        raise HTTPException(status_code=404, detail="QA agent run not found")
+    if run.status not in {"merged", "deployed"} or run.merged_sha != payload.sha:
+        raise HTTPException(status_code=409, detail="QA merge does not match dispatch result")
+    action = await session.scalar(
+        select(AgentRunAction).where(
+            AgentRunAction.action_id == str(payload.action_id),
+            AgentRunAction.agent_run_id == run.id,
+        )
+    )
+    if (
+        action is None
+        or action.kind != "merge"
+        or action.status != "completed"
+        or (action.result or {}).get("merge_sha") != payload.sha
+    ):
+        raise HTTPException(
+            status_code=409, detail="QA result is not tied to the completed merge action"
+        )
+    if run.status == "deployed" and run.qa_ready_sha == payload.sha:
+        return AgentRunOut.model_validate(run)
+    if payload.status == "failed" and run.qa_deploy_dispatch_status == "dispatched":
+        return AgentRunOut.model_validate(run)
+    if payload.status == "dispatched":
+        run.qa_deploy_dispatch_status = "dispatched"
+        run.qa_deploy_dispatch_error = None
+        run.qa_deploy_dispatched_at = run.qa_deploy_dispatched_at or datetime.now(UTC)
+        agent_events.record(session, run, phase="qa_deploy")
+    else:
+        run.qa_deploy_dispatch_status = "failed"
+        run.qa_deploy_dispatch_error = (
+            payload.message or "QA deployment workflow dispatch failed"
+        )
+        agent_events.record(
+            session,
+            run,
+            status="qa_dispatch_failed",
+            phase="qa_deploy",
+            error=run.qa_deploy_dispatch_error,
+        )
+    await session.commit()
+    return AgentRunOut.model_validate(run)
+
+
+@router.post(
+    "/{run_id}/qa-deployment-authorization",
+    response_model=AgentQaDeploymentAuthorizationOut,
+)
+async def authorize_qa_deployment(
+    run_id: str,
+    payload: AgentQaDeploymentAuthorization,
+    session: DbSession,
+    x_agent_qa_callback_token: str | None = Header(default=None),
+) -> AgentQaDeploymentAuthorizationOut:
+    """Authorize only the exact QA merge dispatched by an owner release action."""
+    _qa_deploy_auth(x_agent_qa_callback_token)
+    run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    if run is None or run.repo_full_name != settings.agent_qa_repository:
+        raise HTTPException(status_code=404, detail="QA agent run not found")
+    if (
+        run.status not in {"merged", "deployed"}
+        or run.merged_sha != payload.merge_sha
+        or run.qa_deploy_dispatch_status != "dispatched"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="QA deployment was not authorized by the owner merge",
+        )
+    action = await session.scalar(
+        select(AgentRunAction).where(
+            AgentRunAction.action_id == str(payload.action_id),
+            AgentRunAction.agent_run_id == run.id,
+        )
+    )
+    if (
+        action is None
+        or action.kind != "merge"
+        or action.status != "completed"
+        or action.request_data.get("expected_head_sha") != payload.expected_head_sha
+        or (action.result or {}).get("head_sha") != payload.expected_head_sha
+        or (action.result or {}).get("merge_sha") != payload.merge_sha
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="QA deployment does not match the owner merge action",
+        )
+    current_head = await _verify_deployment(run, payload.merge_sha)
+    if current_head != payload.expected_head_sha:
+        raise HTTPException(
+            status_code=409,
+            detail="QA PR head differs from the owner-approved head",
+        )
+    return AgentQaDeploymentAuthorizationOut(
+        authorized=True,
+        run_id=run.run_id,
+        repo_full_name=run.repo_full_name,
+        expected_head_sha=payload.expected_head_sha,
+        merge_sha=payload.merge_sha,
+    )
 
 
 @router.post("/{run_id}/callback", response_model=AgentRunOut)

@@ -2,11 +2,12 @@ from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import agent_runs
 from app.core.config import settings
-from app.db.models import AgentRun, Project, User
+from app.db.models import AgentRun, AgentRunAction, Project, User
 from app.services.agent_repos import repository_for
 from tests.conftest import auth
 
@@ -135,6 +136,78 @@ async def test_ci_success_waits_for_clean_review_on_same_head(
 
 
 @pytest.mark.asyncio
+async def test_p3_review_is_advisory_but_p2_still_blocks_merge(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    run = await _open_run(
+        client,
+        session,
+        manager,
+        project,
+        status="pr_opened",
+        ci_status="success",
+        review_status="pending",
+    )
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+
+    async def verify_pr(current, number: str, sha: str) -> None:
+        assert number == "4" and sha == _SHA
+
+    async def current_head(current) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", verify_pr)
+    monkeypatch.setattr(agent_runs, "_current_pr_head", current_head)
+    advisory = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/review-result",
+        json={
+            "sha": _SHA,
+            "state": "advisory",
+            "summary": "One low priority suggestion.",
+            "findings": [
+                {
+                    "severity": "P3",
+                    "title": "Prefer a clearer name",
+                    "evidence": "The current name is correct but vague.",
+                }
+            ],
+        },
+        headers=_CALLBACK,
+    )
+    assert advisory.status_code == 200
+    assert advisory.json()["status"] == "pr_ready"
+    assert advisory.json()["review_status"] == "advisory"
+    detail = await client.get(f"/api/v1/agent-runs/{run.run_id}", headers=auth(manager))
+    assert detail.json()["actions"]["merge"]["available"] is True
+    assert detail.json()["review"]["findings"][0]["severity"] == "P3"
+
+    blocking = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/review-result",
+        json={
+            "sha": _SHA,
+            "state": "findings",
+            "summary": "A correctness issue remains.",
+            "findings": [
+                {
+                    "severity": "P2",
+                    "title": "Missing input guard",
+                    "evidence": "An empty value reaches the unsafe branch.",
+                }
+            ],
+        },
+        headers=_CALLBACK,
+    )
+    assert blocking.status_code == 200
+    assert blocking.json()["status"] == "pr_opened"
+    detail = await client.get(f"/api/v1/agent-runs/{run.run_id}", headers=auth(manager))
+    assert detail.json()["actions"]["merge"]["available"] is False
+
+
+@pytest.mark.asyncio
 async def test_owner_merge_is_idempotent_and_rejects_stale_head(
     client: AsyncClient,
     session: AsyncSession,
@@ -190,6 +263,61 @@ async def test_owner_merge_is_idempotent_and_rejects_stale_head(
     assert first.json()["status"] == second.json()["status"] == "in_progress"
     assert first.json()["action_id"] == action_id
     assert dispatched == [action_id]
+
+
+@pytest.mark.asyncio
+async def test_transient_dispatch_failure_can_retry_with_same_action_id(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    run = await _open_run(
+        client,
+        session,
+        manager,
+        project,
+        status="pr_ready",
+        ci_status="success",
+        review_status="clean",
+    )
+    monkeypatch.setattr(settings, "github_agent_token", "task-manager-write-token")
+
+    async def current_head(current) -> tuple[str, bool]:
+        return _SHA, True
+
+    dispatched: list[str] = []
+
+    async def dispatch(current, action, payload) -> None:
+        dispatched.append(action.action_id)
+        if len(dispatched) == 1:
+            raise agent_runs.httpx.ConnectError("connection reset")
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", current_head)
+    monkeypatch.setattr(agent_runs, "_dispatch_release_action", dispatch)
+    action_id = str(uuid4())
+    body = {"expected_head_sha": _SHA, "action_id": action_id}
+    first = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/merge", json=body, headers=auth(manager)
+    )
+    assert first.status_code == 200
+    assert first.json()["status"] == "retryable"
+    second = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/merge", json=body, headers=auth(manager)
+    )
+    third = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/merge", json=body, headers=auth(manager)
+    )
+    assert second.status_code == third.status_code == 200
+    assert second.json()["status"] == third.json()["status"] == "in_progress"
+    assert dispatched == [action_id, action_id]
+    actions = (
+        await session.scalars(
+            select(AgentRunAction).where(AgentRunAction.agent_run_id == run.id)
+        )
+    ).all()
+    assert len(actions) == 1 and actions[0].status == "in_progress"
 
 
 @pytest.mark.asyncio
@@ -283,17 +411,75 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
     run.merged_sha = "b" * 40
+    action_id = str(uuid4())
+    session.add(
+        AgentRunAction(
+            action_id=action_id,
+            agent_run_id=run.id,
+            kind="merge",
+            request_hash="c" * 64,
+            request_data={"expected_head_sha": _SHA},
+            status="completed",
+            result={"head_sha": _SHA, "merge_sha": "b" * 40},
+        )
+    )
     await session.commit()
     monkeypatch.setattr(settings, "agent_qa_enabled", True)
     monkeypatch.setattr(settings, "agent_qa_callback_token", "qa-only-token-0123456789abcdef")
     monkeypatch.setattr(settings, "agent_qa_ready_url", "http://127.0.0.1:18082/ready")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
 
     async def verify_deployment(current, sha: str) -> str:
         assert current.repo_full_name == "Asadtop4ik/agent-qa"
         assert sha == "b" * 40
-        return "c" * 40
+        return _SHA
 
     monkeypatch.setattr(agent_runs, "_verify_deployment", verify_deployment)
+
+    dispatch_url = f"/api/v1/agent-runs/{run.run_id}/qa-deploy-dispatch-result"
+    failed_dispatch = await client.post(
+        dispatch_url,
+        json={
+            "action_id": action_id,
+            "sha": "b" * 40,
+            "status": "failed",
+            "message": "Actions:write is missing",
+        },
+        headers=_CALLBACK,
+    )
+    assert failed_dispatch.status_code == 200
+    assert failed_dispatch.json()["qa_deploy_dispatch_status"] == "failed"
+    assert failed_dispatch.json()["qa_deploy_dispatch_error"] == "Actions:write is missing"
+    retried_dispatch = await client.post(
+        dispatch_url,
+        json={"action_id": action_id, "sha": "b" * 40, "status": "dispatched"},
+        headers=_CALLBACK,
+    )
+    assert retried_dispatch.status_code == 200
+    assert retried_dispatch.json()["qa_deploy_dispatch_status"] == "dispatched"
+    assert retried_dispatch.json()["qa_deploy_dispatch_error"] is None
+
+    authorization_url = f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization"
+    authorization_body = {
+        "action_id": action_id,
+        "expected_head_sha": _SHA,
+        "merge_sha": "b" * 40,
+    }
+    unauthorized_sha = await client.post(
+        authorization_url,
+        json=authorization_body | {"merge_sha": "d" * 40},
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert unauthorized_sha.status_code == 409
+    authorization = await client.post(
+        authorization_url,
+        json=authorization_body,
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert authorization.status_code == 200
+    assert authorization.json()["authorized"] is True
+    assert authorization.json()["merge_sha"] == "b" * 40
+
     url = f"/api/v1/agent-runs/{run.run_id}/qa-deployed"
     body = {
         "sha": "b" * 40,

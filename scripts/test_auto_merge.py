@@ -90,6 +90,7 @@ class PolicyTests(unittest.TestCase):
             "review_sha": "a" * 40,
         }
         self.assertTrue(agent_ready(pr, ready))
+        self.assertTrue(agent_ready(pr, ready | {"review_status": "advisory"}))
         self.assertFalse(agent_ready(pr, ready | {"status": "cancelled"}))
         self.assertFalse(agent_ready(pr, ready | {"head_sha": "b" * 40}))
         self.assertEqual(

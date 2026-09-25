@@ -25,6 +25,11 @@ def upgrade() -> None:
     op.add_column("agent_runs", sa.Column("qa_ready_url", sa.Text()))
     op.add_column("agent_runs", sa.Column("qa_ready_sha", sa.String(40)))
     op.add_column("agent_runs", sa.Column("qa_ready_at", sa.DateTime(timezone=True)))
+    op.add_column("agent_runs", sa.Column("qa_deploy_dispatch_status", sa.String(16)))
+    op.add_column("agent_runs", sa.Column("qa_deploy_dispatch_error", sa.Text()))
+    op.add_column(
+        "agent_runs", sa.Column("qa_deploy_dispatched_at", sa.DateTime(timezone=True))
+    )
     # Existing PRs have no independent review evidence. Force them through a
     # fresh review before the API can consider them ready to merge.
     op.execute(
@@ -72,3 +77,6 @@ def downgrade() -> None:
     op.drop_column("agent_runs", "qa_ready_at")
     op.drop_column("agent_runs", "qa_ready_sha")
     op.drop_column("agent_runs", "qa_ready_url")
+    op.drop_column("agent_runs", "qa_deploy_dispatched_at")
+    op.drop_column("agent_runs", "qa_deploy_dispatch_error")
+    op.drop_column("agent_runs", "qa_deploy_dispatch_status")

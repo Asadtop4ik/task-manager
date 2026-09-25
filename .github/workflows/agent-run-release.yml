@@ -30,7 +30,7 @@ jobs:
           AGENT_QA_REPOSITORY: ${{ vars.AGENT_QA_REPOSITORY }}
         run: python3 scripts/agent_release.py verify-merge
       - name: Merge the exact current PR head
-        if: steps.verify.outcome == 'success'
+        if: steps.verify.outcome == 'success' && steps.verify.outputs.already_merged != 'true'
         env:
           GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || github.event.client_payload.repo_full_name == github.repository && secrets.AGENT_REPO_TOKEN || secrets.AGENT_PUBLIC_REPO_TOKEN }}
           AGENT_QA_ENABLED: ${{ vars.AGENT_QA_ENABLED }}
@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           test -n "$GH_TOKEN"
           gh pr merge "$PR_NUMBER" --repo "$TARGET_REPO" \
-            --squash --match-head-commit "$EXPECTED_HEAD_SHA"
+            --merge --match-head-commit "$EXPECTED_HEAD_SHA"
       - name: Record exact merge result or rejection
         if: always()
         env:
