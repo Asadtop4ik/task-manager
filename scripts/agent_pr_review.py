@@ -21,7 +21,7 @@ TASK_API = "https://tasks.standart-eko.uz/api/v1/agent-runs"
 RUN_ID_PATTERN = re.compile(r"codex/task-[1-9][0-9]*-([0-9a-f-]{36})$")
 ALLOWED_SEVERITIES = {"P1", "P2", "P3"}
 VISIBLE_FINDING_LIMIT = 12
-VISIBLE_REPORT_LIMIT = 12_000
+VISIBLE_REPORT_LIMIT = 20_000
 REDACTION_INPUT_LIMIT = 50_000
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",

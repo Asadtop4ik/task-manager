@@ -140,6 +140,40 @@ class AgentPrReviewTests(unittest.TestCase):
         self.assertLess(report.index("Finding 2 [P2]"), report.index("Finding 3 [P3]"))
         self.assertIn("Additional findings omitted: 2 (P3: 2)", report)
 
+    def test_report_limit_keeps_omitted_severity_counts_visible(self):
+        findings = [
+            {
+                "severity": "P3",
+                "title": "A" * 180,
+                "evidence": "B" * 600,
+                "file": "C" * 200,
+                "line": 1,
+            }
+            for _ in range(12)
+        ]
+        findings.append(
+            {
+                "severity": "P1",
+                "title": "blocking finding",
+                "evidence": "D" * 600,
+                "file": "critical.py",
+                "line": 2,
+            }
+        )
+        report = _review_report(
+            "Asadtop4ik/task-manager",
+            45,
+            "b" * 40,
+            "Summary",
+            findings,
+            "findings",
+            False,
+        )
+
+        self.assertGreater(len(report), 12_000)
+        self.assertIn("Finding 1 [P1]", report)
+        self.assertIn("Additional findings omitted: 1 (P3: 1)", report)
+
 
 if __name__ == "__main__":
     unittest.main()
