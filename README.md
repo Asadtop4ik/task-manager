@@ -113,7 +113,11 @@ server and QA deploy workflow; it only authorizes the exact QA run/SHA readiness
 callback. Set the central Task Manager workflow variables `AGENT_QA_ENABLED`,
 `AGENT_QA_REPOSITORY`, and `AGENT_QA_DEPLOY_WORKFLOW` (the checked-in workflow
 path). The server and workflow must both enable the flag; QA remains absent from
-the normal approved project catalog otherwise.
+the normal approved project catalog otherwise. After deploying the API image,
+run `ops/install_project_catalog.sh` from the clean matching `main` checkout to
+install the host monitor update. It copies the API's effective QA flag and
+repository-scoped read token into `/etc/task-manager/external-monitor.env`
+atomically, starts one monitor pass, and verifies the recurring timer is active.
 
 The workflow keeps GitHub write credentials out of the Codex runner. Its patch
 is applied in a separate clean GitHub-hosted publisher job. Protected paths

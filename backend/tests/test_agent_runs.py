@@ -861,6 +861,60 @@ async def test_ci_verifier_requires_the_catalog_job(monkeypatch) -> None:
     await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
 
 
+async def test_qa_ci_verifier_accepts_its_workflow_and_rejects_ci_yml(
+    monkeypatch,
+) -> None:
+    _credentials(monkeypatch)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    workflow = {
+        "head_sha": "a" * 40,
+        "head_branch": "codex/task-30-00000000-0000-0000-0000-000000000030",
+        "event": "pull_request",
+        "path": ".github/workflows/agent-qa.yml",
+        "status": "completed",
+        "conclusion": "success",
+    }
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, value):
+            self.value = value
+
+        def json(self):
+            return self.value
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            if url.endswith("/jobs?per_page=100"):
+                return FakeResponse({"jobs": [{"name": "PR CI", "conclusion": "success"}]})
+            return FakeResponse(workflow)
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    run = AgentRun(
+        run_id="00000000-0000-0000-0000-000000000030",
+        task_id=30,
+        task_revision="a" * 64,
+        repo_full_name="Asadtop4ik/agent-qa",
+        base_branch="main",
+        mode="pr",
+        status="pr_opened",
+    )
+    url = "https://github.com/Asadtop4ik/agent-qa/actions/runs/36182380264"
+    await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
+    with pytest.raises(HTTPException, match="PR CI does not match this commit"):
+        await agent_runs._verify_pr_ci(run, "b" * 40, "success", url)
+    workflow["path"] = ".github/workflows/ci.yml"
+    with pytest.raises(HTTPException, match="PR CI does not match this commit"):
+        await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
+
+
 async def test_ready_notice_rechecks_current_pr_head(
     client: AsyncClient,
     session: AsyncSession,

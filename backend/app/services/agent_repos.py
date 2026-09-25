@@ -22,6 +22,8 @@ class AgentRepository:
     ci_jobs: tuple[str, ...] = ()
     # Job names in the pull_request CI workflow, before a PR is announced.
     pr_ci_jobs: tuple[str, ...] = ()
+    # Workflow file that owns those jobs.
+    pr_ci_workflow: str = ".github/workflows/ci.yml"
     images: tuple[tuple[str, str], ...] = ()
     qa_only: bool = False
 
@@ -70,6 +72,7 @@ QA_REPOSITORY = AgentRepository(
     "main",
     True,
     pr_ci_jobs=("PR CI",),
+    pr_ci_workflow=".github/workflows/agent-qa.yml",
     qa_only=True,
 )
 PUBLIC_REPOSITORIES = frozenset(

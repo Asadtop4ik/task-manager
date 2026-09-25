@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from agent_deploy_monitor import CI_TARGETS, TARGETS
+from agent_deploy_monitor import TARGETS, ci_targets
 from intake_worker import INTAKE_REPOSITORIES
 from project_catalog import (
     approved_pairs,
@@ -28,9 +28,15 @@ class ProjectCatalogTests(unittest.TestCase):
         self.assertEqual(INTAKE_REPOSITORIES, intake_pairs())
         self.assertEqual(APPROVED_REPOS, approved_pairs())
         self.assertEqual(set(TARGETS), set(APPROVED_REPOS))
-        self.assertEqual(set(CI_TARGETS), {item.full_name for item in REPOSITORIES})
+        disabled_ci_targets = ci_targets(qa_enabled=False)
+        self.assertEqual(
+            set(disabled_ci_targets), {item.full_name for item in REPOSITORIES}
+        )
         for item in REPOSITORIES:
-            self.assertEqual(CI_TARGETS[item.full_name], (item.branch, frozenset(item.pr_ci_jobs)))
+            target = disabled_ci_targets[item.full_name]
+            self.assertEqual(target.branch, item.branch)
+            self.assertEqual(target.jobs, frozenset(item.pr_ci_jobs))
+            self.assertEqual(target.workflow_path, item.pr_ci_workflow)
         for item in public_projects():
             target = TARGETS[item.full_name]
             self.assertEqual(target.branch, item.branch)

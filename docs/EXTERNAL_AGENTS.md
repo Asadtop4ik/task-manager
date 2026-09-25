@@ -57,6 +57,12 @@ ochilgan, Task Manager agent runiga bog‘lanmagan PRlar bu oqimga kirmaydi.
    root-owned 0600 bo‘lsin va mavjud server env’dagi `GITHUB_AGENT_TOKEN` hamda
    `AGENT_CALLBACK_TOKEN` qiymatlarini o‘z ichiga olsin. `systemd-analyze verify`
    va `systemctl enable --now task-manager-external-monitor.timer`ni bajaring.
+   Agent QA yoqilgan bo‘lsa, API deployidan so‘ng aynan shu commitdagi clean
+   `main` checkout’dan `ops/install_project_catalog.sh`ni bajaring. Skript
+   `task-api` konteyneridagi `AGENT_QA_ENABLED` va repository-scoped
+   `GITHUB_AGENT_QA_TOKEN`ni maxfiy qiymatlarni chiqarmasdan monitor env fayliga
+   atomik ko‘chiradi, `task-manager-external-monitor.service`ni bir marta ishga
+   tushiradi va timer faol ekanini tekshiradi.
    Server Compose’da `qurbot-worker` uchun `arq --check
    app.workers.main.WorkerSettings`, `kans-frontend` uchun esa localhost HTTP
    healthcheck qo‘shing. Monitor **har bir** container healthy bo‘lmaguncha

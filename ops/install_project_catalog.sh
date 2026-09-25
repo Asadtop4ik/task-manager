@@ -35,6 +35,7 @@ scp -q backend/app/services/agent_repos.py ops/project_catalog.py \
   ops/intake_worker.py ops/discussion_appserver.py \
   ops/agent_deploy_monitor.py ops/diagnostic_host.py \
   ops/diagnostic_proxy.py ops/diagnostic_security.py \
+  ops/sync_external_monitor_qa_env.py \
   ops/ketoshop_diagnostic_views.sql ops/provision_ketoshop_diagnostics_role.sql \
   ops/ketoshop_diagnostics_qa_fixture.sql ops/requirements-diagnostics.txt \
   ops/task-manager-intake.service ops/task-manager-diagnostics.service \
@@ -45,6 +46,8 @@ ssh -o BatchMode=yes netcup "
   sudo install -o root -g root -m 0644 '$remote_dir/intake_worker.py' /opt/task-manager/ops/intake_worker.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/discussion_appserver.py' /opt/task-manager/ops/discussion_appserver.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/agent_deploy_monitor.py' /opt/task-manager/ops/agent_deploy_monitor.py &&
+  sudo install -o root -g root -m 0644 '$remote_dir/sync_external_monitor_qa_env.py' \
+    /opt/task-manager/ops/sync_external_monitor_qa_env.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/diagnostic_host.py' /opt/task-manager/ops/diagnostic_host.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/diagnostic_proxy.py' /opt/task-manager/ops/diagnostic_proxy.py &&
   sudo install -o root -g root -m 0644 '$remote_dir/diagnostic_security.py' /opt/task-manager/ops/diagnostic_security.py &&
@@ -54,6 +57,7 @@ ssh -o BatchMode=yes netcup "
   sudo install -o root -g root -m 0644 '$remote_dir/requirements-diagnostics.txt' /opt/task-manager/ops/requirements-diagnostics.txt &&
   sudo install -o root -g root -m 0644 '$remote_dir/task-manager-intake.service' /etc/systemd/system/task-manager-intake.service &&
   sudo install -o root -g root -m 0644 '$remote_dir/task-manager-diagnostics.service' /etc/systemd/system/task-manager-diagnostics.service &&
+  sudo python3 /opt/task-manager/ops/sync_external_monitor_qa_env.py &&
   sudo systemctl daemon-reload &&
   sudo systemctl restart task-manager-intake.service &&
   sudo systemctl start task-manager-external-monitor.service &&
