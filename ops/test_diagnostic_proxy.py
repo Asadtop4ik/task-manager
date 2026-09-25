@@ -19,6 +19,25 @@ class DiagnosticProxyTests(unittest.TestCase):
                 "ketoshop_finance_summary",
             ],
         )
+        for tool in TOOLS:
+            with self.subTest(tool=tool["name"]):
+                annotations = tool["annotations"]
+                self.assertEqual(
+                    set(annotations),
+                    {
+                        "title",
+                        "readOnlyHint",
+                        "destructiveHint",
+                        "idempotentHint",
+                        "openWorldHint",
+                    },
+                )
+                self.assertIsInstance(annotations["title"], str)
+                self.assertTrue(annotations["title"])
+                self.assertTrue(annotations["readOnlyHint"])
+                self.assertFalse(annotations["destructiveHint"])
+                self.assertTrue(annotations["idempotentHint"])
+                self.assertFalse(annotations["openWorldHint"])
         with tempfile.TemporaryDirectory() as directory:
             socket_path = str(Path(directory) / "diagnostics.sock")
             received = []

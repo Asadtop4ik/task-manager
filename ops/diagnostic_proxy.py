@@ -29,6 +29,13 @@ TOOLS = [
             "required": ["query"],
             "additionalProperties": False,
         },
+        "annotations": {
+            "title": "Read anonymized Ketoshop order metadata",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     },
     {
         "name": "ketoshop_recent_logs",
@@ -40,6 +47,13 @@ TOOLS = [
             "type": "object",
             "properties": {},
             "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Read redacted Ketoshop log metadata",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
         },
     },
     {
@@ -60,6 +74,13 @@ TOOLS = [
             },
             "required": ["period", "count"],
             "additionalProperties": False,
+        },
+        "annotations": {
+            "title": "Read bounded Ketoshop finance aggregates",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
         },
     },
 ]
