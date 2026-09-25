@@ -32,6 +32,37 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _is_qa_project(project: Project | None) -> bool:
+    return bool(
+        project
+        and (
+            project.key == "agent-qa" or project.repo_full_name == settings.agent_qa_repository
+        )
+    )
+
+
+def _is_qa_owner(user: User | None) -> bool:
+    return bool(
+        user
+        and settings.owner_telegram_id > 0
+        and user.telegram_id == settings.owner_telegram_id
+    )
+
+
+def _qa_project_allowed(project: Project | None, user: User | None) -> bool:
+    return bool(
+        settings.agent_qa_enabled
+        and _is_qa_owner(user)
+        and project is not None
+        and repository_for(
+            project.key,
+            project.repo_full_name,
+            project.default_branch,
+            include_qa=True,
+        )
+    )
+
+
 async def _owned(session: DbSession, discussion_id: int, user: User) -> ProjectDiscussion:
     row = await session.scalar(
         select(ProjectDiscussion)
@@ -42,6 +73,9 @@ async def _owned(session: DbSession, discussion_id: int, user: User) -> ProjectD
         raise HTTPException(status_code=404, detail="discussion not found")
     if not await can_see_project(session, user, row.project_id):
         raise HTTPException(status_code=404, detail="project not found")
+    project = await session.get(Project, row.project_id)
+    if _is_qa_project(project) and not _qa_project_allowed(project, user):
+        raise HTTPException(status_code=404, detail="discussion not found")
     _check_capability(user, "pr")
     return row
 
@@ -62,6 +96,8 @@ async def start_discussion(
     if not await can_see_project(session, user, payload.project_id):
         raise HTTPException(status_code=404, detail="project not found")
     project = await session.get(Project, payload.project_id)
+    if _is_qa_project(project) and not _is_qa_owner(user):
+        raise HTTPException(status_code=403, detail="agent-qa is owner-only")
     repository = (
         repository_for(
             project.key,
@@ -228,10 +264,14 @@ async def lease_discussion(
     if (
         repository is None
         or not allowed_actor
+        or (_is_qa_project(project) and not _qa_project_allowed(project, actor))
         or (not repository.private and not settings.agent_public_enabled)
     ):
         row.status = "failed"
         row.error = "Loyiha yoki Codex huquqi hozir mavjud emas."
+        row.lease_id = None
+        row.lease_until = None
+        row.revision += 1
         agent_events.record(session, row, error=row.error)
         await session.commit()
         return Response(status_code=204)
@@ -325,6 +365,17 @@ async def _leased(
         or row.lease_until <= _now()
     ):
         raise HTTPException(status_code=409, detail="discussion lease expired")
+    project = await session.get(Project, row.project_id)
+    actor = await session.get(User, row.user_id)
+    if _is_qa_project(project) and not _qa_project_allowed(project, actor):
+        row.status = "failed"
+        row.error = "agent-qa is no longer enabled for this owner."
+        row.lease_id = None
+        row.lease_until = None
+        row.revision += 1
+        agent_events.record(session, row, error=row.error)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="QA discussion is no longer authorized")
     return row
 
 

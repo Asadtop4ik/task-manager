@@ -55,6 +55,37 @@ def _worker_auth(token: str | None) -> None:
         raise HTTPException(status_code=401, detail="intake worker authentication required")
 
 
+def _is_qa_project(project: Project | None) -> bool:
+    return bool(
+        project
+        and (
+            project.key == "agent-qa" or project.repo_full_name == settings.agent_qa_repository
+        )
+    )
+
+
+def _is_qa_owner(user: User | None) -> bool:
+    return bool(
+        user
+        and settings.owner_telegram_id > 0
+        and user.telegram_id == settings.owner_telegram_id
+    )
+
+
+def _qa_project_allowed(project: Project | None, user: User | None) -> bool:
+    return bool(
+        settings.agent_qa_enabled
+        and _is_qa_owner(user)
+        and project is not None
+        and repository_for(
+            project.key,
+            project.repo_full_name,
+            project.default_branch,
+            include_qa=True,
+        )
+    )
+
+
 async def _owned(session: DbSession, intake_id: int, user: User) -> AgentIntake:
     row = await session.scalar(
         select(AgentIntake).where(AgentIntake.id == intake_id).with_for_update()
@@ -64,6 +95,9 @@ async def _owned(session: DbSession, intake_id: int, user: User) -> AgentIntake:
         or row.user_id != user.id
         or (row.status != "confirmed" and row.expires_at <= _now())
     ):
+        raise HTTPException(status_code=404, detail="intake not found")
+    project = await session.get(Project, row.project_id)
+    if _is_qa_project(project) and not _qa_project_allowed(project, user):
         raise HTTPException(status_code=404, detail="intake not found")
     return row
 
@@ -98,6 +132,8 @@ async def create_intake(
     if not await can_see_project(session, user, payload.project_id):
         raise HTTPException(status_code=404, detail="project not found")
     project = await session.get(Project, payload.project_id)
+    if _is_qa_project(project) and not _is_qa_owner(user):
+        raise HTTPException(status_code=403, detail="agent-qa is owner-only")
     repository = (
         repository_for(
             project.key,
@@ -217,11 +253,20 @@ async def lease_intake(
         .order_by(AgentIntake.created_at, AgentIntake.id)
         .with_for_update(skip_locked=True)
         .limit(1)
-        .options(selectinload(AgentIntake.project))
+        .options(selectinload(AgentIntake.project), selectinload(AgentIntake.user))
     )
     if row is None:
         if expired_any:
             await session.commit()
+        return Response(status_code=204)
+    if _is_qa_project(row.project) and not _qa_project_allowed(row.project, row.user):
+        row.status = "failed"
+        row.error = "agent-qa is disabled or is not owned by the configured owner."
+        row.lease_id = None
+        row.lease_until = None
+        row.revision += 1
+        agent_events.record(session, row, error=row.error)
+        await session.commit()
         return Response(status_code=204)
     row.status = "analyzing"
     agent_events.record(session, row)
@@ -265,6 +310,17 @@ async def report_intake(
         or row.revision != payload.revision
     ):
         raise HTTPException(status_code=409, detail="intake lease is no longer current")
+    project = await session.get(Project, row.project_id)
+    actor = await session.get(User, row.user_id)
+    if _is_qa_project(project) and not _qa_project_allowed(project, actor):
+        row.status = "failed"
+        row.error = "agent-qa is disabled or is not owned by the configured owner."
+        row.lease_until = None
+        row.lease_id = None
+        row.revision += 1
+        agent_events.record(session, row, error=row.error)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="QA intake is no longer authorized")
     if payload.status == "needs_answers" and row.answer_text is not None:
         raise HTTPException(status_code=409, detail="the clarification round is complete")
     row.status = payload.status
