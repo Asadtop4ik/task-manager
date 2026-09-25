@@ -11,6 +11,7 @@ class AgentRunOut(BaseModel):
     run_id: str
     task_id: int
     repo_full_name: str
+    base_branch: str
     status: str
     ci_status: str | None
     ci_verified_sha: str | None

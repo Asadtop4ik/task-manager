@@ -1137,6 +1137,7 @@ async def test_ready_pr_is_closed_before_cancellation(
     )
     assert status.status_code == 200
     assert status.json()["status"] == "cancelled"
+    assert status.json()["base_branch"] == "main"
 
 
 async def test_verified_pr_rejects_wrong_branch_or_sha(monkeypatch) -> None:
