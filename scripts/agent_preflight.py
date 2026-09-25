@@ -62,12 +62,19 @@ def run(repo: str, root: Path) -> str:
     paths = changed_python(root)
     if repo == "Asadtop4ik/agent-qa":
         if paths:
+            ensure_tools("ruff==0.7.4")
+            # Only safe-fix unused imports in files changed by this agent run.
+            # The full checks below make every other lint/format issue fail closed.
             subprocess.run(
-                [sys.executable, "-m", "compileall", "-q", "--", *paths],
+                ["ruff", "check", "--fix", "--select", "F401", "--", *paths],
                 cwd=root,
                 check=True,
             )
-        return "Agent QA: Python syntax passed"
+            subprocess.run(["ruff", "format", "--", *paths], cwd=root, check=True)
+            subprocess.run(["ruff", "check", "."], cwd=root, check=True)
+            subprocess.run(["ruff", "format", "--check", "."], cwd=root, check=True)
+            subprocess.run(["git", "add", "--", *paths], cwd=root, check=True)
+        return "Agent QA: Ruff 0.7.4 check and format passed"
     if repo == "muradjanov-dev/qurbot":
         if not paths:
             return "QurBot: no Python files changed"
@@ -129,7 +136,9 @@ def run(repo: str, root: Path) -> str:
 def failure_reason(error: Exception) -> str:
     if isinstance(error, subprocess.CalledProcessError):
         command = error.cmd
-        tool = Path(str(command[0] if isinstance(command, (list, tuple)) else command)).name
+        tool = Path(
+            str(command[0] if isinstance(command, (list, tuple)) else command)
+        ).name
         if tool == "ruff":
             return "PR oldi Ruff tekshiruvi xato berdi; faqat xavfsiz F401 avtomatik tuzatildi. GitHub logini ko‘ring."
         if tool == "black":
