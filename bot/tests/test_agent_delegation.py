@@ -48,14 +48,15 @@ async def test_one_line_codex_task_keeps_a_human_owner(
     bot.send_message.assert_awaited_once()
 
 
-async def test_stopagent_cancels_latest_active_run(monkeypatch) -> None:
+@pytest.mark.parametrize("agent_status", ["running", "pr_opened"])
+async def test_stopagent_cancels_latest_active_run(monkeypatch, agent_status: str) -> None:
     message = MagicMock()
     message.text = "/stopagent 42"
     message.answer = AsyncMock()
     api = MagicMock()
     api.agent_runs = AsyncMock(
         return_value=[
-            {"run_id": "active", "status": "running"},
+            {"run_id": "active", "status": agent_status},
             {"run_id": "older", "status": "failed"},
         ]
     )

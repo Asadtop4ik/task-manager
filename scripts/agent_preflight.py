@@ -15,7 +15,7 @@ from pathlib import Path
 
 def changed_python(root: Path) -> list[str]:
     raw = subprocess.check_output(
-        ["git", "diff", "--cached", "--name-only", "-z"], cwd=root
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=root
     )
     return [path for path in raw.decode().split("\0") if path.endswith(".py")]
 
@@ -53,7 +53,9 @@ def ensure_tools(*requirements: str) -> None:
             check=True,
         )
         if not present():
-            raise RuntimeError("publisher formatter version does not match its pinned version")
+            raise RuntimeError(
+                "publisher formatter version does not match its pinned version"
+            )
 
 
 def run(repo: str, root: Path) -> str:

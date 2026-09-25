@@ -217,6 +217,21 @@ async def test_external_merge_notice_does_not_mark_task_done_before_deploy(
     pending = await client.get("/api/v1/agent-runs/external-pending", headers=headers)
     assert pending.status_code == 200 and pending.json()[0]["run_id"] == run_id
     assert pending.json()[0]["id"] > 0 and pending.json()[0]["notified"] is False
+    db_run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    assert db_run is not None
+    db_run.status = "pr_opened"
+    await session.commit()
+    premature = await client.post(
+        f"/api/v1/agent-runs/{run_id}/deployed",
+        json={
+            "sha": "c" * 40,
+            "github_run_url": "https://github.com/muradjanov-dev/qurbot/actions/runs/123",
+        },
+        headers=headers,
+    )
+    assert premature.status_code == 409
+    db_run.status = "pr_ready"
+    await session.commit()
     merged = await client.post(
         f"/api/v1/agent-runs/{run_id}/merged",
         json={"sha": "c" * 40},
@@ -652,6 +667,47 @@ async def test_ci_verifier_requires_the_catalog_job(monkeypatch) -> None:
         await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
     jobs[:] = [{"name": "gate", "conclusion": "success"}]
     await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
+
+
+async def test_ready_notice_rechecks_current_pr_head(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    await _ready_project(session, project)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Review this PR"},
+        headers=auth(manager),
+    )
+    session.add(
+        AgentRun(
+            run_id="00000000-0000-0000-0000-000000000101",
+            task_id=task.json()["id"],
+            task_revision="a" * 64,
+            repo_full_name="Asadtop4ik/task-manager",
+            base_branch="main",
+            mode="pr",
+            status="pr_ready",
+            ci_status="success",
+            ci_verified_sha="a" * 40,
+            head_sha="a" * 40,
+            pr_url="https://github.com/Asadtop4ik/task-manager/pull/17",
+        )
+    )
+    await session.commit()
+
+    async def stale_pr(run, number: str, sha: str) -> None:
+        raise HTTPException(status_code=409, detail="PR head changed")
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", stale_pr)
+    notices = await client.get(
+        "/api/v1/agent-runs/notifications",
+        headers={"X-Agent-Worker-Token": settings.service_token},
+    )
+    assert notices.status_code == 200 and notices.json() == []
 
 
 async def test_dispatch_network_error_can_retry_once(

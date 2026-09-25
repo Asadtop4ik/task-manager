@@ -287,6 +287,7 @@ async def delete_task(task_id: int, session: DbSession, owner: OwnerUser) -> Tas
                     "validating",
                     "publishing",
                     "deploying",
+                    "pr_opened",
                     "pr_ready",
                 )
             ),

@@ -27,12 +27,16 @@ def upgrade() -> None:
                pr_opened_at = pr_ready_at, pr_ready_at = NULL,
                notified_at = CASE WHEN telegram_message_id IS NOT NULL
                                   THEN NULL ELSE notified_at END
-         WHERE status = 'pr_ready' AND pr_url IS NOT NULL""")
+         WHERE status IN ('pr_ready', 'ci_unverified') AND pr_url IS NOT NULL""")
 
 
 def downgrade() -> None:
-    op.execute("""UPDATE agent_runs SET status = 'pr_ready', pr_ready_at = pr_opened_at
-         WHERE status = 'pr_opened' AND pr_url IS NOT NULL""")
+    # The previous release cannot prove CI on a newly pushed PR head. Keep all
+    # open PRs in an unrecognized, non-notifiable state until 0016 is restored.
+    op.execute("""UPDATE agent_runs
+           SET status = 'ci_unverified', notified_at = NULL,
+               error = COALESCE(error, 'PR CI verification unavailable after rollback')
+         WHERE status IN ('pr_opened', 'pr_ready') AND pr_url IS NOT NULL""")
     op.drop_column("agent_runs", "pr_opened_at")
     op.drop_column("agent_runs", "ci_url")
     op.drop_column("agent_runs", "ci_verified_sha")

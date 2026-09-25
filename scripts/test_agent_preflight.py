@@ -1,11 +1,38 @@
 import unittest
+import subprocess
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_preflight import run
+from agent_preflight import changed_python, run
 
 
 class AgentPreflightTests(unittest.TestCase):
+    def test_deleted_python_file_is_not_sent_to_formatter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            source = root / "old.py"
+            source.write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "old.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
+                cwd=root,
+                check=True,
+            )
+            source.unlink()
+            subprocess.run(["git", "add", "-u"], cwd=root, check=True)
+            self.assertEqual(changed_python(root), [])
+
     def test_qurbot_formats_then_checks_before_publication(self):
         with patch(
             "agent_preflight.changed_python",

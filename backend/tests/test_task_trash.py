@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -63,8 +64,13 @@ async def test_only_owner_can_hide_and_restore_a_task_with_history(
     assert len(notices) == 1 and notices[0]["kind"] == "restored"
 
 
+@pytest.mark.parametrize("agent_status", ["running", "pr_opened"])
 async def test_active_agent_must_be_stopped_before_delete(
-    client: AsyncClient, session: AsyncSession, manager: User, project: Project
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    agent_status: str,
 ) -> None:
     task_id = (
         await client.post(
@@ -80,7 +86,7 @@ async def test_active_agent_must_be_stopped_before_delete(
             task_revision="a" * 64,
             repo_full_name="Asadtop4ik/task-manager",
             base_branch="main",
-            status="running",
+            status=agent_status,
         )
     )
     await session.commit()

@@ -177,7 +177,7 @@ export function useAgentRuns(taskId: number) {
       (await api.get<AgentRun[]>(`/agent-runs/tasks/${taskId}`)).data,
     refetchInterval: (query) => {
       const statuses = query.state.data?.map((run) => run.status) ?? [];
-      if (statuses.some((status) => ["pending", "dispatching", "dispatched", "running", "validating", "publishing", "deploying"].includes(status))) return 10_000;
+      if (statuses.some((status) => ["pending", "dispatching", "dispatched", "running", "validating", "publishing", "deploying", "pr_opened"].includes(status))) return 10_000;
       if (statuses.some((status) => ["pr_ready", "merged"].includes(status))) return 30_000;
       return false;
     },

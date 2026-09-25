@@ -322,24 +322,42 @@ async def pending_notifications(
     session: DbSession, x_agent_worker_token: str | None = Header(default=None)
 ) -> list[AgentNotificationOut]:
     _worker_auth(x_agent_worker_token)
-    runs = await session.scalars(
-        select(AgentRun)
-        .where(
-            or_(
-                (
-                    (AgentRun.status == "pr_ready")
-                    & (AgentRun.ci_status == "success")
-                    & (AgentRun.ci_verified_sha == AgentRun.head_sha)
+    runs = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                or_(
+                    (
+                        (AgentRun.status == "pr_ready")
+                        & (AgentRun.ci_status == "success")
+                        & (AgentRun.ci_verified_sha == AgentRun.head_sha)
+                    ),
+                    AgentRun.status.in_(["merged", "failed", "deployed"]),
+                    (AgentRun.status == "pr_opened")
+                    & AgentRun.telegram_message_id.is_not(None),
                 ),
-                AgentRun.status.in_(["merged", "failed", "deployed"]),
-                (AgentRun.status == "pr_opened") & AgentRun.telegram_message_id.is_not(None),
-            ),
-            AgentRun.notified_at.is_(None),
+                AgentRun.notified_at.is_(None),
+            )
+            .options(selectinload(AgentRun.task).selectinload(Task.created_by))
+            .order_by(AgentRun.id)
+            .limit(20)
         )
-        .options(selectinload(AgentRun.task).selectinload(Task.created_by))
-        .order_by(AgentRun.id)
-        .limit(20)
-    )
+    ).all()
+    verified_runs: list[AgentRun] = []
+    for run in runs:
+        if run.status == "pr_ready":
+            # A reviewer can push a new commit between the CI monitor tick and
+            # the bot tick. Never announce the previously verified head.
+            if not run.pr_url or not run.ci_verified_sha:
+                continue
+            pr_number = run.pr_url.rsplit("/", 1)[-1]
+            if not pr_number.isdecimal():
+                continue
+            try:
+                await _verify_pr(run, pr_number, run.ci_verified_sha)
+            except HTTPException:
+                continue  # Fail closed; the CI monitor will reconcile next tick.
+        verified_runs.append(run)
     return [
         AgentNotificationOut(
             run_id=run.run_id,
@@ -360,7 +378,7 @@ async def pending_notifications(
             telegram_message_id=run.telegram_message_id,
             error=run.error,
         )
-        for run in runs
+        for run in verified_runs
     ]
 
 
@@ -976,7 +994,11 @@ async def agent_run_deployed(
     if run.status == "deployed" and run.deployed_sha == payload.sha:
         return AgentRunOut.model_validate(run)
     if run.pr_url:
-        if run.status not in {"pr_opened", "pr_ready", "merged"}:
+        eligible_statuses = {"pr_ready", "merged"}
+        if run.repo_full_name == DISPATCH_REPOSITORY:
+            # The narrow docs/CSS auto-merge independently proves exact PR CI.
+            eligible_statuses.add("pr_opened")
+        if run.status not in eligible_statuses:
             raise HTTPException(status_code=409, detail="agent PR is not ready")
         if run.status == "merged" and run.merged_sha != payload.sha:
             raise HTTPException(status_code=409, detail="deployed SHA differs from merge")
