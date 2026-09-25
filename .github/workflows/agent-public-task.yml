@@ -65,6 +65,7 @@ jobs:
           python3 "$RUNNER_TEMP/agent_images.py" download
 
       - name: Implement with Codex in the public checkout
+        id: codex
         if: steps.start.outputs.cancelled != 'true'
         working-directory: target
         run: |
@@ -106,6 +107,7 @@ jobs:
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
           JOB_STATUS: failure
           FAILURE_PHASE: implement
+          CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
           PR_URL: ''
           HEAD_SHA: ''
         run: |

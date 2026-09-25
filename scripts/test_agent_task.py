@@ -247,6 +247,7 @@ class UsageTests(unittest.TestCase):
                 "GITHUB_RUN_ID": "42",
                 "JOB_STATUS": "failure",
                 "FAILURE_PHASE": "implement",
+                "CODEX_STEP_OUTCOME": "failure",
                 "RUNNER_TEMP": temp,
             }
             with patch.dict(os.environ, environment), patch(
@@ -256,6 +257,35 @@ class UsageTests(unittest.TestCase):
             self.assertEqual(
                 sent.call_args.args[0]["error"], "Which menu label should I use?"
             )
+
+    def test_validator_error_overrides_agent_success_prose(self) -> None:
+        task = {
+            "task_id": 24,
+            "run_id": "00000000-0000-0000-0000-000000000024",
+            "title": "Model update",
+            "description": "",
+            "base_branch": "main",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "agent-result.txt").write_text("Model update complete")
+            (Path(temp) / "agent-failure.txt").write_text(
+                "public agent task rejected: public agent cannot publish protected path: .env.example"
+            )
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                "GITHUB_RUN_ID": "42",
+                "JOB_STATUS": "failure",
+                "FAILURE_PHASE": "implement",
+                "CODEX_STEP_OUTCOME": "success",
+                "RUNNER_TEMP": temp,
+            }
+            with patch.dict(os.environ, environment), patch(
+                "agent_task._send_status", return_value={"status": "failed"}
+            ) as sent:
+                callback()
+            self.assertIn(".env.example", sent.call_args.args[0]["error"])
+            self.assertNotIn("complete", sent.call_args.args[0]["error"])
 
     def test_publisher_failure_does_not_report_successful_agent_summary(self) -> None:
         task = {

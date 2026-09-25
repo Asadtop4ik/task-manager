@@ -434,9 +434,17 @@ def callback() -> None:
         payload["head_sha"] = os.environ["HEAD_SHA"]
     else:
         result_file = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
+        policy_error = Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt"
         fast_error = Path(os.environ["RUNNER_TEMP"]) / "fast-error.txt"
         reason = fast_error.read_text(encoding="utf-8").strip() if fast_error.exists() else ""
-        if not reason and os.environ.get("FAILURE_PHASE") == "implement" and result_file.exists():
+        if not reason and policy_error.exists():
+            reason = policy_error.read_text(encoding="utf-8").strip()
+        if (
+            not reason
+            and os.environ.get("FAILURE_PHASE") == "implement"
+            and os.environ.get("CODEX_STEP_OUTCOME") == "failure"
+            and result_file.exists()
+        ):
             reason = result_file.read_text(encoding="utf-8").strip()
         payload["error"] = reason[:900] or (
             "Publisher failed before PR/deploy; inspect the GitHub run."

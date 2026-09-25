@@ -191,6 +191,11 @@ export default function TaskDetail() {
               ? `${item.project.repo_full_name} · ${item.project.default_branch ?? "branch tanlanmagan"}`
               : "Avval loyiha sozlamalarida repositoryni ko‘rsating."}
           </p>
+          {agentRuns.data?.length === 0 && item.status === "in_progress" && (
+            <p className="mt-2 text-sm text-muted">
+              Vazifa “Bajarilmoqda” ustunida, ammo Codex hali ishga tushmagan.
+            </p>
+          )}
           {canUseCodex && <button
             type="button"
             disabled={

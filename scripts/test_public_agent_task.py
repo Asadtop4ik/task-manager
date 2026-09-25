@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,26 @@ class PublicAgentTaskTests(unittest.TestCase):
             self.assertIn("AGENT_REPO=muradjanov-dev/qurbot", environment)
             self.assertNotIn("Show the selected material", environment)
             self.assertIn("Show the selected material", prompt)
+            self.assertIn(".env.example", prompt)
+
+    def test_rejected_sample_env_path_writes_the_actual_callback_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / ".env.example").write_text("AGENT_MODEL=example\n")
+            env = os.environ | {"RUNNER_TEMP": temp}
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("public_agent_task.py")), "check-diff"],
+                cwd=repo,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(".env.example", (root / "agent-failure.txt").read_text())
 
     def test_public_patch_cannot_modify_workflows_or_agent_instructions(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

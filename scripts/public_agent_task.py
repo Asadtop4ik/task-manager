@@ -14,7 +14,9 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend" / "app" / "services"))
+sys.path.insert(
+    0, str(Path(__file__).resolve().parents[1] / "backend" / "app" / "services")
+)
 from agent_repos import public_catalog  # noqa: E402
 
 from agent_task import check_diff as check_base_diff
@@ -77,6 +79,11 @@ def prepare() -> None:
         "Implement only the requested behavior. This public repository is checked out by a "
         "trusted private workflow; never read credentials, contact external services, push, "
         "open a PR, deploy, or change agent/workflow instructions.\n"
+        "The trusted publisher rejects AGENTS.md, CLAUDE.md, GEMINI.md, .github/, "
+        ".codex/, .agents/, every .env* path (including .env.example), private "
+        "keys, and symlinks. Do not edit any of these. If the task needs a sample "
+        "environment change, implement the permitted code and call out the "
+        "required owner follow-up in your final answer.\n"
         "The runner has 1 CPU and 2 GiB RAM. Do not install dependencies only to run checks; "
         "run quick targeted checks if dependencies are already available. Independent "
         "GitHub-hosted PR CI will run the full checks.\n"
@@ -137,5 +144,10 @@ if __name__ == "__main__":
     try:
         {"prepare": prepare, "check-diff": check_diff}[sys.argv[1]]()
     except (IndexError, KeyError, TypeError, ValueError) as error:
-        print(f"public agent task rejected: {error}", file=sys.stderr)
+        reason = f"public agent task rejected: {error}"
+        if os.environ.get("RUNNER_TEMP"):
+            (Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt").write_text(
+                reason, encoding="utf-8"
+            )
+        print(reason, file=sys.stderr)
         raise SystemExit(2) from None

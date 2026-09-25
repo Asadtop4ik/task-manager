@@ -66,6 +66,7 @@ jobs:
           python3 scripts/agent_images.py download
 
       - name: Implement with Codex
+        id: codex
         if: steps.guard.outputs.exists != 'true' && steps.start.outputs.cancelled != 'true'
         run: |
           set -euo pipefail
@@ -112,6 +113,7 @@ jobs:
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
           JOB_STATUS: failure
           FAILURE_PHASE: implement
+          CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
           PR_URL: ''
           HEAD_SHA: ''
         run: |

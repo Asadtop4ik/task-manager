@@ -20,6 +20,25 @@ from app.config import settings
 from app.texts import PRIORITY_EMOJI, PRIORITY_LABEL, STATUS_EMOJI, STATUS_LABEL
 
 OPEN_STATUSES = {"backlog", "todo", "in_progress", "blocked", "review"}
+MAX_CARD_CHARS = 3900  # Leave room below Telegram's 4096-character message limit.
+
+
+def _telegram_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _description_preview(description: str, budget: int) -> tuple[str, bool]:
+    """Truncate before sending, without splitting an escaped HTML entity."""
+    parts: list[str] = []
+    used = 0
+    for char in description:
+        escaped = escape(char)
+        size = _telegram_length(escaped)
+        if used + size > budget:
+            return "".join(parts), True
+        parts.append(escaped)
+        used += size
+    return "".join(parts), False
 
 
 def format_due(value: str | None, tz: str = settings.timezone) -> str | None:
@@ -63,15 +82,26 @@ def render(task: dict[str, Any]) -> str:
 
     lines = [" · ".join(head), "", f"<b>{escape(task['title'])}</b>"]
 
-    if task.get("description"):
-        lines.append(escape(task["description"]))
-
     footer = [f"#{task['id']}", STATUS_LABEL.get(status, status)]
     assignee = task.get("assignee")
     footer.append(escape(assignee["full_name"]) if assignee else "biriktirilmagan")
     if task.get("spent_minutes"):
         footer.append(f"{task['spent_minutes']} daq")
-    lines += ["", "<i>" + " · ".join(footer) + "</i>"]
+    tail = "<i>" + " · ".join(footer) + "</i>"
+    if task.get("description"):
+        prefix = "\n".join(lines)
+        note = "\n…\nTo‘liq tavsif: 🌐 Ochish"
+        budget = max(
+            0,
+            MAX_CARD_CHARS
+            - _telegram_length(prefix)
+            - _telegram_length(tail)
+            - _telegram_length(note)
+            - 3,
+        )
+        preview, truncated = _description_preview(str(task["description"]), budget)
+        lines.append(preview + (note if truncated else ""))
+    lines += ["", tail]
 
     return "\n".join(lines)
 

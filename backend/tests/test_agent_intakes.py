@@ -1,10 +1,12 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import agent_intakes, agent_runs
+from app.api.v1.agent_intakes import _description
 from app.core.config import settings
 from app.db.models import AgentIntake, AgentRun, Attachment, Project, Task, User
 from tests.conftest import auth
@@ -438,3 +440,20 @@ async def test_other_users_cannot_read_or_confirm_an_intake(
             headers=bot_headers(executor),
         )
     ).status_code == 422
+
+
+def test_discussion_task_description_keeps_approved_brief_without_raw_transcript() -> None:
+    row = SimpleNamespace(
+        text="@codex Quyidagi loyiha suhbatidagi eski xabarlar: " + "old log " * 900,
+        answer_text=None,
+        brief={
+            "title": "Opus 5.5 yangilash",
+            "goal": "Model va xarajatni yangilash",
+            "acceptance": [".env.example o‘zgarmasin"],
+            "assumptions": [],
+        },
+    )
+    title, description = _description(row, False)
+    assert title == "Opus 5.5 yangilash"
+    assert ".env.example o‘zgarmasin" in description
+    assert "old log" not in description

@@ -9,6 +9,7 @@ from pathlib import PurePath
 from typing import Any
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -23,10 +24,12 @@ from app.handlers.helpers import (
     notify_assignee,
     send_card,
 )
+from app.logging import get_logger
 from app.parsing import parse
 from app.states import AgentIntake
 
 router = Router(name="agent_intake")
+log = get_logger(__name__)
 
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -435,35 +438,65 @@ async def _confirm(
         await explain_api_error(query, error)
         return
 
-    await state.clear()
-    if not result.get("created", False):
-        await query.answer("Bu intake oldin tasdiqlangan")
-        prompt = editable(query)
-        if prompt:
-            await prompt.edit_text("Task oldin yaratilgan.")
-        return
-
     task = result["task"]
     mode = result.get("mode", "pr")
-    await query.answer("Task yaratildi")
-    prompt = editable(query)
-    if prompt:
-        await prompt.delete()
+    await state.clear()
     assert query.from_user is not None
     chat_id = query.message.chat.id if query.message else query.from_user.id
-    await send_card(bot, chat_id, task, api)
-    await notify_assignee(bot, task, query.from_user.id, api)
+
+    # Confirmation is persisted by the API before this callback continues. A
+    # repeated callback must recover a task with no run, but must not retry a
+    # failed run or create a second PR for one that was already dispatched.
+    if not result.get("created", False):
+        try:
+            existing_runs = await api.agent_runs(task["id"])
+        except ApiError as error:
+            await explain_api_error(query, error)
+            return
+        if existing_runs:
+            try:
+                await query.answer("Task oldin yaratilgan")
+            except TelegramAPIError:
+                log.warning("intake_confirmation_answer_failed", task_id=task["id"])
+            prompt = editable(query)
+            if prompt:
+                try:
+                    await prompt.edit_text("Task oldin yaratilgan.")
+                except TelegramAPIError:
+                    log.warning("intake_confirmation_edit_failed", task_id=task["id"])
+            return
+
+    try:
+        await query.answer("Task yaratildi")
+    except TelegramAPIError:
+        log.warning("intake_confirmation_answer_failed", task_id=task["id"])
     try:
         run = await api.start_agent_run(task["id"], mode=mode)
     except ApiError as error:
-        await bot.send_message(
-            chat_id,
-            f"#{task['id']} yaratildi. Codex ishga tushmadi: {escape(error.detail)}",
-        )
+        notice = f"#{task['id']} yaratildi. Codex ishga tushmadi: {escape(error.detail)}"
     else:
-        await bot.send_message(
-            chat_id, f"🤖 #{task['id']} Codexga yuborildi ({run['status']})."
-        )
+        notice = f"🤖 #{task['id']} Codexga yuborildi ({run['status']})."
+
+    # Telegram delivery is best effort. Neither a long card nor an already
+    # deleted confirmation message may prevent the agent dispatch above.
+    prompt = editable(query)
+    if prompt:
+        try:
+            await prompt.delete()
+        except TelegramAPIError:
+            log.warning("intake_confirmation_delete_failed", task_id=task["id"])
+    try:
+        await send_card(bot, chat_id, task, api)
+    except TelegramAPIError:
+        log.warning("intake_card_send_failed", task_id=task["id"])
+    try:
+        await notify_assignee(bot, task, query.from_user.id, api)
+    except TelegramAPIError:
+        log.warning("intake_assignee_notice_failed", task_id=task["id"])
+    try:
+        await bot.send_message(chat_id, notice)
+    except TelegramAPIError:
+        log.warning("intake_dispatch_notice_failed", task_id=task["id"])
 
 
 @router.callback_query(AgentIntakeAction.filter(F.action == "confirm"))

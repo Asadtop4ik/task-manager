@@ -446,7 +446,12 @@ def _description(row: AgentIntake, fallback: bool) -> tuple[str, str]:
     if brief.get("assumptions"):
         pieces.extend(["", "Taxminlar:"])
         pieces.extend(f"- {item}" for item in brief["assumptions"])
-    pieces.extend(["", f"Asl so‘rov: {row.text}"])
+    # A discussion-derived request contains a transcript, including earlier
+    # assistant replies and pasted error cards. The user approved the concise
+    # brief above; duplicating that transcript made Telegram cards too long and
+    # accidentally promoted unverified old answers into new requirements.
+    if not row.text.startswith("@codex Quyidagi loyiha suhbatidagi"):
+        pieces.extend(["", f"Asl so‘rov: {row.text[:3000]}"])
     if row.answer_text:
         pieces.append(f"Javoblar: {row.answer_text}")
     return title, "\n".join(pieces)[:12000]
