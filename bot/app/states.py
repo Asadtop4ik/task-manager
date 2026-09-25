@@ -40,3 +40,9 @@ class CardAction(StatesGroup):
 
 class JoinApproval(StatesGroup):
     selecting_projects = State()
+
+
+class AgentCorrection(StatesGroup):
+    """Collect one owner instruction without routing it into task capture."""
+
+    instruction = State()

@@ -3,13 +3,17 @@ from html import escape
 
 import httpx
 from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import InlineKeyboardMarkup
 from arq import cron
 from arq.connections import RedisSettings
 
 from app.cards import build_card
 from app.config import settings
 from app.handlers.agent_intake import notification_message
+from app.handlers.agent_release import release_card, release_keyboard
 from app.handlers.project_discussion import discussion_keyboard
 from app.loader import create_bot
 from app.logging import configure_logging, get_logger
@@ -17,45 +21,86 @@ from app.logging import configure_logging, get_logger
 log = get_logger(__name__)
 
 
+def _html_text(value: object, limit: int) -> str:
+    output: list[str] = []
+    used = 0
+    for char in " ".join(str(value or "").split()):
+        escaped = escape(char)
+        if used + len(escaped) > limit:
+            output.append("…")
+            break
+        output.append(escaped)
+        used += len(escaped)
+    return "".join(output)
+
+
 def agent_result_card(notice: dict[str, object]) -> str:
     """A concise, factual status card. PR-ready requires exact-head CI success."""
     task_id = notice["task_id"]
     project = str(notice.get("repo_full_name") or "").split("/")[-1]
-    title = str(notice.get("title") or "Vazifa").replace("\n", " ")[:180]
+    title = notice.get("title") or "Vazifa"
     status = notice["status"]
-    lines = [f"🤖 #{task_id} · {project}", f"Vazifa: {title}"]
+    lines = [
+        f"🤖 #{task_id} · {_html_text(project, 120)}",
+        f"Vazifa: {_html_text(title, 500)}",
+    ]
     if status == "pr_ready":
         if notice.get("mode") == "fast":
             lines.append("Holat: !fast himoyalangan o‘zgarish PRga o‘tdi; CI yashil.")
         else:
             lines.append("Holat: ✅ PR tayyor. Oxirgi commit CI’dan o‘tdi; review kutilmoqda.")
-        lines.append(f"PR: {notice.get('pr_url') or '—'}")
+        lines.append(f"PR: {_html_text(notice.get('pr_url') or '—', 300)}")
         if notice.get("ci_url"):
-            lines.append(f"CI: {notice['ci_url']}")
+            lines.append(f"CI: {_html_text(notice['ci_url'], 300)}")
     elif status == "pr_opened":
         lines.append(
             "Holat: CI xato; PR tuzatilmoqda."
             if notice.get("ci_status") == "failure"
             else "Holat: yangi commit uchun CI tekshirilmoqda."
         )
-        lines.append(f"PR: {notice.get('pr_url') or '—'}")
+        lines.append(f"PR: {_html_text(notice.get('pr_url') or '—', 300)}")
         if notice.get("ci_url"):
-            lines.append(f"CI: {notice['ci_url']}")
+            lines.append(f"CI: {_html_text(notice['ci_url'], 300)}")
     elif status == "merged":
         lines.append("Holat: PR birlashtirildi; production deploy tekshirilmoqda.")
-        lines.append(f"PR: {notice.get('pr_url') or '—'}")
+        lines.append(f"PR: {_html_text(notice.get('pr_url') or '—', 300)}")
     elif status == "deployed":
         sha = str(notice.get("deployed_sha") or "")
         lines.append("Holat: ✅ Production’da, tekshiruv va image SHA mos.")
         if sha:
             lines.append(f"Commit: {sha[:12]}")
-        lines.append(f"Deploy: {notice.get('github_run_url') or '—'}")
+        lines.append(f"Deploy: {_html_text(notice.get('github_run_url') or '—', 300)}")
     else:
         lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
-        lines.append(f"Sabab: {str(notice.get('error') or 'noma’lum')[:800]}")
+        lines.append(f"Sabab: {_html_text(notice.get('error') or 'noma’lum', 1200)}")
         if notice.get("github_run_url"):
-            lines.append(f"Jarayon: {notice['github_run_url']}")
+            lines.append(f"Jarayon: {_html_text(notice['github_run_url'], 300)}")
     return "\n".join(lines)
+
+
+async def _upsert_agent_message(
+    bot: Bot,
+    *,
+    chat_id: int,
+    message_id: int | None,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> int:
+    """Edit only an ID belonging to this chat; send a new message otherwise."""
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup,
+            )
+            return message_id
+        except TelegramBadRequest as error:
+            if "message is not modified" in str(error).lower():
+                return message_id
+    sent = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    return sent.message_id
 
 
 async def ping(ctx: dict[str, object]) -> str:
@@ -76,40 +121,116 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
         response = await client.get(f"{base}/notifications", headers=headers)
         response.raise_for_status()
         notices = response.json()
-        # Agent error text is untrusted plain text, not Telegram HTML.
-        bot = Bot(token=settings.bot_token)
+        # Owner cards use escaped HTML for compact evidence links and untrusted
+        # review text. Legacy status notices remain plain text.
+        bot = Bot(
+            token=settings.bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
         try:
             for notice in notices:
-                chat_id = notice["chat_id"]
-                message_id = notice.get("telegram_message_id")
-                if chat_id:
-                    text = agent_result_card(notice)
+                run_id = notice["run_id"]
+
+                # Preserve the task-origin card and its message ID. This may
+                # be a group chat and is never reused for the owner's private card.
+                legacy_chat_id = notice.get("chat_id")
+                legacy_message_id = notice.get("telegram_message_id")
+                if legacy_chat_id:
                     try:
-                        if message_id:
-                            try:
-                                await bot.edit_message_text(
-                                    text, chat_id=chat_id, message_id=message_id
-                                )
-                            except TelegramBadRequest as exc:
-                                if "message is not modified" not in str(exc).lower():
-                                    sent = await bot.send_message(chat_id, text)
-                                    message_id = sent.message_id
-                        else:
-                            sent = await bot.send_message(chat_id, text)
-                            message_id = sent.message_id
-                    except (TelegramAPIError, OSError) as exc:
+                        legacy_message_id = await _upsert_agent_message(
+                            bot,
+                            chat_id=legacy_chat_id,
+                            message_id=legacy_message_id,
+                            text=agent_result_card(notice),
+                            reply_markup=None,
+                        )
+                    except (TelegramAPIError, OSError) as error:
                         log.error(
                             "agent_notice_failed",
-                            run_id=notice["run_id"],
-                            error=type(exc).__name__,
+                            run_id=run_id,
+                            error=type(error).__name__,
                         )
-                        continue
-                ack = await client.post(
-                    f"{base}/{notice['run_id']}/notified",
-                    headers=headers,
-                    json={"message_id": message_id},
-                )
-                ack.raise_for_status()
+                    else:
+                        try:
+                            ack = await client.post(
+                                f"{base}/{run_id}/notified",
+                                headers=headers,
+                                json={"message_id": legacy_message_id},
+                            )
+                            ack.raise_for_status()
+                        except httpx.HTTPError as error:
+                            log.error(
+                                "agent_notice_ack_failed",
+                                run_id=run_id,
+                                error=type(error).__name__,
+                            )
+                else:
+                    try:
+                        ack = await client.post(
+                            f"{base}/{run_id}/notified",
+                            headers=headers,
+                            json={"message_id": None},
+                        )
+                        ack.raise_for_status()
+                    except httpx.HTTPError as error:
+                        log.error(
+                            "agent_notice_ack_failed",
+                            run_id=run_id,
+                            error=type(error).__name__,
+                        )
+
+                # Owner controls have a distinct persisted message/chat pair.
+                # Never apply the legacy task-origin message ID to this chat.
+                owner_chat_id = notice.get("owner_chat_id")
+                owner_notice_chat_id = notice.get("owner_notice_chat_id")
+                owner_message_id = notice.get("owner_notice_message_id")
+                if owner_chat_id:
+                    owner_head_sha = str(notice.get("head_sha") or "")
+                    owner_text = (
+                        release_card(notice)
+                        if len(owner_head_sha) == 40
+                        else agent_result_card(notice)
+                    )
+                    owner_markup = None
+                    if len(owner_head_sha) == 40:
+                        actions = notice.get("actions") or {}
+                        if not notice.get("owner_controls_available"):
+                            actions = {}
+                        owner_markup = release_keyboard(
+                            str(run_id), owner_head_sha, actions=actions
+                        )
+                    # An ID is reusable only alongside the same owner chat ID.
+                    reusable_id = (
+                        owner_message_id if owner_notice_chat_id == owner_chat_id else None
+                    )
+                    try:
+                        owner_message_id = await _upsert_agent_message(
+                            bot,
+                            chat_id=owner_chat_id,
+                            message_id=reusable_id,
+                            text=owner_text,
+                            reply_markup=owner_markup,
+                        )
+                    except (TelegramAPIError, OSError) as error:
+                        log.error(
+                            "owner_agent_notice_failed",
+                            run_id=run_id,
+                            error=type(error).__name__,
+                        )
+                    else:
+                        try:
+                            ack = await client.post(
+                                f"{base}/{run_id}/owner-notified",
+                                headers=headers,
+                                json={"message_id": owner_message_id},
+                            )
+                            ack.raise_for_status()
+                        except httpx.HTTPError as error:
+                            log.error(
+                                "owner_agent_notice_ack_failed",
+                                run_id=run_id,
+                                error=type(error).__name__,
+                            )
         finally:
             await bot.session.close()
 

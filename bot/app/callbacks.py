@@ -37,3 +37,11 @@ class JoinAction(CallbackData, prefix="j"):
     action: str  # approve | reject | project | confirm | cancel
     request_id: int
     project_id: int = 0
+
+
+class AgentReleaseAction(CallbackData, prefix="ar"):
+    """Owner controls for one exact PR head; compact enough for Telegram's 64-byte cap."""
+
+    action: str  # merge | correct | detail
+    run_id: str
+    sha12: str
