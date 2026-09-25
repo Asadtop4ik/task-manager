@@ -60,6 +60,14 @@ def ensure_tools(*requirements: str) -> None:
 
 def run(repo: str, root: Path) -> str:
     paths = changed_python(root)
+    if repo == "Asadtop4ik/agent-qa":
+        if paths:
+            subprocess.run(
+                [sys.executable, "-m", "compileall", "-q", "--", *paths],
+                cwd=root,
+                check=True,
+            )
+        return "Agent QA: Python syntax passed"
     if repo == "muradjanov-dev/qurbot":
         if not paths:
             return "QurBot: no Python files changed"

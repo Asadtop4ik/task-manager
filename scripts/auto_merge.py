@@ -66,7 +66,19 @@ def agent_ready(pr: dict, run: dict) -> bool:
         run.get("status") in {"pr_opened", "pr_ready"}
         and run.get("pr_url") == pr.get("html_url")
         and run.get("head_sha") == (pr.get("head") or {}).get("sha")
+        and run.get("ci_status") == "success"
+        and run.get("ci_verified_sha") == run.get("head_sha")
+        and run.get("review_status") == "clean"
+        and run.get("review_sha") == run.get("head_sha")
     )
+
+
+def clean_review_status(statuses: list[dict], sha: str) -> bool:
+    matching = [row for row in statuses if row.get("context") == "codex-review"]
+    if not matching:
+        return False
+    latest = max(matching, key=lambda row: row.get("id", 0))
+    return latest.get("sha") == sha and latest.get("state") == "success"
 
 
 def _agent_allows_merge(pr: dict) -> bool:
@@ -109,15 +121,22 @@ def _files(repo: str, number: int) -> list[str]:
 
 def main() -> None:
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-        run = json.load(source)["workflow_run"]
+        event = json.load(source)
     repo = os.environ["GITHUB_REPOSITORY"]
-    if run.get("event") != "pull_request" or run.get("conclusion") != "success":
-        return
-    candidates = run.get("pull_requests") or []
-    if len(candidates) != 1:
-        return
-    number = candidates[0]["number"]
-    if not isinstance(number, int) or number < 1:
+    if "workflow_run" in event:
+        run = event["workflow_run"]
+        if run.get("event") != "pull_request" or run.get("conclusion") != "success":
+            return
+        candidates = run.get("pull_requests") or []
+        if len(candidates) != 1:
+            return
+        number = candidates[0]["number"]
+        expected_sha = run.get("head_sha")
+    else:
+        dispatched = event.get("client_payload") or {}
+        number = dispatched.get("pull_number")
+        expected_sha = dispatched.get("head_sha")
+    if not isinstance(number, int) or number < 1 or not isinstance(expected_sha, str):
         return
     for _ in range(3):
         pr = _github(f"repos/{repo}/pulls/{number}")
@@ -125,7 +144,7 @@ def main() -> None:
         if pr.get("mergeable_state") != "unknown":
             break
         time.sleep(2)
-    if not current_pr(pr, run, repo):
+    if not current_pr(pr, {"head_sha": expected_sha}, repo):
         return
     if not allowed_files(_files(repo, number)):
         return
@@ -135,9 +154,13 @@ def main() -> None:
     assert isinstance(checks, dict)
     if not latest_checks_pass(checks["check_runs"]):
         return
+    statuses = _github(f"repos/{repo}/commits/{expected_sha}/statuses")
+    assert isinstance(statuses, list)
+    if not clean_review_status(statuses, expected_sha):
+        return
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-        output.write(f"eligible=true\nnumber={number}\nsha={run['head_sha']}\n")
-    print(f"Eligible PR #{number} at {run['head_sha']}")
+        output.write(f"eligible=true\nnumber={number}\nsha={expected_sha}\n")
+    print(f"Eligible PR #{number} at {expected_sha}")
 
 
 if __name__ == "__main__":

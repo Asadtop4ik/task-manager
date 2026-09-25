@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -59,10 +60,35 @@ class AgentRun(Base, TimestampMixin):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    owner_notice_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    owner_notice_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    qa_ready_url: Mapped[str | None] = mapped_column(Text)
+    qa_ready_sha: Mapped[str | None] = mapped_column(String(40))
+    qa_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     runner_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pr_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pr_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_status: Mapped[str | None] = mapped_column(String(16))
+    review_sha: Mapped[str | None] = mapped_column(String(40))
+    review_summary: Mapped[str | None] = mapped_column(Text)
+    review_findings: Mapped[list[dict[str, object]] | None] = mapped_column(JSON)
     merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     task: Mapped["Task"] = relationship()
+
+
+class AgentRunAction(Base, TimestampMixin):
+    """Idempotent owner requests that are completed by trusted GitHub workflows."""
+
+    __tablename__ = "agent_run_actions"
+
+    action_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_data: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    result: Mapped[dict[str, object] | None] = mapped_column(JSON)

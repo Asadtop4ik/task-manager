@@ -18,6 +18,8 @@ jobs:
       contents: read
     env:
       TASK_JSON: ${{ toJSON(github.event.client_payload) }}
+      AGENT_QA_ENABLED: ${{ vars.AGENT_QA_ENABLED }}
+      AGENT_QA_REPOSITORY: ${{ vars.AGENT_QA_REPOSITORY }}
     steps:
       - name: Check out the trusted control repository
         uses: actions/checkout@v4
@@ -37,6 +39,7 @@ jobs:
           repository: ${{ github.event.client_payload.repo_full_name }}
           ref: ${{ github.event.client_payload.base_branch }}
           path: target
+          token: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_READ_TOKEN || github.token }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -131,6 +134,8 @@ jobs:
       actions: read
     env:
       TASK_JSON: ${{ toJSON(github.event.client_payload) }}
+      AGENT_QA_ENABLED: ${{ vars.AGENT_QA_ENABLED }}
+      AGENT_QA_REPOSITORY: ${{ vars.AGENT_QA_REPOSITORY }}
     steps:
       - name: Check out trusted policy
         uses: actions/checkout@v4
@@ -159,6 +164,7 @@ jobs:
           repository: ${{ github.event.client_payload.repo_full_name }}
           ref: ${{ github.event.client_payload.base_branch }}
           path: target
+          token: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_READ_TOKEN || github.token }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -184,7 +190,7 @@ jobs:
         id: branch
         working-directory: target
         env:
-          GH_TOKEN: ${{ secrets.AGENT_PUBLIC_REPO_TOKEN }}
+          GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || secrets.AGENT_PUBLIC_REPO_TOKEN }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -201,7 +207,7 @@ jobs:
         id: pr
         working-directory: target
         env:
-          GH_TOKEN: ${{ secrets.AGENT_PUBLIC_REPO_TOKEN }}
+          GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || secrets.AGENT_PUBLIC_REPO_TOKEN }}
         run: |
           set -euo pipefail
           pr_url=$(gh pr create --repo "$AGENT_REPO" \

@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,6 +32,15 @@ class AgentRunOut(BaseModel):
     runner_started_at: datetime | None
     pr_opened_at: datetime | None
     pr_ready_at: datetime | None
+    owner_notice_chat_id: int | None
+    owner_notice_message_id: int | None
+    qa_ready_url: str | None
+    qa_ready_sha: str | None
+    qa_ready_at: datetime | None
+    review_status: str | None
+    review_sha: str | None
+    review_summary: str | None
+    review_findings: list[dict[str, object]] | None
     merged_at: datetime | None
     deployed_at: datetime | None
 
@@ -57,8 +67,90 @@ class AgentDeployment(BaseModel):
     )
 
 
+class AgentQaDeployment(AgentDeployment):
+    ready_url: str = Field(min_length=1, max_length=300)
+    ready_status: Literal["ready"]
+    ready_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
 class AgentMerge(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class AgentReleaseRequest(BaseModel):
+    expected_head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    action_id: UUID
+
+
+class AgentCorrectionRequest(AgentReleaseRequest):
+    instruction: str = Field(min_length=1, max_length=4000)
+
+
+class AgentReviewFinding(BaseModel):
+    severity: Literal["P1", "P2", "P3"]
+    title: str = Field(min_length=1, max_length=240)
+    evidence: str = Field(min_length=1, max_length=2000)
+    file: str | None = Field(default=None, max_length=500)
+    line: int | None = Field(default=None, ge=1)
+
+
+class AgentReviewResult(BaseModel):
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    state: Literal["clean", "findings", "error"] | None = None
+    summary: str = Field(max_length=2000)
+    findings: list[AgentReviewFinding] = Field(max_length=40)
+
+
+class AgentReviewOut(BaseModel):
+    state: Literal["pending", "clean", "findings", "stale", "error"]
+    reviewed_head_sha: str | None
+    summary: str | None
+    findings: list[AgentReviewFinding]
+
+
+class AgentCiEvidenceOut(BaseModel):
+    state: str | None
+    verified_head_sha: str | None
+    url: str | None
+
+
+class AgentActionAvailability(BaseModel):
+    available: bool
+
+
+class AgentRunDetailOut(BaseModel):
+    run_id: str
+    status: str
+    summary: str
+    impact: str
+    head_sha: str | None
+    ci_evidence: AgentCiEvidenceOut
+    review: AgentReviewOut
+    actions: dict[str, AgentActionAvailability]
+
+
+class AgentActionOut(BaseModel):
+    action_id: UUID
+    status: Literal["accepted", "in_progress", "completed", "rejected"]
+    run_id: str
+    head_sha: str | None
+    message: str | None = None
+
+
+class AgentActionResult(BaseModel):
+    action_id: UUID
+    status: Literal["completed", "rejected"]
+    head_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    merge_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    message: str | None = Field(default=None, max_length=1000)
+
+
+class AgentActionDetailOut(BaseModel):
+    action_id: UUID
+    kind: Literal["merge", "correction"]
+    status: Literal["accepted", "in_progress", "completed", "rejected"]
+    request: dict[str, object]
+    result: dict[str, object] | None
 
 
 class AgentCiResult(BaseModel):
@@ -118,6 +210,15 @@ class AgentNotificationOut(BaseModel):
     deployed_sha: str | None
     telegram_message_id: int | None
     error: str | None
+    owner_chat_id: int | None = None
+    owner_notice_chat_id: int | None = None
+    owner_notice_message_id: int | None = None
+    owner_controls_available: bool = False
+    summary: str = ""
+    impact: str = ""
+    review: AgentReviewOut | None = None
+    ci_evidence: AgentCiEvidenceOut | None = None
+    actions: dict[str, AgentActionAvailability] | None = None
 
 
 class AgentNoticeAck(BaseModel):

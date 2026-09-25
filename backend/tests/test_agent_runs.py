@@ -35,6 +35,7 @@ async def test_public_project_can_dispatch_pr_but_not_fast(
         "github_agent_allowed_repos",
         "Asadtop4ik/task-manager,muradjanov-dev/qurbot",
     )
+    monkeypatch.setattr(settings, "github_public_agent_token", "public-read-token")
 
     async def fake_dispatch(run, task) -> int:
         assert run.repo_full_name == "muradjanov-dev/qurbot"
@@ -362,7 +363,11 @@ async def test_pr_callback_requires_token_and_matching_pr(
         assert conclusion == "success"
         assert url.endswith("/actions/runs/99")
 
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return run.head_sha or "", True
+
     monkeypatch.setattr(agent_runs, "_verify_pr_ci", fake_ci_verify)
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
     created = await client.post(
         "/api/v1/tasks",
         json={"project_id": project.id, "title": "Fix menu"},
@@ -426,12 +431,19 @@ async def test_pr_callback_requires_token_and_matching_pr(
         },
         headers={"X-Agent-Callback-Token": "test-callback-token"},
     )
-    assert ci.status_code == 200 and ci.json()["status"] == "pr_ready"
+    assert ci.status_code == 200 and ci.json()["status"] == "pr_opened"
     assert ci.json()["ci_verified_sha"] == "a" * 40
-    assert ci.json()["pr_ready_at"] is not None
+    assert ci.json()["pr_ready_at"] is None
     assert (
         await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
     ).json()["status"] == "review"
+    review = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/review-result",
+        json={"sha": "a" * 40, "state": "clean", "summary": "Clean", "findings": []},
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert review.status_code == 200 and review.json()["status"] == "pr_ready"
+    assert review.json()["pr_ready_at"] is not None
     notices = await client.get("/api/v1/agent-runs/notifications", headers=worker_headers)
     assert len(notices.json()) == 1 and notices.json()[0]["status"] == "pr_ready"
     acknowledged = await client.post(
@@ -655,9 +667,13 @@ async def test_failed_ci_stays_silent_until_new_head_passes(
     async def fake_ci_verify(run, sha: str, conclusion: str, url: str) -> None:
         assert url.endswith("/actions/runs/1") or url.endswith("/actions/runs/2")
 
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return run.head_sha or "", True
+
     monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
     monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify)
     monkeypatch.setattr(agent_runs, "_verify_pr_ci", fake_ci_verify)
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
     task = await client.post(
         "/api/v1/tasks",
         json={"project_id": project.id, "title": "Fix menu"},
@@ -695,7 +711,12 @@ async def test_failed_ci_stays_silent_until_new_head_passes(
     )
     assert failed.status_code == 200 and failed.json()["ci_status"] == "failure"
     assert failed.json()["status"] == "pr_opened"
-    assert (await client.get("/api/v1/agent-runs/notifications", headers=worker)).json() == []
+    failed_notice = (
+        await client.get("/api/v1/agent-runs/notifications", headers=worker)
+    ).json()
+    assert len(failed_notice) == 1
+    assert failed_notice[0]["ci_status"] == "failure"
+    assert failed_notice[0]["owner_controls_available"] is True
     assert (
         await client.get(f"/api/v1/tasks/{task.json()['id']}", headers=auth(manager))
     ).json()["status"] == "blocked"
@@ -731,9 +752,15 @@ async def test_failed_ci_stays_silent_until_new_head_passes(
         headers=token,
     )
     assert passed.status_code == 200 and passed.json()["ci_verified_sha"] == "b" * 40
-    assert passed.json()["status"] == "pr_ready"
+    assert passed.json()["status"] == "pr_opened"
     notices = (await client.get("/api/v1/agent-runs/notifications", headers=worker)).json()
     assert len(notices) == 1 and notices[0]["ci_url"].endswith("/actions/runs/2")
+    review = await client.post(
+        f"{base}/review-result",
+        json={"sha": "b" * 40, "state": "clean", "summary": "Clean", "findings": []},
+        headers=token,
+    )
+    assert review.status_code == 200 and review.json()["status"] == "pr_ready"
 
 
 async def test_ci_verifier_rejects_wrong_head_even_if_workflow_is_green(monkeypatch) -> None:
@@ -864,10 +891,10 @@ async def test_ready_notice_rechecks_current_pr_head(
     )
     await session.commit()
 
-    async def stale_pr(run, number: str, sha: str) -> None:
+    async def stale_head(run) -> tuple[str, bool]:
         raise HTTPException(status_code=409, detail="PR head changed")
 
-    monkeypatch.setattr(agent_runs, "_verify_pr", stale_pr)
+    monkeypatch.setattr(agent_runs, "_current_pr_head", stale_head)
     notices = await client.get(
         "/api/v1/agent-runs/notifications",
         headers={"X-Agent-Worker-Token": settings.service_token},

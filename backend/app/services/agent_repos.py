@@ -23,6 +23,7 @@ class AgentRepository:
     # Job names in the pull_request CI workflow, before a PR is announced.
     pr_ci_jobs: tuple[str, ...] = ()
     images: tuple[tuple[str, str], ...] = ()
+    qa_only: bool = False
 
 
 REPOSITORIES = (
@@ -63,6 +64,14 @@ REPOSITORIES = (
         images=(("ketoshop", "ghcr.io/muradjanov-dev/ketoshop"),),
     ),
 )
+QA_REPOSITORY = AgentRepository(
+    "agent-qa",
+    "Asadtop4ik/agent-qa",
+    "main",
+    True,
+    pr_ci_jobs=("PR CI",),
+    qa_only=True,
+)
 PUBLIC_REPOSITORIES = frozenset(
     repository.full_name for repository in REPOSITORIES if not repository.private
 )
@@ -73,8 +82,11 @@ def repository_for(
     full_name: str | None,
     branch: str | None,
     repositories: tuple[AgentRepository, ...] = REPOSITORIES,
+    *,
+    include_qa: bool = False,
 ) -> AgentRepository | None:
-    for repository in repositories:
+    candidates = repositories + ((QA_REPOSITORY,) if include_qa else ())
+    for repository in candidates:
         if (
             project_key == repository.project_key
             and full_name == repository.full_name

@@ -6,7 +6,8 @@ import json
 import re
 from datetime import UTC, datetime
 from math import ceil
-from uuid import uuid4
+from typing import Literal, cast
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
@@ -22,13 +23,20 @@ from app.db.models import (
     AgentEvent,
     AgentIntake,
     AgentRun,
+    AgentRunAction,
     Attachment,
     ProjectDiscussion,
     Task,
 )
 from app.schemas.agent_run import (
+    AgentActionAvailability,
+    AgentActionDetailOut,
+    AgentActionOut,
+    AgentActionResult,
+    AgentCiEvidenceOut,
     AgentCiPending,
     AgentCiResult,
+    AgentCorrectionRequest,
     AgentDeployment,
     AgentEventOut,
     AgentImageOut,
@@ -36,7 +44,13 @@ from app.schemas.agent_run import (
     AgentMetricsOut,
     AgentNoticeAck,
     AgentNotificationOut,
+    AgentQaDeployment,
+    AgentReleaseRequest,
+    AgentReviewFinding,
+    AgentReviewOut,
+    AgentReviewResult,
     AgentRunCallback,
+    AgentRunDetailOut,
     AgentRunOut,
     AgentRunStart,
     ExternalAgentPending,
@@ -47,6 +61,7 @@ from app.services.access import can_edit_task, can_see_task
 from app.services.agent_repos import (
     DISPATCH_REPOSITORY,
     PUBLIC_REPOSITORIES,
+    QA_REPOSITORY,
     REPOSITORIES,
     repository_for,
 )
@@ -56,6 +71,173 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
 _GITHUB = "https://api.github.com"
 _METRICS_PILOT_START = datetime(2026, 9, 24, 18, 0, tzinfo=UTC)
+
+
+def _review_out(run: AgentRun) -> AgentReviewOut:
+    findings = [
+        AgentReviewFinding.model_validate(item) for item in (run.review_findings or [])
+    ]
+    state = cast(
+        Literal["pending", "clean", "findings", "stale", "error"],
+        run.review_status or "pending",
+    )
+    return AgentReviewOut(
+        state=state,
+        reviewed_head_sha=run.review_sha,
+        summary=run.review_summary,
+        findings=findings,
+    )
+
+
+def _owner_release_supported(run: AgentRun) -> bool:
+    return run.mode == "pr" and any(
+        item.full_name == run.repo_full_name and item.branch == run.base_branch
+        for item in REPOSITORIES + ((QA_REPOSITORY,) if settings.agent_qa_enabled else ())
+    )
+
+
+def _run_detail(run: AgentRun) -> AgentRunDetailOut:
+    open_pr = bool(
+        _owner_release_supported(run)
+        and run.pr_url
+        and run.head_sha
+        and run.status in {"pr_opened", "pr_ready", "correction_running"}
+    )
+    merge_ready = bool(
+        open_pr
+        and run.status == "pr_ready"
+        and run.ci_status == "success"
+        and run.ci_verified_sha == run.head_sha
+        and run.review_status == "clean"
+        and run.review_sha == run.head_sha
+    )
+    return AgentRunDetailOut(
+        run_id=run.run_id,
+        status=run.status,
+        summary=run.task.title,
+        impact=run.review_summary or run.task.description or "Review pending",
+        head_sha=run.head_sha,
+        ci_evidence=AgentCiEvidenceOut(
+            state=run.ci_status,
+            verified_head_sha=run.ci_verified_sha,
+            url=run.ci_url,
+        ),
+        review=_review_out(run),
+        actions={
+            "merge": AgentActionAvailability(available=merge_ready),
+            "correction": AgentActionAvailability(
+                available=open_pr and run.status in {"pr_opened", "pr_ready"}
+            ),
+        },
+    )
+
+
+def _can_merge(run: AgentRun) -> bool:
+    return _run_detail(run).actions["merge"].available
+
+
+def _refresh_pr_ready(run: AgentRun) -> bool:
+    ready = bool(
+        run.pr_url
+        and run.status in {"pr_opened", "pr_ready"}
+        and run.head_sha
+        and run.ci_status == "success"
+        and run.ci_verified_sha == run.head_sha
+        and run.review_status == "clean"
+        and run.review_sha == run.head_sha
+    )
+    if ready:
+        run.status = "pr_ready"
+        run.pr_ready_at = run.pr_ready_at or datetime.now(UTC)
+    else:
+        run.status = "pr_opened"
+        run.pr_ready_at = None
+    return ready
+
+
+def _action_error(
+    code: str, message: str, *, status_code: int, current_head_sha: str | None = None
+) -> Response:
+    body: dict[str, object] = {"code": code, "message": message}
+    if current_head_sha is not None:
+        body["current_head_sha"] = current_head_sha
+    return Response(
+        content=json.dumps({"error": body}),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+def _action_response(action: AgentRunAction, run: AgentRun) -> AgentActionOut:
+    status_map: dict[str, Literal["accepted", "in_progress", "completed", "rejected"]] = {
+        "accepted": "accepted",
+        "in_progress": "in_progress",
+        "completed": "completed",
+        "rejected": "rejected",
+    }
+    message = (action.result or {}).get("message")
+    if not isinstance(message, str):
+        message = None
+    return AgentActionOut(
+        action_id=UUID(action.action_id),
+        status=status_map.get(action.status, "in_progress"),
+        run_id=run.run_id,
+        head_sha=run.head_sha,
+        message=message,
+    )
+
+
+async def _dispatch_release_action(
+    run: AgentRun, action: AgentRunAction, payload: dict[str, object]
+) -> None:
+    if not _owner_release_supported(run):
+        raise HTTPException(
+            status_code=409, detail="release actions are not enabled for this repository"
+        )
+    if not settings.github_agent_token:
+        raise HTTPException(status_code=503, detail="release workflow token is not configured")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(
+            f"{_GITHUB}/repos/{DISPATCH_REPOSITORY}/dispatches",
+            headers=_headers(),
+            json={
+                "event_type": f"agent_run_{action.kind}",
+                "client_payload": {
+                    "run_id": run.run_id,
+                    "action_id": action.action_id,
+                    "branch": _run_branch(run),
+                    "repo_full_name": run.repo_full_name,
+                    **payload,
+                },
+            },
+        )
+    if response.status_code != 204:
+        raise HTTPException(status_code=502, detail="GitHub did not accept release action")
+
+
+async def _dispatch_external_review(run: AgentRun, pr_number: str) -> None:
+    if run.repo_full_name == DISPATCH_REPOSITORY:
+        return  # This repository's successful CI workflow_run starts its reviewer.
+    if not settings.github_agent_token:
+        raise HTTPException(status_code=503, detail="review workflow token is not configured")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(
+            f"{_GITHUB}/repos/{DISPATCH_REPOSITORY}/dispatches",
+            headers=_headers(),
+            json={
+                "event_type": "agent_pr_review",
+                "client_payload": {
+                    "repo_full_name": run.repo_full_name,
+                    "run_id": run.run_id,
+                    "pull_number": int(pr_number),
+                    "head_sha": run.head_sha,
+                    "branch": _run_branch(run),
+                    "base_branch": run.base_branch,
+                },
+            },
+        )
+    if response.status_code != 204:
+        raise HTTPException(status_code=502, detail="GitHub did not accept independent review")
 
 
 def _duration_summary(values: list[float]) -> MetricDuration:
@@ -72,6 +254,16 @@ def _duration_summary(values: list[float]) -> MetricDuration:
 def _worker_auth(token: str | None) -> None:
     if not token or not hmac.compare_digest(token, settings.service_token):
         raise HTTPException(status_code=401, detail="invalid worker token")
+
+
+def _qa_deploy_auth(token: str | None) -> None:
+    if (
+        not settings.agent_qa_enabled
+        or not settings.agent_qa_callback_token
+        or not token
+        or not hmac.compare_digest(token, settings.agent_qa_callback_token)
+    ):
+        raise HTTPException(status_code=401, detail="invalid QA deployment token")
 
 
 async def _task(session: DbSession, task_id: int, *, lock: bool = False) -> Task:
@@ -102,9 +294,18 @@ def _revision(task: Task, mode: str = "pr") -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _headers() -> dict[str, str]:
+def _headers(repo: str | None = None) -> dict[str, str]:
+    token = (
+        settings.github_public_agent_token
+        if repo in PUBLIC_REPOSITORIES
+        else (
+            settings.github_agent_qa_token
+            if settings.agent_qa_enabled and repo == settings.agent_qa_repository
+            else settings.github_agent_token
+        )
+    )
     return {
-        "Authorization": f"Bearer {settings.github_agent_token}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -113,7 +314,7 @@ def _headers() -> dict[str, str]:
 async def _ensure_repo_visibility(
     client: httpx.AsyncClient, repo: str, *, private: bool
 ) -> None:
-    response = await client.get(f"{_GITHUB}/repos/{repo}", headers=_headers())
+    response = await client.get(f"{_GITHUB}/repos/{repo}", headers=_headers(repo))
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub repository access failed")
     if response.json().get("private") is not private:
@@ -124,7 +325,12 @@ async def _ensure_repo_visibility(
 
 
 async def _dispatch(run: AgentRun, task: Task) -> int:
-    repository = repository_for(task.project.key, run.repo_full_name, run.base_branch)
+    repository = repository_for(
+        task.project.key,
+        run.repo_full_name,
+        run.base_branch,
+        include_qa=settings.agent_qa_enabled,
+    )
     if repository is None:
         raise HTTPException(
             status_code=409, detail="project repository is not enabled for agents"
@@ -135,7 +341,11 @@ async def _dispatch(run: AgentRun, task: Task) -> int:
             f"{_GITHUB}/repos/{DISPATCH_REPOSITORY}/dispatches",
             headers=_headers(),
             json={
-                "event_type": ("agent_task" if repository.private else "agent_public_task"),
+                "event_type": (
+                    "agent_task"
+                    if repository.private and not repository.qa_only
+                    else "agent_public_task"
+                ),
                 "client_payload": {
                     "run_id": run.run_id,
                     "task_id": task.id,
@@ -155,7 +365,7 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(
             f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
-            headers=_headers(),
+            headers=_headers(run.repo_full_name),
         )
     expected_branch = _run_branch(run)
     if (
@@ -168,10 +378,52 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
 
+async def _current_pr_head(run: AgentRun) -> tuple[str, bool]:
+    if not run.pr_url:
+        raise HTTPException(status_code=409, detail="agent PR has no URL")
+    prefix = f"https://github.com/{run.repo_full_name}/pull/"
+    pr_number = run.pr_url.removeprefix(prefix)
+    if not run.pr_url.startswith(prefix) or not pr_number.isdecimal():
+        raise HTTPException(status_code=409, detail="invalid agent PR reference")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
+            headers=_headers(run.repo_full_name),
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="GitHub PR status is unavailable")
+    pr = response.json()
+    head = pr.get("head") or {}
+    sha = head.get("sha", "")
+    if (
+        head.get("ref") != _run_branch(run)
+        or (head.get("repo") or {}).get("full_name", "").lower() != run.repo_full_name.lower()
+        or (pr.get("base") or {}).get("ref") != run.base_branch
+        or not re.fullmatch(r"[0-9a-f]{40}", sha)
+    ):
+        raise HTTPException(status_code=409, detail="PR does not match this agent run")
+    return sha, pr.get("state") == "open" and not pr.get("merged")
+
+
+def _invalidate_review_and_ci(run: AgentRun, head_sha: str) -> None:
+    run.head_sha = head_sha
+    run.status = "pr_opened"
+    run.ci_status = "pending"
+    run.ci_verified_sha = None
+    run.ci_url = None
+    run.pr_ready_at = None
+    run.review_status = "pending"
+    run.review_sha = None
+    run.review_summary = None
+    run.review_findings = None
+    run.notified_at = None
+
+
 async def _verify_recovered_commit(run: AgentRun, sha: str) -> None:
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(
-            f"{_GITHUB}/repos/{run.repo_full_name}/commits/{sha}", headers=_headers()
+            f"{_GITHUB}/repos/{run.repo_full_name}/commits/{sha}",
+            headers=_headers(run.repo_full_name),
         )
     if response.status_code != 200:
         raise HTTPException(
@@ -191,7 +443,7 @@ async def _verify_pr_ci(run: AgentRun, sha: str, conclusion: str, url: str) -> N
     target = next(
         (
             item
-            for item in REPOSITORIES
+            for item in REPOSITORIES + ((QA_REPOSITORY,) if settings.agent_qa_enabled else ())
             if item.full_name == run.repo_full_name and item.branch == run.base_branch
         ),
         None,
@@ -201,7 +453,7 @@ async def _verify_pr_ci(run: AgentRun, sha: str, conclusion: str, url: str) -> N
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(
             f"{_GITHUB}/repos/{run.repo_full_name}/actions/runs/{run_number}",
-            headers=_headers(),
+            headers=_headers(run.repo_full_name),
         )
         if response.status_code != 200:
             raise HTTPException(status_code=502, detail="PR CI verification failed")
@@ -218,7 +470,7 @@ async def _verify_pr_ci(run: AgentRun, sha: str, conclusion: str, url: str) -> N
         if passed:
             jobs_response = await client.get(
                 f"{_GITHUB}/repos/{run.repo_full_name}/actions/runs/{run_number}/jobs?per_page=100",
-                headers=_headers(),
+                headers=_headers(run.repo_full_name),
             )
             if jobs_response.status_code != 200:
                 raise HTTPException(status_code=502, detail="PR CI jobs verification failed")
@@ -239,7 +491,7 @@ async def _verify_deployment(run: AgentRun, sha: str) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(
             f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
-            headers=_headers(),
+            headers=_headers(run.repo_full_name),
         )
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub PR verification failed")
@@ -282,7 +534,8 @@ async def _verify_fast_commit(run: AgentRun, sha: str) -> None:
         raise HTTPException(status_code=409, detail="deployed SHA does not match fast run")
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(
-            f"{_GITHUB}/repos/{run.repo_full_name}/commits/{sha}", headers=_headers()
+            f"{_GITHUB}/repos/{run.repo_full_name}/commits/{sha}",
+            headers=_headers(run.repo_full_name),
         )
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="fast commit verification failed")
@@ -347,6 +600,12 @@ async def pending_notifications(
                         & (AgentRun.ci_verified_sha == AgentRun.head_sha)
                     ),
                     AgentRun.status.in_(["merged", "failed", "deployed"]),
+                    (
+                        (AgentRun.status == "pr_opened")
+                        & (AgentRun.review_status == "findings")
+                    ),
+                    ((AgentRun.status == "pr_opened") & (AgentRun.review_status == "error")),
+                    ((AgentRun.status == "pr_opened") & (AgentRun.ci_status == "failure")),
                     (AgentRun.status == "pr_opened")
                     & AgentRun.telegram_message_id.is_not(None),
                 ),
@@ -359,18 +618,29 @@ async def pending_notifications(
     ).all()
     verified_runs: list[AgentRun] = []
     for run in runs:
-        if run.status == "pr_ready":
+        if run.status in {"pr_opened", "pr_ready"} and _owner_release_supported(run):
             # A reviewer can push a new commit between the CI monitor tick and
-            # the bot tick. Never announce the previously verified head.
-            if not run.pr_url or not run.ci_verified_sha:
-                continue
-            pr_number = run.pr_url.rsplit("/", 1)[-1]
-            if not pr_number.isdecimal():
+            # the bot tick. Never announce controls for the previous head.
+            if not run.pr_url or not run.head_sha:
                 continue
             try:
-                await _verify_pr(run, pr_number, run.ci_verified_sha)
+                current_head, is_open = await _current_pr_head(run)
             except HTTPException:
                 continue  # Fail closed; the CI monitor will reconcile next tick.
+            if current_head != run.head_sha:
+                _invalidate_review_and_ci(run, current_head)
+                await session.commit()
+                continue
+            if not is_open:
+                continue
+            if run.status == "pr_ready" and (
+                run.review_status != "clean"
+                or run.review_sha != run.head_sha
+                or run.ci_verified_sha != run.head_sha
+            ):
+                _refresh_pr_ready(run)
+                await session.commit()
+                continue
         verified_runs.append(run)
     return [
         AgentNotificationOut(
@@ -391,6 +661,25 @@ async def pending_notifications(
             deployed_sha=run.deployed_sha,
             telegram_message_id=run.telegram_message_id,
             error=run.error,
+            owner_chat_id=settings.owner_telegram_id or None,
+            owner_notice_chat_id=run.owner_notice_chat_id,
+            owner_notice_message_id=run.owner_notice_message_id,
+            owner_controls_available=bool(
+                settings.owner_telegram_id
+                and _owner_release_supported(run)
+                and run.pr_url
+                and run.head_sha
+                and run.status in {"pr_opened", "pr_ready"}
+            ),
+            summary=run.task.title,
+            impact=run.review_summary or run.task.description or "Review pending",
+            review=_review_out(run),
+            ci_evidence=AgentCiEvidenceOut(
+                state=run.ci_status,
+                verified_head_sha=run.ci_verified_sha,
+                url=run.ci_url,
+            ),
+            actions=_run_detail(run).actions,
         )
         for run in verified_runs
     ]
@@ -535,17 +824,48 @@ async def mark_notified(
         raise HTTPException(status_code=404, detail="run not found")
     if run.status not in {"pr_opened", "pr_ready", "merged", "failed", "deployed"}:
         raise HTTPException(status_code=409, detail="run is not finished")
-    if run.status == "pr_opened" and run.telegram_message_id is None:
+    if (
+        run.status == "pr_opened"
+        and run.telegram_message_id is None
+        and run.owner_notice_message_id is None
+    ):
         raise HTTPException(status_code=409, detail="no earlier card to update")
     if run.status == "pr_ready" and (
-        run.ci_status != "success" or run.ci_verified_sha != run.head_sha
+        run.ci_status != "success"
+        or run.ci_verified_sha != run.head_sha
+        or run.review_status != "clean"
+        or run.review_sha != run.head_sha
     ):
-        raise HTTPException(status_code=409, detail="PR CI is not verified")
+        raise HTTPException(
+            status_code=409, detail="PR CI and independent review are not verified"
+        )
     if run.notified_at is None:
         if payload is not None and payload.message_id is not None:
             run.telegram_message_id = payload.message_id
         run.notified_at = datetime.now(UTC)
         await session.commit()
+
+
+@router.post("/{run_id}/owner-notified", status_code=204)
+async def mark_owner_notified(
+    run_id: str,
+    payload: AgentNoticeAck,
+    session: DbSession,
+    x_agent_worker_token: str | None = Header(default=None),
+) -> None:
+    _worker_auth(x_agent_worker_token)
+    if not settings.owner_telegram_id:
+        raise HTTPException(status_code=503, detail="owner Telegram ID is not configured")
+    run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.status not in {"pr_opened", "pr_ready", "merged", "failed", "deployed"}:
+        raise HTTPException(status_code=409, detail="run is not notifiable")
+    if payload.message_id is None:
+        raise HTTPException(status_code=422, detail="owner message ID is required")
+    run.owner_notice_chat_id = settings.owner_telegram_id
+    run.owner_notice_message_id = payload.message_id
+    await session.commit()
 
 
 @router.get("/external-pending", response_model=list[ExternalAgentPending])
@@ -647,8 +967,15 @@ async def agent_pr_ci_result(
     if payload.github_run_url:
         await _verify_pr_ci(run, payload.sha, payload.conclusion, payload.github_run_url)
 
+    if run.head_sha != payload.sha:
+        # A new PR commit invalidates every previous review result immediately.
+        run.review_status = "pending"
+        run.review_sha = None
+        run.review_summary = None
+        run.review_findings = None
     unchanged = (
-        run.status == ("pr_ready" if payload.conclusion == "success" else "pr_opened")
+        run.status
+        == ("pr_ready" if payload.conclusion == "success" and _can_merge(run) else "pr_opened")
         and run.head_sha == payload.sha
         and run.ci_status == payload.conclusion
         and run.ci_url == payload.github_run_url
@@ -661,12 +988,13 @@ async def agent_pr_ci_result(
     run.ci_status = payload.conclusion
     run.ci_url = payload.github_run_url
     run.ci_verified_sha = payload.sha if payload.conclusion == "success" else None
+    run.status = "pr_opened"
     run.notified_at = None if run.telegram_message_id is not None else run.notified_at
     if payload.conclusion == "success":
-        run.status = "pr_ready"
-        run.pr_ready_at = datetime.now(UTC)
+        _refresh_pr_ready(run)
         run.notified_at = None
         agent_events.record(session, run, phase="ci", github_run_url=run.ci_url)
+        await _dispatch_external_review(run, pr_number)
         target_status = TaskStatus.REVIEW
     else:
         run.status = "pr_opened"
@@ -700,6 +1028,56 @@ async def agent_pr_ci_result(
     return AgentRunOut.model_validate(run)
 
 
+@router.post("/{run_id}/review-result", response_model=AgentRunOut)
+async def agent_pr_review_result(
+    run_id: str,
+    payload: AgentReviewResult,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+    if run is None or run.status not in {"pr_opened", "pr_ready"} or not run.pr_url:
+        raise HTTPException(status_code=409, detail="agent PR is not awaiting review")
+    if run.head_sha != payload.sha:
+        raise HTTPException(status_code=409, detail="review does not match current PR head")
+    pr_number = run.pr_url.rsplit("/", 1)[-1]
+    if not pr_number.isdecimal():
+        raise HTTPException(status_code=409, detail="invalid agent PR reference")
+    await _verify_pr(run, pr_number, payload.sha)
+    findings = [finding.model_dump() for finding in payload.findings]
+    review_state = payload.state or ("clean" if not findings else "findings")
+    if (review_state == "clean" and findings) or (review_state == "findings" and not findings):
+        raise HTTPException(status_code=422, detail="review state does not match findings")
+    run.review_status = review_state
+    run.review_sha = payload.sha
+    run.review_summary = payload.summary
+    run.review_findings = findings
+    run.status = "pr_opened"
+    if _refresh_pr_ready(run):
+        run.notified_at = None
+        agent_events.record(session, run, phase="review", github_run_url=run.ci_url)
+    else:
+        run.notified_at = None
+        agent_events.record(
+            session,
+            run,
+            status=(
+                "review_findings"
+                if findings
+                else "review_error" if review_state == "error" else "review_passed_ci_pending"
+            ),
+            phase="review",
+        )
+    await session.commit()
+    return AgentRunOut.model_validate(run)
+
+
 @router.get("/tasks/{task_id}", response_model=list[AgentRunOut])
 async def list_task_runs(
     task_id: int, session: DbSession, user: CurrentUser
@@ -711,6 +1089,304 @@ async def list_task_runs(
         select(AgentRun).where(AgentRun.task_id == task_id).order_by(AgentRun.id.desc())
     )
     return [AgentRunOut.model_validate(row) for row in runs]
+
+
+@router.get("/{run_id}", response_model=AgentRunDetailOut)
+async def agent_run_detail(
+    run_id: str, session: DbSession, owner: OwnerUser
+) -> AgentRunDetailOut:
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    is_open = False
+    if run.pr_url and run.status in {"pr_opened", "pr_ready", "correction_running"}:
+        current_head, is_open = await _current_pr_head(run)
+        if current_head != run.head_sha:
+            _invalidate_review_and_ci(run, current_head)
+            await session.commit()
+    detail = _run_detail(run)
+    if not is_open:
+        detail.actions = {
+            "merge": AgentActionAvailability(available=False),
+            "correction": AgentActionAvailability(available=False),
+        }
+    return detail
+
+
+async def _request_owner_action(
+    run_id: str,
+    kind: str,
+    expected_head_sha: str,
+    action_id: str,
+    session: DbSession,
+    *,
+    instruction: str | None = None,
+) -> AgentActionOut | Response:
+    run = await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    action_payload: dict[str, object] = {"expected_head_sha": expected_head_sha}
+    if instruction is not None:
+        action_payload["instruction"] = instruction
+    request_hash = hashlib.sha256(
+        json.dumps(action_payload, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    action = await session.get(AgentRunAction, action_id)
+    if action is not None:
+        if (
+            action.agent_run_id != run.id
+            or action.kind != kind
+            or action.request_hash != request_hash
+        ):
+            return _action_error(
+                "conflict",
+                "action_id was already used for a different request",
+                status_code=409,
+            )
+        return _action_response(action, run)
+    if not _owner_release_supported(run) or not run.pr_url:
+        return _action_error(
+            "not_ready", "this run has no owner-controlled private PR", status_code=409
+        )
+    current_head, is_open = await _current_pr_head(run)
+    if current_head != run.head_sha:
+        _invalidate_review_and_ci(run, current_head)
+        await session.commit()
+    if not is_open:
+        return _action_error("not_ready", "PR is no longer open", status_code=409)
+    if expected_head_sha != current_head:
+        return _action_error(
+            "stale_head",
+            "PR head changed; fetch the current run and retry",
+            status_code=409,
+            current_head_sha=current_head,
+        )
+    if kind == "merge" and not _can_merge(run):
+        return _action_error(
+            "not_ready", "CI and a clean review must pass on the current head", status_code=409
+        )
+    if kind == "correction" and run.status not in {"pr_opened", "pr_ready"}:
+        return _action_error("not_ready", "PR is not open for correction", status_code=409)
+    target_token = (
+        settings.github_public_agent_token
+        if run.repo_full_name in PUBLIC_REPOSITORIES
+        else (
+            settings.github_agent_qa_token
+            if settings.agent_qa_enabled and run.repo_full_name == settings.agent_qa_repository
+            else settings.github_agent_token
+        )
+    )
+    if not settings.github_agent_token or not target_token:
+        raise HTTPException(status_code=503, detail="release workflow token is not configured")
+
+    action = AgentRunAction(
+        action_id=action_id,
+        agent_run_id=run.id,
+        kind=kind,
+        request_hash=request_hash,
+        request_data=action_payload,
+        status="accepted",
+    )
+    session.add(action)
+    await session.commit()
+    payload: dict[str, object] = {
+        "expected_head_sha": expected_head_sha,
+        "task_id": run.task_id,
+    }
+    if instruction is not None:
+        payload["instruction"] = instruction
+    try:
+        await _dispatch_release_action(run, action, payload)
+    except (HTTPException, httpx.HTTPError) as exc:
+        action.status = "rejected"
+        action.result = {"message": "GitHub did not accept this action"}
+        await session.commit()
+        if isinstance(exc, HTTPException):
+            log.warning("agent_release_dispatch_rejected", run_id=run_id, action=kind)
+        else:
+            log.warning("agent_release_dispatch_failed", run_id=run_id, action=kind)
+        return _action_response(action, run)
+    action.status = "in_progress"
+    if kind == "correction":
+        run.status = "correction_running"
+        run.notified_at = None
+        agent_events.record(session, run, phase="correction")
+    await session.commit()
+    return _action_response(action, run)
+
+
+@router.post("/{run_id}/merge", response_model=AgentActionOut)
+async def request_agent_merge(
+    run_id: str,
+    payload: AgentReleaseRequest,
+    session: DbSession,
+    owner: OwnerUser,
+) -> AgentActionOut | Response:
+    return await _request_owner_action(
+        run_id,
+        "merge",
+        payload.expected_head_sha,
+        str(payload.action_id),
+        session,
+    )
+
+
+@router.post("/{run_id}/corrections", response_model=AgentActionOut)
+async def request_agent_correction(
+    run_id: str,
+    payload: AgentCorrectionRequest,
+    session: DbSession,
+    owner: OwnerUser,
+) -> AgentActionOut | Response:
+    return await _request_owner_action(
+        run_id,
+        "correction",
+        payload.expected_head_sha,
+        str(payload.action_id),
+        session,
+        instruction=payload.instruction,
+    )
+
+
+@router.get("/{run_id}/actions/{action_id}", response_model=AgentActionDetailOut)
+async def agent_action_status(
+    run_id: str,
+    action_id: str,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentActionDetailOut:
+    _image_callback_auth(x_agent_callback_token)
+    action = await session.scalar(
+        select(AgentRunAction)
+        .join(AgentRun, AgentRun.id == AgentRunAction.agent_run_id)
+        .where(AgentRun.run_id == run_id, AgentRunAction.action_id == action_id)
+    )
+    if action is None:
+        raise HTTPException(status_code=404, detail="release action not found")
+    return AgentActionDetailOut(
+        action_id=UUID(action.action_id),
+        kind=cast(Literal["merge", "correction"], action.kind),
+        status=cast(
+            Literal["accepted", "in_progress", "completed", "rejected"], action.status
+        ),
+        request=action.request_data,
+        result=action.result,
+    )
+
+
+@router.post("/{run_id}/action-result", response_model=AgentRunOut)
+async def agent_action_result(
+    run_id: str,
+    payload: AgentActionResult,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    action = await session.scalar(
+        select(AgentRunAction)
+        .where(
+            AgentRunAction.action_id == str(payload.action_id),
+            AgentRunAction.agent_run_id == run.id,
+        )
+        .with_for_update()
+    )
+    if action is None:
+        raise HTTPException(status_code=404, detail="release action not found")
+    if action.status == "completed":
+        if action.result and action.result.get("head_sha") == payload.head_sha:
+            return AgentRunOut.model_validate(run)
+        raise HTTPException(status_code=409, detail="release action result changed")
+    if action.status == "rejected":
+        return AgentRunOut.model_validate(run)
+    if payload.status == "rejected":
+        action.status = "rejected"
+        action.result = {"message": payload.message or "GitHub rejected the action"}
+        if action.kind == "correction" and run.status == "correction_running":
+            run.status = "pr_opened"
+            _refresh_pr_ready(run)
+        await session.commit()
+        return AgentRunOut.model_validate(run)
+
+    if action.kind == "merge":
+        if (
+            payload.head_sha != run.head_sha
+            or action.request_data.get("expected_head_sha") != run.head_sha
+            or not _can_merge(run)
+            or not payload.merge_sha
+        ):
+            raise HTTPException(
+                status_code=409, detail="merge result does not match current PR head"
+            )
+        merged_head = await _verify_deployment(run, payload.merge_sha)
+        if merged_head != payload.head_sha:
+            raise HTTPException(status_code=409, detail="merged PR head changed")
+        run.status = "merged"
+        run.merged_sha = payload.merge_sha
+        run.merged_at = run.merged_at or datetime.now(UTC)
+        run.notified_at = None
+        agent_events.record(session, run, phase="merge")
+        action.result = {
+            "head_sha": payload.head_sha,
+            "merge_sha": payload.merge_sha,
+            "message": payload.message,
+        }
+    elif action.kind == "correction":
+        if (
+            run.status != "correction_running"
+            or action.request_data.get("expected_head_sha") != run.head_sha
+        ):
+            raise HTTPException(
+                status_code=409, detail="correction action is no longer current"
+            )
+        if not payload.head_sha:
+            raise HTTPException(
+                status_code=409, detail="correction result needs the current PR head"
+            )
+        pr_number = run.pr_url.rsplit("/", 1)[-1] if run.pr_url else ""
+        if not pr_number.isdecimal():
+            raise HTTPException(status_code=409, detail="invalid agent PR reference")
+        current_head, is_open = await _current_pr_head(run)
+        if not is_open or current_head != payload.head_sha:
+            raise HTTPException(
+                status_code=409, detail="correction PR head changed before recording"
+            )
+        if payload.head_sha != run.head_sha:
+            _invalidate_review_and_ci(run, payload.head_sha)
+        else:
+            # An owner may be asking for a false-positive finding to be
+            # reconsidered. Preserve CI for this exact commit and require a new
+            # independent review result before making Merge available.
+            run.status = "pr_opened"
+            run.pr_ready_at = None
+            run.review_status = "pending"
+            run.review_sha = None
+            run.review_summary = None
+            run.review_findings = None
+            run.notified_at = None
+        action.result = {"head_sha": payload.head_sha, "message": payload.message}
+        agent_events.record(
+            session, run, phase="correction", github_run_url=run.github_run_url
+        )
+    else:
+        raise HTTPException(status_code=409, detail="unknown release action")
+    action.status = "completed"
+    await session.commit()
+    return AgentRunOut.model_validate(run)
 
 
 @router.get("/{run_id}/status", response_model=AgentRunOut)
@@ -807,7 +1483,9 @@ async def start_agent_run(
         raise HTTPException(status_code=409, detail="task is closed")
     repo = task.project.repo_full_name
     branch = task.project.default_branch
-    repository = repository_for(task.project.key, repo, branch)
+    repository = repository_for(
+        task.project.key, repo, branch, include_qa=settings.agent_qa_enabled
+    )
     if repository is not None and not repository.private and not settings.agent_public_enabled:
         raise HTTPException(status_code=503, detail="public project agents are not enabled")
     if mode == "fast" and (repository is None or not repository.fast_enabled):
@@ -817,11 +1495,26 @@ async def start_agent_run(
     allowlist = {
         name.strip().lower() for name in settings.github_agent_allowed_repos.split(",")
     }
+    if settings.agent_qa_enabled:
+        allowlist.add(settings.agent_qa_repository.lower())
     if repository is None or repo is None or repo.lower() not in allowlist:
         raise HTTPException(
             status_code=409, detail="project repository is not enabled for agents"
         )
-    if not settings.github_agent_token or not settings.agent_callback_token:
+    target_token = (
+        settings.github_public_agent_token
+        if repository is not None and not repository.private
+        else (
+            settings.github_agent_qa_token
+            if repository is not None and repository.qa_only
+            else settings.github_agent_token
+        )
+    )
+    if (
+        not settings.github_agent_token
+        or not target_token
+        or not settings.agent_callback_token
+    ):
         raise HTTPException(status_code=503, detail="agent integration is not configured")
     if len(task.description or "") > 12000:
         raise HTTPException(
@@ -1038,6 +1731,63 @@ async def agent_run_deployed(
         # A publisher callback can fail after the validated main push and mark
         # the task blocked. The verified production deploy is the final source
         # of truth for this exact commit.
+        old = run.task.status
+        run.task.status = TaskStatus.DONE
+        run.task.done_at = datetime.now(UTC)
+        activity.record(
+            session,
+            task_id=run.task_id,
+            actor=None,
+            kind=ActivityKind.STATUS_CHANGED,
+            payload={"from": old, "to": TaskStatus.DONE.value, "agent_run_id": run_id},
+        )
+    await session.commit()
+    return AgentRunOut.model_validate(run)
+
+
+@router.post("/{run_id}/qa-deployed", response_model=AgentRunOut)
+async def agent_qa_run_deployed(
+    run_id: str,
+    payload: AgentQaDeployment,
+    session: DbSession,
+    x_agent_qa_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    """Accept deployment completion only for the explicitly enabled QA repo.
+
+    The QA workflow probes its private service, then reports through a token
+    scoped to this one repository instead of receiving the production callback
+    credential used by every agent workflow.
+    """
+    _qa_deploy_auth(x_agent_qa_callback_token)
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+    )
+    if run is None or run.repo_full_name != settings.agent_qa_repository:
+        raise HTTPException(status_code=404, detail="QA agent run not found")
+    if payload.ready_url != settings.agent_qa_ready_url or payload.ready_sha != payload.sha:
+        raise HTTPException(
+            status_code=409, detail="QA readiness evidence does not match the merged SHA"
+        )
+    if run.status == "deployed" and run.deployed_sha == payload.sha:
+        return AgentRunOut.model_validate(run)
+    if run.status != "merged" or run.merged_sha != payload.sha:
+        raise HTTPException(status_code=409, detail="QA run is not merged at this SHA")
+    head_sha = await _verify_deployment(run, payload.sha)
+    expected_url = f"https://github.com/{settings.agent_qa_repository}/actions/runs/"
+    suffix = payload.github_run_url.removeprefix(expected_url)
+    if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
+        raise HTTPException(status_code=400, detail="invalid QA deployment run URL")
+    run.head_sha = head_sha
+    run.status = "deployed"
+    run.deployed_sha = payload.sha
+    run.deployed_at = run.deployed_at or datetime.now(UTC)
+    run.qa_ready_url = payload.ready_url
+    run.qa_ready_sha = payload.ready_sha
+    run.qa_ready_at = run.deployed_at
+    run.finished_at = datetime.now(UTC)
+    run.notified_at = None
+    agent_events.record(session, run, github_run_url=payload.github_run_url)
+    if can_transition(TaskStatus(run.task.status), TaskStatus.DONE):
         old = run.task.status
         run.task.status = TaskStatus.DONE
         run.task.done_at = datetime.now(UTC)
