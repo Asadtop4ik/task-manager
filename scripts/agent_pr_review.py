@@ -6,6 +6,7 @@ passed to Codex as diff text and is never executed by the review workflow.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -18,6 +19,8 @@ API = "https://api.github.com"
 TASK_API = "https://tasks.standart-eko.uz/api/v1/agent-runs"
 RUN_ID_PATTERN = re.compile(r"codex/task-[1-9][0-9]*-([0-9a-f-]{36})$")
 ALLOWED_SEVERITIES = {"P1", "P2", "P3"}
+VISIBLE_FINDING_LIMIT = 12
+VISIBLE_REPORT_LIMIT = 12_000
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",
     "muradjanov-dev/qurbot": "master",
@@ -227,6 +230,84 @@ def _review_decision(findings: list[dict]) -> tuple[str, bool, str]:
     return "clean", True, "Independent Codex review clean"
 
 
+def _safe_feedback_text(value: str, limit: int) -> str:
+    """Bound reviewer supplied text and remove common credential forms."""
+    text = value[:limit]
+    text = re.sub(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        "[redacted private key]",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(r"\bBearer\s+\S+", "Bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b",
+        "[redacted credential]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b([\w-]*(?:token|secret|password|api[_-]?key)[\w-]*\s*[:=]\s*)['\"]?[^\s,;\"']+",
+        r"\1[redacted]",
+        text,
+    )
+    return text
+
+
+def _review_report(
+    repo: str,
+    number: int,
+    sha: str,
+    summary: str,
+    findings: list[dict],
+    review_state: str,
+    is_ready: bool,
+) -> str:
+    """Render bounded reviewer feedback for the Actions summary and log."""
+    result = [
+        f"Repository: {repo}",
+        f"Pull request: #{number}",
+        f"Reviewed SHA: {sha}",
+        f"Decision: {review_state} ({'ready' if is_ready else 'blocked'})",
+        f"Summary: {_safe_feedback_text(summary, 600)}",
+    ]
+    visible = findings[:VISIBLE_FINDING_LIMIT]
+    if not visible:
+        result.append("Findings: none")
+    for index, finding in enumerate(visible, 1):
+        location = finding.get("file", "")
+        if finding.get("line"):
+            location = (
+                f"{location}:{finding['line']}"
+                if location
+                else f"line {finding['line']}"
+            )
+        result.extend(
+            [
+                "",
+                f"Finding {index} [{finding['severity']}]: "
+                f"{_safe_feedback_text(finding['title'], 180)}",
+                f"Location: {_safe_feedback_text(location, 240) or 'not provided'}",
+                f"Evidence: {_safe_feedback_text(finding['evidence'], 600)}",
+            ]
+        )
+    if len(findings) > len(visible):
+        result.extend(
+            ["", f"Additional findings omitted: {len(findings) - len(visible)}"]
+        )
+    plain_text = "\n".join(result)[:VISIBLE_REPORT_LIMIT]
+    # A preformatted HTML block keeps reviewer text inert in GitHub's Markdown
+    # renderer. JSON encoding below keeps it to one safe workflow log line.
+    return f"<h2>Codex review</h2>\n<pre>{html.escape(plain_text, quote=False)}</pre>"
+
+
+def _publish_review_report(report: str) -> None:
+    print("Codex review report (HTML): " + json.dumps(report, ensure_ascii=True))
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with Path(summary_path).open("a", encoding="utf-8") as summary_file:
+            summary_file.write(report + "\n")
+
+
 def _set_review_status(repo: str, sha: str, state: str, description: str) -> None:
     token = os.environ["GH_TOKEN"]
     body = json.dumps(
@@ -268,6 +349,9 @@ def finalize() -> None:
         raise ValueError("pull request head changed during review")
     run_id = target["run_id"]
     review_state, is_ready, review_description = _review_decision(findings)
+    report = _review_report(
+        repo, number, sha, summary, findings, review_state, is_ready
+    )
     if run_id:
         run = _task_api("GET", f"{run_id}/status")
         if (
@@ -300,6 +384,7 @@ def finalize() -> None:
         "success" if is_ready else "failure",
         review_description,
     )
+    _publish_review_report(report)
     if repo != os.environ["GITHUB_REPOSITORY"]:
         return  # External approved repos never use Task Manager's narrow auto-merge.
     # This event retries the narrow docs/CSS auto-merge after the review status
