@@ -99,7 +99,12 @@ async def create_intake(
         raise HTTPException(status_code=404, detail="project not found")
     project = await session.get(Project, payload.project_id)
     repository = (
-        repository_for(project.key, project.repo_full_name, project.default_branch)
+        repository_for(
+            project.key,
+            project.repo_full_name,
+            project.default_branch,
+            include_qa=settings.agent_qa_enabled,
+        )
         if project is not None
         else None
     )

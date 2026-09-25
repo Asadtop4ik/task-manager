@@ -62,6 +62,64 @@ async def test_public_project_can_clarify_pr_but_not_fast(
     assert (await session.scalars(select(Task))).all() == []
 
 
+async def test_qa_project_can_start_pr_intake_only_when_qa_flag_enabled(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    payload = {
+        "project_id": project.id,
+        "text": "Check the isolated QA service",
+        "mode": "pr",
+        "chat_id": manager.telegram_id,
+    }
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    disabled = await client.post(
+        "/api/v1/agent-intakes", json=payload, headers=bot_headers(manager)
+    )
+    assert disabled.status_code == 409
+
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    created = await client.post(
+        "/api/v1/agent-intakes", json=payload, headers=bot_headers(manager)
+    )
+    assert created.status_code == 201 and created.json()["status"] == "queued"
+    assert (await session.scalars(select(Task))).all() == []
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    lease = await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
+    assert lease.status_code == 200
+    result = await client.post(
+        f"/api/v1/agent-intakes/{created.json()['id']}/result",
+        json={
+            "revision": lease.json()["revision"],
+            "lease_id": lease.json()["lease_id"],
+            "status": "ready",
+            "brief": {
+                "title": "Check isolated QA readiness",
+                "goal": "Verify the synthetic service is healthy",
+                "acceptance": ["Ready reports the deployed SHA"],
+            },
+        },
+        headers=worker_headers(),
+    )
+    assert result.status_code == 200 and result.json()["status"] == "ready"
+    confirmed = await client.post(
+        f"/api/v1/agent-intakes/{created.json()['id']}/confirm",
+        json={},
+        headers=bot_headers(manager),
+    )
+    assert confirmed.status_code == 200 and confirmed.json()["created"] is True
+    task = await session.get(Task, confirmed.json()["task"]["id"])
+    assert task is not None and task.project_id == project.id
+
+
 async def test_only_approved_bot_actor_can_start_one_intake(
     client: AsyncClient,
     session: AsyncSession,

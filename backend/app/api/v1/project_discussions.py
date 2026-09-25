@@ -63,7 +63,12 @@ async def start_discussion(
         raise HTTPException(status_code=404, detail="project not found")
     project = await session.get(Project, payload.project_id)
     repository = (
-        repository_for(project.key, project.repo_full_name, project.default_branch)
+        repository_for(
+            project.key,
+            project.repo_full_name,
+            project.default_branch,
+            include_qa=settings.agent_qa_enabled,
+        )
         if project is not None
         else None
     )
@@ -204,7 +209,12 @@ async def lease_discussion(
     project = await session.get(Project, row.project_id)
     actor = await session.get(User, row.user_id)
     repository = (
-        repository_for(project.key, project.repo_full_name, project.default_branch)
+        repository_for(
+            project.key,
+            project.repo_full_name,
+            project.default_branch,
+            include_qa=settings.agent_qa_enabled,
+        )
         if project is not None
         else None
     )

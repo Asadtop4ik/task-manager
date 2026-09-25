@@ -53,6 +53,46 @@ async def test_private_discussion_requires_codex_access_and_creates_no_task(
     assert (await session.scalars(select(Task))).all() == []
 
 
+async def test_qa_project_discussion_requires_qa_flag_and_creates_no_task(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    payload = {"project_id": project.id, "chat_id": manager.telegram_id}
+    disabled = await client.post(
+        "/api/v1/project-discussions", json=payload, headers=bot_headers(manager)
+    )
+    assert disabled.status_code == 409
+
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-worker-token-0123456789abcdef")
+    created = await client.post(
+        "/api/v1/project-discussions", json=payload, headers=bot_headers(manager)
+    )
+    assert created.status_code == 200 and created.json()["status"] == "idle"
+    discussion = await session.get(ProjectDiscussion, created.json()["id"])
+    assert discussion is not None and discussion.project_id == project.id
+    queued = await client.post(
+        f"/api/v1/project-discussions/{discussion.id}/messages",
+        json={"text": "Verify the synthetic service"},
+        headers=bot_headers(manager),
+    )
+    assert queued.status_code == 200 and queued.json()["status"] == "queued"
+    lease = await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    assert lease.status_code == 200
+    assert lease.json()["project_key"] == "agent-qa"
+    assert lease.json()["base_branch"] == "main"
+    assert (await session.scalars(select(Task))).all() == []
+
+
 async def test_messages_resume_one_thread_and_deny_stale_results(
     client: AsyncClient,
     session: AsyncSession,
