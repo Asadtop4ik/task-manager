@@ -355,8 +355,14 @@ async def test_qa_merge_workflow_rejection_retries_with_same_action_id_when_stil
     monkeypatch.setattr(settings, "github_agent_qa_token", "qa-read-token")
     monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
 
+    head_lookups = 0
+
     async def current_head(current) -> tuple[str, bool]:
+        nonlocal head_lookups
+        head_lookups += 1
         assert current.repo_full_name == "Asadtop4ik/agent-qa"
+        if head_lookups == 1:
+            raise agent_runs.httpx.ConnectError("temporary GitHub lookup failure")
         return _SHA, True
 
     dispatched: list[str] = []
@@ -405,6 +411,7 @@ async def test_qa_merge_workflow_rejection_retries_with_same_action_id_when_stil
     )
     assert retried.status_code == 200
     assert retried.json()["status"] == "in_progress"
+    assert head_lookups == 2
     assert dispatched == [action_id]
 
 
