@@ -64,6 +64,13 @@ def run(repo: str, root: Path) -> str:
         if not paths:
             return "QurBot: no Python files changed"
         ensure_tools("ruff==0.7.4")
+        # Restrict automatic lint edits to Ruff's safe unused-import fix on
+        # files already changed by the agent; every other lint error fails closed.
+        subprocess.run(
+            ["ruff", "check", "--fix", "--select", "F401", "--", *paths],
+            cwd=root,
+            check=True,
+        )
         subprocess.run(["ruff", "format", "--", *paths], cwd=root, check=True)
         subprocess.run(["ruff", "check", "."], cwd=root, check=True)
         subprocess.run(["ruff", "format", "--check", "."], cwd=root, check=True)
@@ -89,6 +96,11 @@ def run(repo: str, root: Path) -> str:
             if not local_paths:
                 continue
             cwd = root / part
+            subprocess.run(
+                ["ruff", "check", "--fix", "--select", "F401", "--", *local_paths],
+                cwd=cwd,
+                check=True,
+            )
             subprocess.run(["black", "--", *local_paths], cwd=cwd, check=True)
             subprocess.run(["ruff", "check", "app", "tests"], cwd=cwd, check=True)
             subprocess.run(["black", "--check", "app", "tests"], cwd=cwd, check=True)
@@ -106,14 +118,23 @@ def run(repo: str, root: Path) -> str:
     raise ValueError("repository is outside the trusted preflight catalog")
 
 
+def failure_reason(error: Exception) -> str:
+    if isinstance(error, subprocess.CalledProcessError):
+        command = error.cmd
+        tool = Path(str(command[0] if isinstance(command, (list, tuple)) else command)).name
+        if tool == "ruff":
+            return "PR oldi Ruff tekshiruvi xato berdi; faqat xavfsiz F401 avtomatik tuzatildi. GitHub logini ko‘ring."
+        if tool == "black":
+            return "PR oldi Black tekshiruvi xato berdi. GitHub logini ko‘ring."
+    return "PR oldi ishonchli tekshiruv xato berdi. GitHub publisher logini ko‘ring."
+
+
 if __name__ == "__main__":
     try:
         result = run(os.environ["AGENT_REPO"], Path(os.getcwd()))
     except (ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         failure = Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt"
-        failure.write_text(
-            "Trusted PR preflight failed; inspect the publisher job.", encoding="utf-8"
-        )
+        failure.write_text(failure_reason(error), encoding="utf-8")
         print(f"agent preflight failed: {type(error).__name__}", file=sys.stderr)
         raise SystemExit(1) from None
     print(result)

@@ -470,6 +470,171 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert notices.json()[0]["deployed_sha"] == "b" * 40
 
 
+async def test_failed_publisher_preflight_can_recover_same_verified_pr(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Recover validated patch"},
+        headers=auth(manager),
+    )
+    current_task = await agent_runs._task(session, task.json()["id"])
+    run_id = "00000000-0000-0000-0000-000000000029"
+    session.add(
+        AgentRun(
+            run_id=run_id,
+            task_id=task.json()["id"],
+            task_revision=agent_runs._revision(current_task),
+            repo_full_name="Asadtop4ik/task-manager",
+            base_branch="main",
+            mode="pr",
+            status="failed",
+            error="Trusted PR preflight failed; inspect the publisher job.",
+        )
+    )
+    await session.commit()
+
+    async def fake_verify(run, number: str, sha: str) -> None:
+        assert number == "29" and sha == "b" * 40
+
+    async def fake_recovered_commit(run, sha: str) -> None:
+        assert run.run_id == run_id and sha == "b" * 40
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify)
+    monkeypatch.setattr(agent_runs, "_verify_recovered_commit", fake_recovered_commit)
+    headers = {"X-Agent-Callback-Token": "test-callback-token"}
+    recovered = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json={
+            "run_id": run_id,
+            "status": "pr_opened",
+            "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/29",
+            "head_sha": "b" * 40,
+        },
+        headers=headers,
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "pr_opened"
+    assert recovered.json()["ci_status"] == "pending"
+    assert recovered.json()["error"] is None
+    assert recovered.json()["pr_url"].endswith("/29")
+
+    other_run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    assert other_run is not None
+    other_run.status = "failed"
+    other_run.error = "Unrelated security validation failed"
+    await session.commit()
+    rejected = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json={
+            "run_id": run_id,
+            "status": "pr_opened",
+            "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/29",
+            "head_sha": "b" * 40,
+        },
+        headers=headers,
+    )
+    assert rejected.status_code == 409
+
+
+async def test_recovered_commit_requires_the_original_run_marker(monkeypatch) -> None:
+    _credentials(monkeypatch)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"commit": {"message": "feat: unrelated work"}}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    run = AgentRun(
+        run_id="00000000-0000-0000-0000-000000000029",
+        task_id=29,
+        task_revision="a" * 64,
+        repo_full_name="muradjanov-dev/qurbot",
+        base_branch="master",
+        mode="pr",
+        status="failed",
+    )
+    with pytest.raises(HTTPException, match="not this agent run"):
+        await agent_runs._verify_recovered_commit(run, "a" * 40)
+
+
+@pytest.mark.parametrize("stale_reason", ["new_run", "edited_task"])
+async def test_preflight_recovery_rejects_superseded_task(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    stale_reason: str,
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    task_response = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Original request"},
+        headers=auth(manager),
+    )
+    task_id = task_response.json()["id"]
+    task = await agent_runs._task(session, task_id)
+    old_run_id = "00000000-0000-0000-0000-000000000029"
+    session.add(
+        AgentRun(
+            run_id=old_run_id,
+            task_id=task_id,
+            task_revision=agent_runs._revision(task),
+            repo_full_name="Asadtop4ik/task-manager",
+            base_branch="main",
+            status="failed",
+            error="Trusted PR preflight failed; inspect the publisher job.",
+        )
+    )
+    await session.flush()
+    if stale_reason == "new_run":
+        session.add(
+            AgentRun(
+                run_id="00000000-0000-0000-0000-000000000030",
+                task_id=task_id,
+                task_revision="b" * 64,
+                repo_full_name="Asadtop4ik/task-manager",
+                base_branch="main",
+                status="running",
+            )
+        )
+    else:
+        task.description = "Changed after the failed run"
+    await session.commit()
+
+    blocked = await client.post(
+        f"/api/v1/agent-runs/{old_run_id}/callback",
+        json={
+            "run_id": old_run_id,
+            "status": "pr_opened",
+            "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/29",
+            "head_sha": "b" * 40,
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert blocked.status_code == 409
+
+
 async def test_failed_ci_stays_silent_until_new_head_passes(
     client: AsyncClient,
     session: AsyncSession,

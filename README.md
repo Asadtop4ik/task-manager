@@ -46,7 +46,10 @@ repository CI. A failed CI is shown on the task page without a premature
 "PR tayyor" bot message; pushing a fix to the same PR restarts verification.
 Publisher jobs run repo-specific trusted preflight before opening a PR:
 Ruff for QurBot, Ruff/Black for Task Manager and Kans Shop, and syntax checks
-for Ketoshop. Full target CI remains the final check.
+for Ketoshop. The publisher applies only Ruff's safe unused-import (`F401`)
+fixes to changed Python files, then formats and checks the patch again. Other
+lint and CI failures stop for a human fix; Codex is not automatically rerun.
+Full target CI remains the final check.
 Use `/stopagent 42` or the task page to cancel a running job. A ready PR is
 closed when cancelled, so it cannot auto-merge later. A failed or cancelled job
 can be retried once on the same task; change its description when the agent

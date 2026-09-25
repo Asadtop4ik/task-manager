@@ -168,6 +168,20 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
 
+async def _verify_recovered_commit(run: AgentRun, sha: str) -> None:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{run.repo_full_name}/commits/{sha}", headers=_headers()
+        )
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502, detail="recovered agent commit verification failed"
+        )
+    message = (response.json().get("commit") or {}).get("message", "")
+    if f"Agent-Run-ID: {run.run_id}" not in message.splitlines():
+        raise HTTPException(status_code=409, detail="recovered commit is not this agent run")
+
+
 async def _verify_pr_ci(run: AgentRun, sha: str, conclusion: str, url: str) -> None:
     """Prove a completed CI run belongs to this PR head and passed required jobs."""
     prefix = f"https://github.com/{run.repo_full_name}/actions/runs/"
@@ -1054,11 +1068,31 @@ async def agent_run_callback(
     if run_id != payload.run_id:
         raise HTTPException(status_code=400, detail="run ID mismatch")
     run = await session.scalar(
-        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task).selectinload(Task.project))
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status in {"pr_opened", "pr_ready", "merged", "deployed", "cancelled", "failed"}:
+    recovering_preflight = run.status == "failed" and payload.status == "pr_opened"
+    if recovering_preflight:
+        if (
+            run.error != "Trusted PR preflight failed; inspect the publisher job."
+            or run.pr_url is not None
+            or run.task.deleted_at is not None
+            or run.task.status in {TaskStatus.DONE, TaskStatus.CANCELLED}
+            or run.task_revision != _revision(run.task, run.mode)
+        ):
+            raise HTTPException(status_code=409, detail="failed run cannot publish a PR")
+        newer = await session.scalar(
+            select(AgentRun.id).where(
+                AgentRun.task_id == run.task_id,
+                AgentRun.id > run.id,
+            )
+        )
+        if newer is not None:
+            raise HTTPException(status_code=409, detail="a newer agent attempt exists")
+    elif run.status in {"pr_opened", "pr_ready", "merged", "deployed", "cancelled", "failed"}:
         return AgentRunOut.model_validate(run)
 
     if payload.status in {"validating", "publishing", "deploying"}:
@@ -1087,11 +1121,15 @@ async def agent_run_callback(
         if not pr_number.isdecimal():
             raise HTTPException(status_code=400, detail="invalid PR URL")
         await _verify_pr(run, pr_number, payload.head_sha)
+        if recovering_preflight:
+            await _verify_recovered_commit(run, payload.head_sha)
         run.pr_url = payload.pr_url
         run.head_sha = payload.head_sha
         run.ci_status = "pending"
         run.ci_verified_sha = None
         run.ci_url = None
+        if recovering_preflight:
+            run.notified_at = None  # Edit the earlier failed card, never send a second one.
 
     changed = run.status != payload.status or (
         payload.status == "failed" and run.error != payload.error
