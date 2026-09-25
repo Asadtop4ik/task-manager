@@ -44,6 +44,7 @@ class AppServerTests(unittest.TestCase):
             "initialize", "initialized", "thread/resume", "turn/start"
         ])
         self.assertEqual(sent[-1]["params"]["sandboxPolicy"]["type"], "readOnly")
+        self.assertEqual(sent[-1]["params"]["effort"], "medium")
         self.assertEqual(popen.call_args.args[0][0], CODEX_BINARY)
         self.assertIn("node24/bin", popen.call_args.kwargs["env"]["PATH"])
         self.assertTrue(process.terminated)

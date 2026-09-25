@@ -308,6 +308,7 @@ class IntakeWorkerTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("read-only", command)
         self.assertIn("gpt-6-sol", command)
+        self.assertIn("model_reasoning_effort=medium", command)
         self.assertIn("--image", command)
         self.assertNotIn("task prompt must only be stdin", command)
         self.assertEqual(kwargs["input"], "task prompt must only be stdin")
