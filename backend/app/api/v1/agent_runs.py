@@ -18,9 +18,17 @@ from app.api.deps import CurrentUser, DbSession, OwnerUser
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.enums import ActivityKind, TaskStatus, can_transition
-from app.db.models import AgentRun, Attachment, Task
+from app.db.models import (
+    AgentEvent,
+    AgentIntake,
+    AgentRun,
+    Attachment,
+    ProjectDiscussion,
+    Task,
+)
 from app.schemas.agent_run import (
     AgentDeployment,
+    AgentEventOut,
     AgentImageOut,
     AgentMerge,
     AgentMetricsOut,
@@ -32,7 +40,7 @@ from app.schemas.agent_run import (
     ExternalAgentPending,
     MetricDuration,
 )
-from app.services import activity
+from app.services import activity, agent_events
 from app.services.access import can_edit_task, can_see_task
 from app.services.agent_repos import (
     DISPATCH_REPOSITORY,
@@ -364,6 +372,61 @@ async def agent_metrics(
     )
 
 
+@router.get("/events/recent", response_model=list[AgentEventOut])
+async def recent_agent_events(
+    session: DbSession, owner: OwnerUser, before_id: int | None = None
+) -> list[AgentEventOut]:
+    """Owner-only history for coding, task preparation and project discussions."""
+    if before_id is not None and before_id < 1:
+        raise HTTPException(status_code=422, detail="invalid event cursor")
+    query = (
+        select(AgentEvent, AgentRun, AgentIntake, ProjectDiscussion)
+        .outerjoin(AgentRun, AgentEvent.agent_run_id == AgentRun.id)
+        .outerjoin(AgentIntake, AgentEvent.agent_intake_id == AgentIntake.id)
+        .outerjoin(
+            ProjectDiscussion,
+            AgentEvent.project_discussion_id == ProjectDiscussion.id,
+        )
+        .order_by(AgentEvent.id.desc())
+        .limit(100)
+    )
+    if before_id is not None:
+        query = query.where(AgentEvent.id < before_id)
+    rows = (await session.execute(query)).all()
+    result: list[AgentEventOut] = []
+    for event, run, intake, discussion in rows:
+        flow = "coding" if run else "intake" if intake else "discussion"
+        subject = run or intake or discussion
+        if subject is None:
+            continue
+        result.append(
+            AgentEventOut(
+                id=event.id,
+                flow=flow,
+                source_id=subject.id,
+                task_id=run.task_id if run else intake.task_id if intake else None,
+                project_id=(
+                    intake.project_id
+                    if intake
+                    else discussion.project_id if discussion else None
+                ),
+                status=event.status,
+                phase=event.phase,
+                error=event.error,
+                github_run_url=event.github_run_url,
+                input_tokens=run.input_tokens if run and run.status == event.status else None,
+                cached_input_tokens=(
+                    run.cached_input_tokens if run and run.status == event.status else None
+                ),
+                output_tokens=(
+                    run.output_tokens if run and run.status == event.status else None
+                ),
+                created_at=event.created_at,
+            )
+        )
+    return result
+
+
 @router.post("/{run_id}/notified", status_code=204)
 async def mark_notified(
     run_id: str,
@@ -578,6 +641,8 @@ async def start_agent_run(
         )
         session.add(run)
         try:
+            await session.flush()
+            agent_events.record(session, run)
             await session.commit()
         except IntegrityError:
             await session.rollback()
@@ -596,10 +661,12 @@ async def start_agent_run(
         run.status = "failed"
         run.error = "GitHub dispatch retry limit reached"
         run.finished_at = datetime.now(UTC)
+        agent_events.record(session, run, phase="dispatch", error=run.error)
         await session.commit()
         raise HTTPException(status_code=409, detail="agent dispatch retry limit reached")
 
     run.status = "dispatching"
+    agent_events.record(session, run)
     await session.commit()
     try:
         github_status = await _dispatch(run, task)
@@ -607,23 +674,29 @@ async def start_agent_run(
         run.status = "failed"
         run.error = str(exc.detail)
         run.finished_at = datetime.now(UTC)
+        agent_events.record(session, run, phase="dispatch", error=run.error)
         await session.commit()
         raise
     except httpx.RequestError as exc:
         run.status = "pending"
         run.attempts += 1
+        agent_events.record(
+            session, run, phase="dispatch", error="GitHub dispatch network failed"
+        )
         await session.commit()
         log.error("agent_dispatch_network_failed", task_id=task_id, error=str(exc))
         raise HTTPException(status_code=502, detail="GitHub dispatch failed") from exc
     run.attempts += 1
     if github_status != 204:
         run.status = "pending"
+        agent_events.record(session, run, phase="dispatch", error="GitHub dispatch rejected")
         await session.commit()
         log.error("agent_dispatch_rejected", task_id=task_id, github_status=github_status)
         raise HTTPException(status_code=502, detail="GitHub dispatch was rejected")
     await session.refresh(run)
     if run.status in {"dispatching", "pending"}:
         run.status = "dispatched"
+        agent_events.record(session, run)
     await session.commit()
     return AgentRunOut.model_validate(run)
 
@@ -664,6 +737,7 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         await _cancel_github(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
+    agent_events.record(session, run)
     await session.commit()
     return AgentRunOut.model_validate(run)
 
@@ -690,6 +764,7 @@ async def agent_run_merged(
     run.merged_at = run.merged_at or datetime.now(UTC)
     run.status = "merged"
     run.notified_at = None
+    agent_events.record(session, run)
     await session.commit()
     return AgentRunOut.model_validate(run)
 
@@ -734,6 +809,7 @@ async def agent_run_deployed(
     run.github_run_url = payload.github_run_url
     run.finished_at = datetime.now(UTC)
     run.notified_at = None
+    agent_events.record(session, run, github_run_url=run.github_run_url)
     if can_transition(TaskStatus(run.task.status), TaskStatus.DONE) or (
         run.mode == "fast" and run.task.status == TaskStatus.BLOCKED
     ):
@@ -806,6 +882,9 @@ async def agent_run_callback(
         run.pr_url = payload.pr_url
         run.head_sha = payload.head_sha
 
+    changed = run.status != payload.status or (
+        payload.status == "failed" and run.error != payload.error
+    )
     run.status = payload.status
     if payload.status == "running" and run.runner_started_at is None:
         run.runner_started_at = datetime.now(UTC)
@@ -818,6 +897,22 @@ async def agent_run_callback(
             raise HTTPException(status_code=400, detail="invalid GitHub run URL")
         run.github_run_url = payload.github_run_url
     run.error = payload.error
+    if changed:
+        agent_events.record(
+            session,
+            run,
+            error=(
+                "Kod yozish yoki tekshiruv bosqichi xato bilan tugadi"
+                if payload.status == "failed" and payload.failure_phase == "implement"
+                else (
+                    "PR nashr bosqichi xato bilan tugadi"
+                    if payload.status == "failed" and payload.failure_phase == "publish"
+                    else "Agent ishi xato bilan tugadi" if payload.status == "failed" else None
+                )
+            ),
+            phase=payload.failure_phase if payload.status == "failed" else None,
+            github_run_url=payload.github_run_url,
+        )
     if payload.input_tokens is not None:
         run.input_tokens = payload.input_tokens
     if payload.cached_input_tokens is not None:

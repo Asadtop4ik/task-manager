@@ -433,6 +433,8 @@ def callback() -> None:
         payload["pr_url"] = os.environ["PR_URL"]
         payload["head_sha"] = os.environ["HEAD_SHA"]
     else:
+        if os.environ.get("FAILURE_PHASE") in {"implement", "publish"}:
+            payload["failure_phase"] = os.environ["FAILURE_PHASE"]
         result_file = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
         policy_error = Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt"
         fast_error = Path(os.environ["RUNNER_TEMP"]) / "fast-error.txt"

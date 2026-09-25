@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import project_discussions
 from app.core.config import settings
-from app.db.models import Project, ProjectDiscussion, Task, User
+from app.db.models import AgentEvent, Project, ProjectDiscussion, Task, User
 
 
 def bot_headers(user: User) -> dict[str, str]:
@@ -94,6 +94,14 @@ async def test_messages_resume_one_thread_and_deny_stale_results(
         headers=worker_headers(),
     )
     assert result.status_code == 200 and result.json()["status"] == "idle"
+    events = (
+        await session.scalars(
+            select(AgentEvent.status)
+            .where(AgentEvent.project_discussion_id == discussion_id)
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events == ["idle", "queued", "running", "answered"]
     assert (
         await client.post(
             f"/api/v1/project-discussions/{discussion_id}/result",

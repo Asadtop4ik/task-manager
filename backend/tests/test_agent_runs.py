@@ -1,11 +1,12 @@
 import httpx
 from fastapi import HTTPException
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import agent_runs
 from app.core.config import settings
-from app.db.models import Project, User
+from app.db.models import AgentEvent, AgentRun, Project, User
 from tests.conftest import auth
 
 
@@ -67,6 +68,15 @@ async def test_public_project_can_dispatch_pr_but_not_fast(
         headers={"X-Agent-Callback-Token": "test-callback-token"},
     )
     assert started.status_code == 200 and started.json()["status"] == "running"
+    events = (
+        await session.scalars(
+            select(AgentEvent.status)
+            .join(AgentRun, AgentEvent.agent_run_id == AgentRun.id)
+            .where(AgentRun.run_id == run_id)
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events == ["pending", "dispatching", "dispatched", "running"]
 
 
 async def test_public_dispatch_uses_the_private_control_repository(monkeypatch) -> None:

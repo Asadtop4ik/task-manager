@@ -38,6 +38,7 @@ class AgentRunCallback(BaseModel):
     pr_url: str | None = None
     head_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     error: str | None = Field(default=None, max_length=1000)
+    failure_phase: Literal["implement", "publish"] | None = None
     input_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
@@ -118,3 +119,19 @@ class AgentMetricsOut(BaseModel):
     input_tokens: int
     cached_input_tokens: int
     output_tokens: int
+
+
+class AgentEventOut(BaseModel):
+    id: int
+    flow: Literal["coding", "intake", "discussion"]
+    source_id: int
+    task_id: int | None
+    project_id: int | None
+    status: str
+    phase: str | None
+    error: str | None
+    github_run_url: str | None
+    input_tokens: int | None
+    cached_input_tokens: int | None
+    output_tokens: int | None
+    created_at: datetime

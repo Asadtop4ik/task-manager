@@ -93,6 +93,13 @@ SSH deploy, the exact running image tag and both `/ready` endpoints pass; the
 deployment callback then records the deployed SHA and notifies Telegram.
 Completed Codex runs also store input, cached-input and output token counts;
 these are usage measurements, not a dollar invoice for a ChatGPT subscription.
+The owner-only **Agent tezligi** page also shows a central event history for
+coding runs, task preparation and `/suhbat`. Each new event records its stage,
+time, a short failure category when applicable, and a GitHub run link when available.
+Coding events show the run's token total at its current stage. The history starts
+when this feature is deployed; older runs keep their existing summary fields.
+Prompts, customer chat text, Codex transcripts and credentials are not copied to
+this event history. The existing GitHub patch artifacts expire after one day.
 For automatic review of human and agent PRs, connect this repository to Codex
 Cloud and enable Code review plus Automatic reviews in Codex settings. The
 repository's `AGENTS.md` includes the review rules. This is a separate, one-time

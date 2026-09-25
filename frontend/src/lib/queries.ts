@@ -8,6 +8,7 @@ import { api } from "@/lib/api";
 import type {
   Activity,
   AgentRun,
+  AgentEvent,
   AgentMetrics,
   Comment,
   Member,
@@ -34,6 +35,18 @@ export function useAgentMetrics(enabled: boolean) {
     queryFn: async () => (await api.get<AgentMetrics>("/agent-runs/metrics")).data,
     enabled,
     refetchInterval: 60_000,
+  });
+}
+
+export function useAgentEvents(enabled: boolean, beforeId: number | null) {
+  return useQuery({
+    queryKey: ["agent-events", beforeId],
+    queryFn: async () =>
+      (await api.get<AgentEvent[]>("/agent-runs/events/recent", {
+        params: beforeId === null ? {} : { before_id: beforeId },
+      })).data,
+    enabled,
+    refetchInterval: beforeId === null ? 30_000 : false,
   });
 }
 

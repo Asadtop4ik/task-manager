@@ -20,6 +20,7 @@ from app.schemas.project_discussion import (
     DiscussionStart,
     DiscussionWork,
 )
+from app.services import agent_events
 from app.services.access import can_see_project
 from app.services.agent_repos import repository_for
 from app.services.telegram_media import telegram_image
@@ -87,6 +88,8 @@ async def start_discussion(
             notified_revision=0,
         )
         session.add(row)
+        await session.flush()
+        agent_events.record(session, row)
         await session.commit()
         await session.refresh(row)
     return DiscussionOut.model_validate(row)
@@ -133,6 +136,7 @@ async def send_message(
     row.response_text = None
     row.error = None
     row.status = "queued"
+    agent_events.record(session, row)
     row.revision += 1
     await session.commit()
     await session.refresh(row)
@@ -157,6 +161,7 @@ async def reset_discussion(
     row.response_text = None
     row.error = None
     row.status = "idle"
+    agent_events.record(session, row, status="reset")
     row.revision += 1
     row.notified_revision = row.revision
     await session.commit()
@@ -183,6 +188,7 @@ async def lease_discussion(
     if stale is not None:
         stale.status = "failed"
         stale.error = "Suhbat javobi vaqtida kelmadi. Xabarni qayta yuboring."
+        agent_events.record(session, stale, error=stale.error)
         stale.lease_id = None
         stale.lease_until = None
         await session.commit()
@@ -216,9 +222,11 @@ async def lease_discussion(
     ):
         row.status = "failed"
         row.error = "Loyiha yoki Codex huquqi hozir mavjud emas."
+        agent_events.record(session, row, error=row.error)
         await session.commit()
         return Response(status_code=204)
     row.status = "running"
+    agent_events.record(session, row)
     row.lease_id = str(uuid4())
     row.lease_until = now + timedelta(minutes=5)
     await session.commit()
@@ -294,8 +302,10 @@ async def discussion_result(
     if payload.error:
         row.status = "failed"
         row.error = payload.error
+        agent_events.record(session, row, error=row.error)
     else:
         row.status = "idle"
+        agent_events.record(session, row, status="answered")
         row.thread_id = payload.thread_id
         row.response_text = payload.response
         row.error = None
