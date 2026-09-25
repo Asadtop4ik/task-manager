@@ -472,7 +472,7 @@ async def _verify_pr_ci(run: AgentRun, sha: str, conclusion: str, url: str) -> N
             workflow.get("head_sha") != sha
             or workflow.get("head_branch") != _run_branch(run)
             or workflow.get("event") != "pull_request"
-            or workflow.get("path") != ".github/workflows/ci.yml"
+            or workflow.get("path") != target.pr_ci_workflow
             or workflow.get("status") != "completed"
         ):
             raise HTTPException(status_code=409, detail="PR CI does not match this commit")

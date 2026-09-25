@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import UUID
 
-from project_catalog import REPOSITORIES, public_projects
+from project_catalog import QA_REPOSITORY, REPOSITORIES, public_projects
 
 API = "https://tasks.standart-eko.uz/api/v1/agent-runs"
 GITHUB = "https://api.github.com"
@@ -27,13 +27,32 @@ class Target:
     ci_jobs: frozenset[str]
 
 
+@dataclass(frozen=True)
+class CiTarget:
+    branch: str
+    jobs: frozenset[str]
+    workflow_path: str
+
+
 TARGETS = {
     item.full_name: Target(item.branch, dict(item.images), frozenset(item.ci_jobs))
     for item in public_projects()
 }
-CI_TARGETS = {
-    item.full_name: (item.branch, frozenset(item.pr_ci_jobs)) for item in REPOSITORIES
-}
+
+
+def ci_targets(*, qa_enabled: bool | None = None) -> dict[str, CiTarget]:
+    if qa_enabled is None:
+        qa_enabled = os.environ.get("AGENT_QA_ENABLED", "").lower() == "true"
+    repositories = REPOSITORIES + ((QA_REPOSITORY,) if qa_enabled else ())
+    return {
+        item.full_name: CiTarget(
+            item.branch, frozenset(item.pr_ci_jobs), item.pr_ci_workflow
+        )
+        for item in repositories
+    }
+
+
+CI_TARGETS = ci_targets()
 
 
 def _request(
@@ -100,19 +119,21 @@ def _record(raw: Any) -> dict[str, Any]:
     }
 
 
-def _ci_record(raw: Any) -> dict[str, Any]:
+def _ci_record(
+    raw: Any, targets: dict[str, CiTarget] = CI_TARGETS
+) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("invalid pending CI run")
     row_id = raw.get("id")
     repo = raw.get("repo_full_name")
-    target = CI_TARGETS.get(repo)
+    target = targets.get(repo)
     if (
         isinstance(row_id, bool)
         or not isinstance(row_id, int)
         or row_id < 1
         or target is None
-        or raw.get("base_branch") != target[0]
-        or not target[1]
+        or raw.get("base_branch") != target.branch
+        or not target.jobs
     ):
         raise ValueError("CI run is outside approved repositories")
     run_id = str(UUID(str(raw.get("run_id"))))
@@ -135,11 +156,12 @@ def _ci_record(raw: Any) -> dict[str, Any]:
         "run_id": run_id,
         "repo": repo,
         "pr_number": pr_url[len(prefix) :],
+        "workflow_path": target.workflow_path,
         "head_sha": raw["head_sha"],
         "ci_status": raw.get("ci_status"),
         "ci_verified_sha": raw.get("ci_verified_sha"),
         "ci_url": raw.get("ci_url"),
-        "required_jobs": target[1],
+        "required_jobs": target.jobs,
     }
 
 
@@ -151,6 +173,8 @@ class ExternalDeployMonitor:
         github_token: str,
         opener: Callable[..., Any] | None = None,
         command_runner: Callable[..., Any] | None = None,
+        qa_enabled: bool | None = None,
+        qa_github_token: str | None = None,
     ) -> None:
         if not callback_token.strip() or not github_token.strip():
             raise ValueError("monitor credentials are required")
@@ -158,6 +182,10 @@ class ExternalDeployMonitor:
         self.github_token = github_token
         self.opener = opener or urllib.request.urlopen
         self.command_runner = command_runner or subprocess.run
+        self.ci_targets = ci_targets(qa_enabled=qa_enabled)
+        self.qa_github_token = (qa_github_token or "").strip()
+        if "Asadtop4ik/agent-qa" in self.ci_targets and not self.qa_github_token:
+            raise ValueError("QA monitor requires its repository-scoped GitHub token")
 
     def _json(self, request: urllib.request.Request) -> Any:
         with self.opener(request, timeout=TIMEOUT) as response:
@@ -176,11 +204,14 @@ class ExternalDeployMonitor:
             )
         )
 
-    def _github(self, path: str) -> Any:
+    def _github(self, path: str, *, repo: str | None = None) -> Any:
+        token = self.github_token
+        if repo == "Asadtop4ik/agent-qa":
+            token = self.qa_github_token
         return self._json(
             _request(
                 f"{GITHUB}{path}",
-                f"Bearer {self.github_token}",
+                f"Bearer {token}",
                 token_header="Authorization",
             )
         )
@@ -189,8 +220,10 @@ class ExternalDeployMonitor:
         self, record: dict[str, Any], sha: str, branch: str
     ) -> tuple[str, str | None]:
         repo = record["repo"]
+        workflow_file = record["workflow_path"].rsplit("/", 1)[-1]
         response = self._github(
-            f"/repos/{repo}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={sha}&per_page=20"
+            f"/repos/{repo}/actions/workflows/{workflow_file}/runs?event=pull_request&head_sha={sha}&per_page=20",
+            repo=repo,
         )
         runs = sorted(
             response.get("workflow_runs", []),
@@ -202,7 +235,7 @@ class ExternalDeployMonitor:
                 run.get("head_sha") != sha
                 or run.get("head_branch") != branch
                 or run.get("event") != "pull_request"
-                or run.get("path") != ".github/workflows/ci.yml"
+                or run.get("path") != record["workflow_path"]
                 or not isinstance(run.get("id"), int)
             ):
                 continue
@@ -212,7 +245,8 @@ class ExternalDeployMonitor:
             if run.get("conclusion") != "success":
                 return "failure", url
             jobs = self._github(
-                f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"
+                f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100",
+                repo=repo,
             )
             successful = {
                 job.get("name")
@@ -233,12 +267,13 @@ class ExternalDeployMonitor:
             if not isinstance(pending, list):
                 raise ValueError("invalid pending CI list")
             for raw in pending:
-                record = _ci_record(raw)
+                record = _ci_record(raw, self.ci_targets)
                 if record["id"] <= after_id:
                     raise ValueError("pending CI cursor did not advance")
                 after_id = record["id"]
                 pr = self._github(
-                    f"/repos/{record['repo']}/pulls/{record['pr_number']}"
+                    f"/repos/{record['repo']}/pulls/{record['pr_number']}",
+                    repo=record["repo"],
                 )
                 if pr.get("state") == "closed" and not pr.get("merged"):
                     continue
@@ -275,7 +310,8 @@ class ExternalDeployMonitor:
 
     def _successful_deploy_run(self, repo: str, target: Target, sha: str) -> str | None:
         result = self._github(
-            f"/repos/{repo}/actions/workflows/deploy.yml/runs?event=push&per_page=20&head_sha={sha}"
+            f"/repos/{repo}/actions/workflows/deploy.yml/runs?event=push&per_page=20&head_sha={sha}",
+            repo=repo,
         )
         for run in result.get("workflow_runs", []):
             if (
@@ -287,7 +323,8 @@ class ExternalDeployMonitor:
                 and isinstance(run.get("id"), int)
             ):
                 jobs = self._github(
-                    f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"
+                    f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100",
+                    repo=repo,
                 )
                 succeeded = {
                     job.get("name")
@@ -337,7 +374,9 @@ class ExternalDeployMonitor:
                 repo = record["repo"]
                 target = record["target"]
                 if record["status"] == "pr_ready":
-                    pr = self._github(f"/repos/{repo}/pulls/{record['pr_number']}")
+                    pr = self._github(
+                        f"/repos/{repo}/pulls/{record['pr_number']}", repo=repo
+                    )
                     sha = pr.get("merge_commit_sha")
                     if pr.get("merged") and _valid_sha(sha):
                         self._internal(f"/{record['run_id']}/merged", {"sha": sha})
@@ -360,6 +399,7 @@ def main() -> None:
     monitor = ExternalDeployMonitor(
         callback_token=os.environ["AGENT_CALLBACK_TOKEN"],
         github_token=os.environ["GITHUB_AGENT_TOKEN"],
+        qa_github_token=os.environ.get("GITHUB_AGENT_QA_TOKEN"),
     )
     try:
         ci_updated = monitor.check_ci_once()

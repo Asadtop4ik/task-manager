@@ -4,7 +4,12 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from agent_deploy_monitor import ExternalDeployMonitor, _ci_record, _record
+from agent_deploy_monitor import (
+    ExternalDeployMonitor,
+    _ci_record,
+    _record,
+    ci_targets,
+)
 
 RUN_ID = "00000000-0000-0000-0000-000000000017"
 SHA = "a" * 40
@@ -53,10 +58,116 @@ def ci_pending(*, sha=SHA, conclusion="pending"):
     }
 
 
+def qa_ci_pending(*, sha=SHA, conclusion="pending"):
+    return {
+        "id": 1,
+        "run_id": RUN_ID,
+        "repo_full_name": "Asadtop4ik/agent-qa",
+        "base_branch": "main",
+        "pr_url": "https://github.com/Asadtop4ik/agent-qa/pull/3",
+        "status": "pr_opened",
+        "head_sha": sha,
+        "ci_status": conclusion,
+        "ci_verified_sha": None,
+        "ci_url": None,
+    }
+
+
 class ExternalDeployMonitorTests(unittest.TestCase):
     def test_ci_catalog_rejects_unknown_repository(self):
         with self.assertRaises(ValueError):
             _ci_record(ci_pending() | {"repo_full_name": "other/repo"})
+
+    def test_qa_ci_catalog_is_enabled_only_by_flag_and_uses_its_workflow(self):
+        self.assertNotIn("Asadtop4ik/agent-qa", ci_targets(qa_enabled=False))
+        target = ci_targets(qa_enabled=True)["Asadtop4ik/agent-qa"]
+        self.assertEqual(target.branch, "main")
+        self.assertEqual(target.jobs, frozenset({"PR CI"}))
+        self.assertEqual(target.workflow_path, ".github/workflows/agent-qa.yml")
+        with self.assertRaisesRegex(ValueError, "outside approved repositories"):
+            _ci_record(qa_ci_pending(), ci_targets(qa_enabled=False))
+        self.assertEqual(
+            _ci_record(qa_ci_pending(), ci_targets(qa_enabled=True))["head_sha"], SHA
+        )
+
+    def test_qa_ci_success_posts_exact_verified_head_to_task_manager(self):
+        posts = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "api.github.com/repos/Asadtop4ik/agent-qa/" in url:
+                self.assertEqual(
+                    request.unredirected_hdrs["Authorization"], "Bearer qa-read-token"
+                )
+            if "/ci-pending?" in url:
+                return FakeResponse([qa_ci_pending()])
+            if url.endswith("/pulls/3"):
+                return FakeResponse(
+                    {
+                        "head": {
+                            "sha": SHA,
+                            "ref": "codex/task-30-00000000-0000-0000-0000-000000000017",
+                            "repo": {"full_name": "Asadtop4ik/agent-qa"},
+                        }
+                    }
+                )
+            if "/workflows/agent-qa.yml/runs?" in url:
+                self.assertIn(f"head_sha={SHA}", url)
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 36182380264,
+                                "head_sha": SHA,
+                                "head_branch": (
+                                    "codex/task-30-00000000-0000-0000-0000-000000000017"
+                                ),
+                                "event": "pull_request",
+                                "path": ".github/workflows/agent-qa.yml",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/actions/runs/36182380264/jobs?per_page=100"):
+                return FakeResponse(
+                    {"jobs": [{"name": "PR CI", "conclusion": "success"}]}
+                )
+            if url.endswith("/ci-result"):
+                posts.append(json.loads(request.data))
+                return FakeResponse({"status": "pr_opened"})
+            raise AssertionError(url)
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback",
+            github_token="github",
+            opener=opener,
+            qa_enabled=True,
+            qa_github_token="qa-read-token",
+        )
+        self.assertEqual(monitor.check_ci_once(), 1)
+        self.assertEqual(
+            posts,
+            [
+                {
+                    "sha": SHA,
+                    "conclusion": "success",
+                    "github_run_url": (
+                        "https://github.com/Asadtop4ik/agent-qa/actions/runs/"
+                        "36182380264"
+                    ),
+                }
+            ],
+        )
+
+    def test_qa_monitor_requires_repository_scoped_read_token(self):
+        with self.assertRaisesRegex(ValueError, "repository-scoped"):
+            ExternalDeployMonitor(
+                callback_token="callback",
+                github_token="generic-public-token",
+                qa_enabled=True,
+            )
 
     def test_ci_failure_is_reported_for_exact_pr_head(self):
         posts = []
