@@ -20,8 +20,8 @@ log = get_logger(__name__)
 def agent_result_card(notice: dict[str, object]) -> str:
     """A concise, factual status card. PR-ready never claims CI has passed."""
     task_id = notice["task_id"]
-    project = str(notice.get("repo_full_name") or "").split("/")[-1]
-    title = str(notice.get("title") or "Vazifa").replace("\n", " ")[:180]
+    project = escape(str(notice.get("repo_full_name") or "").split("/")[-1])
+    title = escape(str(notice.get("title") or "Vazifa").replace("\n", " ")[:180])
     status = notice["status"]
     lines = [f"🤖 #{task_id} · {project}", f"Vazifa: {title}"]
     if status == "pr_ready":
@@ -41,7 +41,7 @@ def agent_result_card(notice: dict[str, object]) -> str:
         lines.append(f"Deploy: {notice.get('github_run_url') or '—'}")
     else:
         lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
-        lines.append(f"Sabab: {str(notice.get('error') or 'noma’lum')[:350]}")
+        lines.append(f"Sabab: {escape(str(notice.get('error') or 'noma’lum')[:800])}")
         if notice.get("github_run_url"):
             lines.append(f"Jarayon: {notice['github_run_url']}")
     return "\n".join(lines)

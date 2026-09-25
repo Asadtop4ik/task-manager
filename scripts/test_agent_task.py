@@ -287,6 +287,39 @@ class UsageTests(unittest.TestCase):
             self.assertIn(".env.example", sent.call_args.args[0]["error"])
             self.assertNotIn("complete", sent.call_args.args[0]["error"])
 
+    def test_no_change_failure_includes_labelled_agent_explanation(self) -> None:
+        task = {
+            "task_id": 27,
+            "run_id": "00000000-0000-0000-0000-000000000027",
+            "title": "Model update",
+            "description": "",
+            "base_branch": "main",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "agent-result.txt").write_text(
+                "Could not verify the model price without an official source."
+            )
+            (Path(temp) / "agent-failure.txt").write_text(
+                "public agent task rejected: agent produced no file changes"
+            )
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                "GITHUB_RUN_ID": "42",
+                "JOB_STATUS": "failure",
+                "FAILURE_PHASE": "implement",
+                "CODEX_STEP_OUTCOME": "success",
+                "RUNNER_TEMP": temp,
+            }
+            with patch.dict(os.environ, environment), patch(
+                "agent_task._send_status", return_value={"status": "failed"}
+            ) as sent:
+                callback()
+            error = sent.call_args.args[0]["error"]
+            self.assertIn("agent produced no file changes", error)
+            self.assertIn("Codex izohi (tasdiqlanmagan)", error)
+            self.assertIn("official source", error)
+
     def test_publisher_failure_does_not_report_successful_agent_summary(self) -> None:
         task = {
             "task_id": 7,

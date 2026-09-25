@@ -81,6 +81,22 @@ def test_result_card_distinguishes_unverified_pr_from_deployed_sha() -> None:
     assert "a" * 12 in deployed
 
 
+def test_failure_card_keeps_diagnostic_reason_and_escapes_agent_prose() -> None:
+    card = worker.agent_result_card(
+        {
+            "task_id": 27,
+            "title": "Opus <5.5>",
+            "repo_full_name": "muradjanov-dev/qurbot",
+            "status": "failed",
+            "error": "agent produced no file changes\nCodex izohi: <external source unavailable>",
+        }
+    )
+    assert "agent produced no file changes" in card
+    assert "Codex izohi" in card
+    assert "&lt;external source unavailable&gt;" in card
+    assert "Opus &lt;5.5&gt;" in card
+
+
 async def test_deploy_updates_existing_result_card(monkeypatch) -> None:
     notice = {
         "run_id": "run-2",
