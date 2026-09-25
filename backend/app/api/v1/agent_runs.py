@@ -449,9 +449,7 @@ async def _merge_rejection_is_retryable(run: AgentRun, action: AgentRunAction) -
     except httpx.HTTPError:
         return True
     except HTTPException as error:
-        if error.status_code >= 500:
-            return True
-        return False
+        return error.status_code >= 500
     if current_head != run.head_sha:
         _invalidate_review_and_ci(run, current_head)
         return False
