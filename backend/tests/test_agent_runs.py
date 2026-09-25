@@ -893,9 +893,7 @@ async def test_qa_ci_verifier_accepts_its_workflow_and_rejects_ci_yml(
 
         async def get(self, url, **kwargs):
             if url.endswith("/jobs?per_page=100"):
-                return FakeResponse(
-                    {"jobs": [{"name": "PR CI", "conclusion": "success"}]}
-                )
+                return FakeResponse({"jobs": [{"name": "PR CI", "conclusion": "success"}]})
             return FakeResponse(workflow)
 
     monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
