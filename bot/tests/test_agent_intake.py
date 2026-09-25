@@ -2,6 +2,9 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
+
 from app.handlers import agent_intake
 from app.states import AgentIntake
 
@@ -236,6 +239,90 @@ def test_ready_notice_shows_goal_criteria_assumptions_and_mode() -> None:
     assert markup is not None
 
 
+async def test_confirm_starts_agent_even_when_telegram_card_fails(monkeypatch) -> None:
+    api = _api(monkeypatch)
+    api.confirm_agent_intake = AsyncMock(
+        return_value={"created": True, "mode": "pr", "task": {"id": 26}}
+    )
+    api.start_agent_run = AsyncMock(return_value={"status": "dispatched"})
+    query = MagicMock()
+    query.from_user.id = 202
+    query.message.chat.id = 101
+    query.answer = AsyncMock()
+    prompt = MagicMock()
+    prompt.delete = AsyncMock()
+    monkeypatch.setattr(agent_intake, "editable", lambda _: prompt)
+    monkeypatch.setattr(
+        agent_intake,
+        "send_card",
+        AsyncMock(
+            side_effect=TelegramBadRequest(
+                method=SendMessage(chat_id=101, text="card"),
+                message="message is too long",
+            )
+        ),
+    )
+    monkeypatch.setattr(agent_intake, "notify_assignee", AsyncMock())
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+
+    await agent_intake._confirm(query, 9, _state(), bot, fallback_pr=False)
+
+    api.start_agent_run.assert_awaited_once_with(26, mode="pr")
+    assert "Codexga yuborildi" in bot.send_message.await_args.args[1]
+
+
+async def test_repeated_confirmation_recovers_only_task_without_any_run(monkeypatch) -> None:
+    api = _api(monkeypatch)
+    api.confirm_agent_intake = AsyncMock(
+        return_value={"created": False, "mode": "pr", "task": {"id": 26}}
+    )
+    api.agent_runs = AsyncMock(return_value=[])
+    api.start_agent_run = AsyncMock(return_value={"status": "dispatched"})
+    query = MagicMock()
+    query.from_user.id = 202
+    query.message.chat.id = 101
+    query.answer = AsyncMock()
+    monkeypatch.setattr(agent_intake, "editable", lambda _: None)
+    monkeypatch.setattr(agent_intake, "send_card", AsyncMock())
+    monkeypatch.setattr(agent_intake, "notify_assignee", AsyncMock())
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+
+    await agent_intake._confirm(query, 9, _state(), bot, fallback_pr=False)
+    api.start_agent_run.assert_awaited_once_with(26, mode="pr")
+
+    api.agent_runs.return_value = [{"status": "failed"}]
+    api.start_agent_run.reset_mock()
+    await agent_intake._confirm(query, 9, _state(), bot, fallback_pr=False)
+    api.start_agent_run.assert_not_awaited()
+
+
+async def test_repeated_confirmation_tolerates_deleted_prompt(monkeypatch) -> None:
+    api = _api(monkeypatch)
+    api.confirm_agent_intake = AsyncMock(
+        return_value={"created": False, "mode": "pr", "task": {"id": 26}}
+    )
+    api.agent_runs = AsyncMock(return_value=[{"status": "dispatched"}])
+    api.start_agent_run = AsyncMock()
+    query = MagicMock()
+    query.from_user.id = 202
+    query.message.chat.id = 101
+    query.answer = AsyncMock()
+    prompt = MagicMock()
+    prompt.edit_text = AsyncMock(
+        side_effect=TelegramBadRequest(
+            method=SendMessage(chat_id=101, text="already gone"),
+            message="message to edit not found",
+        )
+    )
+    monkeypatch.setattr(agent_intake, "editable", lambda _: prompt)
+
+    await agent_intake._confirm(query, 9, _state(), MagicMock(), fallback_pr=False)
+
+    api.start_agent_run.assert_not_awaited()
+
+
 async def test_needs_answers_routes_user_text_as_answer(monkeypatch) -> None:
     api = _api(monkeypatch, current={"id": 33, "status": "needs_answers"})
     message = _message(text="Only private users can see it")
@@ -303,6 +390,7 @@ async def test_duplicate_confirm_does_not_send_card_or_start_another_run(monkeyp
         return_value={"task": {"id": 42}, "mode": "pr", "created": False}
     )
     api.start_agent_run = AsyncMock()
+    api.agent_runs = AsyncMock(return_value=[{"status": "dispatched"}])
     monkeypatch.setattr(agent_intake, "api_for", lambda _: api)
     query = MagicMock()
     query.from_user.id = 202

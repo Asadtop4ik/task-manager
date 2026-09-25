@@ -3,7 +3,15 @@ from typing import Any
 
 import pytest
 
-from app.cards import format_due, is_overdue, keyboard, render, summary_line
+from app.cards import (
+    MAX_CARD_CHARS,
+    _telegram_length,
+    format_due,
+    is_overdue,
+    keyboard,
+    render,
+    summary_line,
+)
 
 TZ = "Asia/Tashkent"
 
@@ -52,6 +60,13 @@ class TestKeyboard:
 
 
 class TestRender:
+    def test_long_description_stays_within_telegram_limit_and_keeps_html_valid(self) -> None:
+        body = render(make_task(description="🧪<&>" * 1500))
+        assert _telegram_length(body) <= MAX_CARD_CHARS
+        assert "To‘liq tavsif: 🌐 Ochish" in body
+        assert "&lt;" in body
+        assert "&am" not in body.replace("&amp;", "")
+
     def test_escapes_html_in_user_text(self) -> None:
         """Titles are user input and the parse mode is HTML."""
         body = render(make_task(title="fix <b>bold</b> & co"))

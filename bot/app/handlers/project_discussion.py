@@ -124,18 +124,23 @@ async def route_discussion_image(message: Message, state: FSMContext) -> bool:
 def _task_request(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     lines: list[str] = []
     images: list[dict[str, Any]] = []
-    for item in messages[-30:]:
+    # The discussion may be months old. Earlier bot explanations, pasted run
+    # cards and unrelated questions are not requirements for the new task.
+    for item in messages[-6:]:
         role = "Men" if item.get("role") == "user" else "Codex"
-        body = str(item.get("text") or "").strip()
+        body = str(item.get("text") or "").strip()[:750]
         if body:
             lines.append(f"{role}: {body}")
         if item.get("role") == "user":
             images.extend(item.get("images") or [])
-    transcript = "\n".join(lines)[-10_500:]
+    transcript = "\n".join(lines)[-4_500:]
     request = (
         "@codex Quyidagi loyiha suhbatidagi oxirgi kelishilgan o‘zgarishni taskga "
         "aylantir. Agar bajariladigan o‘zgarish aniq bo‘lmasa, savol ber. "
-        "Mijozga oid yangi qoida o‘ylab topma.\n\nSuhbat:\n" + transcript
+        "Mijozga oid yangi qoida o‘ylab topma. Oldingi Codex javobi yoki "
+        "yuborilgan xato kartasi ish productionga chiqqanini isbotlamaydi; "
+        "buni repo holatidan tekshir. Oxirgi foydalanuvchi talabini ustun qo‘y.\n\n"
+        "So‘nggi suhbat:\n" + transcript
     )
     return request[:12_000], images[-3:]
 
