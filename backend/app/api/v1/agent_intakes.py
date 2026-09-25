@@ -410,6 +410,10 @@ async def intake_image(
         or index >= len(row.images)
     ):
         raise HTTPException(status_code=404, detail="image not found")
+    project = await session.get(Project, row.project_id)
+    actor = await session.get(User, row.user_id)
+    if _is_qa_project(project) and not _qa_project_allowed(project, actor):
+        raise HTTPException(status_code=404, detail="image not found")
     image = row.images[index]
     data = await telegram_image(image["file_id"], image["mime"], image.get("size"))
     return Response(content=data, media_type=image["mime"])
