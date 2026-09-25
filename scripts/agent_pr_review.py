@@ -13,6 +13,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 API = "https://api.github.com"
@@ -21,6 +22,7 @@ RUN_ID_PATTERN = re.compile(r"codex/task-[1-9][0-9]*-([0-9a-f-]{36})$")
 ALLOWED_SEVERITIES = {"P1", "P2", "P3"}
 VISIBLE_FINDING_LIMIT = 12
 VISIBLE_REPORT_LIMIT = 12_000
+REDACTION_INPUT_LIMIT = 50_000
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",
     "muradjanov-dev/qurbot": "master",
@@ -232,9 +234,11 @@ def _review_decision(findings: list[dict]) -> tuple[str, bool, str]:
 
 def _safe_feedback_text(value: str, limit: int) -> str:
     """Bound reviewer supplied text and remove common credential forms."""
-    text = value[:limit]
+    # Redact before applying the display limit. In particular, a PEM terminator
+    # may be beyond that limit, and an unmatched BEGIN marker must redact to EOF.
+    text = value[:REDACTION_INPUT_LIMIT]
     text = re.sub(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
         "[redacted private key]",
         text,
         flags=re.DOTALL,
@@ -250,7 +254,7 @@ def _safe_feedback_text(value: str, limit: int) -> str:
         r"\1[redacted]",
         text,
     )
-    return text
+    return text[:limit]
 
 
 def _review_report(
@@ -270,7 +274,9 @@ def _review_report(
         f"Decision: {review_state} ({'ready' if is_ready else 'blocked'})",
         f"Summary: {_safe_feedback_text(summary, 600)}",
     ]
-    visible = findings[:VISIBLE_FINDING_LIMIT]
+    severity_order = {"P1": 0, "P2": 1, "P3": 2}
+    ordered = sorted(findings, key=lambda item: severity_order[item["severity"]])
+    visible = ordered[:VISIBLE_FINDING_LIMIT]
     if not visible:
         result.append("Findings: none")
     for index, finding in enumerate(visible, 1):
@@ -291,8 +297,19 @@ def _review_report(
             ]
         )
     if len(findings) > len(visible):
+        omitted_counts = Counter(item["severity"] for item in findings)
+        omitted_counts.subtract(item["severity"] for item in visible)
+        omitted_summary = ", ".join(
+            f"{severity}: {omitted_counts[severity]}"
+            for severity in severity_order
+            if omitted_counts[severity] > 0
+        )
         result.extend(
-            ["", f"Additional findings omitted: {len(findings) - len(visible)}"]
+            [
+                "",
+                f"Additional findings omitted: {len(findings) - len(visible)} "
+                f"({omitted_summary})",
+            ]
         )
     plain_text = "\n".join(result)[:VISIBLE_REPORT_LIMIT]
     # A preformatted HTML block keeps reviewer text inert in GitHub's Markdown
