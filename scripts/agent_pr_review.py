@@ -243,6 +243,26 @@ def _review_decision(findings: list[dict]) -> tuple[str, bool, str]:
     return "clean", True, "Independent Codex review clean"
 
 
+def _pull_request_files(repo: str, number: int, token: str) -> set[str]:
+    """Fetch changed paths across GitHub's bounded 3,000-file PR listing."""
+    trusted_files: set[str] = set()
+    for page in range(1, 31):
+        files = _github(
+            f"repos/{repo}/pulls/{number}/files?per_page=100&page={page}",
+            token=token,
+        )
+        if not isinstance(files, list):
+            raise TypeError("pull request file list is unavailable")
+        trusted_files.update(
+            item["filename"]
+            for item in files
+            if isinstance(item, dict) and isinstance(item.get("filename"), str)
+        )
+        if len(files) < 100:
+            break
+    return trusted_files
+
+
 def _safe_finding_location(finding: dict, trusted_files: set[str]) -> str:
     """Allow only an ordinary relative path and a positive line number."""
     path = finding.get("file")
@@ -363,17 +383,9 @@ def finalize() -> None:
     pr = _github(f"repos/{repo}/pulls/{number}", token=os.environ["GH_TOKEN"])
     if not isinstance(pr, dict) or not _current_pr(pr, repo, sha):
         raise ValueError("pull request head changed during review")
-    files = _github(
-        f"repos/{repo}/pulls/{number}/files?per_page=100",
-        token=os.environ["GH_TOKEN"],
+    trusted_files = _pull_request_files(
+        repo, number, token=os.environ["GH_TOKEN"]
     )
-    if not isinstance(files, list):
-        raise TypeError("pull request file list is unavailable")
-    trusted_files = {
-        item["filename"]
-        for item in files
-        if isinstance(item, dict) and isinstance(item.get("filename"), str)
-    }
     pr = _github(f"repos/{repo}/pulls/{number}", token=os.environ["GH_TOKEN"])
     if not isinstance(pr, dict) or not _current_pr(pr, repo, sha):
         raise ValueError("pull request head changed during review")

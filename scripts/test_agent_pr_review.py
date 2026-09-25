@@ -9,12 +9,13 @@ from unittest.mock import patch
 
 from agent_pr_review import (
     VISIBLE_REPORT_LIMIT,
+    _pull_request_files,
     _review_report,
     finalize,
 )
 
 
-def finalize_result(result, run_id=""):
+def finalize_result(result, run_id="", file_pages=None):
     sha = "a" * 40
     pr = {
         "state": "open",
@@ -29,6 +30,8 @@ def finalize_result(result, run_id=""):
         "backend/auth.py",
         "critical.py",
     }
+    if file_pages is None:
+        file_pages = [[{"filename": path} for path in trusted_files]]
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         (root / "agent-review-target.json").write_text(
@@ -57,7 +60,7 @@ def finalize_result(result, run_id=""):
             "agent_pr_review._github",
             side_effect=[
                 pr,
-                [{"filename": path} for path in trusted_files],
+                *file_pages,
                 pr,
             ],
         ), patch("agent_pr_review._task_api") as task_api, patch(
@@ -237,6 +240,45 @@ class AgentPrReviewTests(unittest.TestCase):
         )
 
         self.assertIn("Finding 1 [P2]: [location omitted]", report)
+
+    def test_finalize_trusts_changed_path_from_second_file_page(self):
+        page_one = [
+            {"filename": f"src/first-{index}.py"} for index in range(100)
+        ]
+        page_two = [{"filename": "backend/only-page-two.py"}]
+        report, _, _, _ = finalize_result(
+            {
+                "summary": "Location is on page two",
+                "findings": [
+                    {
+                        "severity": "P2",
+                        "title": "Finding title is withheld",
+                        "evidence": "Evidence is withheld",
+                        "file": "backend/only-page-two.py",
+                        "line": 23,
+                    }
+                ],
+            },
+            file_pages=[page_one, page_two],
+        )
+
+        self.assertIn("backend/only-page-two.py:23", report)
+
+    def test_pull_request_file_pagination_stops_at_github_limit(self):
+        pages = [
+            [
+                {"filename": f"page-{page}/file-{index}.py"}
+                for index in range(100)
+            ]
+            for page in range(1, 31)
+        ]
+        with patch("agent_pr_review._github", side_effect=pages) as github:
+            files = _pull_request_files("Asadtop4ik/task-manager", 45, "token")
+
+        self.assertEqual(len(files), 3_000)
+        self.assertEqual(github.call_count, 30)
+        self.assertTrue(github.call_args_list[0].args[0].endswith("page=1"))
+        self.assertTrue(github.call_args_list[-1].args[0].endswith("page=30"))
 
     def test_agent_run_callback_keeps_full_structured_review_data(self):
         run_id = "11111111-1111-4111-8111-111111111111"
