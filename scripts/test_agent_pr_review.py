@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_pr_review import _review_report, _safe_feedback_text, finalize
+from agent_pr_review import (
+    _review_report,
+    _safe_feedback_text,
+    finalize,
+)
 
 
 def finalize_result(result):
@@ -74,7 +78,7 @@ class AgentPrReviewTests(unittest.TestCase):
         self.assertIn("scripts/check.py:17", report)
         self.assertIn("&lt;script&gt;", report)
         self.assertNotIn("<script>", report)
-        self.assertIn("[redacted]", report)
+        self.assertIn("[sensitive evidence omitted]", report)
         self.assertNotIn("ghp_", report)
         self.assertIn("Codex review report", log)
         self.assertEqual(
@@ -106,7 +110,7 @@ class AgentPrReviewTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("[redacted private key]", report)
+        self.assertIn("[sensitive evidence omitted]", report)
         self.assertNotIn("PRIVATE_KEY_MATERIAL_7f3a", report)
         self.assertNotIn("PRIVATE_KEY_MATERIAL_7f3a", log)
         unterminated = _safe_feedback_text(
@@ -114,6 +118,26 @@ class AgentPrReviewTests(unittest.TestCase):
         )
         self.assertIn("[redacted private key]", unterminated)
         self.assertNotIn("PRIVATE_KEY_MATERIAL_7f3a", unterminated)
+
+    def test_finalize_redacts_quoted_credentials_through_close_quote_or_eof(self):
+        summary = (
+            "password='correct horse battery staple' "
+            'api_key="multi word api key" '
+            "secret='unfinished credential value"
+        )
+        report, log, _, _ = finalize_result({"summary": summary, "findings": []})
+
+        for secret_tail in (
+            "correct horse battery staple",
+            "multi word api key",
+            "unfinished credential value",
+        ):
+            self.assertNotIn(secret_tail, report)
+            self.assertNotIn(secret_tail, log)
+        self.assertIn("password=[redacted]", report)
+        self.assertIn("api_key=[redacted]", report)
+        self.assertIn("secret=[redacted]", report)
+        self.assertEqual(_safe_feedback_text("token=abc trailing text", 100), "token=[redacted] trailing text")
 
     def test_report_prioritizes_blockers_and_counts_omitted_severities(self):
         findings = [

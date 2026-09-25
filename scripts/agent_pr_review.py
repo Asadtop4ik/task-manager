@@ -23,6 +23,15 @@ ALLOWED_SEVERITIES = {"P1", "P2", "P3"}
 VISIBLE_FINDING_LIMIT = 12
 VISIBLE_REPORT_LIMIT = 20_000
 REDACTION_INPUT_LIMIT = 50_000
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)\b([\w-]*(?:token|secret|password|api[_-]?key)[\w-]*\s*[:=]\s*)"
+    r"(?:([\"'])(.*?)(?:\2|\Z)|([^\s,;\"']+))",
+    flags=re.DOTALL,
+)
+_KNOWN_CREDENTIAL = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
+)
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",
     "muradjanov-dev/qurbot": "master",
@@ -244,17 +253,27 @@ def _safe_feedback_text(value: str, limit: int) -> str:
         flags=re.DOTALL,
     )
     text = re.sub(r"\bBearer\s+\S+", "Bearer [redacted]", text, flags=re.IGNORECASE)
-    text = re.sub(
-        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b",
+    text = _KNOWN_CREDENTIAL.sub(
         "[redacted credential]",
         text,
     )
-    text = re.sub(
-        r"(?i)\b([\w-]*(?:token|secret|password|api[_-]?key)[\w-]*\s*[:=]\s*)['\"]?[^\s,;\"']+",
-        r"\1[redacted]",
-        text,
+    text = _CREDENTIAL_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}[redacted]", text
     )
     return text[:limit]
+
+
+def _safe_evidence_text(value: str, limit: int) -> str:
+    """Omit secret-bearing excerpts while keeping the finding's context visible."""
+    bounded = value[:REDACTION_INPUT_LIMIT]
+    if (
+        re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", bounded)
+        or _KNOWN_CREDENTIAL.search(bounded)
+        or re.search(r"\bBearer\s+\S+", bounded, flags=re.IGNORECASE)
+        or _CREDENTIAL_ASSIGNMENT.search(bounded)
+    ):
+        return "[sensitive evidence omitted]"
+    return _safe_feedback_text(value, limit)
 
 
 def _review_report(
@@ -293,7 +312,7 @@ def _review_report(
                 f"Finding {index} [{finding['severity']}]: "
                 f"{_safe_feedback_text(finding['title'], 180)}",
                 f"Location: {_safe_feedback_text(location, 240) or 'not provided'}",
-                f"Evidence: {_safe_feedback_text(finding['evidence'], 600)}",
+                f"Evidence: {_safe_evidence_text(finding['evidence'], 600)}",
             ]
         )
     if len(findings) > len(visible):
