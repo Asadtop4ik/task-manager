@@ -484,12 +484,13 @@ async def test_failed_publisher_preflight_can_recover_same_verified_pr(
         json={"project_id": project.id, "title": "Recover validated patch"},
         headers=auth(manager),
     )
+    current_task = await agent_runs._task(session, task.json()["id"])
     run_id = "00000000-0000-0000-0000-000000000029"
     session.add(
         AgentRun(
             run_id=run_id,
             task_id=task.json()["id"],
-            task_revision="a" * 64,
+            task_revision=agent_runs._revision(current_task),
             repo_full_name="Asadtop4ik/task-manager",
             base_branch="main",
             mode="pr",
@@ -573,6 +574,65 @@ async def test_recovered_commit_requires_the_original_run_marker(monkeypatch) ->
     )
     with pytest.raises(HTTPException, match="not this agent run"):
         await agent_runs._verify_recovered_commit(run, "a" * 40)
+
+
+@pytest.mark.parametrize("stale_reason", ["new_run", "edited_task"])
+async def test_preflight_recovery_rejects_superseded_task(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    stale_reason: str,
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+    task_response = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Original request"},
+        headers=auth(manager),
+    )
+    task_id = task_response.json()["id"]
+    task = await agent_runs._task(session, task_id)
+    old_run_id = "00000000-0000-0000-0000-000000000029"
+    session.add(
+        AgentRun(
+            run_id=old_run_id,
+            task_id=task_id,
+            task_revision=agent_runs._revision(task),
+            repo_full_name="Asadtop4ik/task-manager",
+            base_branch="main",
+            status="failed",
+            error="Trusted PR preflight failed; inspect the publisher job.",
+        )
+    )
+    await session.flush()
+    if stale_reason == "new_run":
+        session.add(
+            AgentRun(
+                run_id="00000000-0000-0000-0000-000000000030",
+                task_id=task_id,
+                task_revision="b" * 64,
+                repo_full_name="Asadtop4ik/task-manager",
+                base_branch="main",
+                status="running",
+            )
+        )
+    else:
+        task.description = "Changed after the failed run"
+    await session.commit()
+
+    blocked = await client.post(
+        f"/api/v1/agent-runs/{old_run_id}/callback",
+        json={
+            "run_id": old_run_id,
+            "status": "pr_opened",
+            "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/29",
+            "head_sha": "b" * 40,
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert blocked.status_code == 409
 
 
 async def test_failed_ci_stays_silent_until_new_head_passes(

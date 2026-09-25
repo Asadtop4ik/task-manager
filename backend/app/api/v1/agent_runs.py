@@ -1068,7 +1068,9 @@ async def agent_run_callback(
     if run_id != payload.run_id:
         raise HTTPException(status_code=400, detail="run ID mismatch")
     run = await session.scalar(
-        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task).selectinload(Task.project))
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -1079,13 +1081,13 @@ async def agent_run_callback(
             or run.pr_url is not None
             or run.task.deleted_at is not None
             or run.task.status in {TaskStatus.DONE, TaskStatus.CANCELLED}
+            or run.task_revision != _revision(run.task, run.mode)
         ):
             raise HTTPException(status_code=409, detail="failed run cannot publish a PR")
         newer = await session.scalar(
             select(AgentRun.id).where(
                 AgentRun.task_id == run.task_id,
-                AgentRun.task_revision == run.task_revision,
-                AgentRun.attempt_index > run.attempt_index,
+                AgentRun.id > run.id,
             )
         )
         if newer is not None:
