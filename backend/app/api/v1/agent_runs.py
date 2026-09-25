@@ -198,7 +198,8 @@ async def _dispatch_release_action(
 ) -> None:
     if not _owner_release_supported(run):
         raise HTTPException(
-            status_code=409, detail="release actions are not enabled for this repository"
+            status_code=409,
+            detail="release actions are not enabled for this repository",
         )
     if not settings.github_agent_token:
         raise HTTPException(status_code=503, detail="release workflow token is not configured")
@@ -809,7 +810,9 @@ async def recent_agent_events(
                 phase=event.phase,
                 error=event.error,
                 github_run_url=event.github_run_url,
-                input_tokens=run.input_tokens if run and run.status == event.status else None,
+                input_tokens=(
+                    run.input_tokens if run and run.status == event.status else None
+                ),
                 cached_input_tokens=(
                     run.cached_input_tokens if run and run.status == event.status else None
                 ),
@@ -1204,7 +1207,9 @@ async def _request_owner_action(
         )
     if kind == "merge" and not _can_merge(run):
         return _action_error(
-            "not_ready", "CI and a clean review must pass on the current head", status_code=409
+            "not_ready",
+            "CI and a clean review must pass on the current head",
+            status_code=409,
         )
     if kind == "correction" and run.status not in {"pr_opened", "pr_ready"}:
         return _action_error("not_ready", "PR is not open for correction", status_code=409)
@@ -1321,7 +1326,8 @@ async def agent_action_status(
         action_id=UUID(action.action_id),
         kind=cast(Literal["merge", "correction"], action.kind),
         status=cast(
-            Literal["accepted", "in_progress", "completed", "rejected"], action.status
+            Literal["accepted", "in_progress", "completed", "rejected", "retryable"],
+            action.status,
         ),
         request=action.request_data,
         result=action.result,
@@ -1442,7 +1448,9 @@ async def agent_action_result(
 
 @router.get("/{run_id}/status", response_model=AgentRunOut)
 async def agent_run_status(
-    run_id: str, session: DbSession, x_agent_callback_token: str | None = Header(default=None)
+    run_id: str,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
 ) -> AgentRunOut:
     if (
         not settings.agent_callback_token
@@ -1515,7 +1523,10 @@ async def download_run_image(
     "/tasks/{task_id}", response_model=AgentRunOut, status_code=status.HTTP_201_CREATED
 )
 async def start_agent_run(
-    task_id: int, session: DbSession, user: CurrentUser, payload: AgentRunStart | None = None
+    task_id: int,
+    session: DbSession,
+    user: CurrentUser,
+    payload: AgentRunStart | None = None,
 ) -> AgentRunOut:
     task = await _task(session, task_id, lock=True)
     mode = payload.mode if payload else "pr"
@@ -1693,7 +1704,11 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
                 task_id=run.task_id,
                 actor=user,
                 kind=ActivityKind.STATUS_CHANGED,
-                payload={"from": old, "to": TaskStatus.TODO.value, "agent_run_id": run_id},
+                payload={
+                    "from": old,
+                    "to": TaskStatus.TODO.value,
+                    "agent_run_id": run_id,
+                },
             )
     else:
         await _cancel_github(run)
@@ -1817,7 +1832,8 @@ async def agent_qa_run_deployed(
         raise HTTPException(status_code=404, detail="QA agent run not found")
     if payload.ready_url != settings.agent_qa_ready_url or payload.ready_sha != payload.sha:
         raise HTTPException(
-            status_code=409, detail="QA readiness evidence does not match the merged SHA"
+            status_code=409,
+            detail="QA readiness evidence does not match the merged SHA",
         )
     if run.status == "deployed" and run.deployed_sha == payload.sha:
         return AgentRunOut.model_validate(run)
@@ -1885,7 +1901,8 @@ async def agent_qa_deploy_dispatch_result(
         or (action.result or {}).get("merge_sha") != payload.sha
     ):
         raise HTTPException(
-            status_code=409, detail="QA result is not tied to the completed merge action"
+            status_code=409,
+            detail="QA result is not tied to the completed merge action",
         )
     if run.status == "deployed" and run.qa_ready_sha == payload.sha:
         return AgentRunOut.model_validate(run)
@@ -2009,7 +2026,14 @@ async def agent_run_callback(
         )
         if newer is not None:
             raise HTTPException(status_code=409, detail="a newer agent attempt exists")
-    elif run.status in {"pr_opened", "pr_ready", "merged", "deployed", "cancelled", "failed"}:
+    elif run.status in {
+        "pr_opened",
+        "pr_ready",
+        "merged",
+        "deployed",
+        "cancelled",
+        "failed",
+    }:
         return AgentRunOut.model_validate(run)
 
     if payload.status in {"validating", "publishing", "deploying"}:
@@ -2073,7 +2097,9 @@ async def agent_run_callback(
                 else (
                     "PR nashr bosqichi xato bilan tugadi"
                     if payload.status == "failed" and payload.failure_phase == "publish"
-                    else "Agent ishi xato bilan tugadi" if payload.status == "failed" else None
+                    else (
+                        "Agent ishi xato bilan tugadi" if payload.status == "failed" else None
+                    )
                 )
             ),
             phase=payload.failure_phase if payload.status == "failed" else None,
@@ -2097,7 +2123,11 @@ async def agent_run_callback(
             task_id=run.task_id,
             actor=None,
             kind=ActivityKind.STATUS_CHANGED,
-            payload={"from": old, "to": TaskStatus.BLOCKED.value, "agent_run_id": run_id},
+            payload={
+                "from": old,
+                "to": TaskStatus.BLOCKED.value,
+                "agent_run_id": run_id,
+            },
         )
     if payload.status == "running" and can_transition(
         TaskStatus(run.task.status), TaskStatus.IN_PROGRESS
@@ -2110,7 +2140,11 @@ async def agent_run_callback(
             task_id=run.task_id,
             actor=None,
             kind=ActivityKind.STATUS_CHANGED,
-            payload={"from": old, "to": TaskStatus.IN_PROGRESS.value, "agent_run_id": run_id},
+            payload={
+                "from": old,
+                "to": TaskStatus.IN_PROGRESS.value,
+                "agent_run_id": run_id,
+            },
         )
     await session.commit()
     return AgentRunOut.model_validate(run)

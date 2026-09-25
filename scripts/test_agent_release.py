@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -159,6 +160,150 @@ class AgentReleaseTests(unittest.TestCase):
             agent_release.report_merge()
         self.assertEqual(
             calls, [("merge-recorded", None), ("dispatch-failed", "failed")]
+        )
+
+    def test_failed_qa_dispatch_can_be_retried_after_merge_is_recorded(self) -> None:
+        run_id = "00000000-0000-0000-0000-000000000007"
+        action = {
+            "action_id": "00000000-0000-0000-0000-000000000008",
+            "status": "completed",
+            "result": {"head_sha": "a" * 40, "merge_sha": "b" * 40},
+        }
+        run = {
+            "repo_full_name": "Asadtop4ik/agent-qa",
+            "base_branch": "main",
+            "status": "merged",
+            "merged_sha": "b" * 40,
+            "qa_deploy_dispatch_status": "failed",
+        }
+        pr = {
+            "merged": True,
+            "head": {"sha": "a" * 40},
+            "merge_commit_sha": "b" * 40,
+        }
+        calls: list[str] = []
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "AGENT_QA_ENABLED": "true",
+                    "GH_TOKEN": "test",
+                    "AGENT_QA_DEPLOY_WORKFLOW": ".github/workflows/agent-qa.yml",
+                },
+            ),
+            patch.object(
+                agent_release,
+                "_merge_report_context",
+                return_value=({}, run, action, run_id, 9, "a" * 40),
+            ),
+            patch.object(agent_release, "_pr", return_value=pr),
+            patch.object(agent_release, "_task_callback") as task_callback,
+            patch.object(
+                agent_release.subprocess,
+                "run",
+                side_effect=lambda *args, **kwargs: calls.append("dispatch"),
+            ),
+            patch.object(
+                agent_release,
+                "_qa_dispatch_result",
+                side_effect=lambda *args, **kwargs: calls.append(args[3]),
+            ),
+        ):
+            agent_release.report_merge()
+        task_callback.assert_not_called()
+        self.assertEqual(calls, ["dispatch", "dispatched"])
+
+    def test_same_head_correction_review_dispatch_includes_full_target_context(
+        self,
+    ) -> None:
+        run_id = "00000000-0000-0000-0000-000000000007"
+        action_id = "00000000-0000-0000-0000-000000000008"
+        expected = "a" * 40
+        repo = "muradjanov-dev/qurbot"
+        branch = f"codex/task-7-{run_id}"
+        payload = {
+            "run_id": run_id,
+            "action_id": action_id,
+            "repo_full_name": repo,
+            "branch": branch,
+            "expected_head_sha": expected,
+            "instruction": "Reconsider this finding on the same head.",
+        }
+        run = {
+            "run_id": run_id,
+            "task_id": 7,
+            "repo_full_name": repo,
+            "base_branch": "master",
+            "pr_url": f"https://github.com/{repo}/pull/9",
+            "status": "correction_running",
+        }
+        action = {"action_id": action_id, "status": "in_progress"}
+        pr = {
+            "state": "open",
+            "head": {
+                "sha": expected,
+                "ref": branch,
+                "repo": {"full_name": repo},
+            },
+            "base": {"ref": "master"},
+        }
+        dispatches: list[dict] = []
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ,
+                {
+                    "RUNNER_TEMP": temp,
+                    "GH_TOKEN": "target-token",
+                    "DISPATCH_TOKEN": "control-token",
+                    "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                },
+            ),
+        ):
+            Path(temp, "agent-correction-target.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "action_id": action_id,
+                        "branch": branch,
+                        "expected_head_sha": expected,
+                        "instruction": payload["instruction"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(temp, "agent-correction.patch").write_text("", encoding="utf-8")
+
+            def request(url: str, **kwargs):
+                if url.endswith(f"git/ref/heads/{branch}"):
+                    return {"object": {"sha": expected}}
+                dispatches.append(kwargs["body"]["client_payload"])
+                return None
+
+            with (
+                patch.object(
+                    agent_release,
+                    "_context",
+                    return_value=(payload, run, action, run_id, 9, expected),
+                ),
+                patch.object(agent_release, "_pr", return_value=pr),
+                patch.object(agent_release, "_request", side_effect=request),
+                patch.object(agent_release, "_task_callback"),
+            ):
+                agent_release.publish_correction()
+
+        self.assertEqual(
+            dispatches,
+            [
+                {
+                    "repo_full_name": repo,
+                    "run_id": run_id,
+                    "pull_number": 9,
+                    "head_sha": expected,
+                    "branch": branch,
+                    "base_branch": "master",
+                }
+            ],
         )
 
     def test_failed_merge_verification_rejects_action_without_marking_merge(

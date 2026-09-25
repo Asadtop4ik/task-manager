@@ -283,6 +283,7 @@ async def test_transient_dispatch_failure_can_retry_with_same_action_id(
         review_status="clean",
     )
     monkeypatch.setattr(settings, "github_agent_token", "task-manager-write-token")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
 
     async def current_head(current) -> tuple[str, bool]:
         return _SHA, True
@@ -303,6 +304,11 @@ async def test_transient_dispatch_failure_can_retry_with_same_action_id(
     )
     assert first.status_code == 200
     assert first.json()["status"] == "retryable"
+    action_status = await client.get(
+        f"/api/v1/agent-runs/{run.run_id}/actions/{action_id}", headers=_CALLBACK
+    )
+    assert action_status.status_code == 200
+    assert action_status.json()["status"] == "retryable"
     second = await client.post(
         f"/api/v1/agent-runs/{run.run_id}/merge", json=body, headers=auth(manager)
     )

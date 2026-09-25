@@ -542,7 +542,14 @@ def publish_correction() -> None:
         body = json.dumps(
             {
                 "event_type": "agent_pr_review",
-                "client_payload": {"pull_number": number, "head_sha": expected},
+                "client_payload": {
+                    "repo_full_name": repo,
+                    "run_id": run_id,
+                    "pull_number": number,
+                    "head_sha": expected,
+                    "branch": branch,
+                    "base_branch": run["base_branch"],
+                },
             }
         ).encode()
         _request(
