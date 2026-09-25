@@ -36,7 +36,12 @@ SHA deploy → bot xabarini sinang. Eski to‘rt loyiha ushbu yangilanishdan key
 ham ishlashi kerak.
 
 Botdagi draft suhbat va 3 tagacha rasm ham shu repolarni ko‘radi. Tasdiqdan
-oldin task ochilmaydi. Keyin agent PR havolasi botga keladi. Merge bo‘lgach bot
+oldin task ochilmaydi. Publisher PR ochishdan oldin repo uchun tasdiqlangan
+format/lint yoki sintaksis preflightini qiladi. PR havolasi task sahifasida darhol ko‘rinadi,
+ammo botdagi **PR tayyor** xabari faqat PRning joriy commitidagi CI muvaffaqiyatli
+tugagach yuboriladi. CI qizil bo‘lsa, task sahifasida xato va CI havolasi
+ko‘rinadi; shu PR branchiga tuzatish push qilinib, yangi SHA qayta tekshiriladi.
+Merge bo‘lgach bot
 alohida xabar beradi; deploy faqat GitHub `Deploy` workflow’i aynan merge
 commitida muvaffaqiyatli tugab, netcup’dagi tegishli Docker image’lar shu SHA’da
 ishlayotgan va health tekshiruvi o‘tganidan keyin `done` bo‘ladi. Qo‘lda

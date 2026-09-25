@@ -150,6 +150,10 @@ jobs:
           name: agent-patch
           path: ${{ runner.temp }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Prepare publication metadata
         run: python3 scripts/agent_task.py prepare
 
@@ -159,6 +163,15 @@ jobs:
           git switch -c "$AGENT_BRANCH" "$GITHUB_SHA"
           git apply --index "$RUNNER_TEMP/agent.patch"
           git show "$GITHUB_SHA:scripts/agent_task.py" > "$RUNNER_TEMP/agent-validator.py"
+          python3 "$RUNNER_TEMP/agent-validator.py" check-diff
+
+      - name: Trusted formatter and lint preflight before PR
+        env:
+          AGENT_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git show "$GITHUB_SHA:scripts/agent_preflight.py" > "$RUNNER_TEMP/agent-preflight.py"
+          python3 "$RUNNER_TEMP/agent-preflight.py"
           python3 "$RUNNER_TEMP/agent-validator.py" check-diff
 
       - name: Commit and push isolated branch

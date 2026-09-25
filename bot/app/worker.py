@@ -18,7 +18,7 @@ log = get_logger(__name__)
 
 
 def agent_result_card(notice: dict[str, object]) -> str:
-    """A concise, factual status card. PR-ready never claims CI has passed."""
+    """A concise, factual status card. PR-ready requires exact-head CI success."""
     task_id = notice["task_id"]
     project = str(notice.get("repo_full_name") or "").split("/")[-1]
     title = str(notice.get("title") or "Vazifa").replace("\n", " ")[:180]
@@ -26,10 +26,21 @@ def agent_result_card(notice: dict[str, object]) -> str:
     lines = [f"🤖 #{task_id} · {project}", f"Vazifa: {title}"]
     if status == "pr_ready":
         if notice.get("mode") == "fast":
-            lines.append("Holat: !fast himoyalangan o‘zgarish sabab PRga o‘tdi.")
+            lines.append("Holat: !fast himoyalangan o‘zgarish PRga o‘tdi; CI yashil.")
         else:
-            lines.append("Holat: PR tayyor. CI natijasini PR sahifasida ko‘ring.")
+            lines.append("Holat: ✅ PR tayyor. Oxirgi commit CI’dan o‘tdi; review kutilmoqda.")
         lines.append(f"PR: {notice.get('pr_url') or '—'}")
+        if notice.get("ci_url"):
+            lines.append(f"CI: {notice['ci_url']}")
+    elif status == "pr_opened":
+        lines.append(
+            "Holat: CI xato; PR tuzatilmoqda."
+            if notice.get("ci_status") == "failure"
+            else "Holat: yangi commit uchun CI tekshirilmoqda."
+        )
+        lines.append(f"PR: {notice.get('pr_url') or '—'}")
+        if notice.get("ci_url"):
+            lines.append(f"CI: {notice['ci_url']}")
     elif status == "merged":
         lines.append("Holat: PR birlashtirildi; production deploy tekshirilmoqda.")
         lines.append(f"PR: {notice.get('pr_url') or '—'}")

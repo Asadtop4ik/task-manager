@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -27,6 +27,8 @@ from app.db.models import (
     Task,
 )
 from app.schemas.agent_run import (
+    AgentCiPending,
+    AgentCiResult,
     AgentDeployment,
     AgentEventOut,
     AgentImageOut,
@@ -45,6 +47,7 @@ from app.services.access import can_edit_task, can_see_task
 from app.services.agent_repos import (
     DISPATCH_REPOSITORY,
     PUBLIC_REPOSITORIES,
+    REPOSITORIES,
     repository_for,
 )
 from app.services.telegram_media import IMAGE_MIMES, telegram_image
@@ -165,6 +168,56 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
 
+async def _verify_pr_ci(run: AgentRun, sha: str, conclusion: str, url: str) -> None:
+    """Prove a completed CI run belongs to this PR head and passed required jobs."""
+    prefix = f"https://github.com/{run.repo_full_name}/actions/runs/"
+    run_number = url.removeprefix(prefix)
+    if not url.startswith(prefix) or not run_number.isdecimal():
+        raise HTTPException(status_code=400, detail="invalid PR CI run URL")
+    target = next(
+        (
+            item
+            for item in REPOSITORIES
+            if item.full_name == run.repo_full_name and item.branch == run.base_branch
+        ),
+        None,
+    )
+    if target is None or not target.pr_ci_jobs:
+        raise HTTPException(status_code=409, detail="PR CI policy is not configured")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{run.repo_full_name}/actions/runs/{run_number}",
+            headers=_headers(),
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail="PR CI verification failed")
+        workflow = response.json()
+        if (
+            workflow.get("head_sha") != sha
+            or workflow.get("head_branch") != _run_branch(run)
+            or workflow.get("event") != "pull_request"
+            or workflow.get("path") != ".github/workflows/ci.yml"
+            or workflow.get("status") != "completed"
+        ):
+            raise HTTPException(status_code=409, detail="PR CI does not match this commit")
+        passed = workflow.get("conclusion") == "success"
+        if passed:
+            jobs_response = await client.get(
+                f"{_GITHUB}/repos/{run.repo_full_name}/actions/runs/{run_number}/jobs?per_page=100",
+                headers=_headers(),
+            )
+            if jobs_response.status_code != 200:
+                raise HTTPException(status_code=502, detail="PR CI jobs verification failed")
+            successful = {
+                job.get("name")
+                for job in jobs_response.json().get("jobs", [])
+                if job.get("conclusion") == "success"
+            }
+            passed = set(target.pr_ci_jobs).issubset(successful)
+        if passed != (conclusion == "success"):
+            raise HTTPException(status_code=409, detail="PR CI conclusion does not match")
+
+
 async def _verify_deployment(run: AgentRun, sha: str) -> str:
     if not run.pr_url or not run.head_sha:
         raise HTTPException(status_code=409, detail="agent PR is not verified")
@@ -269,16 +322,42 @@ async def pending_notifications(
     session: DbSession, x_agent_worker_token: str | None = Header(default=None)
 ) -> list[AgentNotificationOut]:
     _worker_auth(x_agent_worker_token)
-    runs = await session.scalars(
-        select(AgentRun)
-        .where(
-            AgentRun.status.in_(["pr_ready", "merged", "failed", "deployed"]),
-            AgentRun.notified_at.is_(None),
+    runs = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                or_(
+                    (
+                        (AgentRun.status == "pr_ready")
+                        & (AgentRun.ci_status == "success")
+                        & (AgentRun.ci_verified_sha == AgentRun.head_sha)
+                    ),
+                    AgentRun.status.in_(["merged", "failed", "deployed"]),
+                    (AgentRun.status == "pr_opened")
+                    & AgentRun.telegram_message_id.is_not(None),
+                ),
+                AgentRun.notified_at.is_(None),
+            )
+            .options(selectinload(AgentRun.task).selectinload(Task.created_by))
+            .order_by(AgentRun.id)
+            .limit(20)
         )
-        .options(selectinload(AgentRun.task).selectinload(Task.created_by))
-        .order_by(AgentRun.id)
-        .limit(20)
-    )
+    ).all()
+    verified_runs: list[AgentRun] = []
+    for run in runs:
+        if run.status == "pr_ready":
+            # A reviewer can push a new commit between the CI monitor tick and
+            # the bot tick. Never announce the previously verified head.
+            if not run.pr_url or not run.ci_verified_sha:
+                continue
+            pr_number = run.pr_url.rsplit("/", 1)[-1]
+            if not pr_number.isdecimal():
+                continue
+            try:
+                await _verify_pr(run, pr_number, run.ci_verified_sha)
+            except HTTPException:
+                continue  # Fail closed; the CI monitor will reconcile next tick.
+        verified_runs.append(run)
     return [
         AgentNotificationOut(
             run_id=run.run_id,
@@ -288,6 +367,8 @@ async def pending_notifications(
             chat_id=run.task.source_chat_id
             or (run.task.created_by.telegram_id if run.task.created_by else None),
             status=run.status,
+            ci_status=run.ci_status,
+            ci_url=run.ci_url,
             mode=run.mode,
             pr_url=run.pr_url,
             github_run_url=run.github_run_url,
@@ -297,7 +378,7 @@ async def pending_notifications(
             telegram_message_id=run.telegram_message_id,
             error=run.error,
         )
-        for run in runs
+        for run in verified_runs
     ]
 
 
@@ -338,9 +419,9 @@ async def agent_metrics(
         if run.runner_started_at
     ]
     implementation = [
-        (run.pr_ready_at - run.runner_started_at).total_seconds()
+        (run.pr_opened_at - run.runner_started_at).total_seconds()
         for run in current
-        if run.pr_ready_at and run.runner_started_at
+        if run.pr_opened_at and run.runner_started_at
     ]
     human_review = [
         (run.merged_at - run.pr_ready_at).total_seconds()
@@ -438,8 +519,14 @@ async def mark_notified(
     run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status not in {"pr_ready", "merged", "failed", "deployed"}:
+    if run.status not in {"pr_opened", "pr_ready", "merged", "failed", "deployed"}:
         raise HTTPException(status_code=409, detail="run is not finished")
+    if run.status == "pr_opened" and run.telegram_message_id is None:
+        raise HTTPException(status_code=409, detail="no earlier card to update")
+    if run.status == "pr_ready" and (
+        run.ci_status != "success" or run.ci_verified_sha != run.head_sha
+    ):
+        raise HTTPException(status_code=409, detail="PR CI is not verified")
     if run.notified_at is None:
         if payload is not None and payload.message_id is not None:
             run.telegram_message_id = payload.message_id
@@ -481,6 +568,122 @@ async def external_pending(
         for run in rows
         if run.pr_url is not None
     ]
+
+
+@router.get("/ci-pending", response_model=list[AgentCiPending])
+async def pending_pr_ci(
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+    after_id: int = 0,
+) -> list[AgentCiPending]:
+    _image_callback_auth(x_agent_callback_token)
+    if after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+    rows = await session.scalars(
+        select(AgentRun)
+        .where(
+            AgentRun.status.in_(["pr_opened", "pr_ready"]),
+            AgentRun.pr_url.is_not(None),
+            AgentRun.head_sha.is_not(None),
+            AgentRun.id > after_id,
+        )
+        .order_by(AgentRun.id)
+        .limit(50)
+    )
+    return [
+        AgentCiPending(
+            id=run.id,
+            run_id=run.run_id,
+            repo_full_name=run.repo_full_name,
+            base_branch=run.base_branch,
+            pr_url=run.pr_url,
+            head_sha=run.head_sha,
+            status=run.status,
+            ci_status=run.ci_status,
+            ci_verified_sha=run.ci_verified_sha,
+            ci_url=run.ci_url,
+        )
+        for run in rows
+        if run.pr_url is not None and run.head_sha is not None
+    ]
+
+
+@router.post("/{run_id}/ci-result", response_model=AgentRunOut)
+async def agent_pr_ci_result(
+    run_id: str,
+    payload: AgentCiResult,
+    session: DbSession,
+    x_agent_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    _image_callback_auth(x_agent_callback_token)
+    run = await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+    if run is None or run.status not in {"pr_opened", "pr_ready"} or not run.pr_url:
+        raise HTTPException(status_code=409, detail="agent PR is not awaiting CI")
+    pr_number = run.pr_url.rsplit("/", 1)[-1]
+    if not pr_number.isdecimal():
+        raise HTTPException(status_code=409, detail="invalid agent PR reference")
+    await _verify_pr(run, pr_number, payload.sha)
+    if payload.conclusion != "pending" and not payload.github_run_url:
+        raise HTTPException(status_code=400, detail="completed PR CI needs its run URL")
+    if payload.github_run_url:
+        await _verify_pr_ci(run, payload.sha, payload.conclusion, payload.github_run_url)
+
+    unchanged = (
+        run.status == ("pr_ready" if payload.conclusion == "success" else "pr_opened")
+        and run.head_sha == payload.sha
+        and run.ci_status == payload.conclusion
+        and run.ci_url == payload.github_run_url
+        and (payload.conclusion != "success" or run.ci_verified_sha == payload.sha)
+    )
+    if unchanged:
+        return AgentRunOut.model_validate(run)
+
+    run.head_sha = payload.sha
+    run.ci_status = payload.conclusion
+    run.ci_url = payload.github_run_url
+    run.ci_verified_sha = payload.sha if payload.conclusion == "success" else None
+    run.notified_at = None if run.telegram_message_id is not None else run.notified_at
+    if payload.conclusion == "success":
+        run.status = "pr_ready"
+        run.pr_ready_at = datetime.now(UTC)
+        run.notified_at = None
+        agent_events.record(session, run, phase="ci", github_run_url=run.ci_url)
+        target_status = TaskStatus.REVIEW
+    else:
+        run.status = "pr_opened"
+        run.pr_ready_at = None
+        agent_events.record(
+            session,
+            run,
+            status="ci_failed" if payload.conclusion == "failure" else "ci_pending",
+            phase="ci",
+            error=("PR CI xato bilan tugadi" if payload.conclusion == "failure" else None),
+            github_run_url=run.ci_url,
+        )
+        target_status = (
+            TaskStatus.BLOCKED if payload.conclusion == "failure" else TaskStatus.IN_PROGRESS
+        )
+    if can_transition(TaskStatus(run.task.status), target_status):
+        old_task_status = run.task.status
+        run.task.status = target_status
+        activity.record(
+            session,
+            task_id=run.task_id,
+            actor=None,
+            kind=ActivityKind.STATUS_CHANGED,
+            payload={
+                "from": old_task_status,
+                "to": target_status.value,
+                "agent_run_id": run_id,
+            },
+        )
+    await session.commit()
+    return AgentRunOut.model_validate(run)
 
 
 @router.get("/tasks/{task_id}", response_model=list[AgentRunOut])
@@ -718,10 +921,11 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         "dispatched",
         "running",
         "validating",
+        "pr_opened",
         "pr_ready",
     }:
         raise HTTPException(status_code=409, detail="agent run is already finished")
-    if run.status == "pr_ready":
+    if run.status in {"pr_opened", "pr_ready"}:
         await _close_pr(run)
         if can_transition(TaskStatus(run.task.status), TaskStatus.TODO):
             old = run.task.status
@@ -757,7 +961,7 @@ async def agent_run_merged(
         raise HTTPException(status_code=404, detail="external agent PR not found")
     if run.status == "merged" and run.merged_sha == payload.sha:
         return AgentRunOut.model_validate(run)
-    if run.status != "pr_ready":
+    if run.status not in {"pr_opened", "pr_ready"}:
         raise HTTPException(status_code=409, detail="agent PR is not ready for merge tracking")
     run.head_sha = await _verify_deployment(run, payload.sha)
     run.merged_sha = payload.sha
@@ -790,7 +994,11 @@ async def agent_run_deployed(
     if run.status == "deployed" and run.deployed_sha == payload.sha:
         return AgentRunOut.model_validate(run)
     if run.pr_url:
-        if run.status not in {"pr_ready", "merged"}:
+        eligible_statuses = {"pr_ready", "merged"}
+        if run.repo_full_name == DISPATCH_REPOSITORY:
+            # The narrow docs/CSS auto-merge independently proves exact PR CI.
+            eligible_statuses.add("pr_opened")
+        if run.status not in eligible_statuses:
             raise HTTPException(status_code=409, detail="agent PR is not ready")
         if run.status == "merged" and run.merged_sha != payload.sha:
             raise HTTPException(status_code=409, detail="deployed SHA differs from merge")
@@ -850,7 +1058,7 @@ async def agent_run_callback(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status in {"pr_ready", "merged", "deployed", "cancelled", "failed"}:
+    if run.status in {"pr_opened", "pr_ready", "merged", "deployed", "cancelled", "failed"}:
         return AgentRunOut.model_validate(run)
 
     if payload.status in {"validating", "publishing", "deploying"}:
@@ -869,7 +1077,7 @@ async def agent_run_callback(
         await _verify_fast_branch(run, payload.head_sha)
         run.head_sha = payload.head_sha
 
-    if payload.status == "pr_ready":
+    if payload.status == "pr_opened":
         if not payload.pr_url or not payload.head_sha or not settings.github_agent_token:
             raise HTTPException(status_code=400, detail="PR URL and SHA are required")
         prefix = f"https://github.com/{run.repo_full_name}/pull/"
@@ -881,6 +1089,9 @@ async def agent_run_callback(
         await _verify_pr(run, pr_number, payload.head_sha)
         run.pr_url = payload.pr_url
         run.head_sha = payload.head_sha
+        run.ci_status = "pending"
+        run.ci_verified_sha = None
+        run.ci_url = None
 
     changed = run.status != payload.status or (
         payload.status == "failed" and run.error != payload.error
@@ -888,8 +1099,8 @@ async def agent_run_callback(
     run.status = payload.status
     if payload.status == "running" and run.runner_started_at is None:
         run.runner_started_at = datetime.now(UTC)
-    if payload.status == "pr_ready" and run.pr_ready_at is None:
-        run.pr_ready_at = datetime.now(UTC)
+    if payload.status == "pr_opened" and run.pr_opened_at is None:
+        run.pr_opened_at = datetime.now(UTC)
     if payload.github_run_url:
         expected_url = f"https://github.com/{DISPATCH_REPOSITORY}/actions/runs/"
         suffix = payload.github_run_url.removeprefix(expected_url)
@@ -919,7 +1130,7 @@ async def agent_run_callback(
         run.cached_input_tokens = payload.cached_input_tokens
     if payload.output_tokens is not None:
         run.output_tokens = payload.output_tokens
-    if payload.status in {"pr_ready", "failed"}:
+    if payload.status in {"pr_opened", "failed"}:
         run.finished_at = datetime.now(UTC)
     if payload.status == "failed" and can_transition(
         TaskStatus(run.task.status), TaskStatus.BLOCKED
@@ -945,22 +1156,6 @@ async def agent_run_callback(
             actor=None,
             kind=ActivityKind.STATUS_CHANGED,
             payload={"from": old, "to": TaskStatus.IN_PROGRESS.value, "agent_run_id": run_id},
-        )
-    if payload.status == "pr_ready" and can_transition(
-        TaskStatus(run.task.status), TaskStatus.REVIEW
-    ):
-        old = run.task.status
-        run.task.status = TaskStatus.REVIEW
-        activity.record(
-            session,
-            task_id=run.task_id,
-            actor=None,
-            kind=ActivityKind.STATUS_CHANGED,
-            payload={
-                "from": old,
-                "to": TaskStatus.REVIEW.value,
-                "agent_run_id": run_id,
-            },
         )
     await session.commit()
     return AgentRunOut.model_validate(run)

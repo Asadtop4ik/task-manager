@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import UUID
 
-from project_catalog import public_projects
+from project_catalog import REPOSITORIES, public_projects
 
 API = "https://tasks.standart-eko.uz/api/v1/agent-runs"
 GITHUB = "https://api.github.com"
@@ -31,6 +31,9 @@ TARGETS = {
     item.full_name: Target(item.branch, dict(item.images), frozenset(item.ci_jobs))
     for item in public_projects()
 }
+CI_TARGETS = {
+    item.full_name: (item.branch, frozenset(item.pr_ci_jobs)) for item in REPOSITORIES
+}
 
 
 def _request(
@@ -40,7 +43,9 @@ def _request(
     token_header: str,
     data: dict[str, Any] | None = None,
 ) -> urllib.request.Request:
-    payload = json.dumps(data, separators=(",", ":")).encode() if data is not None else None
+    payload = (
+        json.dumps(data, separators=(",", ":")).encode() if data is not None else None
+    )
     request = urllib.request.Request(
         url,
         data=payload,
@@ -70,7 +75,11 @@ def _record(raw: Any) -> dict[str, Any]:
     run_id = str(UUID(str(raw.get("run_id"))))
     pr_url = raw.get("pr_url")
     prefix = f"https://github.com/{repo}/pull/"
-    if not isinstance(pr_url, str) or not pr_url.startswith(prefix) or not pr_url[len(prefix):].isdigit():
+    if (
+        not isinstance(pr_url, str)
+        or not pr_url.startswith(prefix)
+        or not pr_url[len(prefix) :].isdigit()
+    ):
         raise ValueError("invalid PR reference")
     if raw.get("status") not in {"pr_ready", "merged"}:
         raise ValueError("invalid pending status")
@@ -79,8 +88,59 @@ def _record(raw: Any) -> dict[str, Any]:
     sha = raw.get("merged_sha")
     if raw["status"] == "merged" and not _valid_sha(sha):
         raise ValueError("merged run lacks its commit")
-    return {"id": row_id, "run_id": run_id, "repo": repo, "target": target, "pr_number": pr_url[len(prefix):],
-            "status": raw["status"], "sha": sha, "notified": raw["notified"]}
+    return {
+        "id": row_id,
+        "run_id": run_id,
+        "repo": repo,
+        "target": target,
+        "pr_number": pr_url[len(prefix) :],
+        "status": raw["status"],
+        "sha": sha,
+        "notified": raw["notified"],
+    }
+
+
+def _ci_record(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("invalid pending CI run")
+    row_id = raw.get("id")
+    repo = raw.get("repo_full_name")
+    target = CI_TARGETS.get(repo)
+    if (
+        isinstance(row_id, bool)
+        or not isinstance(row_id, int)
+        or row_id < 1
+        or target is None
+        or raw.get("base_branch") != target[0]
+        or not target[1]
+    ):
+        raise ValueError("CI run is outside approved repositories")
+    run_id = str(UUID(str(raw.get("run_id"))))
+    pr_url = raw.get("pr_url")
+    prefix = f"https://github.com/{repo}/pull/"
+    if (
+        not isinstance(pr_url, str)
+        or not pr_url.startswith(prefix)
+        or not pr_url[len(prefix) :].isdigit()
+    ):
+        raise ValueError("invalid CI PR reference")
+    if raw.get("status") not in {"pr_opened", "pr_ready"} or not _valid_sha(
+        raw.get("head_sha")
+    ):
+        raise ValueError("invalid CI run status or SHA")
+    if raw.get("ci_status") not in {None, "pending", "failure", "success"}:
+        raise ValueError("invalid CI conclusion")
+    return {
+        "id": row_id,
+        "run_id": run_id,
+        "repo": repo,
+        "pr_number": pr_url[len(prefix) :],
+        "head_sha": raw["head_sha"],
+        "ci_status": raw.get("ci_status"),
+        "ci_verified_sha": raw.get("ci_verified_sha"),
+        "ci_url": raw.get("ci_url"),
+        "required_jobs": target[1],
+    }
 
 
 class ExternalDeployMonitor:
@@ -124,6 +184,94 @@ class ExternalDeployMonitor:
                 token_header="Authorization",
             )
         )
+
+    def _latest_pr_ci(
+        self, record: dict[str, Any], sha: str, branch: str
+    ) -> tuple[str, str | None]:
+        repo = record["repo"]
+        response = self._github(
+            f"/repos/{repo}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={sha}&per_page=20"
+        )
+        runs = sorted(
+            response.get("workflow_runs", []),
+            key=lambda item: item.get("id", 0),
+            reverse=True,
+        )
+        for run in runs:
+            if (
+                run.get("head_sha") != sha
+                or run.get("head_branch") != branch
+                or run.get("event") != "pull_request"
+                or run.get("path") != ".github/workflows/ci.yml"
+                or not isinstance(run.get("id"), int)
+            ):
+                continue
+            if run.get("status") != "completed":
+                return "pending", None
+            url = f"https://github.com/{repo}/actions/runs/{run['id']}"
+            if run.get("conclusion") != "success":
+                return "failure", url
+            jobs = self._github(
+                f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"
+            )
+            successful = {
+                job.get("name")
+                for job in jobs.get("jobs", [])
+                if job.get("conclusion") == "success"
+            }
+            return (
+                "success" if record["required_jobs"].issubset(successful) else "failure"
+            ), url
+        return "pending", None
+
+    def check_ci_once(self) -> int:
+        """Update exact-head CI status; the API alone decides when PR-ready is notifiable."""
+        updated = 0
+        after_id = 0
+        while True:
+            pending = self._internal(f"/ci-pending?after_id={after_id}")
+            if not isinstance(pending, list):
+                raise ValueError("invalid pending CI list")
+            for raw in pending:
+                record = _ci_record(raw)
+                if record["id"] <= after_id:
+                    raise ValueError("pending CI cursor did not advance")
+                after_id = record["id"]
+                pr = self._github(
+                    f"/repos/{record['repo']}/pulls/{record['pr_number']}"
+                )
+                if pr.get("state") == "closed" and not pr.get("merged"):
+                    continue
+                head = pr.get("head") or {}
+                sha = head.get("sha")
+                branch = head.get("ref")
+                if (
+                    not _valid_sha(sha)
+                    or not isinstance(branch, str)
+                    or (head.get("repo") or {}).get("full_name", "").lower()
+                    != record["repo"].lower()
+                ):
+                    continue
+                conclusion, url = self._latest_pr_ci(record, sha, branch)
+                if (
+                    record["head_sha"] == sha
+                    and record["ci_status"] == conclusion
+                    and record["ci_url"] == url
+                    and (conclusion != "success" or record["ci_verified_sha"] == sha)
+                ):
+                    continue
+                self._internal(
+                    f"/{record['run_id']}/ci-result",
+                    {
+                        "sha": sha,
+                        "conclusion": conclusion,
+                        "github_run_url": url,
+                    },
+                )
+                updated += 1
+            if len(pending) < 50:
+                break
+        return updated
 
     def _successful_deploy_run(self, repo: str, target: Target, sha: str) -> str | None:
         result = self._github(
@@ -214,11 +362,16 @@ def main() -> None:
         github_token=os.environ["GITHUB_AGENT_TOKEN"],
     )
     try:
+        ci_updated = monitor.check_ci_once()
         merged, deployed = monitor.run_once()
     except Exception as error:
-        print(f"external deploy monitor failed: {type(error).__name__}", file=sys.stderr)
+        print(
+            f"external deploy monitor failed: {type(error).__name__}", file=sys.stderr
+        )
         raise SystemExit(1) from None
-    print(f"external agent runs: {merged} merged, {deployed} deployed")
+    print(
+        f"agent CI: {ci_updated} updated; external runs: {merged} merged, {deployed} deployed"
+    )
 
 
 if __name__ == "__main__":

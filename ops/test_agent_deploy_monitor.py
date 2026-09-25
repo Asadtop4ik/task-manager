@@ -4,10 +4,11 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from agent_deploy_monitor import ExternalDeployMonitor, _record
+from agent_deploy_monitor import ExternalDeployMonitor, _ci_record, _record
 
 RUN_ID = "00000000-0000-0000-0000-000000000017"
 SHA = "a" * 40
+NEW_SHA = "b" * 40
 
 
 class FakeResponse:
@@ -37,7 +38,188 @@ def pending(status="pr_ready", *, notified=True):
     }
 
 
+def ci_pending(*, sha=SHA, conclusion="pending"):
+    return {
+        "id": 1,
+        "run_id": RUN_ID,
+        "repo_full_name": "muradjanov-dev/qurbot",
+        "base_branch": "master",
+        "pr_url": "https://github.com/muradjanov-dev/qurbot/pull/8",
+        "status": "pr_opened",
+        "head_sha": sha,
+        "ci_status": conclusion,
+        "ci_verified_sha": None,
+        "ci_url": None,
+    }
+
+
 class ExternalDeployMonitorTests(unittest.TestCase):
+    def test_ci_catalog_rejects_unknown_repository(self):
+        with self.assertRaises(ValueError):
+            _ci_record(ci_pending() | {"repo_full_name": "other/repo"})
+
+    def test_ci_failure_is_reported_for_exact_pr_head(self):
+        posts = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "/ci-pending?" in url:
+                return FakeResponse([ci_pending()])
+            if url.endswith("/pulls/8"):
+                return FakeResponse(
+                    {
+                        "head": {
+                            "sha": SHA,
+                            "ref": "codex/task-28-demo",
+                            "repo": {"full_name": "muradjanov-dev/qurbot"},
+                        }
+                    }
+                )
+            if "/workflows/ci.yml/runs?" in url:
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 123,
+                                "head_sha": SHA,
+                                "head_branch": "codex/task-28-demo",
+                                "event": "pull_request",
+                                "path": ".github/workflows/ci.yml",
+                                "status": "completed",
+                                "conclusion": "failure",
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/ci-result"):
+                posts.append(json.loads(request.data))
+                return FakeResponse({"status": "pr_opened"})
+            raise AssertionError(url)
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback", github_token="github", opener=opener
+        )
+        self.assertEqual(monitor.check_ci_once(), 1)
+        self.assertEqual(
+            posts,
+            [
+                {
+                    "sha": SHA,
+                    "conclusion": "failure",
+                    "github_run_url": "https://github.com/muradjanov-dev/qurbot/actions/runs/123",
+                }
+            ],
+        )
+
+    def test_new_pr_head_waits_for_its_own_ci_not_old_green_run(self):
+        posts = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "/ci-pending?" in url:
+                return FakeResponse(
+                    [
+                        ci_pending(sha=SHA, conclusion="success")
+                        | {
+                            "ci_verified_sha": SHA,
+                            "ci_url": "https://github.com/muradjanov-dev/qurbot/actions/runs/122",
+                            "status": "pr_ready",
+                        }
+                    ]
+                )
+            if url.endswith("/pulls/8"):
+                return FakeResponse(
+                    {
+                        "head": {
+                            "sha": NEW_SHA,
+                            "ref": "codex/task-28-demo",
+                            "repo": {"full_name": "muradjanov-dev/qurbot"},
+                        }
+                    }
+                )
+            if "/workflows/ci.yml/runs?" in url:
+                self.assertIn(f"head_sha={NEW_SHA}", url)
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 122,
+                                "head_sha": SHA,
+                                "head_branch": "codex/task-28-demo",
+                                "event": "pull_request",
+                                "path": ".github/workflows/ci.yml",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/ci-result"):
+                posts.append(json.loads(request.data))
+                return FakeResponse({"status": "pr_opened"})
+            raise AssertionError(url)
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback", github_token="github", opener=opener
+        )
+        self.assertEqual(monitor.check_ci_once(), 1)
+        self.assertEqual(
+            posts, [{"sha": NEW_SHA, "conclusion": "pending", "github_run_url": None}]
+        )
+
+    def test_ci_success_requires_the_named_job(self):
+        for job_conclusion, expected in (
+            ("failure", "failure"),
+            ("success", "success"),
+        ):
+            with self.subTest(job_conclusion=job_conclusion):
+                posts = []
+
+                def opener(request, timeout):
+                    url = request.full_url
+                    if "/ci-pending?" in url:
+                        return FakeResponse([ci_pending()])
+                    if url.endswith("/pulls/8"):
+                        return FakeResponse(
+                            {
+                                "head": {
+                                    "sha": SHA,
+                                    "ref": "codex/task-28-demo",
+                                    "repo": {"full_name": "muradjanov-dev/qurbot"},
+                                }
+                            }
+                        )
+                    if "/workflows/ci.yml/runs?" in url:
+                        return FakeResponse(
+                            {
+                                "workflow_runs": [
+                                    {
+                                        "id": 123,
+                                        "head_sha": SHA,
+                                        "head_branch": "codex/task-28-demo",
+                                        "event": "pull_request",
+                                        "path": ".github/workflows/ci.yml",
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                    }
+                                ]
+                            }
+                        )
+                    if url.endswith("/actions/runs/123/jobs?per_page=100"):
+                        return FakeResponse(
+                            {"jobs": [{"name": "check", "conclusion": job_conclusion}]}
+                        )
+                    if url.endswith("/ci-result"):
+                        posts.append(json.loads(request.data))
+                        return FakeResponse({"status": "pr_ready"})
+                    raise AssertionError(url)
+
+                monitor = ExternalDeployMonitor(
+                    callback_token="callback", github_token="github", opener=opener
+                )
+                self.assertEqual(monitor.check_ci_once(), 1)
+                self.assertEqual(posts[0]["conclusion"], expected)
+
     def test_unknown_repo_or_branch_is_rejected(self):
         for changed in (
             {"repo_full_name": "other/repo"},
@@ -87,7 +269,9 @@ class ExternalDeployMonitorTests(unittest.TestCase):
             url = request.full_url
             if "/external-pending?after_id=0" in url:
                 pages.append(0)
-                return FakeResponse([pending(notified=False) | {"id": index} for index in range(1, 51)])
+                return FakeResponse(
+                    [pending(notified=False) | {"id": index} for index in range(1, 51)]
+                )
             if "/external-pending?after_id=50" in url:
                 pages.append(50)
                 return FakeResponse([pending() | {"id": 51}])
@@ -114,20 +298,28 @@ class ExternalDeployMonitorTests(unittest.TestCase):
                         return FakeResponse([pending("merged")])
                     if "/workflows/deploy.yml/runs?" in request.full_url:
                         return FakeResponse(
-                            {"workflow_runs": [{
-                                "id": 123,
-                                "head_sha": SHA,
-                                "head_branch": "master",
-                                "event": "push",
-                                "status": "completed",
-                                "conclusion": "success",
-                            }]}
+                            {
+                                "workflow_runs": [
+                                    {
+                                        "id": 123,
+                                        "head_sha": SHA,
+                                        "head_branch": "master",
+                                        "event": "push",
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                    }
+                                ]
+                            }
                         )
                     if request.full_url.endswith("/actions/runs/123/jobs?per_page=100"):
-                        return FakeResponse({"jobs": [
-                            {"name": "ci / check", "conclusion": "success"},
-                            {"name": "deploy", "conclusion": "success"},
-                        ]})
+                        return FakeResponse(
+                            {
+                                "jobs": [
+                                    {"name": "ci / check", "conclusion": "success"},
+                                    {"name": "deploy", "conclusion": "success"},
+                                ]
+                            }
+                        )
                     if request.full_url.endswith("/deployed"):
                         self.assertEqual(json.loads(request.data)["sha"], SHA)
                         return FakeResponse({"status": "deployed"})
@@ -137,15 +329,24 @@ class ExternalDeployMonitorTests(unittest.TestCase):
                     self.assertEqual(args[-1], "ketoshop")
                     return SimpleNamespace(
                         returncode=0,
-                        stdout=json.dumps({
-                            "Config": {"Image": f"ghcr.io/muradjanov-dev/ketoshop:{image_sha}"},
-                            "State": {"Running": True, "Health": {"Status": "healthy"}},
-                        }),
+                        stdout=json.dumps(
+                            {
+                                "Config": {
+                                    "Image": f"ghcr.io/muradjanov-dev/ketoshop:{image_sha}"
+                                },
+                                "State": {
+                                    "Running": True,
+                                    "Health": {"Status": "healthy"},
+                                },
+                            }
+                        ),
                     )
 
                 monitor = ExternalDeployMonitor(
-                    callback_token="callback", github_token="github",
-                    opener=opener, command_runner=docker,
+                    callback_token="callback",
+                    github_token="github",
+                    opener=opener,
+                    command_runner=docker,
                 )
                 self.assertEqual(monitor.run_once(), expected)
                 self.assertEqual(
@@ -163,30 +364,47 @@ class ExternalDeployMonitorTests(unittest.TestCase):
             container = args[-1]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps({
-                    "Config": {"Image": images[container]},
-                    "State": {"Running": True, "Health": {"Status": "healthy"}},
-                }),
+                stdout=json.dumps(
+                    {
+                        "Config": {"Image": images[container]},
+                        "State": {"Running": True, "Health": {"Status": "healthy"}},
+                    }
+                ),
             )
 
         monitor = ExternalDeployMonitor(
-            callback_token="callback", github_token="github",
+            callback_token="callback",
+            github_token="github",
             opener=lambda *args, **kwargs: FakeResponse({}),
             command_runner=docker,
         )
         from agent_deploy_monitor import TARGETS
 
-        self.assertFalse(monitor._production_matches(TARGETS["muradjanov-dev/qurbot"], SHA))
+        self.assertFalse(
+            monitor._production_matches(TARGETS["muradjanov-dev/qurbot"], SHA)
+        )
 
     def test_green_deploy_without_required_ci_job_does_not_count(self):
         def opener(request, timeout):
             if "/workflows/deploy.yml/runs?" in request.full_url:
-                return FakeResponse({"workflow_runs": [{
-                    "id": 123, "head_sha": SHA, "head_branch": "master",
-                    "event": "push", "status": "completed", "conclusion": "success",
-                }]})
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 123,
+                                "head_sha": SHA,
+                                "head_branch": "master",
+                                "event": "push",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ]
+                    }
+                )
             if request.full_url.endswith("/actions/runs/123/jobs?per_page=100"):
-                return FakeResponse({"jobs": [{"name": "deploy", "conclusion": "success"}]})
+                return FakeResponse(
+                    {"jobs": [{"name": "deploy", "conclusion": "success"}]}
+                )
             raise AssertionError(request.full_url)
 
         from agent_deploy_monitor import TARGETS

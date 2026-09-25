@@ -57,7 +57,7 @@ async def test_merged_agent_run_notifies_bot_without_claiming_deploy(monkeypatch
     assert client.posts == ["http://api/api/v1/agent-runs/run-1/notified"]
 
 
-def test_result_card_distinguishes_unverified_pr_from_deployed_sha() -> None:
+def test_result_card_announces_only_verified_pr_as_ready() -> None:
     base = {
         "task_id": 18,
         "title": "Katalog yozuvini tuzatish",
@@ -65,8 +65,10 @@ def test_result_card_distinguishes_unverified_pr_from_deployed_sha() -> None:
         "mode": "pr",
         "pr_url": "https://github.com/muradjanov-dev/qurbot/pull/4",
     }
-    ready = worker.agent_result_card(base | {"status": "pr_ready"})
-    assert "CI natijasini PR sahifasida" in ready
+    pending = worker.agent_result_card(base | {"status": "pr_opened", "ci_status": "pending"})
+    assert "PR tayyor" not in pending
+    ready = worker.agent_result_card(base | {"status": "pr_ready", "ci_status": "success"})
+    assert "PR tayyor" in ready and "CI’dan o‘tdi" in ready
     assert "Production’da" not in ready
 
     deployed = worker.agent_result_card(

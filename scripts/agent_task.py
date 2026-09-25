@@ -358,10 +358,10 @@ def check_diff(*, cwd: str | None = None) -> None:
     if result.exists():
         summary = result.read_text(encoding="utf-8").strip()[:3000]
         if summary:
-            with (Path(os.environ["RUNNER_TEMP"]) / "agent-pr-body.md").open(
-                "a", encoding="utf-8"
-            ) as body:
-                body.write(f"\nCodex summary:\n\n{summary}\n")
+            body_path = Path(os.environ["RUNNER_TEMP"]) / "agent-pr-body.md"
+            if "\nCodex summary:\n\n" not in body_path.read_text(encoding="utf-8"):
+                with body_path.open("a", encoding="utf-8") as body:
+                    body.write(f"\nCodex summary:\n\n{summary}\n")
 
 
 def usage() -> dict[str, int]:
@@ -426,7 +426,7 @@ def callback() -> None:
         return
     payload: dict[str, object] = {
         "run_id": task["run_id"],
-        "status": "pr_ready" if success else "failed",
+        "status": "pr_opened" if success else "failed",
         "github_run_url": run_url,
     }
     if success:

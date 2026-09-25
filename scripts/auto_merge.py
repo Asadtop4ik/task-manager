@@ -63,7 +63,7 @@ def agent_run_id(pr: dict) -> str | None:
 
 def agent_ready(pr: dict, run: dict) -> bool:
     return bool(
-        run.get("status") == "pr_ready"
+        run.get("status") in {"pr_opened", "pr_ready"}
         and run.get("pr_url") == pr.get("html_url")
         and run.get("head_sha") == (pr.get("head") or {}).get("sha")
     )

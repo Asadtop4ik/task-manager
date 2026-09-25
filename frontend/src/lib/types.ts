@@ -39,7 +39,10 @@ export type AgentRun = {
   run_id: string;
   task_id: number;
   repo_full_name: string;
-  status: "pending" | "dispatching" | "dispatched" | "running" | "validating" | "publishing" | "deploying" | "pr_ready" | "merged" | "failed" | "deployed" | "cancelled";
+  status: "pending" | "dispatching" | "dispatched" | "running" | "validating" | "publishing" | "deploying" | "pr_opened" | "pr_ready" | "merged" | "failed" | "deployed" | "cancelled";
+  ci_status: "pending" | "success" | "failure" | null;
+  ci_verified_sha: string | null;
+  ci_url: string | null;
   mode: "pr" | "fast";
   github_run_url: string | null;
   pr_url: string | null;
@@ -55,6 +58,7 @@ export type AgentRun = {
   created_at: string;
   finished_at: string | null;
   runner_started_at: string | null;
+  pr_opened_at: string | null;
   pr_ready_at: string | null;
   merged_at: string | null;
   deployed_at: string | null;

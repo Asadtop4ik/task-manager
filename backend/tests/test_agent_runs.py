@@ -1,4 +1,5 @@
 import httpx
+import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -216,6 +217,21 @@ async def test_external_merge_notice_does_not_mark_task_done_before_deploy(
     pending = await client.get("/api/v1/agent-runs/external-pending", headers=headers)
     assert pending.status_code == 200 and pending.json()[0]["run_id"] == run_id
     assert pending.json()[0]["id"] > 0 and pending.json()[0]["notified"] is False
+    db_run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    assert db_run is not None
+    db_run.status = "pr_opened"
+    await session.commit()
+    premature = await client.post(
+        f"/api/v1/agent-runs/{run_id}/deployed",
+        json={
+            "sha": "c" * 40,
+            "github_run_url": "https://github.com/muradjanov-dev/qurbot/actions/runs/123",
+        },
+        headers=headers,
+    )
+    assert premature.status_code == 409
+    db_run.status = "pr_ready"
+    await session.commit()
     merged = await client.post(
         f"/api/v1/agent-runs/{run_id}/merged",
         json={"sha": "c" * 40},
@@ -340,6 +356,13 @@ async def test_pr_callback_requires_token_and_matching_pr(
 
     monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
     monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify)
+
+    async def fake_ci_verify(run, sha: str, conclusion: str, url: str) -> None:
+        assert sha == "a" * 40
+        assert conclusion == "success"
+        assert url.endswith("/actions/runs/99")
+
+    monkeypatch.setattr(agent_runs, "_verify_pr_ci", fake_ci_verify)
     created = await client.post(
         "/api/v1/tasks",
         json={"project_id": project.id, "title": "Fix menu"},
@@ -359,7 +382,7 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert started.status_code == 200 and started.json()["runner_started_at"] is not None
     payload = {
         "run_id": run["run_id"],
-        "status": "pr_ready",
+        "status": "pr_opened",
         "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/17",
         "head_sha": "a" * 40,
         "input_tokens": 6194,
@@ -379,20 +402,38 @@ async def test_pr_callback_requires_token_and_matching_pr(
         url, json=payload, headers={"X-Agent-Callback-Token": "test-callback-token"}
     )
     assert accepted.status_code == 200
-    assert accepted.json()["status"] == "pr_ready"
+    assert accepted.json()["status"] == "pr_opened"
     assert accepted.json()["head_sha"] == "a" * 40
     assert accepted.json()["input_tokens"] == 6194
     assert accepted.json()["cached_input_tokens"] == 4000
     assert accepted.json()["output_tokens"] == 280
-    assert accepted.json()["pr_ready_at"] is not None
+    assert accepted.json()["pr_opened_at"] is not None
+    assert accepted.json()["pr_ready_at"] is None
     assert (
         await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
-    ).json()["status"] == "review"
+    ).json()["status"] == "in_progress"
 
     worker_headers = {"X-Agent-Worker-Token": settings.service_token}
     notices = await client.get("/api/v1/agent-runs/notifications", headers=worker_headers)
     assert notices.status_code == 200
-    assert notices.json()[0]["status"] == "pr_ready"
+    assert notices.json() == []
+    ci = await client.post(
+        f"/api/v1/agent-runs/{run['run_id']}/ci-result",
+        json={
+            "sha": "a" * 40,
+            "conclusion": "success",
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/99",
+        },
+        headers={"X-Agent-Callback-Token": "test-callback-token"},
+    )
+    assert ci.status_code == 200 and ci.json()["status"] == "pr_ready"
+    assert ci.json()["ci_verified_sha"] == "a" * 40
+    assert ci.json()["pr_ready_at"] is not None
+    assert (
+        await client.get(f"/api/v1/tasks/{created.json()['id']}", headers=auth(manager))
+    ).json()["status"] == "review"
+    notices = await client.get("/api/v1/agent-runs/notifications", headers=worker_headers)
+    assert len(notices.json()) == 1 and notices.json()[0]["status"] == "pr_ready"
     acknowledged = await client.post(
         f"/api/v1/agent-runs/{run['run_id']}/notified",
         json={"message_id": 42},
@@ -427,6 +468,246 @@ async def test_pr_callback_requires_token_and_matching_pr(
     assert notices.json()[0]["status"] == "deployed"
     assert notices.json()[0]["telegram_message_id"] == 42
     assert notices.json()[0]["deployed_sha"] == "b" * 40
+
+
+async def test_failed_ci_stays_silent_until_new_head_passes(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    await _ready_project(session, project)
+    _credentials(monkeypatch)
+
+    async def fake_dispatch(run, task) -> int:
+        return 204
+
+    async def fake_verify(run, number: str, sha: str) -> None:
+        assert number == "17"
+        assert sha in {"a" * 40, "b" * 40}
+
+    async def fake_ci_verify(run, sha: str, conclusion: str, url: str) -> None:
+        assert url.endswith("/actions/runs/1") or url.endswith("/actions/runs/2")
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify)
+    monkeypatch.setattr(agent_runs, "_verify_pr_ci", fake_ci_verify)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix menu"},
+        headers=auth(manager),
+    )
+    run = (
+        await client.post(
+            f"/api/v1/agent-runs/tasks/{task.json()['id']}", headers=auth(manager)
+        )
+    ).json()
+    base = f"/api/v1/agent-runs/{run['run_id']}"
+    token = {"X-Agent-Callback-Token": "test-callback-token"}
+    worker = {"X-Agent-Worker-Token": settings.service_token}
+    await client.post(
+        f"{base}/callback", json={"run_id": run["run_id"], "status": "running"}, headers=token
+    )
+    await client.post(
+        f"{base}/callback",
+        json={
+            "run_id": run["run_id"],
+            "status": "pr_opened",
+            "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/17",
+            "head_sha": "a" * 40,
+        },
+        headers=token,
+    )
+    failed = await client.post(
+        f"{base}/ci-result",
+        json={
+            "sha": "a" * 40,
+            "conclusion": "failure",
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/1",
+        },
+        headers=token,
+    )
+    assert failed.status_code == 200 and failed.json()["ci_status"] == "failure"
+    assert failed.json()["status"] == "pr_opened"
+    assert (await client.get("/api/v1/agent-runs/notifications", headers=worker)).json() == []
+    assert (
+        await client.get(f"/api/v1/tasks/{task.json()['id']}", headers=auth(manager))
+    ).json()["status"] == "blocked"
+
+    # A pre-gate rollout may already have sent a PR card; only that card is edited.
+    db_run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run["run_id"]))
+    assert db_run is not None
+    db_run.telegram_message_id = 42
+    await session.commit()
+
+    waiting = await client.post(
+        f"{base}/ci-result",
+        json={
+            "sha": "b" * 40,
+            "conclusion": "pending",
+        },
+        headers=token,
+    )
+    assert waiting.status_code == 200 and waiting.json()["ci_status"] == "pending"
+    pending_notices = (
+        await client.get("/api/v1/agent-runs/notifications", headers=worker)
+    ).json()
+    assert len(pending_notices) == 1 and pending_notices[0]["status"] == "pr_opened"
+    assert pending_notices[0]["telegram_message_id"] == 42
+    await client.post(f"{base}/notified", json={"message_id": 42}, headers=worker)
+    passed = await client.post(
+        f"{base}/ci-result",
+        json={
+            "sha": "b" * 40,
+            "conclusion": "success",
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/2",
+        },
+        headers=token,
+    )
+    assert passed.status_code == 200 and passed.json()["ci_verified_sha"] == "b" * 40
+    assert passed.json()["status"] == "pr_ready"
+    notices = (await client.get("/api/v1/agent-runs/notifications", headers=worker)).json()
+    assert len(notices) == 1 and notices[0]["ci_url"].endswith("/actions/runs/2")
+
+
+async def test_ci_verifier_rejects_wrong_head_even_if_workflow_is_green(monkeypatch) -> None:
+    from app.db.models import AgentRun
+
+    _credentials(monkeypatch)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "head_sha": "b" * 40,
+                "head_branch": "codex/task-1-00000000-0000-0000-0000-000000000001",
+                "event": "pull_request",
+                "path": ".github/workflows/ci.yml",
+                "status": "completed",
+                "conclusion": "success",
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    run = AgentRun(
+        run_id="00000000-0000-0000-0000-000000000001",
+        task_id=1,
+        task_revision="a" * 64,
+        repo_full_name="Asadtop4ik/task-manager",
+        base_branch="main",
+        mode="pr",
+        status="pr_opened",
+    )
+    with pytest.raises(HTTPException, match="PR CI does not match this commit"):
+        await agent_runs._verify_pr_ci(
+            run,
+            "a" * 40,
+            "success",
+            "https://github.com/Asadtop4ik/task-manager/actions/runs/17",
+        )
+
+
+async def test_ci_verifier_requires_the_catalog_job(monkeypatch) -> None:
+    _credentials(monkeypatch)
+    jobs = [{"name": "unrelated", "conclusion": "success"}]
+    run = AgentRun(
+        run_id="00000000-0000-0000-0000-000000000001",
+        task_id=1,
+        task_revision="a" * 64,
+        repo_full_name="Asadtop4ik/task-manager",
+        base_branch="main",
+        mode="pr",
+        status="pr_opened",
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, value):
+            self.value = value
+
+        def json(self):
+            return self.value
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            if url.endswith("/jobs?per_page=100"):
+                return FakeResponse({"jobs": jobs})
+            return FakeResponse(
+                {
+                    "head_sha": "a" * 40,
+                    "head_branch": "codex/task-1-00000000-0000-0000-0000-000000000001",
+                    "event": "pull_request",
+                    "path": ".github/workflows/ci.yml",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            )
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    url = "https://github.com/Asadtop4ik/task-manager/actions/runs/17"
+    with pytest.raises(HTTPException, match="PR CI conclusion does not match"):
+        await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
+    jobs[:] = [{"name": "gate", "conclusion": "success"}]
+    await agent_runs._verify_pr_ci(run, "a" * 40, "success", url)
+
+
+async def test_ready_notice_rechecks_current_pr_head(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    await _ready_project(session, project)
+    task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Review this PR"},
+        headers=auth(manager),
+    )
+    session.add(
+        AgentRun(
+            run_id="00000000-0000-0000-0000-000000000101",
+            task_id=task.json()["id"],
+            task_revision="a" * 64,
+            repo_full_name="Asadtop4ik/task-manager",
+            base_branch="main",
+            mode="pr",
+            status="pr_ready",
+            ci_status="success",
+            ci_verified_sha="a" * 40,
+            head_sha="a" * 40,
+            pr_url="https://github.com/Asadtop4ik/task-manager/pull/17",
+        )
+    )
+    await session.commit()
+
+    async def stale_pr(run, number: str, sha: str) -> None:
+        raise HTTPException(status_code=409, detail="PR head changed")
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", stale_pr)
+    notices = await client.get(
+        "/api/v1/agent-runs/notifications",
+        headers={"X-Agent-Worker-Token": settings.service_token},
+    )
+    assert notices.status_code == 200 and notices.json() == []
 
 
 async def test_dispatch_network_error_can_retry_once(
@@ -589,7 +870,7 @@ async def test_ready_pr_is_closed_before_cancellation(
         f"/api/v1/agent-runs/{run['run_id']}/callback",
         json={
             "run_id": run["run_id"],
-            "status": "pr_ready",
+            "status": "pr_opened",
             "pr_url": pr_url,
             "head_sha": "a" * 40,
         },

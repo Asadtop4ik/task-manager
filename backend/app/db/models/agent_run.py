@@ -43,6 +43,9 @@ class AgentRun(Base, TimestampMixin):
         String(8), default="pr", server_default="pr", nullable=False
     )
     status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
+    ci_status: Mapped[str | None] = mapped_column(String(16))
+    ci_verified_sha: Mapped[str | None] = mapped_column(String(40))
+    ci_url: Mapped[str | None] = mapped_column(Text)
     github_run_url: Mapped[str | None] = mapped_column(Text)
     pr_url: Mapped[str | None] = mapped_column(Text)
     head_sha: Mapped[str | None] = mapped_column(String(40))
@@ -57,6 +60,7 @@ class AgentRun(Base, TimestampMixin):
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     runner_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pr_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pr_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

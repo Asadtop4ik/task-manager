@@ -142,6 +142,10 @@ jobs:
           name: public-agent-patch
           path: ${{ runner.temp }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Validate target and prepare PR metadata
         run: |
           set -euo pipefail
@@ -167,6 +171,13 @@ jobs:
           git cat-file -e "$base_sha^{commit}"
           git switch -c "$AGENT_BRANCH" "$base_sha"
           git apply --index "$RUNNER_TEMP/agent.patch"
+          PYTHONPATH="$RUNNER_TEMP" python3 "$RUNNER_TEMP/public_agent_task.py" check-diff
+
+      - name: Trusted formatter and lint preflight before PR
+        working-directory: target
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/agent_preflight.py"
           PYTHONPATH="$RUNNER_TEMP" python3 "$RUNNER_TEMP/public_agent_task.py" check-diff
 
       - name: Push branch using a token unavailable to Codex
