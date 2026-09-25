@@ -78,7 +78,7 @@ class AgentPrReviewTests(unittest.TestCase):
         self.assertIn("scripts/check.py:17", report)
         self.assertIn("&lt;script&gt;", report)
         self.assertNotIn("<script>", report)
-        self.assertIn("[sensitive evidence omitted]", report)
+        self.assertIn("[sensitive content omitted]", report)
         self.assertNotIn("ghp_", report)
         self.assertIn("Codex review report", log)
         self.assertEqual(
@@ -110,34 +110,58 @@ class AgentPrReviewTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("[sensitive evidence omitted]", report)
+        self.assertIn("[sensitive content omitted]", report)
         self.assertNotIn("PRIVATE_KEY_MATERIAL_7f3a", report)
         self.assertNotIn("PRIVATE_KEY_MATERIAL_7f3a", log)
         unterminated = _safe_feedback_text(
             "-----BEGIN PRIVATE KEY-----\n" + secret_body, 600
         )
-        self.assertIn("[redacted private key]", unterminated)
+        self.assertIn("[sensitive content omitted]", unterminated)
         self.assertNotIn("PRIVATE_KEY_MATERIAL_7f3a", unterminated)
 
-    def test_finalize_redacts_quoted_credentials_through_close_quote_or_eof(self):
+    def test_finalize_omits_sensitive_fields_with_quoted_or_json_credentials(self):
         summary = (
             "password='correct horse battery staple' "
             'api_key="multi word api key" '
-            "secret='unfinished credential value"
+            "secret='unfinished credential value "
+            '{"password": "json credential value"}\n'
+            "-----BEGIN PRIVATE KEY-----\nUNTERMINATED_SUMMARY_KEY"
         )
-        report, log, _, _ = finalize_result({"summary": summary, "findings": []})
+        finding = {
+            "severity": "P1",
+            "title": (
+                'JSON key "password": "title credential value"\n'
+                "second line"
+            ),
+            "evidence": (
+                '{"password": "evidence credential value"}\n'
+                "second line evidence"
+            ),
+            "file": "app/auth.py",
+            "line": 42,
+        }
+        report, log, _, _ = finalize_result(
+            {"summary": summary, "findings": [finding]}
+        )
 
         for secret_tail in (
             "correct horse battery staple",
             "multi word api key",
             "unfinished credential value",
+            "json credential value",
+            "title credential value",
+            "evidence credential value",
+            "UNTERMINATED_SUMMARY_KEY",
         ):
             self.assertNotIn(secret_tail, report)
             self.assertNotIn(secret_tail, log)
-        self.assertIn("password=[redacted]", report)
-        self.assertIn("api_key=[redacted]", report)
-        self.assertIn("secret=[redacted]", report)
-        self.assertEqual(_safe_feedback_text("token=abc trailing text", 100), "token=[redacted] trailing text")
+        self.assertIn("[sensitive content omitted]", report)
+        self.assertIn("app/auth.py:42", report)
+        self.assertIn("Finding 1 [P1]: [sensitive content omitted]", report)
+        self.assertEqual(
+            _safe_feedback_text("token=abc trailing text", 100),
+            "[sensitive content omitted]",
+        )
 
     def test_report_prioritizes_blockers_and_counts_omitted_severities(self):
         findings = [

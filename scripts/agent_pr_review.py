@@ -23,14 +23,10 @@ ALLOWED_SEVERITIES = {"P1", "P2", "P3"}
 VISIBLE_FINDING_LIMIT = 12
 VISIBLE_REPORT_LIMIT = 20_000
 REDACTION_INPUT_LIMIT = 50_000
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)\b([\w-]*(?:token|secret|password|api[_-]?key)[\w-]*\s*[:=]\s*)"
-    r"(?:([\"'])(.*?)(?:\2|\Z)|([^\s,;\"']+))",
-    flags=re.DOTALL,
-)
-_KNOWN_CREDENTIAL = re.compile(
-    r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
-    r"AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
+_SENSITIVE_MARKER = re.compile(
+    r"(?i)(?:password|token|secret|api[_\s-]*key|-----BEGIN [A-Z0-9 ]+-----|"
+    r"gh[pousr]_|github_pat_|AKIA|xox[baprs]-|sk-(?:proj-|live-|test-)?|"
+    r"AIza|ya29\.|Bearer\s+)"
 )
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",
@@ -242,38 +238,11 @@ def _review_decision(findings: list[dict]) -> tuple[str, bool, str]:
 
 
 def _safe_feedback_text(value: str, limit: int) -> str:
-    """Bound reviewer supplied text and remove common credential forms."""
-    # Redact before applying the display limit. In particular, a PEM terminator
-    # may be beyond that limit, and an unmatched BEGIN marker must redact to EOF.
-    text = value[:REDACTION_INPUT_LIMIT]
-    text = re.sub(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
-        "[redacted private key]",
-        text,
-        flags=re.DOTALL,
-    )
-    text = re.sub(r"\bBearer\s+\S+", "Bearer [redacted]", text, flags=re.IGNORECASE)
-    text = _KNOWN_CREDENTIAL.sub(
-        "[redacted credential]",
-        text,
-    )
-    text = _CREDENTIAL_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}[redacted]", text
-    )
-    return text[:limit]
-
-
-def _safe_evidence_text(value: str, limit: int) -> str:
-    """Omit secret-bearing excerpts while keeping the finding's context visible."""
+    """Omit any reviewer field containing a sensitive marker before clipping."""
     bounded = value[:REDACTION_INPUT_LIMIT]
-    if (
-        re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", bounded)
-        or _KNOWN_CREDENTIAL.search(bounded)
-        or re.search(r"\bBearer\s+\S+", bounded, flags=re.IGNORECASE)
-        or _CREDENTIAL_ASSIGNMENT.search(bounded)
-    ):
-        return "[sensitive evidence omitted]"
-    return _safe_feedback_text(value, limit)
+    if _SENSITIVE_MARKER.search(bounded):
+        return "[sensitive content omitted]"
+    return bounded[:limit]
 
 
 def _review_report(
@@ -312,7 +281,7 @@ def _review_report(
                 f"Finding {index} [{finding['severity']}]: "
                 f"{_safe_feedback_text(finding['title'], 180)}",
                 f"Location: {_safe_feedback_text(location, 240) or 'not provided'}",
-                f"Evidence: {_safe_evidence_text(finding['evidence'], 600)}",
+                f"Evidence: {_safe_feedback_text(finding['evidence'], 600)}",
             ]
         )
     if len(findings) > len(visible):
