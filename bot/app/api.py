@@ -20,10 +20,19 @@ log = get_logger(__name__)
 class ApiError(Exception):
     """A request the API refused. `status` is what it said."""
 
-    def __init__(self, status: int, detail: str) -> None:
+    def __init__(
+        self,
+        status: int,
+        detail: str,
+        *,
+        code: str | None = None,
+        current_head_sha: str | None = None,
+    ) -> None:
         super().__init__(f"{status}: {detail}")
         self.status = status
         self.detail = detail
+        self.code = code
+        self.current_head_sha = current_head_sha
 
     @property
     def is_pending_approval(self) -> bool:
@@ -50,11 +59,27 @@ class TaskApi:
 
         if response.status_code >= 400:
             try:
-                detail = str(response.json().get("detail", response.text))
+                payload = response.json()
+                error = payload.get("error")
+                if isinstance(error, dict):
+                    detail = str(error.get("message") or error.get("code") or response.text)
+                    code = str(error.get("code")) if error.get("code") else None
+                    current_head_sha = error.get("current_head_sha")
+                else:
+                    detail = str(payload.get("detail", response.text))
+                    code = None
+                    current_head_sha = None
             except ValueError:
                 detail = response.text
+                code = None
+                current_head_sha = None
             log.info("api_error", method=method, path=path, status=response.status_code)
-            raise ApiError(response.status_code, detail)
+            raise ApiError(
+                response.status_code,
+                detail,
+                code=code,
+                current_head_sha=current_head_sha,
+            )
 
         if response.status_code == 204 or not response.content:
             return None
@@ -110,6 +135,36 @@ class TaskApi:
 
     async def cancel_agent_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("POST", f"/agent-runs/{run_id}/cancel")
+
+    async def agent_run(self, run_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/agent-runs/{run_id}")
+
+    async def merge_agent_run(
+        self, run_id: str, *, expected_head_sha: str, action_id: str
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/agent-runs/{run_id}/merge",
+            json={"expected_head_sha": expected_head_sha, "action_id": action_id},
+        )
+
+    async def request_agent_correction(
+        self,
+        run_id: str,
+        *,
+        instruction: str,
+        expected_head_sha: str,
+        action_id: str,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/agent-runs/{run_id}/corrections",
+            json={
+                "instruction": instruction,
+                "expected_head_sha": expected_head_sha,
+                "action_id": action_id,
+            },
+        )
 
     # --- agent intake ---------------------------------------------------
 

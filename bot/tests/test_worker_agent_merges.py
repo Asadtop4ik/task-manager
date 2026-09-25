@@ -95,8 +95,8 @@ def test_failure_card_keeps_plain_text_diagnostic_reason() -> None:
     )
     assert "agent produced no file changes" in card
     assert "Codex izohi" in card
-    assert "<external source unavailable>" in card
-    assert "Opus <5.5>" in card
+    assert "&lt;external source unavailable&gt;" in card
+    assert "Opus &lt;5.5&gt;" in card
 
 
 async def test_deploy_updates_existing_result_card(monkeypatch) -> None:
@@ -152,3 +152,203 @@ async def test_deploy_updates_existing_result_card(monkeypatch) -> None:
     bot.edit_message_text.assert_awaited_once()
     bot.send_message.assert_not_awaited()
     assert client.acks == [{"message_id": 42}]
+
+
+async def test_owner_release_card_has_controls_and_uses_private_owner_chat(
+    monkeypatch,
+) -> None:
+    notice = {
+        "run_id": "12345678-1234-5678-1234-567812345678",
+        "task_id": 18,
+        "title": "Katalog <yozuv>",
+        "repo_full_name": "muradjanov-dev/qurbot",
+        "status": "pr_ready",
+        "mode": "pr",
+        "chat_id": -1001,
+        "owner_chat_id": 1001,
+        "owner_controls_available": True,
+        "head_sha": "c" * 40,
+        "summary": "Checkout <timeout> fix",
+        "impact": "Retries stay bounded",
+        "ci_evidence": {
+            "state": "success",
+            "verified_sha": "c" * 40,
+            "url": "https://github.com/muradjanov-dev/qurbot/actions/runs/8",
+        },
+        "review": {
+            "state": "clean",
+            "reviewed_head_sha": "c" * 40,
+            "findings": [],
+        },
+        "actions": {
+            "merge": {"available": True},
+            "correction": {"available": True},
+        },
+        "pr_url": "https://github.com/muradjanov-dev/qurbot/pull/8",
+        "telegram_message_id": None,
+    }
+
+    class Client:
+        def __init__(self):
+            self.acks = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            response = MagicMock()
+            response.json.return_value = [notice]
+            return response
+
+        async def post(self, url, **kwargs):
+            self.acks.append(kwargs["json"])
+            return MagicMock()
+
+    client = Client()
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=43))
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(worker, "Bot", lambda **kwargs: bot)
+    monkeypatch.setattr(
+        worker,
+        "settings",
+        SimpleNamespace(
+            service_token="test", api_base_url="http://api", bot_token="123456:TEST"
+        ),
+    )
+
+    await worker.notify_agent_runs({})
+
+    args = bot.send_message.await_args
+    assert args.args[0] == 1001
+    assert "&lt;timeout&gt;" in args.args[1]
+    assert args.kwargs["reply_markup"] is not None
+    assert client.acks == [{"message_id": 43}]
+
+
+async def test_owner_deploy_notice_edits_same_private_card_and_removes_controls(
+    monkeypatch,
+) -> None:
+    notice = {
+        "run_id": "run-3",
+        "task_id": 18,
+        "title": "Katalog yozuvini tuzatish",
+        "repo_full_name": "muradjanov-dev/qurbot",
+        "status": "deployed",
+        "mode": "pr",
+        "chat_id": -1001,
+        "owner_chat_id": 1001,
+        "owner_controls_available": False,
+        "head_sha": "d" * 40,
+        "summary": "Updated checkout timeout",
+        "impact": "Retry impact",
+        "ci_evidence": {"state": "success", "verified_sha": "d" * 40},
+        "review": {"state": "clean", "findings": []},
+        "telegram_message_id": 42,
+    }
+
+    class Client:
+        def __init__(self):
+            self.acks = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            response = MagicMock()
+            response.json.return_value = [notice]
+            return response
+
+        async def post(self, url, **kwargs):
+            self.acks.append(kwargs["json"])
+            return MagicMock()
+
+    client = Client()
+    bot = MagicMock()
+    bot.edit_message_text = AsyncMock()
+    bot.send_message = AsyncMock()
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(worker, "Bot", lambda **kwargs: bot)
+    monkeypatch.setattr(
+        worker,
+        "settings",
+        SimpleNamespace(
+            service_token="test", api_base_url="http://api", bot_token="123456:TEST"
+        ),
+    )
+
+    await worker.notify_agent_runs({})
+
+    bot.edit_message_text.assert_awaited_once()
+    assert bot.edit_message_text.await_args.kwargs["chat_id"] == 1001
+    assert bot.edit_message_text.await_args.kwargs["reply_markup"] is None
+    bot.send_message.assert_not_awaited()
+    assert client.acks == [{"message_id": 42}]
+
+
+async def test_owner_failure_notice_edits_existing_card_with_escaped_reason(
+    monkeypatch,
+) -> None:
+    notice = {
+        "run_id": "run-failed",
+        "task_id": 19,
+        "title": "Review check",
+        "repo_full_name": "Asadtop4ik/task-manager",
+        "status": "failed",
+        "chat_id": -1001,
+        "owner_chat_id": 1001,
+        "owner_controls_available": False,
+        "head_sha": "e" * 40,
+        "summary": "Review could not complete",
+        "impact": "No merge was made",
+        "review": {"state": "failed", "findings": []},
+        "ci_evidence": {"state": "success"},
+        "error": "<review unavailable> & retry later",
+        "telegram_message_id": 45,
+    }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            response = MagicMock()
+            response.json.return_value = [notice]
+            return response
+
+        async def post(self, url, **kwargs):
+            return MagicMock()
+
+    bot = MagicMock()
+    bot.edit_message_text = AsyncMock()
+    bot.send_message = AsyncMock()
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(worker, "Bot", lambda **kwargs: bot)
+    monkeypatch.setattr(
+        worker,
+        "settings",
+        SimpleNamespace(
+            service_token="test", api_base_url="http://api", bot_token="123456:TEST"
+        ),
+    )
+
+    await worker.notify_agent_runs({})
+
+    bot.edit_message_text.assert_awaited_once()
+    args = bot.edit_message_text.await_args
+    assert args.kwargs["chat_id"] == 1001
+    assert "&lt;review unavailable&gt; &amp; retry later" in args.args[0]
+    assert args.kwargs["reply_markup"] is None
+    bot.send_message.assert_not_awaited()
