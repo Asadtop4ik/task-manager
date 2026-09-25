@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,22 @@ from agent_task import (
 
 
 class UsageTests(unittest.TestCase):
+    def test_private_validator_records_no_change_failure_for_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("agent_task.py")), "check-diff"],
+                cwd=repo,
+                env=os.environ | {"RUNNER_TEMP": temp},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("agent produced no file changes", (Path(temp) / "agent-failure.txt").read_text())
+
     def test_reference_image_cannot_be_committed_even_if_renamed(self) -> None:
         task = {
             "task_id": 7,

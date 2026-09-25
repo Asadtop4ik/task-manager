@@ -476,5 +476,9 @@ if __name__ == "__main__":
         urllib.error.URLError,
         subprocess.CalledProcessError,
     ) as exc:
+        if len(sys.argv) > 1 and sys.argv[1] == "check-diff" and os.environ.get("RUNNER_TEMP"):
+            (Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt").write_text(
+                f"agent task failed: {exc}", encoding="utf-8"
+            )
         print(f"agent task failed: {exc}", file=sys.stderr)
         sys.exit(1)

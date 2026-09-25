@@ -81,7 +81,7 @@ def test_result_card_distinguishes_unverified_pr_from_deployed_sha() -> None:
     assert "a" * 12 in deployed
 
 
-def test_failure_card_keeps_diagnostic_reason_and_escapes_agent_prose() -> None:
+def test_failure_card_keeps_plain_text_diagnostic_reason() -> None:
     card = worker.agent_result_card(
         {
             "task_id": 27,
@@ -93,8 +93,8 @@ def test_failure_card_keeps_diagnostic_reason_and_escapes_agent_prose() -> None:
     )
     assert "agent produced no file changes" in card
     assert "Codex izohi" in card
-    assert "&lt;external source unavailable&gt;" in card
-    assert "Opus &lt;5.5&gt;" in card
+    assert "<external source unavailable>" in card
+    assert "Opus <5.5>" in card
 
 
 async def test_deploy_updates_existing_result_card(monkeypatch) -> None:
