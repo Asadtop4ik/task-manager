@@ -311,6 +311,8 @@ def _run_codex_child(
         "read-only",
         "--model",
         "gpt-6-sol",
+        "-c",
+        "model_reasoning_effort=medium",
         "--ephemeral",
         "--ignore-user-config",
         "--json",

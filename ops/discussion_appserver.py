@@ -123,7 +123,7 @@ def run_turn(
             "cwd": str(snapshot),
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly"},
-            "model": "gpt-6-sol", "effort": "low", "summary": "concise",
+            "model": "gpt-6-sol", "effort": "medium", "summary": "concise",
         })
         response(3)
         answer = ""

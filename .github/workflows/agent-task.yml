@@ -75,6 +75,7 @@ jobs:
             [[ -z "$image_path" ]] || IMAGE_ARGS+=(--image "$image_path")
           done < "$RUNNER_TEMP/agent-image-paths.txt"
           codex exec --sandbox workspace-write -c approval_policy=never \
+            -c model_reasoning_effort=medium \
             --model gpt-6-sol --ephemeral --json "${IMAGE_ARGS[@]}" \
             --output-last-message "$RUNNER_TEMP/agent-result.txt" \
             - < "$RUNNER_TEMP/agent-prompt.txt" \
