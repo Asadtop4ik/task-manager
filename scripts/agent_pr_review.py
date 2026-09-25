@@ -22,7 +22,6 @@ RUN_ID_PATTERN = re.compile(r"codex/task-[1-9][0-9]*-([0-9a-f-]{36})$")
 ALLOWED_SEVERITIES = {"P1", "P2", "P3"}
 VISIBLE_FINDING_LIMIT = 12
 VISIBLE_REPORT_LIMIT = 20_000
-REDACTION_INPUT_LIMIT = 50_000
 _SENSITIVE_MARKER = re.compile(
     r"(?i)(?:password|token|secret|api[_\s-]*key|private[_\s-]*key|"
     r"client[_\s-]*secret|access[_\s-]*key|authorization|cookie|session|"
@@ -30,13 +29,6 @@ _SENSITIVE_MARKER = re.compile(
     r"sk-(?:proj-|live-|test-)?|AIza|ya29\.|Bearer\s+|"
     r"Basic\s+[A-Za-z0-9+/=_-]{8,}|"
     r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=]))"
-)
-_SENSITIVE_LOCATION = re.compile(
-    r"(?i)(?:-----BEGIN [A-Z0-9 ]+-----|gh[pousr]_|github_pat_|AKIA|"
-    r"xox[baprs]-|sk-(?:proj-|live-|test-)?|AIza|ya29\.|Bearer\s+|"
-    r"Basic\s+[A-Za-z0-9+/=_-]{8,}|"
-    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"
-    r")"
 )
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",
@@ -232,7 +224,11 @@ def _parse_result(path: Path) -> tuple[str, list[dict]]:
         }
         if isinstance(finding.get("file"), str):
             row["file"] = finding["file"][:500]
-        if isinstance(finding.get("line"), int) and finding["line"] > 0:
+        if (
+            isinstance(finding.get("line"), int)
+            and not isinstance(finding["line"], bool)
+            and finding["line"] > 0
+        ):
             row["line"] = finding["line"]
         normalized.append(row)
     return result["summary"][:2000], normalized
@@ -247,38 +243,44 @@ def _review_decision(findings: list[dict]) -> tuple[str, bool, str]:
     return "clean", True, "Independent Codex review clean"
 
 
-def _safe_feedback_text(value: str, limit: int) -> str:
-    """Omit any reviewer field containing a sensitive marker before clipping."""
-    bounded = value[:REDACTION_INPUT_LIMIT]
-    if _SENSITIVE_MARKER.search(bounded):
-        return "[sensitive content omitted]"
-    return bounded[:limit]
-
-
-def _safe_location_text(value: str, limit: int) -> str:
-    """Keep ordinary paths actionable while suppressing credential-shaped paths."""
-    bounded = value[:REDACTION_INPUT_LIMIT]
-    if _SENSITIVE_LOCATION.search(bounded):
-        return "[sensitive location omitted]"
-    return bounded[:limit]
+def _safe_finding_location(finding: dict, trusted_files: set[str]) -> str:
+    """Allow only an ordinary relative path and a positive line number."""
+    path = finding.get("file")
+    line = finding.get("line")
+    if (
+        not isinstance(path, str)
+        or path not in trusted_files
+        or not re.fullmatch(r"[A-Za-z0-9._/-]+", path)
+        or path.startswith("/")
+        or ".." in path
+        or any(part in {"", "."} for part in path.split("/"))
+        or _SENSITIVE_MARKER.search(path)
+        or not isinstance(line, int)
+        or isinstance(line, bool)
+        or line <= 0
+    ):
+        return "[location omitted]"
+    return f"{path}:{line}"
 
 
 def _review_report(
     repo: str,
     number: int,
     sha: str,
-    summary: str,
     findings: list[dict],
     review_state: str,
     is_ready: bool,
+    trusted_files: set[str],
 ) -> str:
-    """Render bounded reviewer feedback for the Actions summary and log."""
+    """Render bounded review metadata without exposing model-generated prose."""
+    counts = Counter(finding["severity"] for finding in findings)
     result = [
         f"Repository: {repo}",
         f"Pull request: #{number}",
         f"Reviewed SHA: {sha}",
         f"Decision: {review_state} ({'ready' if is_ready else 'blocked'})",
-        f"Summary: {_safe_feedback_text(summary, 600)}",
+        "Finding counts: "
+        + ", ".join(f"{severity}={counts[severity]}" for severity in ("P1", "P2", "P3")),
     ]
     severity_order = {"P1": 0, "P2": 1, "P3": 2}
     ordered = sorted(findings, key=lambda item: severity_order[item["severity"]])
@@ -286,24 +288,15 @@ def _review_report(
     if not visible:
         result.append("Findings: none")
     for index, finding in enumerate(visible, 1):
-        location = finding.get("file", "")
-        if finding.get("line"):
-            location = (
-                f"{location}:{finding['line']}"
-                if location
-                else f"line {finding['line']}"
-            )
         result.extend(
             [
                 "",
                 f"Finding {index} [{finding['severity']}]: "
-                f"{_safe_feedback_text(finding['title'], 180)}",
-                f"Location: {_safe_location_text(location, 240) or 'not provided'}",
-                f"Evidence: {_safe_feedback_text(finding['evidence'], 600)}",
+                f"{_safe_finding_location(finding, trusted_files)}",
             ]
         )
     if len(findings) > len(visible):
-        omitted_counts = Counter(item["severity"] for item in findings)
+        omitted_counts = counts.copy()
         omitted_counts.subtract(item["severity"] for item in visible)
         omitted_summary = ", ".join(
             f"{severity}: {omitted_counts[severity]}"
@@ -318,7 +311,7 @@ def _review_report(
             ]
         )
     plain_text = "\n".join(result)[:VISIBLE_REPORT_LIMIT]
-    # A preformatted HTML block keeps reviewer text inert in GitHub's Markdown
+    # A preformatted HTML block keeps metadata inert in GitHub's Markdown
     # renderer. JSON encoding below keeps it to one safe workflow log line.
     return f"<h2>Codex review</h2>\n<pre>{html.escape(plain_text, quote=False)}</pre>"
 
@@ -370,11 +363,26 @@ def finalize() -> None:
     pr = _github(f"repos/{repo}/pulls/{number}", token=os.environ["GH_TOKEN"])
     if not isinstance(pr, dict) or not _current_pr(pr, repo, sha):
         raise ValueError("pull request head changed during review")
+    files = _github(
+        f"repos/{repo}/pulls/{number}/files?per_page=100",
+        token=os.environ["GH_TOKEN"],
+    )
+    if not isinstance(files, list):
+        raise TypeError("pull request file list is unavailable")
+    trusted_files = {
+        item["filename"]
+        for item in files
+        if isinstance(item, dict) and isinstance(item.get("filename"), str)
+    }
+    pr = _github(f"repos/{repo}/pulls/{number}", token=os.environ["GH_TOKEN"])
+    if not isinstance(pr, dict) or not _current_pr(pr, repo, sha):
+        raise ValueError("pull request head changed during review")
     run_id = target["run_id"]
     review_state, is_ready, review_description = _review_decision(findings)
     report = _review_report(
-        repo, number, sha, summary, findings, review_state, is_ready
+        repo, number, sha, findings, review_state, is_ready, trusted_files
     )
+    _publish_review_report(report)
     if run_id:
         run = _task_api("GET", f"{run_id}/status")
         if (
@@ -407,7 +415,6 @@ def finalize() -> None:
         "success" if is_ready else "failure",
         review_description,
     )
-    _publish_review_report(report)
     if repo != os.environ["GITHUB_REPOSITORY"]:
         return  # External approved repos never use Task Manager's narrow auto-merge.
     # This event retries the narrow docs/CSS auto-merge after the review status
