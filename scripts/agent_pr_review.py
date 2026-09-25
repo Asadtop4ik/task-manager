@@ -24,9 +24,19 @@ VISIBLE_FINDING_LIMIT = 12
 VISIBLE_REPORT_LIMIT = 20_000
 REDACTION_INPUT_LIMIT = 50_000
 _SENSITIVE_MARKER = re.compile(
-    r"(?i)(?:password|token|secret|api[_\s-]*key|-----BEGIN [A-Z0-9 ]+-----|"
-    r"gh[pousr]_|github_pat_|AKIA|xox[baprs]-|sk-(?:proj-|live-|test-)?|"
-    r"AIza|ya29\.|Bearer\s+)"
+    r"(?i)(?:password|token|secret|api[_\s-]*key|private[_\s-]*key|"
+    r"client[_\s-]*secret|access[_\s-]*key|authorization|cookie|session|"
+    r"-----BEGIN [A-Z0-9 ]+-----|gh[pousr]_|github_pat_|AKIA|xox[baprs]-|"
+    r"sk-(?:proj-|live-|test-)?|AIza|ya29\.|Bearer\s+|"
+    r"Basic\s+[A-Za-z0-9+/=_-]{8,}|"
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=]))"
+)
+_SENSITIVE_LOCATION = re.compile(
+    r"(?i)(?:-----BEGIN [A-Z0-9 ]+-----|gh[pousr]_|github_pat_|AKIA|"
+    r"xox[baprs]-|sk-(?:proj-|live-|test-)?|AIza|ya29\.|Bearer\s+|"
+    r"Basic\s+[A-Za-z0-9+/=_-]{8,}|"
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"
+    r")"
 )
 APPROVED_REPOSITORIES = {
     "Asadtop4ik/task-manager": "main",
@@ -245,6 +255,14 @@ def _safe_feedback_text(value: str, limit: int) -> str:
     return bounded[:limit]
 
 
+def _safe_location_text(value: str, limit: int) -> str:
+    """Keep ordinary paths actionable while suppressing credential-shaped paths."""
+    bounded = value[:REDACTION_INPUT_LIMIT]
+    if _SENSITIVE_LOCATION.search(bounded):
+        return "[sensitive location omitted]"
+    return bounded[:limit]
+
+
 def _review_report(
     repo: str,
     number: int,
@@ -280,7 +298,7 @@ def _review_report(
                 "",
                 f"Finding {index} [{finding['severity']}]: "
                 f"{_safe_feedback_text(finding['title'], 180)}",
-                f"Location: {_safe_feedback_text(location, 240) or 'not provided'}",
+                f"Location: {_safe_location_text(location, 240) or 'not provided'}",
                 f"Evidence: {_safe_feedback_text(finding['evidence'], 600)}",
             ]
         )

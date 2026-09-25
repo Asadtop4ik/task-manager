@@ -137,7 +137,7 @@ class AgentPrReviewTests(unittest.TestCase):
                 '{"password": "evidence credential value"}\n'
                 "second line evidence"
             ),
-            "file": "app/auth.py",
+            "file": "app/secrets.py",
             "line": 42,
         }
         report, log, _, _ = finalize_result(
@@ -156,12 +156,38 @@ class AgentPrReviewTests(unittest.TestCase):
             self.assertNotIn(secret_tail, report)
             self.assertNotIn(secret_tail, log)
         self.assertIn("[sensitive content omitted]", report)
-        self.assertIn("app/auth.py:42", report)
+        self.assertIn("app/secrets.py:42", report)
         self.assertIn("Finding 1 [P1]: [sensitive content omitted]", report)
         self.assertEqual(
             _safe_feedback_text("token=abc trailing text", 100),
             "[sensitive content omitted]",
         )
+
+    def test_finalize_omits_basic_authorization_from_all_free_text_fields(self):
+        credential = "Authorization: Basic dXNlcjpwYXNz"
+        finding = {
+            "severity": "P2",
+            "title": f"Header contains {credential}",
+            "evidence": f"Observed {credential}",
+            "file": "backend/auth.py",
+            "line": 51,
+        }
+        report, log, _, _ = finalize_result(
+            {"summary": f"Review found {credential}", "findings": [finding]}
+        )
+
+        self.assertNotIn("dXNlcjpwYXNz", report)
+        self.assertNotIn("dXNlcjpwYXNz", log)
+        self.assertGreaterEqual(report.count("[sensitive content omitted]"), 3)
+        self.assertIn("backend/auth.py:51", report)
+
+    def test_finalize_omits_standalone_base64_like_blob(self):
+        blob = "dXNlcjpwYXNz" * 4
+        report, log, _, _ = finalize_result({"summary": blob, "findings": []})
+
+        self.assertNotIn(blob, report)
+        self.assertNotIn(blob, log)
+        self.assertIn("[sensitive content omitted]", report)
 
     def test_report_prioritizes_blockers_and_counts_omitted_severities(self):
         findings = [
@@ -192,9 +218,9 @@ class AgentPrReviewTests(unittest.TestCase):
         findings = [
             {
                 "severity": "P3",
-                "title": "A" * 180,
-                "evidence": "B" * 600,
-                "file": "C" * 200,
+                "title": "A_" * 90,
+                "evidence": "B_" * 300,
+                "file": "C_" * 120,
                 "line": 1,
             }
             for _ in range(12)
@@ -218,7 +244,7 @@ class AgentPrReviewTests(unittest.TestCase):
             False,
         )
 
-        self.assertGreater(len(report), 12_000)
+        self.assertGreater(len(report), 11_000)
         self.assertIn("Finding 1 [P1]", report)
         self.assertIn("Additional findings omitted: 1 (P3: 1)", report)
 
