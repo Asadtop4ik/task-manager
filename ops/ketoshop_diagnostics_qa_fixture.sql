@@ -15,18 +15,53 @@ CREATE TABLE public.orders (
     items text,
     total double precision NOT NULL,
     status text NOT NULL,
-    created_at timestamptz NOT NULL,
+    created_at timestamp NOT NULL,
     source text
 );
 
-INSERT INTO public.orders (id, customer_name, phone, address, items, total, status, created_at, source)
+CREATE TABLE public.products (
+    id integer PRIMARY KEY,
+    cost_price numeric(18, 2)
+);
+INSERT INTO public.products (id, cost_price) VALUES (1, 25000.00), (2, NULL);
+
+CREATE TABLE public.expenses (
+    id integer PRIMARY KEY,
+    name text NOT NULL,
+    amount double precision NOT NULL,
+    created_at timestamp NOT NULL
+);
+
+INSERT INTO public.orders (
+    id, customer_name, phone, address, items, total, status, created_at, source
+)
+SELECT
+    71000 + n,
+    'Synthetic Customer ' || n,
+    '+998900000000',
+    'Synthetic Test Address ' || n,
+    CASE
+        WHEN n = 205 THEN '{broken synthetic JSON'
+        ELSE json_build_array(json_build_object(
+            'product_id', CASE WHEN n % 17 = 0 THEN 2 ELSE 1 END,
+            'name', 'Synthetic Keto Product',
+            'quantity', 1.25,
+            'price', 45000,
+            'unit', 'pcs'
+        ))::text
+    END,
+    56250,
+    CASE WHEN n % 10 = 0 THEN 'pending' ELSE 'delivered' END,
+    (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - ((n % 7) * INTERVAL '1 day'),
+    CASE WHEN n % 2 = 0 THEN 'bot' ELSE 'b2b' END
+FROM generate_series(1, 205) AS n;
+
+INSERT INTO public.expenses (id, name, amount, created_at)
 VALUES
-    (71001, 'Synthetic Customer One', '+998901234567', 'Synthetic Street 1',
-     '[{"name":"Synthetic Keto Bread","quantity":2,"price":45000,"unit":"pcs"}]',
-     90000, 'delivered', '2026-09-01T10:00:00Z', 'bot'),
-    (71002, 'Synthetic Customer Two', '+998909876543', 'Synthetic Street 2',
-     '[{"name":"Synthetic Almond Flour","quantity":1.5,"price":80000,"unit":"kg"}]',
-     120000, 'pending', '2026-09-02T11:30:00Z', 'bot');
+    (1, 'Synthetic delivery supplies', 12000,
+     (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - INTERVAL '1 day'),
+    (2, 'Synthetic packing materials', 8000,
+     (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - INTERVAL '2 days');
 
 DO $role$
 BEGIN

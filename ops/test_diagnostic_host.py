@@ -1,10 +1,13 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from diagnostic_host import AuditLog, DiagnosticHost
 
@@ -45,7 +48,7 @@ class DiagnosticHostTests(unittest.TestCase):
                 api_base_url="https://api.test/api/v1",
                 audit=audit,
             )
-            context = Mock(return_value=(3, "ketoshop"))
+            context = Mock(return_value=(3, 41, 9, "ketoshop"))
             host._context = context
             host._orders = Mock(
                 return_value=(
@@ -56,6 +59,7 @@ class DiagnosticHostTests(unittest.TestCase):
             )
             request = {
                 "discussion_id": 99,
+                "lease_id": "private-lease-capability",
                 "tool": "ketoshop_query",
                 "query": "SELECT order_id FROM ketoshop_diag_orders",
             }
@@ -77,6 +81,9 @@ class DiagnosticHostTests(unittest.TestCase):
                         "time",
                         "discussion_id",
                         "revision",
+                        "actor_id",
+                        "project_id",
+                        "project_key",
                         "tool",
                         "query_sha256",
                         "rows",
@@ -92,11 +99,88 @@ class DiagnosticHostTests(unittest.TestCase):
             self.assertNotIn("private-db-secret", audit_text)
             self.assertNotIn("private-worker-token", audit_text)
             self.assertNotIn("Synthetic Customer", audit_text)
+            self.assertNotIn("private-lease-capability", audit_text)
+
+    def test_wrong_discussion_capability_is_denied_before_any_tool_runs(self):
+        class Response:
+            def __init__(self, payload):
+                self.payload = json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                return self.payload
+
+        def opener(request, timeout):
+            lease = request.get_header("X-intake-lease-id")
+            discussion_id = int(request.full_url.split("/")[-2])
+            authorized = discussion_id == 99 and lease == "active-owner-lease"
+            return Response(
+                {
+                    "authorized": authorized,
+                    "active": authorized,
+                    "project_key": "ketoshop" if authorized else "other",
+                    "revision": 4 if authorized else 0,
+                    "actor_id": 41 if authorized else 0,
+                    "project_id": 9 if authorized else 8,
+                }
+            )
+
+        host = DiagnosticHost(
+            intake_token="worker-secret",
+            database_url="postgresql://private-db",
+            api_base_url="https://api.test/api/v1",
+            opener=opener,
+            audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
+        )
+        host._orders = Mock(return_value=({"rows": []}, "a" * 64, 0))
+        request = {
+            "discussion_id": 99,
+            "lease_id": "guessed-capability",
+            "tool": "ketoshop_query",
+            "query": "SELECT order_id FROM ketoshop_diag_orders",
+        }
+        denied = host.handle(request)
+        self.assertFalse(denied["ok"])
+        host._orders.assert_not_called()
+
+        request["discussion_id"] = 98
+        request["lease_id"] = "active-owner-lease"
+        cross_discussion = host.handle(request)
+        self.assertFalse(cross_discussion["ok"])
+        host._orders.assert_not_called()
+
+        request["discussion_id"] = 99
+        request["lease_id"] = "active-owner-lease"
+        allowed = host.handle(request)
+        self.assertTrue(allowed["ok"])
+        host._orders.assert_called_once()
+
+    def test_order_rows_mark_truncated_only_when_lookahead_found_more(self):
+        host = DiagnosticHost(
+            intake_token="worker-secret",
+            database_url="postgresql://db-secret",
+        )
+        rows = [{"order_id": index} for index in range(200)]
+        host._select = Mock(return_value=(rows, "hash", False))
+        exact, _digest, _count = host._orders("SELECT * FROM ketoshop_diag_orders")
+        self.assertFalse(exact["truncated"])
+        host._select.return_value = (rows, "hash", True)
+        more, _digest, _count = host._orders("SELECT * FROM ketoshop_diag_orders")
+        self.assertTrue(more["truncated"])
 
     def test_recent_logs_use_fixed_container_and_redact_before_return(self):
         runner = Mock(
             return_value=SimpleNamespace(
-                stdout=b"phone=+998901234567 user@example.com Bearer secret-token\n",
+                stdout=(
+                    b'{"time":"2026-09-25T09:00:00Z","level":"error",'
+                    b'"event":"db_timeout","message":"Name Jane Doe address Unit 9"}\n'
+                    b"plain text address Unit 4, House 9\n"
+                ),
                 returncode=0,
             )
         )
@@ -108,13 +192,105 @@ class DiagnosticHostTests(unittest.TestCase):
         )
         result, _digest, count = host._logs()
         self.assertEqual(count, 1)
-        self.assertNotIn("+998901234567", result["lines"][0])
-        self.assertNotIn("user@example.com", result["lines"][0])
-        self.assertNotIn("secret-token", result["lines"][0])
+        entry = result["entries"][0]
+        self.assertEqual(entry["event"], "db_timeout")
+        self.assertNotIn("message", entry)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(runner.call_args.kwargs["stderr"], subprocess.STDOUT)
         self.assertEqual(
             runner.call_args.args[0],
             ["/usr/bin/docker", "logs", "--since", "24h", "--tail", "500", "ketoshop"],
         )
+
+    def test_logs_return_bounded_recent_metadata_and_cli_errors_fail_closed(self):
+        body = b"".join(
+            (
+                b'{"time":"2026-09-25T09:00:00Z","level":"error",'
+                b'"event":"database_timeout","message":"private full text"}'
+                b"\n"
+            )
+            for _ in range(500)
+        )
+        runner = Mock(return_value=SimpleNamespace(stdout=body, returncode=0))
+        host = DiagnosticHost(
+            intake_token="worker-secret",
+            database_url="postgresql://db-secret",
+            command_runner=runner,
+            audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
+        )
+        result, _digest, count = host._logs()
+        encoded = json.dumps(result, separators=(",", ":")).encode()
+        self.assertLessEqual(len(encoded), 24 * 1024)
+        self.assertLess(count, 500)
+        self.assertTrue(result["truncated"])
+        self.assertNotIn("private full text", encoded.decode())
+
+        runner.return_value.returncode = 1
+        from diagnostic_host import DiagnosticsError
+
+        with self.assertRaisesRegex(DiagnosticsError, "logs are unavailable"):
+            host._logs()
+
+    def test_finance_summary_aggregates_over_200_orders_with_numeric_money(self):
+        executed = []
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, query, params=None):
+                executed.append((query, params))
+
+            def fetchmany(self, limit):
+                return [
+                    {
+                        "bucket": "2026-09-25",
+                        "order_count": 205,
+                        "revenue": Decimal("10250.00"),
+                        "current_catalog_cost": Decimal("5125.00"),
+                        "missing_cost_items": 7,
+                        "expenses": Decimal("250.00"),
+                        "status_breakdown": {"delivered": {"order_count": 205}},
+                        "source_breakdown": {"bot": {"order_count": 205}},
+                        "cost_basis": "current_catalog",
+                        "historical_cost_data_available": False,
+                    }
+                ][:limit]
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return Cursor()
+
+        fake_psycopg = ModuleType("psycopg")
+        fake_psycopg.Error = RuntimeError
+        fake_psycopg.connect = Mock(return_value=Connection())
+        fake_rows = ModuleType("psycopg.rows")
+        fake_rows.dict_row = object()
+        with patch.dict(
+            sys.modules, {"psycopg": fake_psycopg, "psycopg.rows": fake_rows}
+        ):
+            host = DiagnosticHost(
+                intake_token="worker-secret",
+                database_url="postgresql://db-secret",
+                audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
+            )
+            result, digest, rows = host._finance_summary({"period": "day", "count": 1})
+        self.assertEqual(rows, 1)
+        self.assertEqual(result["buckets"][0]["order_count"], 205)
+        self.assertEqual(result["buckets"][0]["revenue"], "10250.00")
+        self.assertFalse(result["historical_cost_data_available"])
+        self.assertEqual(result["cost_basis"], "current_catalog")
+        self.assertTrue(digest)
+        self.assertTrue(any("SUM(o.revenue)" in query for query, _ in executed))
 
 
 if __name__ == "__main__":

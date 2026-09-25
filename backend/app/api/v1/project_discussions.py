@@ -256,14 +256,18 @@ async def diagnostic_context(
     discussion_id: int,
     session: DbSession,
     x_intake_worker_token: Annotated[str | None, Header()] = None,
+    x_intake_lease_id: Annotated[str | None, Header()] = None,
 ) -> dict[str, bool | str | int]:
-    """Re-check owner, project and active lease before host diagnostics run."""
+    """Re-check owner, project and unguessable active lease before diagnostics."""
     _worker_auth(x_intake_worker_token)
     row = await session.get(ProjectDiscussion, discussion_id)
     if (
         row is None
         or row.status != "running"
         or not row.lease_id
+        or not x_intake_lease_id
+        or not x_intake_lease_id.isascii()
+        or not hmac.compare_digest(row.lease_id, x_intake_lease_id)
         or row.lease_until is None
         or row.lease_until <= _now()
     ):
@@ -284,6 +288,8 @@ async def diagnostic_context(
     return {
         "authorized": True,
         "project_key": "ketoshop",
+        "project_id": project.id,
+        "actor_id": actor.id,
         "active": True,
         "revision": row.revision,
     }

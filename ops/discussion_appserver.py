@@ -24,13 +24,19 @@ DIAGNOSTIC_PROXY = "/opt/task-manager/ops/diagnostic_proxy.py"
 DIAGNOSTIC_SOCKET = "/run/task-manager-diagnostics/diagnostics.sock"
 
 
-def _app_server_command(diagnostics_discussion_id: int | None) -> list[str]:
+def _app_server_command(
+    diagnostics_discussion_id: int | None, diagnostics_lease_id: str | None
+) -> list[str]:
     command = [CODEX_BINARY, "app-server", "--stdio"]
     if diagnostics_discussion_id is not None:
+        if not diagnostics_lease_id:
+            raise DiscussionError("diagnostic lease capability is required")
         proxy_args = json.dumps([
             DIAGNOSTIC_PROXY,
             "--discussion-id",
             str(diagnostics_discussion_id),
+            "--lease-id",
+            diagnostics_lease_id,
             "--socket",
             DIAGNOSTIC_SOCKET,
         ], separators=(",", ":"))
@@ -60,6 +66,7 @@ def run_turn(
     prompt: str,
     images: list[Path],
     diagnostics_discussion_id: int | None = None,
+    diagnostics_lease_id: str | None = None,
     timeout: int = 150,
 ) -> tuple[str, str]:
     """Return the persisted thread id and final Uzbek answer, without logs."""
@@ -71,8 +78,10 @@ def run_turn(
         "PATH": CODEX_PATH,
         "LANG": "C.UTF-8",
     }
+    if (diagnostics_discussion_id is None) != (diagnostics_lease_id is None):
+        raise DiscussionError("diagnostic discussion and lease must be paired")
     process = subprocess.Popen(
-        _app_server_command(diagnostics_discussion_id),
+        _app_server_command(diagnostics_discussion_id, diagnostics_lease_id),
         cwd=snapshot,
         env=env,
         stdin=subprocess.PIPE,

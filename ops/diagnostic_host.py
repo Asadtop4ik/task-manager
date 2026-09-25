@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -19,7 +20,7 @@ from diagnostic_security import (
     MAX_ROWS,
     ParsedQuery,
     parse_select,
-    redact_log_line,
+    structured_log_metadata,
 )
 
 API_BASE_URL = os.environ.get(
@@ -42,8 +43,113 @@ MAX_AUDIT_AGE = timedelta(hours=24)
 MAX_AUDIT_LINES = 500
 MAX_CALLS_PER_REVISION = 10
 MAX_LOG_BYTES = 1024 * 1024
+MAX_LOG_RESULT_BYTES = 24 * 1024
 ALLOWED_CONTAINER = "ketoshop"
-ALLOWED_TOOLS = frozenset({"ketoshop_query", "ketoshop_recent_logs"})
+ALLOWED_TOOLS = frozenset(
+    {"ketoshop_query", "ketoshop_recent_logs", "ketoshop_finance_summary"}
+)
+
+FINANCE_SUMMARY_SQL = """
+WITH parameters AS (
+    SELECT
+        %s::text AS granularity,
+        %s::integer AS bucket_count,
+        date_trunc(
+            %s,
+            CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tashkent'
+        ) AS local_current_bucket,
+        date_trunc(
+            %s,
+            CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tashkent'
+        ) - INTERVAL '5 hours' AS current_bucket,
+        CASE WHEN %s::text = 'day' THEN INTERVAL '1 day'
+             ELSE INTERVAL '1 month' END AS bucket_step
+), buckets AS (
+    SELECT generate_series(
+        local_current_bucket - ((bucket_count - 1) * bucket_step),
+        local_current_bucket,
+        bucket_step
+    )::date AS bucket
+    FROM parameters
+), orders_by_bucket AS (
+    SELECT
+        date_trunc(p.granularity, o.created_at + INTERVAL '5 hours')::date AS bucket,
+        o.status,
+        o.source,
+        COUNT(*)::integer AS order_count,
+        SUM(o.revenue)::numeric AS revenue,
+        SUM(o.current_catalog_cost)::numeric AS current_catalog_cost,
+        SUM(o.missing_cost_items)::integer AS missing_cost_items
+    FROM public.ketoshop_diag_finance_orders AS o
+    CROSS JOIN parameters AS p
+    WHERE o.created_at >= p.current_bucket - ((p.bucket_count - 1) * p.bucket_step)
+      AND o.created_at < p.current_bucket + p.bucket_step
+    GROUP BY 1, 2, 3
+), totals AS (
+    SELECT
+        bucket,
+        SUM(order_count)::integer AS order_count,
+        SUM(revenue)::numeric AS revenue,
+        SUM(current_catalog_cost)::numeric AS current_catalog_cost,
+        SUM(missing_cost_items)::integer AS missing_cost_items
+    FROM orders_by_bucket
+    GROUP BY bucket
+), status_breakdown AS (
+    SELECT
+        bucket,
+        jsonb_object_agg(status, jsonb_build_object(
+            'order_count', order_count,
+            'revenue', revenue
+        )) AS breakdown
+    FROM (
+        SELECT bucket, status, SUM(order_count)::integer AS order_count,
+               SUM(revenue)::numeric AS revenue
+        FROM orders_by_bucket
+        GROUP BY bucket, status
+    ) AS grouped
+    GROUP BY bucket
+), source_breakdown AS (
+    SELECT
+        bucket,
+        jsonb_object_agg(source, jsonb_build_object(
+            'order_count', order_count,
+            'revenue', revenue
+        )) AS breakdown
+    FROM (
+        SELECT bucket, source, SUM(order_count)::integer AS order_count,
+               SUM(revenue)::numeric AS revenue
+        FROM orders_by_bucket
+        GROUP BY bucket, source
+    ) AS grouped
+    GROUP BY bucket
+), expenses_by_bucket AS (
+    SELECT
+        date_trunc(p.granularity, e.created_at + INTERVAL '5 hours')::date AS bucket,
+        SUM(e.amount)::numeric AS expenses
+    FROM public.ketoshop_diag_expenses AS e
+    CROSS JOIN parameters AS p
+    WHERE e.created_at >= p.current_bucket - ((p.bucket_count - 1) * p.bucket_step)
+      AND e.created_at < p.current_bucket + p.bucket_step
+    GROUP BY 1
+)
+SELECT
+    b.bucket,
+    COALESCE(t.order_count, 0)::integer AS order_count,
+    COALESCE(t.revenue, 0::numeric)::numeric AS revenue,
+    COALESCE(t.current_catalog_cost, 0::numeric)::numeric AS current_catalog_cost,
+    COALESCE(t.missing_cost_items, 0)::integer AS missing_cost_items,
+    COALESCE(e.expenses, 0::numeric)::numeric AS expenses,
+    COALESCE(s.breakdown, '{}'::jsonb) AS status_breakdown,
+    COALESCE(src.breakdown, '{}'::jsonb) AS source_breakdown,
+    'current_catalog'::text AS cost_basis,
+    FALSE AS historical_cost_data_available
+FROM buckets AS b
+LEFT JOIN totals AS t USING (bucket)
+LEFT JOIN status_breakdown AS s USING (bucket)
+LEFT JOIN source_breakdown AS src USING (bucket)
+LEFT JOIN expenses_by_bucket AS e USING (bucket)
+ORDER BY b.bucket DESC
+"""
 
 
 class DiagnosticsError(RuntimeError):
@@ -63,6 +169,23 @@ class AuditLog:
             "time": now.isoformat(),
             "discussion_id": int(event["discussion_id"]),
             "revision": int(event["revision"]),
+            "actor_id": (
+                int(event["actor_id"])
+                if isinstance(event.get("actor_id"), int)
+                and not isinstance(event.get("actor_id"), bool)
+                and event["actor_id"] > 0
+                else None
+            ),
+            "project_id": (
+                int(event["project_id"])
+                if isinstance(event.get("project_id"), int)
+                and not isinstance(event.get("project_id"), bool)
+                and event["project_id"] > 0
+                else None
+            ),
+            "project_key": (
+                "ketoshop" if event.get("project_key") == "ketoshop" else "unknown"
+            ),
             "tool": (
                 event["tool"]
                 if isinstance(event.get("tool"), str) and event["tool"] in ALLOWED_TOOLS
@@ -121,17 +244,21 @@ class DiagnosticHost:
         self._counter_lock = threading.Lock()
         self._calls: dict[int, tuple[int, int, float]] = {}
 
-    def _context(self, discussion_id: int) -> tuple[int, str]:
+    def _context(self, discussion_id: int, lease_id: str) -> tuple[int, int, int, str]:
         if (
             isinstance(discussion_id, bool)
             or not isinstance(discussion_id, int)
             or discussion_id < 1
+            or not isinstance(lease_id, str)
+            or not lease_id
+            or len(lease_id) > 100
         ):
             raise DiagnosticsError("diagnostics are not available")
         request = urllib.request.Request(
             f"{self._api_base_url}/project-discussions/{discussion_id}/diagnostic-context",
             headers={
                 "X-Intake-Worker-Token": self._intake_token,
+                "X-Intake-Lease-ID": lease_id,
                 "Accept": "application/json",
             },
             method="GET",
@@ -153,9 +280,20 @@ class DiagnosticHost:
             or isinstance(context.get("revision"), bool)
             or not isinstance(context.get("revision"), int)
             or context["revision"] < 1
+            or isinstance(context.get("actor_id"), bool)
+            or not isinstance(context.get("actor_id"), int)
+            or isinstance(context.get("project_id"), bool)
+            or not isinstance(context.get("project_id"), int)
+            or context["actor_id"] < 1
+            or context["project_id"] < 1
         ):
             raise DiagnosticsError("diagnostics are not available")
-        return context["revision"], "ketoshop"
+        return (
+            context["revision"],
+            context["actor_id"],
+            context["project_id"],
+            "ketoshop",
+        )
 
     def _consume_call(self, discussion_id: int, revision: int) -> None:
         now = time.monotonic()
@@ -173,7 +311,7 @@ class DiagnosticHost:
                 )
             self._calls[discussion_id] = (revision, count + 1, now)
 
-    def _select(self, query: str) -> tuple[list[dict[str, Any]], str]:
+    def _select(self, query: str) -> tuple[list[dict[str, Any]], str, bool]:
         parsed: ParsedQuery = parse_select(query)
         try:
             import psycopg
@@ -196,7 +334,8 @@ class DiagnosticHost:
                 )
                 cursor.execute(parsed.sql, parsed.params)
                 rows = cursor.fetchmany(min(parsed.limit, MAX_ROWS) + 1)
-            return rows[:MAX_ROWS], parsed.digest
+            has_more = len(rows) > parsed.limit
+            return rows[: parsed.limit], parsed.digest, has_more
         except psycopg.Error as exc:
             # Do not surface SQL, DSNs or server exception text to the model.
             raise DiagnosticsError("approved Ketoshop query failed") from exc
@@ -205,12 +344,19 @@ class DiagnosticHost:
     def _clean_value(value: Any) -> Any:
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
+        if isinstance(value, dict):
+            return {
+                str(key): DiagnosticHost._clean_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [DiagnosticHost._clean_value(item) for item in value]
         if hasattr(value, "isoformat"):
             return value.isoformat()
         return str(value)[:512]
 
     def _orders(self, query: str) -> tuple[dict[str, Any], str, int]:
-        rows, digest = self._select(query)
+        rows, digest, has_more = self._select(query)
         cleaned = [
             {key: self._clean_value(value) for key, value in row.items()}
             for row in rows
@@ -218,9 +364,67 @@ class DiagnosticHost:
         result = {
             "rows": cleaned,
             "row_count": len(cleaned),
-            "truncated": len(rows) == MAX_ROWS,
+            "truncated": has_more,
         }
         return result, digest, len(cleaned)
+
+    def _finance_summary(
+        self, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any], str, int]:
+        period = arguments.get("period")
+        bucket_count = arguments.get("count")
+        if period not in {"day", "month"}:
+            raise DiagnosticsError("period must be day or month")
+        maximum = 180 if period == "day" else 36
+        if (
+            isinstance(bucket_count, bool)
+            or not isinstance(bucket_count, int)
+            or not 1 <= bucket_count <= maximum
+        ):
+            raise DiagnosticsError(
+                f"count must be between 1 and {maximum} for {period}"
+            )
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError:
+            raise DiagnosticsError(
+                "diagnostics database driver is unavailable"
+            ) from None
+        try:
+            with (
+                psycopg.connect(
+                    self._database_url, connect_timeout=3, row_factory=dict_row
+                ) as connection,
+                connection.cursor() as cursor,
+            ):
+                cursor.execute("SET TRANSACTION READ ONLY")
+                cursor.execute("SET LOCAL statement_timeout = '5000ms'")
+                cursor.execute(
+                    "SET LOCAL idle_in_transaction_session_timeout = '5000ms'"
+                )
+                cursor.execute(
+                    FINANCE_SUMMARY_SQL,
+                    (period, bucket_count, period, period, period),
+                )
+                rows = cursor.fetchmany(min(bucket_count, MAX_ROWS) + 1)
+        except psycopg.Error as exc:
+            raise DiagnosticsError("approved Ketoshop finance summary failed") from exc
+        if len(rows) > bucket_count or len(rows) > MAX_ROWS:
+            raise DiagnosticsError("finance summary exceeded its fixed bucket limit")
+        buckets = [
+            {key: self._clean_value(value) for key, value in row.items()}
+            for row in rows
+        ]
+        result = {
+            "period": period,
+            "bucket_count": len(buckets),
+            "buckets": buckets,
+            "cost_basis": "current_catalog",
+            "historical_cost_data_available": False,
+        }
+        digest = hashlib.sha256(f"finance:{period}:{bucket_count}".encode()).hexdigest()
+        return result, digest, len(buckets)
 
     def _logs(self) -> tuple[dict[str, Any], str, int]:
         try:
@@ -235,33 +439,59 @@ class DiagnosticHost:
                     ALLOWED_CONTAINER,
                 ],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
                 timeout=5,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             raise DiagnosticsError("Ketoshop logs are unavailable") from None
+        if completed.returncode != 0:
+            raise DiagnosticsError("Ketoshop logs are unavailable")
         raw = completed.stdout or b""
         if isinstance(raw, str):
             raw = raw.encode("utf-8", "replace")
+        truncated = len(raw) > MAX_LOG_BYTES
         raw = raw[-MAX_LOG_BYTES:]
-        lines = raw.decode("utf-8", "replace").splitlines()[-500:]
-        secrets = (self._intake_token, self._database_url)
-        redacted = [redact_log_line(line[:2_000], secrets) for line in lines]
-        result = {"lines": redacted, "line_count": len(redacted), "window_hours": 24}
-        return result, "", len(redacted)
+        entries: list[dict[str, Any]] = []
+        for line in raw.decode("utf-8", "replace").splitlines()[-500:]:
+            metadata = structured_log_metadata(line[:4_096])
+            if metadata is not None:
+                entries.append(metadata)
+        result: dict[str, Any] = {
+            "entries": entries,
+            "entry_count": len(entries),
+            "window_hours": 24,
+            "truncated": truncated,
+        }
+        while (
+            entries
+            and len(
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
+            )
+            > MAX_LOG_RESULT_BYTES
+        ):
+            entries.pop(0)
+            truncated = True
+            result["entry_count"] = len(entries)
+            result["truncated"] = truncated
+        return result, "", len(entries)
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         discussion_id = request.get("discussion_id")
+        lease_id = request.get("lease_id")
         tool = request.get("tool")
         revision = 0
+        actor_id = 0
+        project_id = 0
         digest = ""
         rows = 0
         outcome = "denied"
         body: dict[str, Any]
         try:
-            revision, _project = self._context(discussion_id)
+            revision, actor_id, project_id, _project = self._context(
+                discussion_id, lease_id
+            )
             self._consume_call(discussion_id, revision)
             if tool == "ketoshop_query":
                 query = request.get("query")
@@ -270,6 +500,11 @@ class DiagnosticHost:
                 body, digest, rows = self._orders(query)
             elif tool == "ketoshop_recent_logs":
                 body, digest, rows = self._logs()
+            elif tool == "ketoshop_finance_summary":
+                arguments = request.get("arguments")
+                if not isinstance(arguments, dict):
+                    raise DiagnosticsError("invalid finance summary arguments")
+                body, digest, rows = self._finance_summary(arguments)
             else:
                 raise DiagnosticsError("unknown diagnostic tool")
             encoded = json.dumps(
@@ -291,6 +526,9 @@ class DiagnosticHost:
                 {
                     "discussion_id": discussion_id,
                     "revision": revision,
+                    "actor_id": actor_id if revision > 0 else None,
+                    "project_id": project_id if revision > 0 else None,
+                    "project_key": "ketoshop" if revision > 0 else "unknown",
                     "tool": (
                         tool
                         if isinstance(tool, str) and tool in ALLOWED_TOOLS
@@ -308,7 +546,7 @@ class DiagnosticHost:
 
 def _handle_client(connection: socket.socket, host: DiagnosticHost) -> None:
     with connection:
-        connection.settimeout(7)
+        connection.settimeout(18)
         data = bytearray()
         while len(data) <= MAX_REQUEST_BYTES:
             chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 1 - len(data)))

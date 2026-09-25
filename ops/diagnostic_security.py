@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -179,7 +180,9 @@ class _Parser:
         sql = f'SELECT {quoted_columns} FROM "{table}"'
         if predicates:
             sql += " WHERE " + " AND ".join(predicates)
-        sql += order_clause + f" LIMIT {min(limit, MAX_ROWS + 1)}"
+        # Fetch one lookahead row so the caller can distinguish exactly 200
+        # matches from a result that was cut at the row cap.
+        sql += order_clause + f" LIMIT {min(limit + 1, MAX_ROWS + 1)}"
         return ParsedQuery(
             sql=sql,
             params=tuple(self.params),
@@ -201,6 +204,9 @@ _QUOTED_SENSITIVE_KV = re.compile(
     r"(?i)([\"']?(?:phone|address|customer_name|username|user_id|chat_id|telegram_id)"
     r"[\"']?\s*[=:]\s*)([\"'])(.*?)(\2)"
 )
+_MULTIWORD_SENSITIVE_REST = re.compile(
+    r"(?i)([\"']?(?:address|customer_name|full_name|name)[\"']?\s*[=:]\s*).*$"
+)
 _EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _PHONE = re.compile(r"(?<!\w)(?:\+?\d[\d ()-]{7,}\d)(?!\w)")
 _BOT_TOKEN = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{20,}\b")
@@ -214,7 +220,106 @@ def redact_log_line(line: str, secrets: tuple[str, ...] = ()) -> str:
             line = line.replace(secret, "[redacted]")
     line = _BEARER.sub("Bearer [redacted]", line)
     line = _BOT_TOKEN.sub("[redacted-token]", line)
+    # Addresses and names are not reliably token-delimited. Drop everything
+    # after one of these keys instead of leaving the remaining words behind.
+    line = _MULTIWORD_SENSITIVE_REST.sub(r"\1[redacted]", line)
     line = _QUOTED_SENSITIVE_KV.sub(r"\1[redacted]", line)
     line = _SENSITIVE_KV.sub(r"\1[redacted]", line)
     line = _EMAIL.sub("[redacted-email]", line)
     return _PHONE.sub("[redacted-phone]", line)
+
+
+_SAFE_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$"
+)
+_SAFE_LEVELS = frozenset({"debug", "info", "warning", "warn", "error", "critical"})
+_SAFE_LOG_EVENTS = frozenset(
+    {
+        "database_timeout",
+        "db_timeout",
+        "database_error",
+        "db_connection_error",
+        "connection_lost",
+        "request_failed",
+        "webhook_error",
+        "worker_error",
+        "startup_failed",
+        "unhandled_exception",
+    }
+)
+_SAFE_EXCEPTION_TYPES = frozenset(
+    {
+        "AssertionError",
+        "CancelledError",
+        "ConnectionError",
+        "DatabaseError",
+        "HTTPException",
+        "InterfaceError",
+        "IntegrityError",
+        "JSONDecodeError",
+        "KeyError",
+        "OperationalError",
+        "OSError",
+        "PostgresError",
+        "RuntimeError",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+    }
+)
+_TEXT_LOG_PREFIX = re.compile(
+    r"^(?:(?P<time>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?)\s+)?"
+    r"(?:(?:stdout|stderr)\s+F\s+)?"
+    r"(?P<level>DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL):"
+    r"(?P<logger>[A-Za-z0-9_.-]{1,120}):"
+)
+
+
+def structured_log_metadata(line: str) -> dict[str, Any] | None:
+    """Extract safe fields from JSON logs; omit free-form messages and raw lines."""
+    try:
+        value = json.loads(line)
+    except (ValueError, TypeError):
+        match = _TEXT_LOG_PREFIX.match(line)
+        if match is None:
+            return None
+        metadata = {
+            "level": match.group("level").casefold(),
+            "event": "python_log",
+        }
+        if match.group("time"):
+            metadata["time"] = match.group("time")
+        return metadata
+    if not isinstance(value, dict):
+        return None
+
+    safe: dict[str, Any] = {}
+    for key in ("time", "timestamp", "asctime"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and _SAFE_TIMESTAMP.fullmatch(candidate):
+            safe["time"] = candidate[:40]
+            break
+    for key in ("level", "levelname", "severity"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.casefold() in _SAFE_LEVELS:
+            safe["level"] = candidate.casefold()
+            break
+    for key in ("event", "event_name", "error_code"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.casefold() in _SAFE_LOG_EVENTS:
+            safe["event"] = candidate.casefold()
+            break
+    for key in ("exception_type", "exception_class"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate in _SAFE_EXCEPTION_TYPES:
+            safe["exception_type"] = candidate
+            break
+    status = value.get("status_code")
+    if (
+        isinstance(status, int)
+        and not isinstance(status, bool)
+        and 100 <= status <= 599
+    ):
+        safe["status_code"] = status
+    return safe or None

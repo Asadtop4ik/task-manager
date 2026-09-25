@@ -165,15 +165,26 @@ async def test_ketoshop_diagnostic_context_is_owner_project_and_active_turn_only
     assert work["project_key"] == "ketoshop" and work["diagnostics_enabled"] is True
     context = await client.get(
         f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
-        headers=worker_headers(),
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
     )
     assert context.status_code == 200
     assert context.json() == {
         "authorized": True,
         "project_key": "ketoshop",
+        "project_id": project.id,
+        "actor_id": manager.id,
         "active": True,
         "revision": work["revision"],
     }
+    missing_capability = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers(),
+    )
+    wrong_capability = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": "guessable-wrong"},
+    )
+    assert missing_capability.status_code == wrong_capability.status_code == 404
 
     completed = await client.post(
         f"/api/v1/project-discussions/{discussion_id}/result",
@@ -188,7 +199,7 @@ async def test_ketoshop_diagnostic_context_is_owner_project_and_active_turn_only
     assert completed.status_code == 200
     inactive = await client.get(
         f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
-        headers=worker_headers(),
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
     )
     assert inactive.status_code == 404
 
@@ -221,7 +232,7 @@ async def test_nonowner_ketoshop_discussion_does_not_get_diagnostics(
     assert work["diagnostics_enabled"] is False
     denied = await client.get(
         f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
-        headers=worker_headers(),
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
     )
     assert denied.status_code == 404
 

@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 MAX_MESSAGE_BYTES = 64 * 1024
+HOST_CALL_TIMEOUT_SECONDS = 15
 DEFAULT_SOCKET = "/run/task-manager-diagnostics/diagnostics.sock"
 
 TOOLS = [
@@ -32,12 +33,31 @@ TOOLS = [
     {
         "name": "ketoshop_recent_logs",
         "description": (
-            "Read redacted Ketoshop bot logs from the last 24 hours, capped at 500 lines. "
-            "The result removes phone numbers, email addresses, common customer fields and tokens."
+            "Read safe structured metadata from Ketoshop bot logs in the last 24 hours. "
+            "At most 500 lines are examined. Free-form message text and unstructured lines are omitted."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "ketoshop_finance_summary",
+        "description": (
+            "Return finance totals grouped by day or month, including status/source breakdowns, "
+            "delivered revenue, expenses, known current-catalog cost and missing-cost item counts. "
+            "Current catalog costs are estimates, not historical cost snapshots. Historical cost "
+            "data is unavailable and is labeled as such. This bounded aggregate covers more than "
+            "200 orders without returning one row per order."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "enum": ["day", "month"]},
+                "count": {"type": "integer", "minimum": 1, "maximum": 180},
+            },
+            "required": ["period", "count"],
             "additionalProperties": False,
         },
     },
@@ -52,7 +72,7 @@ def _request_host(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": "diagnostic request is too large"}
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
+            connection.settimeout(HOST_CALL_TIMEOUT_SECONDS)
             connection.connect(socket_path)
             connection.sendall(raw)
             chunks = bytearray()
@@ -77,7 +97,7 @@ def _request_host(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_call(
-    socket_path: str, discussion_id: int, params: dict[str, Any]
+    socket_path: str, discussion_id: int, lease_id: str, params: dict[str, Any]
 ) -> dict[str, Any]:
     name = params.get("name")
     arguments = params.get("arguments")
@@ -85,19 +105,38 @@ def _tool_call(
         arguments = {}
     if name == "ketoshop_query":
         query = arguments.get("query")
-        if not isinstance(query, str) or len(query) > 2_000:
+        if (
+            not isinstance(query, str)
+            or len(query) > 2_000
+            or set(arguments) != {"query"}
+        ):
             return {"ok": False, "error": "invalid query"}
         action = {"tool": name, "query": query}
     elif name == "ketoshop_recent_logs":
         if arguments:
             return {"ok": False, "error": "this tool accepts no arguments"}
         action = {"tool": name}
+    elif name == "ketoshop_finance_summary":
+        period = arguments.get("period")
+        count = arguments.get("count")
+        if (
+            period not in {"day", "month"}
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= (180 if period == "day" else 36)
+            or set(arguments) != {"period", "count"}
+        ):
+            return {"ok": False, "error": "invalid finance summary arguments"}
+        action = {"tool": name, "arguments": {"period": period, "count": count}}
     else:
         return {"ok": False, "error": "unknown diagnostic tool"}
-    return _request_host(socket_path, {"discussion_id": discussion_id, **action})
+    return _request_host(
+        socket_path,
+        {"discussion_id": discussion_id, "lease_id": lease_id, **action},
+    )
 
 
-def serve(socket_path: str, discussion_id: int) -> None:
+def serve(socket_path: str, discussion_id: int, lease_id: str) -> None:
     for line in sys.stdin.buffer:
         if len(line) > MAX_MESSAGE_BYTES:
             continue
@@ -121,7 +160,7 @@ def serve(socket_path: str, discussion_id: int) -> None:
             result = {"tools": TOOLS}
         elif method == "tools/call":
             host_result = _tool_call(
-                socket_path, discussion_id, message.get("params", {})
+                socket_path, discussion_id, lease_id, message.get("params", {})
             )
             successful = bool(host_result.get("ok"))
             body = host_result.get("result") if successful else host_result.get("error")
@@ -150,11 +189,12 @@ def serve(socket_path: str, discussion_id: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--discussion-id", type=int, required=True)
+    parser.add_argument("--lease-id", required=True)
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     args = parser.parse_args()
-    if args.discussion_id < 1:
+    if args.discussion_id < 1 or not args.lease_id or len(args.lease_id) > 100:
         raise SystemExit(2)
-    serve(args.socket, args.discussion_id)
+    serve(args.socket, args.discussion_id, args.lease_id)
 
 
 if __name__ == "__main__":

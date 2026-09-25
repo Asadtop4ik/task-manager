@@ -28,10 +28,16 @@ class Response:
 class DiscussionWorkerTests(unittest.TestCase):
     def test_private_lease_uses_tokenless_child_and_posts_answer(self):
         lease = {
-            "id": 8, "revision": 2, "lease_id": "lease-id",
-            "repo_full_name": "Asadtop4ik/task-manager", "base_branch": "main",
-            "project_key": "task-manager", "diagnostics_enabled": False,
-            "thread_id": "thr_previous", "text": "Buyurtma qanday?", "images": [],
+            "id": 8,
+            "revision": 2,
+            "lease_id": "lease-id",
+            "repo_full_name": "Asadtop4ik/task-manager",
+            "base_branch": "main",
+            "project_key": "task-manager",
+            "diagnostics_enabled": False,
+            "thread_id": "thr_previous",
+            "text": "Buyurtma qanday?",
+            "images": [],
         }
         posted = []
 
@@ -47,6 +53,7 @@ class DiscussionWorkerTests(unittest.TestCase):
             payload = json.loads(kwargs["input"])
             self.assertEqual(payload["thread_id"], "thr_previous")
             self.assertIsNone(payload["diagnostics_discussion_id"])
+            self.assertIsNone(payload["diagnostics_lease_id"])
             self.assertNotIn("test-worker-secret", kwargs["input"])
             self.assertEqual(command[-1], "codex-child")
             (Path(payload["session_dir"]) / "discussion-result.json").write_text(
@@ -56,20 +63,31 @@ class DiscussionWorkerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             worker = IntakeWorker(
-                intake_token="test-worker-secret", github_token="test-github-secret",
-                temp_root=directory, opener=opener, command_runner=child,
+                intake_token="test-worker-secret",
+                github_token="test-github-secret",
+                temp_root=directory,
+                opener=opener,
+                command_runner=child,
             )
-            with patch.object(worker, "_fetch_snapshot", side_effect=lambda target, *_: target.mkdir()):
+            with patch.object(
+                worker, "_fetch_snapshot", side_effect=lambda target, *_: target.mkdir()
+            ):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
         self.assertEqual(posted[0]["response"], "Javob.")
         self.assertEqual(posted[0]["revision"], 2)
 
     def test_owner_ketoshop_turn_passes_only_discussion_scope_to_mcp_config(self):
         lease = {
-            "id": 18, "revision": 4, "lease_id": "lease-id",
-            "repo_full_name": "muradjanov-dev/ketoshop", "base_branch": "master",
-            "project_key": "ketoshop", "diagnostics_enabled": True,
-            "thread_id": None, "text": "Buyurtma holati", "images": [],
+            "id": 18,
+            "revision": 4,
+            "lease_id": "lease-id",
+            "repo_full_name": "muradjanov-dev/ketoshop",
+            "base_branch": "master",
+            "project_key": "ketoshop",
+            "diagnostics_enabled": True,
+            "thread_id": None,
+            "text": "Buyurtma holati",
+            "images": [],
         }
         child_requests = []
 
@@ -90,20 +108,32 @@ class DiscussionWorkerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             worker = IntakeWorker(
-                intake_token="test-worker-secret", github_token="test-github-secret",
-                temp_root=directory, opener=opener, command_runner=child,
+                intake_token="test-worker-secret",
+                github_token="test-github-secret",
+                temp_root=directory,
+                opener=opener,
+                command_runner=child,
             )
-            with patch.object(worker, "_fetch_snapshot", side_effect=lambda target, *_: target.mkdir()):
+            with patch.object(
+                worker, "_fetch_snapshot", side_effect=lambda target, *_: target.mkdir()
+            ):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
         self.assertEqual(child_requests[0]["diagnostics_discussion_id"], 18)
+        self.assertEqual(child_requests[0]["diagnostics_lease_id"], "lease-id")
         self.assertIn("ketoshop_diagnostics MCP tools", child_requests[0]["prompt"])
 
     def test_wrong_branch_fails_without_starting_codex(self):
         lease = {
-            "id": 8, "revision": 2, "lease_id": "lease-id",
-            "repo_full_name": "Asadtop4ik/task-manager", "base_branch": "wrong",
-            "project_key": "task-manager", "diagnostics_enabled": False,
-            "thread_id": None, "text": "Savol", "images": [],
+            "id": 8,
+            "revision": 2,
+            "lease_id": "lease-id",
+            "repo_full_name": "Asadtop4ik/task-manager",
+            "base_branch": "wrong",
+            "project_key": "task-manager",
+            "diagnostics_enabled": False,
+            "thread_id": None,
+            "text": "Savol",
+            "images": [],
         }
         posted = []
 
@@ -115,8 +145,10 @@ class DiscussionWorkerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             worker = IntakeWorker(
-                intake_token="test-worker-secret", github_token="test-github-secret",
-                temp_root=directory, opener=opener,
+                intake_token="test-worker-secret",
+                github_token="test-github-secret",
+                temp_root=directory,
+                opener=opener,
                 command_runner=lambda *_args, **_kwargs: self.fail("Codex was started"),
             )
             self.assertEqual(worker.poll_discussion_once(), "failed")

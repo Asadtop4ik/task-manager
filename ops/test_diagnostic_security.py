@@ -1,6 +1,11 @@
 import unittest
 
-from diagnostic_security import QueryError, parse_select, redact_log_line
+from diagnostic_security import (
+    QueryError,
+    parse_select,
+    redact_log_line,
+    structured_log_metadata,
+)
 
 
 class DiagnosticSecurityTests(unittest.TestCase):
@@ -12,6 +17,7 @@ class DiagnosticSecurityTests(unittest.TestCase):
         self.assertEqual(parsed.params, (71001,))
         self.assertEqual(parsed.limit, 12)
         self.assertIn('FROM "ketoshop_diag_orders"', parsed.sql)
+        self.assertTrue(parsed.sql.endswith("LIMIT 13"))
         self.assertNotIn("71001", parsed.sql)
         self.assertTrue(parsed.digest)
 
@@ -42,6 +48,19 @@ class DiagnosticSecurityTests(unittest.TestCase):
         self.assertNotIn("Synthetic Street", safe)
         self.assertNotIn("owner@example.com", safe)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz0123456789", safe)
+        unquoted_multiword = redact_log_line(
+            "address=Unit 4, House 9 customer_name=Jane Example"
+        )
+        self.assertNotIn("House 9", unquoted_multiword)
+        self.assertNotIn("Jane Example", unquoted_multiword)
+
+    def test_log_metadata_drops_unstructured_text_and_unknown_event_values(self):
+        self.assertIsNone(structured_log_metadata("ERROR: customer Alice Doe"))
+        safe = structured_log_metadata(
+            '{"level":"error","event":"customer Alice Doe",'
+            '"message":"address Unit 4, House 9"}'
+        )
+        self.assertEqual(safe, {"level": "error"})
 
 
 if __name__ == "__main__":

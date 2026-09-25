@@ -359,7 +359,8 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
     from discussion_appserver import DiscussionError, run_turn
 
     if set(request) != {
-        "kind", "session_dir", "prompt", "images", "thread_id", "diagnostics_discussion_id"
+        "kind", "session_dir", "prompt", "images", "thread_id",
+        "diagnostics_discussion_id", "diagnostics_lease_id",
     }:
         return 2
     try:
@@ -373,6 +374,7 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
         thread_id = request["thread_id"]
         raw_images = request["images"]
         diagnostics_discussion_id = request["diagnostics_discussion_id"]
+        diagnostics_lease_id = request["diagnostics_lease_id"]
         if (
             not isinstance(prompt, str) or not 1 <= len(prompt) <= 10_000
             or (thread_id is not None and (
@@ -388,6 +390,15 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
                     or diagnostics_discussion_id < 1
                 )
             )
+            or (
+                diagnostics_lease_id is not None
+                and (
+                    not isinstance(diagnostics_lease_id, str)
+                    or not diagnostics_lease_id
+                    or len(diagnostics_lease_id) > 100
+                )
+            )
+            or ((diagnostics_discussion_id is None) != (diagnostics_lease_id is None))
         ):
             return 2
         snapshot = session_dir / "snapshot"
@@ -403,6 +414,7 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
             prompt=prompt,
             images=images,
             diagnostics_discussion_id=diagnostics_discussion_id,
+            diagnostics_lease_id=diagnostics_lease_id,
         )
         result = session_dir / "discussion-result.json"
         result.write_text(
@@ -807,6 +819,7 @@ class IntakeWorker:
                     "prompt": prompt, "images": [str(path) for path in image_paths],
                     "thread_id": thread_id,
                     "diagnostics_discussion_id": discussion_id if diagnostics_enabled else None,
+                    "diagnostics_lease_id": lease_id if diagnostics_enabled else None,
                 }, ensure_ascii=False)
                 completed = self._command_runner(
                     [SUDO_BIN, "-n", "-u", "codex-runner", "--", "/usr/bin/python3",
