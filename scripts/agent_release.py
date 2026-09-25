@@ -20,6 +20,9 @@ from uuid import UUID
 
 API = "https://api.github.com"
 TASK_API = "https://tasks.standart-eko.uz/api/v1/agent-runs"
+QA_REPOSITORY = "Asadtop4ik/agent-qa"
+QA_PR_CI_WORKFLOW = ".github/workflows/agent-qa.yml"
+QA_PR_CI_JOB = "PR CI"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 APPROVED_BRANCHES = {
     "Asadtop4ik/task-manager": "main",
@@ -214,24 +217,27 @@ def verify_merge() -> None:
     _verify_pr(pr, run["repo_full_name"], run, expected, require_open=True)
     if pr.get("draft") or pr.get("mergeable_state") != "clean":
         raise ValueError("PR is draft or is not mergeable")
-    checks = _request(
-        f"{API}/repos/{run['repo_full_name']}/commits/{expected}/check-runs?per_page=100",
-        token=token,
-    )
-    if not isinstance(checks, dict) or not isinstance(checks.get("check_runs"), list):
-        raise TypeError("required PR checks are unavailable")
-    latest: dict[str, dict] = {}
-    required_checks = REQUIRED_PR_CHECKS[run["repo_full_name"]]
-    for check in checks["check_runs"]:
-        name = check.get("name")
-        if name in required_checks and check.get("id", 0) > latest.get(name, {}).get(
-            "id", 0
+    if run["repo_full_name"] == QA_REPOSITORY:
+        _verify_qa_pull_request_ci(run, number, expected, token)
+    else:
+        checks = _request(
+            f"{API}/repos/{run['repo_full_name']}/commits/{expected}/check-runs?per_page=100",
+            token=token,
+        )
+        if not isinstance(checks, dict) or not isinstance(checks.get("check_runs"), list):
+            raise TypeError("required PR checks are unavailable")
+        latest: dict[str, dict] = {}
+        required_checks = REQUIRED_PR_CHECKS[run["repo_full_name"]]
+        for check in checks["check_runs"]:
+            name = check.get("name")
+            if name in required_checks and check.get("id", 0) > latest.get(name, {}).get(
+                "id", 0
+            ):
+                latest[name] = check
+        if set(latest) != required_checks or any(
+            row.get("conclusion") != "success" for row in latest.values()
         ):
-            latest[name] = check
-    if set(latest) != required_checks or any(
-        row.get("conclusion") != "success" for row in latest.values()
-    ):
-        raise ValueError("latest required PR CI checks have not passed")
+            raise ValueError("latest required PR checks have not passed")
     statuses = _request(
         f"{API}/repos/{run['repo_full_name']}/commits/{expected}/statuses", token=token
     )
@@ -245,6 +251,61 @@ def verify_merge() -> None:
         raise ValueError("independent review is not clean on the current head")
     _write_output("pull_number", str(number))
     _write_output("head_sha", expected)
+
+
+def _verify_qa_pull_request_ci(
+    run: dict, pull_number: int, expected_sha: str, token: str
+) -> None:
+    repo = run["repo_full_name"]
+    branch = f"codex/task-{run['task_id']}-{run['run_id']}"
+    workflow = _request(
+        f"{API}/repos/{repo}/actions/workflows/{QA_PR_CI_WORKFLOW.rsplit('/', 1)[-1]}"
+        f"/runs?event=pull_request&head_sha={expected_sha}&per_page=100",
+        token=token,
+    )
+    if not isinstance(workflow, dict) or not isinstance(
+        workflow.get("workflow_runs"), list
+    ):
+        raise TypeError("QA pull request CI runs are unavailable")
+    matching = [
+        item
+        for item in workflow["workflow_runs"]
+        if isinstance(item, dict)
+        and item.get("event") == "pull_request"
+        and item.get("path") == QA_PR_CI_WORKFLOW
+        and item.get("head_sha") == expected_sha
+        and item.get("head_branch") == branch
+        and any(
+            isinstance(pr, dict)
+            and pr.get("number") == pull_number
+            and (pr.get("head") or {}).get("sha") == expected_sha
+            and (pr.get("head") or {}).get("ref") == branch
+            for pr in item.get("pull_requests") or []
+        )
+        and isinstance(item.get("id"), int)
+    ]
+    if not matching:
+        raise ValueError("exact QA PR CI run is unavailable")
+    latest = max(matching, key=lambda item: item["id"])
+    if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+        raise ValueError("latest exact QA PR CI run has not passed")
+    jobs = _request(
+        f"{API}/repos/{repo}/actions/runs/{latest['id']}/jobs?per_page=100",
+        token=token,
+    )
+    if not isinstance(jobs, dict) or not isinstance(jobs.get("jobs"), list):
+        raise TypeError("QA pull request CI jobs are unavailable")
+    required_jobs = [
+        job
+        for job in jobs["jobs"]
+        if isinstance(job, dict)
+        and job.get("name") == QA_PR_CI_JOB
+        and isinstance(job.get("id"), int)
+    ]
+    if not required_jobs or max(required_jobs, key=lambda item: item["id"]).get(
+        "conclusion"
+    ) != "success":
+        raise ValueError("required QA PR CI job has not passed")
 
 
 def verify_correction() -> None:
