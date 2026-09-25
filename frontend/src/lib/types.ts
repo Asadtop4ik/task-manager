@@ -84,6 +84,22 @@ export type AgentMetrics = {
   output_tokens: number;
 };
 
+export type AgentEvent = {
+  id: number;
+  flow: "coding" | "intake" | "discussion";
+  source_id: number;
+  task_id: number | null;
+  project_id: number | null;
+  status: string;
+  phase: string | null;
+  error: string | null;
+  github_run_url: string | null;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
+  created_at: string;
+};
+
 export type Task = {
   id: number;
   project: Project;

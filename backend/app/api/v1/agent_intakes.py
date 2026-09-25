@@ -27,7 +27,7 @@ from app.schemas.agent_intake import (
     IntakeWorkOut,
 )
 from app.schemas.task import TaskOut
-from app.services import activity
+from app.services import activity, agent_events
 from app.services.access import can_see_project, is_manager
 from app.services.agent_repos import repository_for
 from app.services.telegram_media import telegram_image
@@ -142,6 +142,8 @@ async def create_intake(
         notified_revision=0,
     )
     session.add(row)
+    await session.flush()
+    agent_events.record(session, row)
     await session.commit()
     await session.refresh(row)
     return _as_out(row)
@@ -190,6 +192,7 @@ async def lease_intake(
     for expired in exhausted:
         expired.status = "failed"
         expired.error = "Codex intake worker timed out"
+        agent_events.record(session, expired, error=expired.error)
         expired.lease_until = None
         expired.lease_id = None
         expired.revision += 1
@@ -212,6 +215,7 @@ async def lease_intake(
     if row is None:
         return Response(status_code=204)
     row.status = "analyzing"
+    agent_events.record(session, row)
     row.lease_until = now + timedelta(minutes=2)
     row.lease_id = str(uuid4())
     row.attempts += 1
@@ -255,6 +259,11 @@ async def report_intake(
     if payload.status == "needs_answers" and row.answer_text is not None:
         raise HTTPException(status_code=409, detail="the clarification round is complete")
     row.status = payload.status
+    agent_events.record(
+        session,
+        row,
+        error="Task tahlili xato bilan tugadi" if payload.status == "failed" else None,
+    )
     row.questions = payload.questions
     row.brief = payload.brief.model_dump() if payload.brief else {}
     row.error = payload.error
@@ -366,6 +375,7 @@ async def answer_intake(
         raise HTTPException(status_code=409, detail="intake is not awaiting an answer")
     row.answer_text = payload.text.strip()
     row.status = "queued"
+    agent_events.record(session, row)
     row.error = None
     row.attempts = 0
     row.revision += 1
@@ -391,6 +401,7 @@ async def revise_intake(
     row.brief = {}
     row.error = None
     row.status = "queued"
+    agent_events.record(session, row)
     row.attempts = 0
     row.analysis_rounds = 0
     row.revision += 1
@@ -412,6 +423,7 @@ async def retry_intake(
     if row.retry_count >= 1:
         raise HTTPException(status_code=409, detail="intake retry limit reached")
     row.status = "queued"
+    agent_events.record(session, row)
     row.error = None
     row.attempts = 0
     row.retry_count += 1
@@ -431,6 +443,7 @@ async def cancel_intake(
     row = await _owned(session, intake_id, user)
     if row.status not in _FINISHED:
         row.status = "cancelled"
+        agent_events.record(session, row)
         row.revision += 1
         await session.commit()
     return _as_out(row)
@@ -510,6 +523,7 @@ async def confirm_intake(
     row.task_id = task.id
     row.confirmed_mode = mode
     row.status = "confirmed"
+    agent_events.record(session, row)
     row.revision += 1
     await session.commit()
     loaded = await load_task(session, task.id)

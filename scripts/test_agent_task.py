@@ -274,6 +274,7 @@ class UsageTests(unittest.TestCase):
             self.assertEqual(
                 sent.call_args.args[0]["error"], "Which menu label should I use?"
             )
+            self.assertEqual(sent.call_args.args[0]["failure_phase"], "implement")
 
     def test_validator_error_overrides_agent_success_prose(self) -> None:
         task = {
@@ -363,6 +364,7 @@ class UsageTests(unittest.TestCase):
                 sent.call_args.args[0]["error"],
                 "Publisher failed before PR/deploy; inspect the GitHub run.",
             )
+            self.assertEqual(sent.call_args.args[0]["failure_phase"], "publish")
 
     def test_extracts_last_completed_turn_and_ignores_partial_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

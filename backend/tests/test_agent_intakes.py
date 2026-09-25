@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1 import agent_intakes, agent_runs
 from app.api.v1.agent_intakes import _description
 from app.core.config import settings
-from app.db.models import AgentIntake, AgentRun, Attachment, Project, Task, User
+from app.db.models import AgentEvent, AgentIntake, AgentRun, Attachment, Project, Task, User
 from tests.conftest import auth
 
 
@@ -133,6 +133,14 @@ async def test_questions_then_confirmation_persists_brief_and_image_once(
         headers=worker_headers(),
     )
     assert questions.status_code == 200 and questions.json()["status"] == "needs_answers"
+    events = (
+        await session.scalars(
+            select(AgentEvent.status)
+            .where(AgentEvent.agent_intake_id == intake_id)
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events == ["queued", "analyzing", "needs_answers"]
     notices = (
         await client.get(
             "/api/v1/agent-intakes/notifications",

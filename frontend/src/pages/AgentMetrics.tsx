@@ -1,6 +1,8 @@
+import { useState } from "react";
+import { Link } from "react-router-dom";
 import Page from "@/components/Page";
 import { useAuth } from "@/lib/auth";
-import { useAgentMetrics } from "@/lib/queries";
+import { useAgentEvents, useAgentMetrics } from "@/lib/queries";
 import type { MetricDuration } from "@/lib/types";
 
 function time(seconds: number | null): string {
@@ -21,7 +23,10 @@ function Metric({ label, value }: { label: string; value: MetricDuration }) {
 export default function AgentMetricsPage() {
   const { state } = useAuth();
   const owner = state.status === "authenticated" && state.user.is_owner;
+  const [beforeId, setBeforeId] = useState<number | null>(null);
   const { data, isLoading, isError } = useAgentMetrics(owner);
+  const events = useAgentEvents(owner, beforeId);
+  const oldestEventId = events.data?.slice(-1)[0]?.id;
   if (!owner) return <Page><p className="p-4">Bunga ruxsatingiz yo‘q.</p></Page>;
 
   return (
@@ -66,6 +71,54 @@ export default function AgentMetricsPage() {
             )}
           </>
         )}
+        <section className="mt-8">
+          <h2 className="text-lg font-semibold text-ink">Agent jarayonlari tarixi</h2>
+          <p className="mt-1 text-sm text-muted">
+            Kod, task tayyorlash va loyiha suhbatining bosqichlari shu yerda yig‘iladi.
+            Tarix ushbu funksiyadan keyingi ishlar uchun yoziladi; xabar va Codex matnlari saqlanmaydi.
+          </p>
+          {events.isLoading && <p className="mt-4 text-muted">Tarix yuklanmoqda…</p>}
+          {events.isError && <p className="mt-4 text-late">Tarixni olib bo‘lmadi.</p>}
+          {events.data?.length === 0 && <p className="mt-4 text-muted">Hozircha yangi hodisa yo‘q.</p>}
+          <ol className="mt-4 space-y-2">
+            {events.data?.map((event) => (
+              <li key={event.id} className="rounded-xl border border-hairline bg-card p-3 text-sm">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span className="font-medium text-ink">
+                    {event.flow === "coding" ? "Kod" : event.flow === "intake" ? "Task tayyorlash" : "Suhbat"}
+                    {event.task_id ? ` · task #${event.task_id}` : ` · #${event.source_id}`}
+                  </span>
+                  <span>{event.status}{event.phase ? ` · ${event.phase}` : ""}</span>
+                  <time className="text-muted" dateTime={event.created_at}>
+                    {new Date(event.created_at).toLocaleString("uz-UZ", { timeZone: "Asia/Tashkent" })}
+                  </time>
+                  {event.task_id && <Link className="underline" to={`/tasks/${event.task_id}`}>Task</Link>}
+                  {event.github_run_url && <a className="underline" href={event.github_run_url} target="_blank" rel="noreferrer">GitHub log</a>}
+                </div>
+                {event.error && <p className="mt-1 text-late">Sabab: {event.error}</p>}
+                {event.input_tokens !== null && event.output_tokens !== null && (
+                  <p className="mt-1 text-muted">
+                    Token: {event.input_tokens.toLocaleString()} kirish, {event.cached_input_tokens?.toLocaleString() ?? "0"} kesh, {event.output_tokens.toLocaleString()} chiqish
+                  </p>
+                )}
+              </li>
+            ))}
+          </ol>
+          {events.data?.length === 100 && oldestEventId !== undefined && (
+            <button
+              type="button"
+              className="mt-3 text-sm underline"
+              onClick={() => setBeforeId(oldestEventId)}
+            >
+              Eski hodisalar
+            </button>
+          )}
+          {beforeId !== null && (
+            <button type="button" className="ml-4 mt-3 text-sm underline" onClick={() => setBeforeId(null)}>
+              Eng so‘nggilari
+            </button>
+          )}
+        </section>
       </div>
     </Page>
   );
