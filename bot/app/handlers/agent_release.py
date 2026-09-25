@@ -62,7 +62,9 @@ def _evidence_lines(run: dict[str, Any]) -> list[str]:
         state = ci.get("state") or run.get("ci_status")
         if state:
             lines.append(f"CI: {_html_text(state, 30)}")
-        verified_sha = ci.get("verified_sha") or ci.get("ci_verified_sha")
+        verified_sha = (
+            ci.get("verified_head_sha") or ci.get("verified_sha") or ci.get("ci_verified_sha")
+        )
         if verified_sha:
             lines.append(f"CI SHA: <code>{_html_text(str(verified_sha)[:12], 12)}</code>")
         ci_url = ci.get("url") or ci.get("details_url")

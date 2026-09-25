@@ -111,6 +111,20 @@ def test_details_remain_available_when_release_actions_are_gated() -> None:
     assert [button.text for row in keyboard.inline_keyboard for button in row] == ["Batafsil"]
 
 
+def test_release_card_displays_backend_verified_head_sha_field() -> None:
+    run = _run()
+    run["ci_evidence"] = {
+        "state": "success",
+        "verified_head_sha": "a" * 40,
+        "url": "https://github.com/Asadtop4ik/task-manager/actions/runs/123",
+    }
+
+    card = agent_release.release_card(run)
+
+    assert f"CI SHA: <code>{'a' * 12}</code>" in card
+    assert "CI natijasini ochish" in card
+
+
 async def test_stale_callback_refetches_and_never_merges(monkeypatch) -> None:
     api = MagicMock()
     api.me = AsyncMock(return_value={"is_owner": True})
