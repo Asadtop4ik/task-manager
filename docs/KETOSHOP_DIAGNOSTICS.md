@@ -8,6 +8,13 @@ which constant-time compares it with the active lease on that exact discussion.
 The model never receives the intake token, database URL, Docker socket or
 database password. Its proxy can call only the host broker over one Unix socket.
 
+The lease capability is passed only to that turn's MCP proxy. We verified the
+same systemd/bubblewrap profile with two simultaneous `codex-runner` processes:
+a second read-only Codex shell reported the proxy PID's `/proc/<pid>/cmdline`
+as unreadable. The host still requires the
+capability and verifies it against the active lease for every call, so a socket
+caller without the owner's current capability is denied.
+
 The broker asks the Task Manager API to re-check the owner, Ketoshop project,
 active discussion lease and turn revision before every tool call. It reads only
 the allowlisted `ketoshop_diag_*` views in a read-only transaction. The row
