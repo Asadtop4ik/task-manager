@@ -41,7 +41,12 @@ After an operator configures a private project repository and the agent credenti
 send `task-manager: update the task view @codex` to the Telegram bot. Confirm the
 parsed task; the bot creates it and starts one Codex run. `/agent 42` delegates
 an existing task. The task detail page shows the current run and PR link, and
-the bot reports PR-ready or failed runs through the worker's notification queue.
+the bot reports a PR as ready only after the current PR head passes its target
+repository CI. A failed CI is shown on the task page without a premature
+"PR tayyor" bot message; pushing a fix to the same PR restarts verification.
+Publisher jobs run repo-specific trusted preflight before opening a PR:
+Ruff for QurBot, Ruff/Black for Task Manager and Kans Shop, and syntax checks
+for Ketoshop. Full target CI remains the final check.
 Use `/stopagent 42` or the task page to cancel a running job. A ready PR is
 closed when cancelled, so it cannot auto-merge later. A failed or cancelled job
 can be retried once on the same task; change its description when the agent
@@ -88,7 +93,8 @@ is applied in a separate clean GitHub-hosted publisher job. Protected paths
 and agent control) take the PR route even when the owner requested `!fast`.
 The default-branch auto-merge workflow accepts only README, Markdown docs and
 frontend CSS changes after the latest commit's backend, bot, frontend and policy
-checks pass. Other PRs need review. A coding task is done only after CI, a real
+checks pass. Other PRs need owner review after the CI-verified ready notice.
+A coding task is done only after CI, a real
 SSH deploy, the exact running image tag and both `/ready` endpoints pass; the
 deployment callback then records the deployed SHA and notifies Telegram.
 Completed Codex runs also store input, cached-input and output token counts;

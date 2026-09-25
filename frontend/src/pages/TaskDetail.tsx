@@ -218,7 +218,14 @@ export default function TaskDetail() {
           )}
           {agentRuns.data?.map((run) => (
             <div key={run.run_id} className="mt-3 text-sm">
-              <span className="font-medium">{run.mode === "fast" ? "⚡ Fast · " : ""}{run.status === "merged" ? "PR birlashtirildi · serverga chiqishi tekshirilmoqda" : run.status}</span>
+              <span className="font-medium">
+                {run.mode === "fast" ? "⚡ Fast · " : ""}
+                {run.status === "pr_opened"
+                  ? run.ci_status === "failure" ? "PR ochildi · CI xato" : "PR ochildi · CI kutilmoqda"
+                  : run.status === "pr_ready" ? "PR tayyor · CI yashil"
+                  : run.status === "merged" ? "PR birlashtirildi · serverga chiqishi tekshirilmoqda"
+                  : run.status}
+              </span>
               {run.pr_url && (
                 <a className="ml-3 underline" href={run.pr_url} target="_blank" rel="noreferrer">
                   PRni ochish
@@ -229,8 +236,13 @@ export default function TaskDetail() {
                   Jarayon
                 </a>
               )}
+              {run.ci_url && (
+                <a className="ml-3 underline" href={run.ci_url} target="_blank" rel="noreferrer">
+                  CI natijasi
+                </a>
+              )}
               {run.error && <p className="text-late">{run.error}</p>}
-              {["pending", "dispatching", "dispatched", "running", "validating", "pr_ready"].includes(run.status) && (
+              {["pending", "dispatching", "dispatched", "running", "validating", "pr_opened", "pr_ready"].includes(run.status) && (
                 <button
                   type="button"
                   disabled={cancelAgent.isPending}

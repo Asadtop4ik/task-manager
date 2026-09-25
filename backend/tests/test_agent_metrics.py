@@ -46,6 +46,7 @@ async def test_owner_metrics_count_tasks_retries_and_stage_times(
                 attempts=1,
                 created_at=now - timedelta(minutes=8),
                 runner_started_at=now - timedelta(minutes=7, seconds=50),
+                pr_opened_at=now - timedelta(minutes=6, seconds=50),
                 pr_ready_at=now - timedelta(minutes=6, seconds=50),
                 merged_at=now - timedelta(minutes=3, seconds=50),
                 deployed_at=now,

@@ -20,17 +20,22 @@ class AgentRepository:
     fast_enabled: bool = False
     # Public-repo deploy verification. Keep these empty for private projects.
     ci_jobs: tuple[str, ...] = ()
+    # Job names in the pull_request CI workflow, before a PR is announced.
+    pr_ci_jobs: tuple[str, ...] = ()
     images: tuple[tuple[str, str], ...] = ()
 
 
 REPOSITORIES = (
-    AgentRepository("task-manager", DISPATCH_REPOSITORY, "main", True, True),
+    AgentRepository(
+        "task-manager", DISPATCH_REPOSITORY, "main", True, True, pr_ci_jobs=("gate",)
+    ),
     AgentRepository(
         "qurbot",
         "muradjanov-dev/qurbot",
         "master",
         False,
         ci_jobs=("ci / check",),
+        pr_ci_jobs=("check",),
         images=(
             ("qurbot-web", "ghcr.io/muradjanov-dev/qurbot"),
             ("qurbot-worker", "ghcr.io/muradjanov-dev/qurbot"),
@@ -42,6 +47,7 @@ REPOSITORIES = (
         "main",
         False,
         ci_jobs=("ci / backend", "ci / frontend"),
+        pr_ci_jobs=("backend", "frontend"),
         images=(
             ("kans-api", "ghcr.io/muradjanov-dev/kans-shop-api"),
             ("kans-frontend", "ghcr.io/muradjanov-dev/kans-shop-frontend"),
@@ -53,6 +59,7 @@ REPOSITORIES = (
         "master",
         False,
         ci_jobs=("ci / check",),
+        pr_ci_jobs=("check",),
         images=(("ketoshop", "ghcr.io/muradjanov-dev/ketoshop"),),
     ),
 )
@@ -97,6 +104,8 @@ def validate_catalog(
     names = [item.full_name for item in repositories]
     if len(keys) != len(set(keys)) or len(names) != len(set(names)):
         raise ValueError("duplicate agent project or repository")
+    if any(not item.pr_ci_jobs for item in repositories):
+        raise ValueError("agent project lacks PR CI verification")
     public_catalog(repositories)
 
 

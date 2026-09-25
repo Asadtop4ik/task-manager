@@ -11,6 +11,9 @@ class AgentRunOut(BaseModel):
     task_id: int
     repo_full_name: str
     status: str
+    ci_status: str | None
+    ci_verified_sha: str | None
+    ci_url: str | None
     mode: str
     github_run_url: str | None
     pr_url: str | None
@@ -26,6 +29,7 @@ class AgentRunOut(BaseModel):
     created_at: datetime
     finished_at: datetime | None
     runner_started_at: datetime | None
+    pr_opened_at: datetime | None
     pr_ready_at: datetime | None
     merged_at: datetime | None
     deployed_at: datetime | None
@@ -33,7 +37,9 @@ class AgentRunOut(BaseModel):
 
 class AgentRunCallback(BaseModel):
     run_id: str
-    status: str = Field(pattern=r"^(running|validating|publishing|deploying|pr_ready|failed)$")
+    status: str = Field(
+        pattern=r"^(running|validating|publishing|deploying|pr_opened|failed)$"
+    )
     github_run_url: str | None = None
     pr_url: str | None = None
     head_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
@@ -53,6 +59,25 @@ class AgentDeployment(BaseModel):
 
 class AgentMerge(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class AgentCiResult(BaseModel):
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    conclusion: Literal["pending", "success", "failure"]
+    github_run_url: str | None = None
+
+
+class AgentCiPending(BaseModel):
+    id: int
+    run_id: str
+    repo_full_name: str
+    base_branch: str
+    pr_url: str
+    head_sha: str
+    status: Literal["pr_opened", "pr_ready"]
+    ci_status: str | None
+    ci_verified_sha: str | None
+    ci_url: str | None
 
 
 class ExternalAgentPending(BaseModel):
@@ -83,6 +108,8 @@ class AgentNotificationOut(BaseModel):
     repo_full_name: str
     chat_id: int | None
     status: str
+    ci_status: str | None
+    ci_url: str | None
     mode: str
     pr_url: str | None
     github_run_url: str | None

@@ -20,6 +20,32 @@ from agent_task import (
 
 
 class UsageTests(unittest.TestCase):
+    def test_successful_publisher_reports_pr_opened_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            task = {
+                "task_id": 28,
+                "run_id": "00000000-0000-0000-0000-000000000028",
+                "title": "Page products",
+                "description": "",
+                "base_branch": "master",
+                "repo_full_name": "muradjanov-dev/qurbot",
+                "mode": "pr",
+            }
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                "GITHUB_RUN_ID": "99",
+                "RUNNER_TEMP": temp,
+                "JOB_STATUS": "success",
+                "PR_URL": "https://github.com/muradjanov-dev/qurbot/pull/8",
+                "HEAD_SHA": "a" * 40,
+            }
+            with patch.dict(os.environ, environment), patch(
+                "agent_task._send_status", return_value={"status": "pr_opened"}
+            ) as sent:
+                callback()
+            self.assertEqual(sent.call_args.args[0]["status"], "pr_opened")
+
     def test_private_validator_records_no_change_failure_for_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"

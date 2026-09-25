@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from agent_deploy_monitor import TARGETS
+from agent_deploy_monitor import CI_TARGETS, TARGETS
 from intake_worker import INTAKE_REPOSITORIES
 from project_catalog import approved_pairs, intake_pairs, public_projects
 
@@ -24,6 +24,9 @@ class ProjectCatalogTests(unittest.TestCase):
         self.assertEqual(INTAKE_REPOSITORIES, intake_pairs())
         self.assertEqual(APPROVED_REPOS, approved_pairs())
         self.assertEqual(set(TARGETS), set(APPROVED_REPOS))
+        self.assertEqual(set(CI_TARGETS), {item.full_name for item in REPOSITORIES})
+        for item in REPOSITORIES:
+            self.assertEqual(CI_TARGETS[item.full_name], (item.branch, frozenset(item.pr_ci_jobs)))
         for item in public_projects():
             target = TARGETS[item.full_name]
             self.assertEqual(target.branch, item.branch)
@@ -34,6 +37,7 @@ class ProjectCatalogTests(unittest.TestCase):
         demo = AgentRepository(
             "demo", "example/demo", "main", False,
             ci_jobs=("ci / check",),
+            pr_ci_jobs=("check",),
             images=(("demo-api", "ghcr.io/example/demo-api"),),
         )
         catalog = (*REPOSITORIES, demo)
