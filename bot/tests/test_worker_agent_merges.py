@@ -194,7 +194,9 @@ async def test_owner_release_card_has_controls_and_uses_private_owner_chat(
             "correction": {"available": True},
         },
         "pr_url": "https://github.com/muradjanov-dev/qurbot/pull/8",
-        "telegram_message_id": None,
+        "telegram_message_id": 41,
+        "owner_notice_chat_id": None,
+        "owner_notice_message_id": None,
     }
 
     class Client:
@@ -213,11 +215,12 @@ async def test_owner_release_card_has_controls_and_uses_private_owner_chat(
             return response
 
         async def post(self, url, **kwargs):
-            self.acks.append(kwargs["json"])
+            self.acks.append((url, kwargs["json"]))
             return MagicMock()
 
     client = Client()
     bot = MagicMock()
+    bot.edit_message_text = AsyncMock()
     bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=43))
     bot.session.close = AsyncMock()
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: client)
@@ -232,11 +235,25 @@ async def test_owner_release_card_has_controls_and_uses_private_owner_chat(
 
     await worker.notify_agent_runs({})
 
-    args = bot.send_message.await_args
-    assert args.args[0] == 1001
-    assert "&lt;timeout&gt;" in args.args[1]
-    assert args.kwargs["reply_markup"] is not None
-    assert client.acks == [{"message_id": 43}]
+    bot.edit_message_text.assert_awaited_once()
+    legacy_edit = bot.edit_message_text.await_args
+    assert legacy_edit.kwargs["chat_id"] == -1001
+    assert legacy_edit.kwargs["message_id"] == 41
+    assert legacy_edit.kwargs["reply_markup"] is None
+    owner_send = bot.send_message.await_args
+    assert owner_send.args[0] == 1001
+    assert "&lt;timeout&gt;" in owner_send.args[1]
+    assert owner_send.kwargs["reply_markup"] is not None
+    assert client.acks == [
+        (
+            "http://api/api/v1/agent-runs/12345678-1234-5678-1234-567812345678/notified",
+            {"message_id": 41},
+        ),
+        (
+            "http://api/api/v1/agent-runs/12345678-1234-5678-1234-567812345678/owner-notified",
+            {"message_id": 43},
+        ),
+    ]
 
 
 async def test_owner_deploy_notice_edits_same_card_and_keeps_details(
@@ -257,6 +274,8 @@ async def test_owner_deploy_notice_edits_same_card_and_keeps_details(
         "impact": "Retry impact",
         "ci_evidence": {"state": "success", "verified_sha": "d" * 40},
         "review": {"state": "clean", "findings": []},
+        "owner_notice_chat_id": 1001,
+        "owner_notice_message_id": 43,
         "telegram_message_id": 42,
     }
 
@@ -276,7 +295,7 @@ async def test_owner_deploy_notice_edits_same_card_and_keeps_details(
             return response
 
         async def post(self, url, **kwargs):
-            self.acks.append(kwargs["json"])
+            self.acks.append((url, kwargs["json"]))
             return MagicMock()
 
     client = Client()
@@ -296,12 +315,20 @@ async def test_owner_deploy_notice_edits_same_card_and_keeps_details(
 
     await worker.notify_agent_runs({})
 
-    bot.edit_message_text.assert_awaited_once()
-    assert bot.edit_message_text.await_args.kwargs["chat_id"] == 1001
-    markup = bot.edit_message_text.await_args.kwargs["reply_markup"]
+    assert bot.edit_message_text.await_count == 2
+    legacy_edit, owner_edit = bot.edit_message_text.await_args_list
+    assert legacy_edit.kwargs["chat_id"] == -1001
+    assert legacy_edit.kwargs["message_id"] == 42
+    assert legacy_edit.kwargs["reply_markup"] is None
+    assert owner_edit.kwargs["chat_id"] == 1001
+    assert owner_edit.kwargs["message_id"] == 43
+    markup = owner_edit.kwargs["reply_markup"]
     assert [button.text for row in markup.inline_keyboard for button in row] == ["Batafsil"]
     bot.send_message.assert_not_awaited()
-    assert client.acks == [{"message_id": 42}]
+    assert client.acks == [
+        ("http://api/api/v1/agent-runs/run-3/notified", {"message_id": 42}),
+        ("http://api/api/v1/agent-runs/run-3/owner-notified", {"message_id": 43}),
+    ]
 
 
 async def test_owner_failure_notice_edits_existing_card_with_escaped_reason(
@@ -322,6 +349,8 @@ async def test_owner_failure_notice_edits_existing_card_with_escaped_reason(
         "review": {"state": "failed", "findings": []},
         "ci_evidence": {"state": "success"},
         "error": "<review unavailable> & retry later",
+        "owner_notice_chat_id": 1001,
+        "owner_notice_message_id": 55,
         "telegram_message_id": 45,
     }
 
@@ -356,11 +385,16 @@ async def test_owner_failure_notice_edits_existing_card_with_escaped_reason(
 
     await worker.notify_agent_runs({})
 
-    bot.edit_message_text.assert_awaited_once()
-    args = bot.edit_message_text.await_args
-    assert args.kwargs["chat_id"] == 1001
-    assert "&lt;review unavailable&gt; &amp; retry later" in args.args[0]
+    assert bot.edit_message_text.await_count == 2
+    legacy_edit, owner_edit = bot.edit_message_text.await_args_list
+    assert legacy_edit.kwargs["chat_id"] == -1001
+    assert legacy_edit.kwargs["message_id"] == 45
+    assert owner_edit.kwargs["chat_id"] == 1001
+    assert owner_edit.kwargs["message_id"] == 55
+    assert "&lt;review unavailable&gt; &amp; retry later" in owner_edit.args[0]
     assert [
-        button.text for row in args.kwargs["reply_markup"].inline_keyboard for button in row
+        button.text
+        for row in owner_edit.kwargs["reply_markup"].inline_keyboard
+        for button in row
     ] == ["Batafsil"]
     bot.send_message.assert_not_awaited()

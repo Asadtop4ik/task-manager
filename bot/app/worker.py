@@ -6,6 +6,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import InlineKeyboardMarkup
 from arq import cron
 from arq.connections import RedisSettings
 
@@ -77,6 +78,31 @@ def agent_result_card(notice: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+async def _upsert_agent_message(
+    bot: Bot,
+    *,
+    chat_id: int,
+    message_id: int | None,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> int:
+    """Edit only an ID belonging to this chat; send a new message otherwise."""
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup,
+            )
+            return message_id
+        except TelegramBadRequest as error:
+            if "message is not modified" in str(error).lower():
+                return message_id
+    sent = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    return sent.message_id
+
+
 async def ping(ctx: dict[str, object]) -> str:
     """Round-trip check for the queue itself.
 
@@ -103,57 +129,108 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
         )
         try:
             for notice in notices:
-                chat_id = notice["chat_id"]
+                run_id = notice["run_id"]
+
+                # Preserve the task-origin card and its message ID. This may
+                # be a group chat and is never reused for the owner's private card.
+                legacy_chat_id = notice.get("chat_id")
+                legacy_message_id = notice.get("telegram_message_id")
+                if legacy_chat_id:
+                    try:
+                        legacy_message_id = await _upsert_agent_message(
+                            bot,
+                            chat_id=legacy_chat_id,
+                            message_id=legacy_message_id,
+                            text=agent_result_card(notice),
+                            reply_markup=None,
+                        )
+                    except (TelegramAPIError, OSError) as error:
+                        log.error(
+                            "agent_notice_failed",
+                            run_id=run_id,
+                            error=type(error).__name__,
+                        )
+                    else:
+                        try:
+                            ack = await client.post(
+                                f"{base}/{run_id}/notified",
+                                headers=headers,
+                                json={"message_id": legacy_message_id},
+                            )
+                            ack.raise_for_status()
+                        except httpx.HTTPError as error:
+                            log.error(
+                                "agent_notice_ack_failed",
+                                run_id=run_id,
+                                error=type(error).__name__,
+                            )
+                else:
+                    try:
+                        ack = await client.post(
+                            f"{base}/{run_id}/notified",
+                            headers=headers,
+                            json={"message_id": None},
+                        )
+                        ack.raise_for_status()
+                    except httpx.HTTPError as error:
+                        log.error(
+                            "agent_notice_ack_failed",
+                            run_id=run_id,
+                            error=type(error).__name__,
+                        )
+
+                # Owner controls have a distinct persisted message/chat pair.
+                # Never apply the legacy task-origin message ID to this chat.
                 owner_chat_id = notice.get("owner_chat_id")
+                owner_notice_chat_id = notice.get("owner_notice_chat_id")
+                owner_message_id = notice.get("owner_notice_message_id")
                 if owner_chat_id:
-                    # Keep the review card and its later deploy updates in the
-                    # owner's private chat even when a run started in a group.
-                    chat_id = owner_chat_id
-                message_id = notice.get("telegram_message_id")
-                if chat_id:
-                    head_sha = str(notice.get("head_sha") or "")
-                    if owner_chat_id and len(head_sha) == 40:
-                        text = release_card(notice)
+                    owner_head_sha = str(notice.get("head_sha") or "")
+                    owner_text = (
+                        release_card(notice)
+                        if len(owner_head_sha) == 40
+                        else agent_result_card(notice)
+                    )
+                    owner_markup = None
+                    if len(owner_head_sha) == 40:
                         actions = notice.get("actions") or {}
                         if not notice.get("owner_controls_available"):
                             actions = {}
-                        markup = release_keyboard(
-                            str(notice["run_id"]), head_sha, actions=actions
+                        owner_markup = release_keyboard(
+                            str(run_id), owner_head_sha, actions=actions
+                        )
+                    # An ID is reusable only alongside the same owner chat ID.
+                    reusable_id = (
+                        owner_message_id if owner_notice_chat_id == owner_chat_id else None
+                    )
+                    try:
+                        owner_message_id = await _upsert_agent_message(
+                            bot,
+                            chat_id=owner_chat_id,
+                            message_id=reusable_id,
+                            text=owner_text,
+                            reply_markup=owner_markup,
+                        )
+                    except (TelegramAPIError, OSError) as error:
+                        log.error(
+                            "owner_agent_notice_failed",
+                            run_id=run_id,
+                            error=type(error).__name__,
                         )
                     else:
-                        text = agent_result_card(notice)
-                        markup = None
-                    try:
-                        if message_id:
-                            try:
-                                await bot.edit_message_text(
-                                    text,
-                                    chat_id=chat_id,
-                                    message_id=message_id,
-                                    reply_markup=markup,
-                                )
-                            except TelegramBadRequest as exc:
-                                if "message is not modified" not in str(exc).lower():
-                                    sent = await bot.send_message(
-                                        chat_id, text, reply_markup=markup
-                                    )
-                                    message_id = sent.message_id
-                        else:
-                            sent = await bot.send_message(chat_id, text, reply_markup=markup)
-                            message_id = sent.message_id
-                    except (TelegramAPIError, OSError) as exc:
-                        log.error(
-                            "agent_notice_failed",
-                            run_id=notice["run_id"],
-                            error=type(exc).__name__,
-                        )
-                        continue
-                ack = await client.post(
-                    f"{base}/{notice['run_id']}/notified",
-                    headers=headers,
-                    json={"message_id": message_id},
-                )
-                ack.raise_for_status()
+                        try:
+                            ack = await client.post(
+                                f"{base}/{run_id}/owner-notified",
+                                headers=headers,
+                                json={"message_id": owner_message_id},
+                            )
+                            ack.raise_for_status()
+                        except httpx.HTTPError as error:
+                            log.error(
+                                "owner_agent_notice_ack_failed",
+                                run_id=run_id,
+                                error=type(error).__name__,
+                            )
         finally:
             await bot.session.close()
 
