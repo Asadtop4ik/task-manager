@@ -37,6 +37,8 @@ class DiscussionWork(BaseModel):
     lease_id: str
     repo_full_name: str
     base_branch: str
+    project_key: str
+    diagnostics_enabled: bool = False
     thread_id: str | None
     text: str
     images: list[IntakeImage]

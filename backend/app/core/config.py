@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     agent_intake_enabled: bool = Field(default=False, alias="AGENT_INTAKE_ENABLED")
     agent_public_enabled: bool = Field(default=False, alias="AGENT_PUBLIC_ENABLED")
     intake_worker_token: str = Field(default="", alias="INTAKE_WORKER_TOKEN")
+    ketoshop_diagnostics_enabled: bool = Field(
+        default=False, alias="KETOSHOP_DIAGNOSTICS_ENABLED"
+    )
 
     # --- Web ---
     public_url: str = Field(default="http://localhost:5173", alias="PUBLIC_URL")

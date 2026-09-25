@@ -32,9 +32,11 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 LockPersonality=yes
 RestrictSUIDSGID=no
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ProtectProc=invisible
-ProcSubset=pid
+# Codex's bubblewrap namespace setup reads /proc/sys/kernel/overflowuid.
+# ProtectKernelTunables still prevents access to host kernel tunables.
+ProcSubset=all
 # Codex CLI needs to update its own auth/session state even for --ephemeral
 # read-only analysis. The model's shell sandbox remains read-only.
 ReadWritePaths=/run/task-manager-intake /home/codex-runner/.codex

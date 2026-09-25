@@ -138,6 +138,112 @@ async def test_messages_resume_one_thread_and_deny_stale_results(
     assert (await session.scalars(select(Task))).all() == []
 
 
+async def test_ketoshop_diagnostic_context_is_owner_project_and_active_turn_only(
+    client: AsyncClient,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "ketoshop"
+    project.repo_full_name = "muradjanov-dev/ketoshop"
+    project.default_branch = "master"
+    await ready_project_flags(monkeypatch)
+    created = await client.post(
+        "/api/v1/project-discussions",
+        json={"project_id": project.id, "chat_id": manager.telegram_id},
+        headers=bot_headers(manager),
+    )
+    discussion_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/project-discussions/{discussion_id}/messages",
+        json={"text": "Buyurtmalarni tekshiring"},
+        headers=bot_headers(manager),
+    )
+    work = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert work["project_key"] == "ketoshop" and work["diagnostics_enabled"] is True
+    context = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert context.status_code == 200
+    assert context.json() == {
+        "authorized": True,
+        "project_key": "ketoshop",
+        "project_id": project.id,
+        "actor_id": manager.id,
+        "active": True,
+        "revision": work["revision"],
+    }
+    missing_capability = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers(),
+    )
+    wrong_capability = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": "guessable-wrong"},
+    )
+    assert missing_capability.status_code == wrong_capability.status_code == 404
+
+    completed = await client.post(
+        f"/api/v1/project-discussions/{discussion_id}/result",
+        json={
+            "revision": work["revision"],
+            "lease_id": work["lease_id"],
+            "thread_id": "thr_diag",
+            "response": "Tayyor.",
+        },
+        headers=worker_headers(),
+    )
+    assert completed.status_code == 200
+    inactive = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert inactive.status_code == 404
+
+
+async def test_nonowner_ketoshop_discussion_does_not_get_diagnostics(
+    client: AsyncClient,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "ketoshop"
+    project.repo_full_name = "muradjanov-dev/ketoshop"
+    project.default_branch = "master"
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id + 1)
+    created = await client.post(
+        "/api/v1/project-discussions",
+        json={"project_id": project.id, "chat_id": manager.telegram_id},
+        headers=bot_headers(manager),
+    )
+    discussion_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/project-discussions/{discussion_id}/messages",
+        json={"text": "Tekshiring"},
+        headers=bot_headers(manager),
+    )
+    work = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert work["diagnostics_enabled"] is False
+    denied = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert denied.status_code == 404
+
+
+async def ready_project_flags(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_public_enabled", True)
+    monkeypatch.setattr(settings, "ketoshop_diagnostics_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-worker-token-0123456789abcdef")
+
+
 async def test_image_is_leased_only_to_worker_and_reset_clears_context(
     client: AsyncClient,
     session: AsyncSession,

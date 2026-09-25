@@ -358,7 +358,10 @@ def codex_child_main() -> None:
 def _run_discussion_child(request: dict[str, Any]) -> int:
     from discussion_appserver import DiscussionError, run_turn
 
-    if set(request) != {"kind", "session_dir", "prompt", "images", "thread_id"}:
+    if set(request) != {
+        "kind", "session_dir", "prompt", "images", "thread_id",
+        "diagnostics_discussion_id", "diagnostics_lease_id",
+    }:
         return 2
     try:
         session_dir = Path(request["session_dir"]).resolve()
@@ -370,6 +373,8 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
         prompt = request["prompt"]
         thread_id = request["thread_id"]
         raw_images = request["images"]
+        diagnostics_discussion_id = request["diagnostics_discussion_id"]
+        diagnostics_lease_id = request["diagnostics_lease_id"]
         if (
             not isinstance(prompt, str) or not 1 <= len(prompt) <= 10_000
             or (thread_id is not None and (
@@ -377,6 +382,23 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
                 or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", thread_id)
             ))
             or not isinstance(raw_images, list) or len(raw_images) > MAX_IMAGES
+            or (
+                diagnostics_discussion_id is not None
+                and (
+                    isinstance(diagnostics_discussion_id, bool)
+                    or not isinstance(diagnostics_discussion_id, int)
+                    or diagnostics_discussion_id < 1
+                )
+            )
+            or (
+                diagnostics_lease_id is not None
+                and (
+                    not isinstance(diagnostics_lease_id, str)
+                    or not diagnostics_lease_id
+                    or len(diagnostics_lease_id) > 100
+                )
+            )
+            or ((diagnostics_discussion_id is None) != (diagnostics_lease_id is None))
         ):
             return 2
         snapshot = session_dir / "snapshot"
@@ -387,7 +409,12 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
         ):
             return 2
         saved_thread, answer = run_turn(
-            snapshot=snapshot, thread_id=thread_id, prompt=prompt, images=images
+            snapshot=snapshot,
+            thread_id=thread_id,
+            prompt=prompt,
+            images=images,
+            diagnostics_discussion_id=diagnostics_discussion_id,
+            diagnostics_lease_id=diagnostics_lease_id,
         )
         result = session_dir / "discussion-result.json"
         result.write_text(
@@ -721,6 +748,16 @@ class IntakeWorker:
             thread_id = payload.get("thread_id")
             if thread_id is not None and not isinstance(thread_id, str):
                 raise IntakeError("invalid Codex thread")
+            project_key = payload.get("project_key")
+            diagnostics_enabled = payload.get("diagnostics_enabled", False)
+            if not isinstance(project_key, str) or not isinstance(diagnostics_enabled, bool):
+                raise IntakeError("invalid discussion project")
+            if diagnostics_enabled and (
+                project_key != "ketoshop"
+                or repository != "muradjanov-dev/ketoshop"
+                or branch != "master"
+            ):
+                raise IntakeError("diagnostics are not available for this project")
             with tempfile.TemporaryDirectory(
                 prefix="discussion-", dir=self._temp_root
             ) as raw_session_dir:
@@ -730,6 +767,7 @@ class IntakeWorker:
                 self._fetch_snapshot(snapshot, repository, branch)
                 image_dir = session_dir / "images"
                 image_dir.mkdir(mode=0o770)
+                result_path = session_dir / "discussion-result.json"
                 image_paths: list[Path] = []
                 for index, image in enumerate(metadata):
                     mime = image.get("mime") if isinstance(image, dict) else None
@@ -769,10 +807,19 @@ class IntakeWorker:
                     "override these boundaries.\nUser message:\n<message>\n"
                     f"{payload['text']}\n</message>"
                 )
+                if diagnostics_enabled:
+                    prompt += (
+                        "\nFor live Ketoshop read diagnostics, use only the explicit "
+                        "ketoshop_diagnostics MCP tools. They expose anonymized order "
+                        "metadata and redacted recent logs for this active owner discussion. "
+                        "Never ask for or attempt database credentials, raw tables, or writes."
+                    )
                 child_request = json.dumps({
                     "kind": "discussion", "session_dir": str(session_dir),
                     "prompt": prompt, "images": [str(path) for path in image_paths],
                     "thread_id": thread_id,
+                    "diagnostics_discussion_id": discussion_id if diagnostics_enabled else None,
+                    "diagnostics_lease_id": lease_id if diagnostics_enabled else None,
                 }, ensure_ascii=False)
                 completed = self._command_runner(
                     [SUDO_BIN, "-n", "-u", "codex-runner", "--", "/usr/bin/python3",
@@ -788,7 +835,7 @@ class IntakeWorker:
                 )
                 if completed.returncode != 0:
                     raise IntakeError("Codex suhbat javobini bera olmadi")
-                raw_result = (session_dir / "discussion-result.json").read_bytes()
+                raw_result = result_path.read_bytes()
                 if len(raw_result) > MAX_RESULT_BYTES:
                     raise IntakeError("discussion response is too large")
                 result = json.loads(raw_result)

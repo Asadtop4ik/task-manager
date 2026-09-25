@@ -1,0 +1,42 @@
+[Unit]
+Description=Task Manager owner-only Ketoshop read diagnostics broker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=task-diagnostics
+Group=codex-runner
+SupplementaryGroups=docker
+EnvironmentFile=/etc/task-manager/diagnostics.env
+Environment=TASK_MANAGER_DIAGNOSTICS_SOCKET=/run/task-manager-diagnostics/diagnostics.sock
+Environment=TASK_MANAGER_DIAGNOSTICS_AUDIT_FILE=/var/log/task-manager-diagnostics/audit.jsonl
+RuntimeDirectory=task-manager-diagnostics
+RuntimeDirectoryMode=0770
+LogsDirectory=task-manager-diagnostics
+LogsDirectoryMode=0750
+UMask=0077
+WorkingDirectory=/opt/task-manager
+ExecStart=/opt/task-manager/diagnostics-venv/bin/python /opt/task-manager/ops/diagnostic_host.py
+Restart=on-failure
+RestartSec=3
+CPUQuota=25%
+MemoryMax=256M
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/task-manager-diagnostics /var/log/task-manager-diagnostics
+
+[Install]
+WantedBy=multi-user.target
