@@ -61,18 +61,20 @@ def ensure_tools(*requirements: str) -> None:
 def run(repo: str, root: Path) -> str:
     paths = changed_python(root)
     if repo == "Asadtop4ik/agent-qa":
+        ensure_tools("ruff==0.7.4")
         if paths:
-            ensure_tools("ruff==0.7.4")
             # Only safe-fix unused imports in files changed by this agent run.
-            # The full checks below make every other lint/format issue fail closed.
             subprocess.run(
                 ["ruff", "check", "--fix", "--select", "F401", "--", *paths],
                 cwd=root,
                 check=True,
             )
             subprocess.run(["ruff", "format", "--", *paths], cwd=root, check=True)
-            subprocess.run(["ruff", "check", "."], cwd=root, check=True)
-            subprocess.run(["ruff", "format", "--check", "."], cwd=root, check=True)
+        # Config-only patches still run the whole-project checks. Auto-fixes,
+        # formatting, and staging stay limited to changed Python files above.
+        subprocess.run(["ruff", "check", "."], cwd=root, check=True)
+        subprocess.run(["ruff", "format", "--check", "."], cwd=root, check=True)
+        if paths:
             subprocess.run(["git", "add", "--", *paths], cwd=root, check=True)
         return "Agent QA: Ruff 0.7.4 check and format passed"
     if repo == "muradjanov-dev/qurbot":

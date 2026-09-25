@@ -133,6 +133,58 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertNotIn(["ruff", "format", "--", "unchanged.py"], calls)
         self.assertNotIn(["git", "add", "--", "unchanged.py"], calls)
 
+    def test_agent_qa_config_only_patch_still_checks_without_mutating_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "pyproject.toml"
+            unchanged = root / "unchanged.py"
+            config.write_text("[tool.ruff]\nline-length = 88\n", encoding="utf-8")
+            unchanged.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
+                cwd=root,
+                check=True,
+            )
+            config.write_text("[tool.ruff]\nline-length = 100\n", encoding="utf-8")
+            subprocess.run(["git", "add", "pyproject.toml"], cwd=root, check=True)
+            original_unchanged = unchanged.read_bytes()
+            original_run = subprocess.run
+            calls = []
+
+            def run_command(command, *args, **kwargs):
+                calls.append(command)
+                if command[0] == "ruff":
+                    return subprocess.CompletedProcess(command, 0)
+                return original_run(command, *args, **kwargs)
+
+            with patch("agent_preflight.ensure_tools") as install, patch(
+                "agent_preflight.subprocess.run", side_effect=run_command
+            ):
+                result = run("Asadtop4ik/agent-qa", root)
+
+            install.assert_called_once_with("ruff==0.7.4")
+            self.assertIn(["ruff", "check", "."], calls)
+            self.assertIn(["ruff", "format", "--check", "."], calls)
+            self.assertFalse(any("--fix" in command for command in calls))
+            self.assertNotIn(["git", "add", "--", "pyproject.toml"], calls)
+            self.assertIn("passed", result)
+            self.assertEqual(unchanged.read_bytes(), original_unchanged)
+            staged = subprocess.check_output(
+                ["git", "diff", "--cached", "--name-only"], cwd=root, text=True
+            ).splitlines()
+            self.assertEqual(staged, ["pyproject.toml"])
+
     @unittest.skipUnless(shutil.which("ruff"), "Ruff is installed by QA CI")
     def test_agent_qa_fixes_f401_and_leaves_unmodified_files_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
