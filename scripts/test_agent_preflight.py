@@ -119,6 +119,20 @@ class AgentPreflightTests(unittest.TestCase):
             calls,
         )
 
+    def test_agent_qa_formats_and_stages_only_changed_python_files(self):
+        with patch(
+            "agent_preflight.changed_python", return_value=["changed.py"]
+        ), patch("agent_preflight.ensure_tools"), patch(
+            "agent_preflight.subprocess.run"
+        ) as command:
+            run("Asadtop4ik/agent-qa", Path("/tmp/target"))
+
+        calls = [item.args[0] for item in command.call_args_list]
+        self.assertIn(["ruff", "format", "--", "changed.py"], calls)
+        self.assertIn(["git", "add", "--", "changed.py"], calls)
+        self.assertNotIn(["ruff", "format", "--", "unchanged.py"], calls)
+        self.assertNotIn(["git", "add", "--", "unchanged.py"], calls)
+
     @unittest.skipUnless(shutil.which("ruff"), "Ruff is installed by QA CI")
     def test_agent_qa_fixes_f401_and_leaves_unmodified_files_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
