@@ -25,6 +25,7 @@ class DiagnosticSecurityTests(unittest.TestCase):
         for query in (
             "SELECT phone FROM orders",
             "SELECT address FROM ketoshop_diag_orders",
+            "SELECT item_name FROM ketoshop_diag_order_items",
             "SELECT order_id FROM public.orders",
             "SELECT order_id FROM ketoshop_diag_orders; DROP TABLE orders",
             "SELECT order_id FROM ketoshop_diag_orders JOIN users ON true",

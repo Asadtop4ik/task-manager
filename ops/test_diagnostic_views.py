@@ -85,6 +85,7 @@ class DiagnosticViewFixtureTests(unittest.TestCase):
         self.assertNotIn("phone", exposed)
         self.assertNotIn("address", exposed)
         self.assertNotIn("customer_name", exposed)
+        self.assertNotIn("item_name", exposed)
 
     def test_host_aggregate_spans_more_than_200_order_rows(self) -> None:
         host = DiagnosticHost(
@@ -95,6 +96,17 @@ class DiagnosticViewFixtureTests(unittest.TestCase):
             {"period": "day", "count": 7}
         )
         self.assertEqual(row_count, 7)
+        self.assertEqual(result["source"], "ketoshop_postgresql_views")
+        self.assertEqual(result["period"], "day")
+        self.assertEqual(result["timezone"], "Asia/Tashkent")
+        self.assertTrue(result["captured_at"].endswith("+00:00"))
+        self.assertEqual(
+            result["verified_version"]["verified"],
+            bool(
+                result["verified_version"]["git_commit"]
+                and result["verified_version"]["image_digest"]
+            ),
+        )
         self.assertEqual(
             sum(bucket["order_count"] for bucket in result["buckets"]), 205
         )

@@ -24,7 +24,6 @@ VIEW_COLUMNS: dict[str, tuple[str, ...]] = {
         "order_id",
         "created_at",
         "status",
-        "item_name",
         "quantity",
         "unit",
         "line_amount",

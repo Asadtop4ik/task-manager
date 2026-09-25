@@ -9,7 +9,7 @@ import sys
 from typing import Any
 
 MAX_MESSAGE_BYTES = 64 * 1024
-HOST_CALL_TIMEOUT_SECONDS = 15
+HOST_CALL_TIMEOUT_SECONDS = 20
 DEFAULT_SOCKET = "/run/task-manager-diagnostics/diagnostics.sock"
 
 TOOLS = [
@@ -20,7 +20,7 @@ TOOLS = [
             "Use one SELECT from ketoshop_diag_orders or ketoshop_diag_order_items. "
             "Available columns: ketoshop_diag_orders(order_id, created_at, status, total, "
             "quantity_total); ketoshop_diag_order_items(order_id, created_at, status, "
-            "item_name, quantity, unit, line_amount). WHERE supports AND comparisons. "
+            "quantity, unit, line_amount). WHERE supports AND comparisons. "
             "ORDER BY and LIMIT are optional. No raw tables, writes, contact fields or joins."
         ),
         "inputSchema": {
@@ -49,7 +49,8 @@ TOOLS = [
             "delivered revenue, expenses, known current-catalog cost and missing-cost item counts. "
             "Current catalog costs are estimates, not historical cost snapshots. Historical cost "
             "data is unavailable and is labeled as such. This bounded aggregate covers more than "
-            "200 orders without returning one row per order."
+            "200 orders without returning one row per order. Results include source, selected "
+            "period, UTC capture time and verified Ketoshop Git commit/image digest metadata when available."
         ),
         "inputSchema": {
             "type": "object",

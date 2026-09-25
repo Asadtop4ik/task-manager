@@ -103,7 +103,6 @@ SELECT
     normalized.id AS order_id,
     normalized.created_at,
     normalized.status,
-    LEFT(COALESCE(item.value ->> 'name', ''), 160) AS item_name,
     CASE
         WHEN public.ketoshop_try_numeric(item.value ->> 'quantity') IS NOT NULL
             THEN public.ketoshop_try_numeric(item.value ->> 'quantity')

@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import selectors
 import socket
 import subprocess
 import threading
@@ -42,12 +44,16 @@ MAX_REQUEST_BYTES = 8 * 1024
 MAX_AUDIT_AGE = timedelta(hours=24)
 MAX_AUDIT_LINES = 500
 MAX_CALLS_PER_REVISION = 10
-MAX_LOG_BYTES = 1024 * 1024
+MAX_LOG_INPUT_BYTES = 4 * 1024 * 1024
+MAX_LOG_LINE_BYTES = 4 * 1024
 MAX_LOG_RESULT_BYTES = 24 * 1024
+FINANCE_VERSION_TIMEOUT_SECONDS = 3
 ALLOWED_CONTAINER = "ketoshop"
 ALLOWED_TOOLS = frozenset(
     {"ketoshop_query", "ketoshop_recent_logs", "ketoshop_finance_summary"}
 )
+_KETOSHOP_IMAGE_REF = re.compile(r"^ghcr\.io/muradjanov-dev/ketoshop:([0-9a-f]{40})$")
+_KETOSHOP_IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 FINANCE_SUMMARY_SQL = """
 WITH parameters AS (
@@ -231,6 +237,7 @@ class DiagnosticHost:
         api_base_url: str = API_BASE_URL,
         audit: AuditLog | None = None,
         command_runner: Any = subprocess.run,
+        popen_factory: Any = subprocess.Popen,
         opener: Any = urllib.request.urlopen,
     ) -> None:
         if not intake_token or not database_url:
@@ -240,6 +247,7 @@ class DiagnosticHost:
         self._api_base_url = api_base_url.rstrip("/")
         self._audit = audit or AuditLog()
         self._command_runner = command_runner
+        self._popen_factory = popen_factory
         self._opener = opener
         self._counter_lock = threading.Lock()
         self._calls: dict[int, tuple[int, int, float]] = {}
@@ -412,49 +420,153 @@ class DiagnosticHost:
             raise DiagnosticsError("approved Ketoshop finance summary failed") from exc
         if len(rows) > bucket_count or len(rows) > MAX_ROWS:
             raise DiagnosticsError("finance summary exceeded its fixed bucket limit")
+        image_version = self._verified_ketoshop_image_version()
         buckets = [
             {key: self._clean_value(value) for key, value in row.items()}
             for row in rows
         ]
         result = {
+            "source": "ketoshop_postgresql_views",
             "period": period,
+            "timezone": "Asia/Tashkent",
+            "captured_at": datetime.now(timezone.utc).isoformat(),
             "bucket_count": len(buckets),
             "buckets": buckets,
             "cost_basis": "current_catalog",
             "historical_cost_data_available": False,
+            "verified_version": {
+                "git_commit": image_version["git_commit"] if image_version else None,
+                "image_digest": (
+                    image_version["image_digest"] if image_version else None
+                ),
+                "verified": image_version is not None,
+            },
         }
         digest = hashlib.sha256(f"finance:{period}:{bucket_count}".encode()).hexdigest()
         return result, digest, len(buckets)
 
-    def _logs(self) -> tuple[dict[str, Any], str, int]:
+    def _verified_ketoshop_image_version(self) -> dict[str, str] | None:
         try:
             completed = self._command_runner(
                 [
                     "/usr/bin/docker",
-                    "logs",
-                    "--since",
-                    "24h",
-                    "--tail",
-                    "500",
+                    "inspect",
+                    "--format",
+                    "{{.Config.Image}} {{.Image}}",
                     ALLOWED_CONTAINER,
                 ],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=5,
+                stderr=subprocess.DEVNULL,
+                timeout=FINANCE_VERSION_TIMEOUT_SECONDS,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            raise DiagnosticsError("Ketoshop logs are unavailable") from None
+            return None
         if completed.returncode != 0:
+            return None
+        value = completed.stdout or b""
+        if isinstance(value, bytes):
+            value = value.decode("ascii", "ignore")
+        fields = str(value).split()
+        if len(fields) != 2:
+            return None
+        image_ref, image_id = fields
+        ref_match = _KETOSHOP_IMAGE_REF.fullmatch(image_ref)
+        if ref_match is None or _KETOSHOP_IMAGE_ID.fullmatch(image_id) is None:
+            return None
+        return {"git_commit": ref_match.group(1), "image_digest": image_id}
+
+    def _logs(self) -> tuple[dict[str, Any], str, int]:
+        command = [
+            "/usr/bin/docker",
+            "logs",
+            "--since",
+            "24h",
+            "--tail",
+            "500",
+            ALLOWED_CONTAINER,
+        ]
+        try:
+            process = self._popen_factory(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+            )
+        except OSError:
+            raise DiagnosticsError("Ketoshop logs are unavailable") from None
+        if process.stdout is None:
+            process.kill()
             raise DiagnosticsError("Ketoshop logs are unavailable")
-        raw = completed.stdout or b""
-        if isinstance(raw, str):
-            raw = raw.encode("utf-8", "replace")
-        truncated = len(raw) > MAX_LOG_BYTES
-        raw = raw[-MAX_LOG_BYTES:]
+
+        lines: list[bytes] = []
+        pending = bytearray()
+        dropping_long_line = False
+        bytes_read = 0
+        truncated = False
+        input_capped = False
+        deadline = time.monotonic() + 5
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, 5)
+                    events = selector.select(min(remaining, 0.5))
+                    if not events:
+                        continue
+                    for key, _ in events:
+                        chunk = os.read(key.fd, 4096)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        bytes_read += len(chunk)
+                        if bytes_read > MAX_LOG_INPUT_BYTES:
+                            truncated = True
+                            input_capped = True
+                            process.kill()
+                            selector.unregister(key.fileobj)
+                            break
+                        for byte in chunk:
+                            if byte == 10:
+                                if not dropping_long_line:
+                                    lines.append(bytes(pending).rstrip(b"\r"))
+                                    if len(lines) > 500:
+                                        del lines[0]
+                                        truncated = True
+                                pending.clear()
+                                dropping_long_line = False
+                            elif not dropping_long_line:
+                                if len(pending) < MAX_LOG_LINE_BYTES:
+                                    pending.append(byte)
+                                else:
+                                    pending.clear()
+                                    dropping_long_line = True
+                                    truncated = True
+                if pending and not dropping_long_line and len(lines) < 500:
+                    lines.append(bytes(pending).rstrip(b"\r"))
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            raise DiagnosticsError("Ketoshop logs are unavailable") from None
+        finally:
+            process.stdout.close()
+        try:
+            return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+            raise DiagnosticsError("Ketoshop logs are unavailable") from None
+        if return_code != 0 and not input_capped:
+            raise DiagnosticsError("Ketoshop logs are unavailable")
+
         entries: list[dict[str, Any]] = []
-        for line in raw.decode("utf-8", "replace").splitlines()[-500:]:
-            metadata = structured_log_metadata(line[:4_096])
+        for line in lines[-500:]:
+            metadata = structured_log_metadata(line.decode("utf-8", "replace"))
             if metadata is not None:
                 entries.append(metadata)
         result: dict[str, Any] = {
@@ -546,7 +658,7 @@ class DiagnosticHost:
 
 def _handle_client(connection: socket.socket, host: DiagnosticHost) -> None:
     with connection:
-        connection.settimeout(18)
+        connection.settimeout(22)
         data = bytearray()
         while len(data) <= MAX_REQUEST_BYTES:
             chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 1 - len(data)))

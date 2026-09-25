@@ -10,10 +10,12 @@ database password. Its proxy can call only the host broker over one Unix socket.
 
 The lease capability is passed only to that turn's MCP proxy. We verified the
 same systemd/bubblewrap profile with two simultaneous `codex-runner` processes:
-a second read-only Codex shell reported the proxy PID's `/proc/<pid>/cmdline`
-as unreadable. The host still requires the
-capability and verifies it against the active lease for every call, so a socket
-caller without the owner's current capability is denied.
+a second read-only Codex shell reported both a synthetic proxy PID and the
+actual Codex app-server PID's `/proc/<pid>/cmdline` as hidden, and `ps` did not
+list either host PID. The test app-server's argv contained a synthetic lease
+marker. The host still requires the capability and verifies it against the
+active lease for every call, so a socket caller without the owner's current
+capability is denied.
 
 The broker asks the Task Manager API to re-check the owner, Ketoshop project,
 active discussion lease and turn revision before every tool call. It reads only
@@ -25,6 +27,9 @@ breakdowns, delivered revenue, expenses, current catalog cost estimates and
 missing-cost item counts across more than 200 orders.
 Daily and monthly buckets use Asia/Tashkent business time; the production
 Ketoshop database stores these timestamps without a timezone on a UTC server.
+Each result includes the database-view source, selected period, UTC capture
+time, and the verified Ketoshop Git commit plus immutable image digest when
+Docker reports a matching SHA-tagged image and digest.
 
 Historical `cost_price` values are not stored in Ketoshop order snapshots.
 Finance summaries label cost as a current catalog estimate and mark historical
@@ -35,11 +40,13 @@ Limits are five seconds per database statement, 200 rows, 64 KB per result and
 10 tool calls per active turn. The logs tool reads only the fixed `ketoshop`
 container, at most 500 lines from the last 24 hours, captures both output
 streams, and returns at most 24 KB of safe metadata. It exposes structured
-time, level, logger, event and status fields only; free-form messages and
-unstructured lines are omitted. The audit file stores discussion ID, internal
-actor/project IDs, revision, tool name, query hash, row count, result size,
-duration and outcome. It keeps the latest 500 records from the last 24 hours;
-it never stores lease capabilities, query text or results.
+time, level, allowlisted event/exception types and status codes only; free-form
+messages and unstructured lines are omitted. Capture drops lines above 4 KB and
+stops after 4 MB of combined Docker output before reducing the result to its
+24 KB cap. The order-item view omits free-form item names. The audit file stores
+discussion ID, internal actor/project IDs, revision, tool name, query hash, row
+count, result size, duration and outcome. It keeps the latest 500 records from
+the last 24 hours; it never stores lease capabilities, query text or results.
 
 ## Provision the read-only Ketoshop database role
 

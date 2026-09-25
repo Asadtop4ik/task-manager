@@ -174,20 +174,26 @@ class DiagnosticHostTests(unittest.TestCase):
         self.assertTrue(more["truncated"])
 
     def test_recent_logs_use_fixed_container_and_redact_before_return(self):
-        runner = Mock(
-            return_value=SimpleNamespace(
-                stdout=(
-                    b'{"time":"2026-09-25T09:00:00Z","level":"error",'
-                    b'"event":"db_timeout","message":"Name Jane Doe address Unit 9"}\n'
-                    b"plain text address Unit 4, House 9\n"
-                ),
-                returncode=0,
-            )
+        combined_stream = (
+            b'{"time":"2026-09-25T09:00:00Z","level":"error",'
+            b'"event":"db_timeout","message":"Name Jane Doe address Unit 9"}\n'
+            b"plain text address Unit 4, House 9\n"
         )
+
+        def spawn(command, **kwargs):
+            code = (
+                "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); "
+                "sys.exit(int(sys.argv[2]))"
+            )
+            return subprocess.Popen(
+                [sys.executable, "-c", code, combined_stream.hex(), "0"], **kwargs
+            )
+
+        runner = Mock(side_effect=spawn)
         host = DiagnosticHost(
             intake_token="private-worker-token",
             database_url="postgresql://private-db-secret",
-            command_runner=runner,
+            popen_factory=runner,
             audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
         )
         result, _digest, count = host._logs()
@@ -211,11 +217,23 @@ class DiagnosticHostTests(unittest.TestCase):
             )
             for _ in range(500)
         )
-        runner = Mock(return_value=SimpleNamespace(stdout=body, returncode=0))
+        exit_status = {"value": 0}
+
+        def spawn(_command, **kwargs):
+            code = (
+                "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); "
+                "sys.exit(int(sys.argv[2]))"
+            )
+            return subprocess.Popen(
+                [sys.executable, "-c", code, body.hex(), str(exit_status["value"])],
+                **kwargs,
+            )
+
+        runner = Mock(side_effect=spawn)
         host = DiagnosticHost(
             intake_token="worker-secret",
             database_url="postgresql://db-secret",
-            command_runner=runner,
+            popen_factory=runner,
             audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
         )
         result, _digest, count = host._logs()
@@ -225,11 +243,34 @@ class DiagnosticHostTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertNotIn("private full text", encoded.decode())
 
-        runner.return_value.returncode = 1
+        exit_status["value"] = 1
         from diagnostic_host import DiagnosticsError
 
         with self.assertRaisesRegex(DiagnosticsError, "logs are unavailable"):
             host._logs()
+
+    def test_logs_stop_reading_after_the_raw_byte_budget(self):
+        script = (
+            "import sys\n"
+            'line = b\'{"level":"error","event":"database_timeout"}\\n\'\n'
+            "while True: sys.stdout.buffer.write(line)\n"
+        )
+
+        def spawn(_command, **kwargs):
+            return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+        runner = Mock(side_effect=spawn)
+        host = DiagnosticHost(
+            intake_token="worker-secret",
+            database_url="postgresql://db-secret",
+            popen_factory=runner,
+            audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
+        )
+        result, _digest, count = host._logs()
+        encoded = json.dumps(result, separators=(",", ":")).encode()
+        self.assertLessEqual(len(encoded), 24 * 1024)
+        self.assertLessEqual(count, 500)
+        self.assertTrue(result["truncated"])
 
     def test_finance_summary_aggregates_over_200_orders_with_numeric_money(self):
         executed = []
@@ -275,6 +316,17 @@ class DiagnosticHostTests(unittest.TestCase):
         fake_psycopg.connect = Mock(return_value=Connection())
         fake_rows = ModuleType("psycopg.rows")
         fake_rows.dict_row = object()
+        image_runner = Mock(
+            return_value=SimpleNamespace(
+                stdout=(
+                    b"ghcr.io/muradjanov-dev/ketoshop:"
+                    + b"a" * 40
+                    + b" sha256:"
+                    + b"d" * 64
+                ),
+                returncode=0,
+            )
+        )
         with patch.dict(
             sys.modules, {"psycopg": fake_psycopg, "psycopg.rows": fake_rows}
         ):
@@ -282,6 +334,7 @@ class DiagnosticHostTests(unittest.TestCase):
                 intake_token="worker-secret",
                 database_url="postgresql://db-secret",
                 audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
+                command_runner=image_runner,
             )
             result, digest, rows = host._finance_summary({"period": "day", "count": 1})
         self.assertEqual(rows, 1)
@@ -289,6 +342,18 @@ class DiagnosticHostTests(unittest.TestCase):
         self.assertEqual(result["buckets"][0]["revenue"], "10250.00")
         self.assertFalse(result["historical_cost_data_available"])
         self.assertEqual(result["cost_basis"], "current_catalog")
+        self.assertEqual(result["source"], "ketoshop_postgresql_views")
+        self.assertEqual(result["period"], "day")
+        self.assertEqual(result["timezone"], "Asia/Tashkent")
+        self.assertTrue(result["captured_at"].endswith("+00:00"))
+        self.assertEqual(
+            result["verified_version"],
+            {
+                "git_commit": "a" * 40,
+                "image_digest": "sha256:" + "d" * 64,
+                "verified": True,
+            },
+        )
         self.assertTrue(digest)
         self.assertTrue(any("SUM(o.revenue)" in query for query, _ in executed))
 
