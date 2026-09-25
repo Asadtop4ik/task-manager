@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +53,202 @@ async def test_private_discussion_requires_codex_access_and_creates_no_task(
     rows = (await session.scalars(select(ProjectDiscussion))).all()
     assert len(rows) == 1
     assert (await session.scalars(select(Task))).all() == []
+
+
+async def test_qa_project_discussion_requires_qa_flag_and_creates_no_task(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    payload = {"project_id": project.id, "chat_id": manager.telegram_id}
+    disabled = await client.post(
+        "/api/v1/project-discussions", json=payload, headers=bot_headers(manager)
+    )
+    assert disabled.status_code == 409
+
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    executor.can_use_codex = True
+    await session.commit()
+    nonowner = await client.post(
+        "/api/v1/project-discussions",
+        json=payload | {"chat_id": executor.telegram_id},
+        headers=bot_headers(executor),
+    )
+    assert nonowner.status_code == 403
+    monkeypatch.setattr(settings, "intake_worker_token", "test-worker-token-0123456789abcdef")
+    created = await client.post(
+        "/api/v1/project-discussions", json=payload, headers=bot_headers(manager)
+    )
+    assert created.status_code == 200 and created.json()["status"] == "idle"
+    discussion = await session.get(ProjectDiscussion, created.json()["id"])
+    assert discussion is not None and discussion.project_id == project.id
+    queued = await client.post(
+        f"/api/v1/project-discussions/{discussion.id}/messages",
+        json={"text": "Verify the synthetic service"},
+        headers=bot_headers(manager),
+    )
+    assert queued.status_code == 200 and queued.json()["status"] == "queued"
+    lease = await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    assert lease.status_code == 200
+    assert lease.json()["project_key"] == "agent-qa"
+    assert lease.json()["base_branch"] == "main"
+    assert (await session.scalars(select(Task))).all() == []
+
+
+async def test_qa_discussion_lease_refuses_nonowner_and_disabled_flag(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    executor.can_use_codex = True
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-worker-token-0123456789abcdef")
+
+    nonowner_row = ProjectDiscussion(
+        user_id=executor.id,
+        project_id=project.id,
+        chat_id=executor.telegram_id,
+        status="queued",
+        messages=[{"role": "user", "text": "Unauthorized"}],
+        pending_text="Unauthorized",
+        pending_images=[],
+        revision=1,
+        notified_revision=0,
+    )
+    session.add(nonowner_row)
+    await session.commit()
+    not_leased = await client.post(
+        "/api/v1/project-discussions/lease", headers=worker_headers()
+    )
+    assert not_leased.status_code == 204
+    await session.refresh(nonowner_row)
+    assert nonowner_row.status == "failed" and nonowner_row.lease_id is None
+
+    owner_row = ProjectDiscussion(
+        user_id=manager.id,
+        project_id=project.id,
+        chat_id=manager.telegram_id,
+        status="queued",
+        messages=[{"role": "user", "text": "Check QA"}],
+        pending_text="Check QA",
+        pending_images=[],
+        revision=1,
+        notified_revision=0,
+    )
+    session.add(owner_row)
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    disabled = await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    assert disabled.status_code == 204
+    await session.refresh(owner_row)
+    assert owner_row.status == "failed" and owner_row.lease_id is None
+
+
+async def test_qa_discussion_result_is_rejected_if_flag_turns_off_after_lease(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-worker-token-0123456789abcdef")
+    created = await client.post(
+        "/api/v1/project-discussions",
+        json={"project_id": project.id, "chat_id": manager.telegram_id},
+        headers=bot_headers(manager),
+    )
+    queued = await client.post(
+        f"/api/v1/project-discussions/{created.json()['id']}/messages",
+        json={"text": "Check QA"},
+        headers=bot_headers(manager),
+    )
+    assert queued.status_code == 200
+    lease = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    result = await client.post(
+        f"/api/v1/project-discussions/{created.json()['id']}/result",
+        json={
+            "revision": lease["revision"],
+            "lease_id": lease["lease_id"],
+            "thread_id": "thr_qa_disabled",
+            "response": "Must be discarded",
+        },
+        headers=worker_headers(),
+    )
+    assert result.status_code == 409
+    row = await session.get(ProjectDiscussion, created.json()["id"])
+    assert row is not None and row.status == "failed" and row.thread_id is None
+
+
+async def test_qa_discussion_result_is_rejected_for_nonowner_legacy_row(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    executor.can_use_codex = True
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-worker-token-0123456789abcdef")
+    row = ProjectDiscussion(
+        user_id=executor.id,
+        project_id=project.id,
+        chat_id=executor.telegram_id,
+        status="running",
+        messages=[{"role": "user", "text": "Legacy nonowner QA run"}],
+        pending_text="Legacy nonowner QA run",
+        pending_images=[],
+        lease_id="00000000-0000-4000-8000-000000000001",
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
+        revision=1,
+        notified_revision=0,
+    )
+    session.add(row)
+    await session.commit()
+    response = await client.post(
+        f"/api/v1/project-discussions/{row.id}/result",
+        json={
+            "revision": row.revision,
+            "lease_id": row.lease_id,
+            "thread_id": "thr_nonowner",
+            "response": "Must be discarded",
+        },
+        headers=worker_headers(),
+    )
+    assert response.status_code == 409
+    await session.refresh(row)
+    assert row.status == "failed" and row.lease_id is None and row.thread_id is None
 
 
 async def test_messages_resume_one_thread_and_deny_stale_results(
@@ -229,6 +427,39 @@ async def test_nonowner_ketoshop_discussion_does_not_get_diagnostics(
     work = (
         await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
     ).json()
+    assert work["diagnostics_enabled"] is False
+    denied = await client.get(
+        f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert denied.status_code == 404
+
+
+async def test_other_project_discussion_does_not_get_diagnostics(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    await ready_project(session, project, monkeypatch)
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id)
+    created = await client.post(
+        "/api/v1/project-discussions",
+        json={"project_id": project.id, "chat_id": manager.telegram_id},
+        headers=bot_headers(manager),
+    )
+    discussion_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/project-discussions/{discussion_id}/messages",
+        json={"text": "Tekshiring"},
+        headers=bot_headers(manager),
+    )
+    work = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert work["project_key"] == "task-manager"
     assert work["diagnostics_enabled"] is False
     denied = await client.get(
         f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",

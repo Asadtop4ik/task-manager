@@ -62,6 +62,342 @@ async def test_public_project_can_clarify_pr_but_not_fast(
     assert (await session.scalars(select(Task))).all() == []
 
 
+async def test_qa_project_can_start_pr_intake_only_when_qa_flag_enabled(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    payload = {
+        "project_id": project.id,
+        "text": "Check the isolated QA service",
+        "mode": "pr",
+        "chat_id": manager.telegram_id,
+    }
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    disabled = await client.post(
+        "/api/v1/agent-intakes", json=payload, headers=bot_headers(manager)
+    )
+    assert disabled.status_code == 409
+
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    executor.can_use_codex = True
+    await session.commit()
+    nonowner = await client.post(
+        "/api/v1/agent-intakes",
+        json=payload | {"chat_id": executor.telegram_id},
+        headers=bot_headers(executor),
+    )
+    assert nonowner.status_code == 403
+    created = await client.post(
+        "/api/v1/agent-intakes", json=payload, headers=bot_headers(manager)
+    )
+    assert created.status_code == 201 and created.json()["status"] == "queued"
+    assert (await session.scalars(select(Task))).all() == []
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    lease = await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
+    assert lease.status_code == 200
+    result = await client.post(
+        f"/api/v1/agent-intakes/{created.json()['id']}/result",
+        json={
+            "revision": lease.json()["revision"],
+            "lease_id": lease.json()["lease_id"],
+            "status": "ready",
+            "brief": {
+                "title": "Check isolated QA readiness",
+                "goal": "Verify the synthetic service is healthy",
+                "acceptance": ["Ready reports the deployed SHA"],
+            },
+        },
+        headers=worker_headers(),
+    )
+    assert result.status_code == 200 and result.json()["status"] == "ready"
+    confirmed = await client.post(
+        f"/api/v1/agent-intakes/{created.json()['id']}/confirm",
+        json={},
+        headers=bot_headers(manager),
+    )
+    assert confirmed.status_code == 200 and confirmed.json()["created"] is True
+    task = await session.get(Task, confirmed.json()["task"]["id"])
+    assert task is not None and task.project_id == project.id
+
+
+async def test_qa_intake_worker_does_not_lease_nonowner_rows(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    executor.can_use_codex = True
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    row = AgentIntake(
+        user_id=executor.id,
+        project_id=project.id,
+        chat_id=executor.telegram_id,
+        text="Queued before owner-only validation",
+        mode="pr",
+        status="queued",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    session.add(row)
+    await session.commit()
+
+    response = await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
+    assert response.status_code == 204
+    await session.refresh(row)
+    assert row.status == "failed" and row.lease_id is None
+
+
+async def test_qa_intake_lease_and_result_revalidate_enabled_flag(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    payload = {
+        "project_id": project.id,
+        "text": "Check isolated QA",
+        "mode": "pr",
+        "chat_id": manager.telegram_id,
+    }
+    queued = await client.post(
+        "/api/v1/agent-intakes", json=payload, headers=bot_headers(manager)
+    )
+    assert queued.status_code == 201
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    disabled_lease = await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
+    assert disabled_lease.status_code == 204
+    row = await session.get(AgentIntake, queued.json()["id"])
+    assert row is not None and row.status == "failed" and row.lease_id is None
+
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    cancelled = await client.post(
+        f"/api/v1/agent-intakes/{queued.json()['id']}/cancel",
+        json={},
+        headers=bot_headers(manager),
+    )
+    assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
+    active = await client.post(
+        "/api/v1/agent-intakes", json=payload, headers=bot_headers(manager)
+    )
+    lease = (await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())).json()
+    assert lease["id"] == active.json()["id"]
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    rejected = await client.post(
+        f"/api/v1/agent-intakes/{active.json()['id']}/result",
+        json={
+            "revision": lease["revision"],
+            "lease_id": lease["lease_id"],
+            "status": "failed",
+            "error": "late QA result",
+        },
+        headers=worker_headers(),
+    )
+    assert rejected.status_code == 409
+    row = await session.get(AgentIntake, active.json()["id"])
+    assert row is not None and row.status == "failed" and row.lease_id is None
+    confirmation = await client.post(
+        f"/api/v1/agent-intakes/{active.json()['id']}/confirm",
+        json={"fallback_pr": True},
+        headers=bot_headers(manager),
+    )
+    assert confirmation.status_code == 404
+    assert (await session.scalars(select(Task))).all() == []
+
+
+async def test_qa_intake_lease_revalidates_catalog_after_queueing(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    queued = await client.post(
+        "/api/v1/agent-intakes",
+        json={
+            "project_id": project.id,
+            "text": "Check isolated QA",
+            "mode": "pr",
+            "chat_id": manager.telegram_id,
+        },
+        headers=bot_headers(manager),
+    )
+    assert queued.status_code == 201
+    project.default_branch = "unapproved"
+    await session.commit()
+
+    response = await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
+    assert response.status_code == 204
+    row = await session.get(AgentIntake, queued.json()["id"])
+    assert row is not None and row.status == "failed" and row.lease_id is None
+
+
+async def test_qa_intake_result_is_rejected_for_nonowner_legacy_row(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    executor.can_use_codex = True
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    row = AgentIntake(
+        user_id=executor.id,
+        project_id=project.id,
+        chat_id=executor.telegram_id,
+        text="Legacy nonowner QA run",
+        mode="pr",
+        status="analyzing",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
+        lease_id="00000000-0000-4000-8000-000000000001",
+        attempts=1,
+        revision=1,
+    )
+    session.add(row)
+    await session.commit()
+    response = await client.post(
+        f"/api/v1/agent-intakes/{row.id}/result",
+        json={
+            "revision": row.revision,
+            "lease_id": row.lease_id,
+            "status": "failed",
+            "error": "Legacy result",
+        },
+        headers=worker_headers(),
+    )
+    assert response.status_code == 409
+    await session.refresh(row)
+    assert row.status == "failed" and row.lease_id is None
+
+
+async def test_qa_intake_image_is_hidden_when_flag_is_disabled(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    queued = await client.post(
+        "/api/v1/agent-intakes",
+        json={
+            "project_id": project.id,
+            "text": "Review this QA image",
+            "mode": "pr",
+            "chat_id": manager.telegram_id,
+            "images": [{"file_id": "qa-image", "mime": "image/jpeg", "size": 1}],
+        },
+        headers=bot_headers(manager),
+    )
+    assert queued.status_code == 201
+    lease = (await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())).json()
+    image_calls = 0
+
+    async def fake_image(file_id: str, mime: str, size: int | None) -> bytes:
+        nonlocal image_calls
+        image_calls += 1
+        return b"image"
+
+    monkeypatch.setattr(agent_intakes, "telegram_image", fake_image)
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    response = await client.get(
+        f"/api/v1/agent-intakes/{queued.json()['id']}/images/0",
+        headers=worker_headers() | {"X-Intake-Lease-ID": lease["lease_id"]},
+    )
+    assert response.status_code == 404 and image_calls == 0
+
+
+async def test_qa_intake_image_is_hidden_from_nonowner_legacy_lease(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    executor: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    executor.can_use_codex = True
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    row = AgentIntake(
+        user_id=executor.id,
+        project_id=project.id,
+        chat_id=executor.telegram_id,
+        text="Legacy nonowner QA image",
+        mode="pr",
+        status="analyzing",
+        images=[{"file_id": "qa-image", "mime": "image/jpeg", "size": 1}],
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
+        lease_id="00000000-0000-4000-8000-000000000001",
+        attempts=1,
+        revision=1,
+    )
+    session.add(row)
+    await session.commit()
+    image_calls = 0
+
+    async def fake_image(file_id: str, mime: str, size: int | None) -> bytes:
+        nonlocal image_calls
+        image_calls += 1
+        return b"image"
+
+    monkeypatch.setattr(agent_intakes, "telegram_image", fake_image)
+    response = await client.get(
+        f"/api/v1/agent-intakes/{row.id}/images/0",
+        headers=worker_headers() | {"X-Intake-Lease-ID": row.lease_id},
+    )
+    assert response.status_code == 404 and image_calls == 0
+
+
 async def test_only_approved_bot_actor_can_start_one_intake(
     client: AsyncClient,
     session: AsyncSession,
