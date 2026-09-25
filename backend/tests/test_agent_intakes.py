@@ -385,8 +385,17 @@ async def test_expired_worker_lease_reports_failure_instead_of_stalling(
     assert (
         await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
     ).status_code == 204
+    await session.rollback()  # The production request closes its session here.
     await session.refresh(row)
     assert row.status == "failed" and row.error == "Codex intake worker timed out"
+    events = (
+        await session.scalars(
+            select(AgentEvent.status)
+            .where(AgentEvent.agent_intake_id == intake_id)
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events[-1] == "failed"
     notices = (
         await client.get(
             "/api/v1/agent-intakes/notifications",

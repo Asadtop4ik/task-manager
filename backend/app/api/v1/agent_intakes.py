@@ -189,7 +189,9 @@ async def lease_intake(
         .with_for_update(skip_locked=True)
         .limit(20)
     )
+    expired_any = False
     for expired in exhausted:
+        expired_any = True
         expired.status = "failed"
         expired.error = "Codex intake worker timed out"
         agent_events.record(session, expired, error=expired.error)
@@ -213,6 +215,8 @@ async def lease_intake(
         .options(selectinload(AgentIntake.project))
     )
     if row is None:
+        if expired_any:
+            await session.commit()
         return Response(status_code=204)
     row.status = "analyzing"
     agent_events.record(session, row)
