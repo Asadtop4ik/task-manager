@@ -18,11 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from project_catalog import discussion_pairs, intake_pairs
+from project_catalog import intake_pairs
 
 API_BASE_URL = "https://tasks.standart-eko.uz/api/v1"
 INTAKE_REPOSITORIES = intake_pairs()
-DISCUSSION_REPOSITORIES = discussion_pairs()
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -545,20 +544,8 @@ class IntakeWorker:
             output.append(image_path)
         return output
 
-    def _fetch_snapshot(
-        self,
-        target: Path,
-        repository: str,
-        branch: str,
-        *,
-        approved_repositories: dict[str, str] | None = None,
-    ) -> None:
-        approved = (
-            INTAKE_REPOSITORIES
-            if approved_repositories is None
-            else approved_repositories
-        )
-        if approved.get(repository) != branch:
+    def _fetch_snapshot(self, target: Path, repository: str, branch: str) -> None:
+        if INTAKE_REPOSITORIES.get(repository) != branch:
             raise IntakeError("repository snapshot is outside the approved set")
         url = f"https://api.github.com/repos/{repository}/tarball/{branch}"
         request = _request(
@@ -753,7 +740,7 @@ class IntakeWorker:
         try:
             if (
                 not isinstance(repository, str)
-                or DISCUSSION_REPOSITORIES.get(repository) != branch
+                or INTAKE_REPOSITORIES.get(repository) != branch
             ):
                 raise IntakeError("discussion repository is not approved")
             if not isinstance(payload.get("text"), str):
@@ -784,7 +771,6 @@ class IntakeWorker:
                     snapshot,
                     repository,
                     branch,
-                    approved_repositories=DISCUSSION_REPOSITORIES,
                 )
                 image_dir = session_dir / "images"
                 image_dir.mkdir(mode=0o770)

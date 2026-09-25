@@ -163,6 +163,40 @@ async def test_qa_intake_worker_does_not_lease_nonowner_rows(
     assert row.status == "failed" and row.lease_id is None
 
 
+async def test_qa_intake_worker_does_not_lease_when_qa_flag_is_disabled(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
+    project.default_branch = "main"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_intake_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "intake_worker_token", "test-intake-worker-token-0123456789")
+    row = AgentIntake(
+        user_id=manager.id,
+        project_id=project.id,
+        chat_id=manager.telegram_id,
+        text="Owner QA intake queued before flag was disabled",
+        mode="pr",
+        status="queued",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    session.add(row)
+    await session.commit()
+
+    monkeypatch.setattr(settings, "agent_qa_enabled", False)
+    response = await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())
+
+    assert response.status_code == 204
+    await session.refresh(row)
+    assert row.status == "failed" and row.lease_id is None
+
+
 async def test_qa_intake_lease_and_result_revalidate_enabled_flag(
     client: AsyncClient,
     session: AsyncSession,

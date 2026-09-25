@@ -65,17 +65,15 @@ class DiscussionWorkerTests(unittest.TestCase):
                 opener=opener,
                 command_runner=child,
             )
-
-            def fetch_snapshot(target, repository, branch, *, approved_repositories):
-                snapshots.append((repository, branch, approved_repositories))
+            def fetch_snapshot(target, repository, branch):
+                snapshots.append((repository, branch))
                 target.mkdir()
 
             with patch.object(worker, "_fetch_snapshot", side_effect=fetch_snapshot):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
 
-        repository, branch, approved_repositories = snapshots[0]
+        repository, branch = snapshots[0]
         self.assertEqual((repository, branch), ("Asadtop4ik/agent-qa", "main"))
-        self.assertEqual(approved_repositories[repository], branch)
         self.assertEqual(posted[0]["response"], "README qisqacha.")
 
     def test_unknown_private_repository_is_rejected_before_snapshot_or_codex(self):
@@ -161,7 +159,7 @@ class DiscussionWorkerTests(unittest.TestCase):
             with patch.object(
                 worker,
                 "_fetch_snapshot",
-                side_effect=lambda target, *_, **__: target.mkdir(),
+                side_effect=lambda target, *_: target.mkdir(),
             ):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
         self.assertEqual(posted[0]["response"], "Javob.")
@@ -208,7 +206,7 @@ class DiscussionWorkerTests(unittest.TestCase):
             with patch.object(
                 worker,
                 "_fetch_snapshot",
-                side_effect=lambda target, *_, **__: target.mkdir(),
+                side_effect=lambda target, *_: target.mkdir(),
             ):
                 self.assertEqual(worker.poll_discussion_once(), "answered")
         self.assertEqual(child_requests[0]["diagnostics_discussion_id"], 18)

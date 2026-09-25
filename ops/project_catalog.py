@@ -33,9 +33,7 @@ def approved_pairs(
 def intake_pairs(
     repositories: tuple[AgentRepository, ...] = REPOSITORIES,
 ) -> dict[str, str]:
-    return {item.full_name: item.branch for item in repositories}
-
-
-def discussion_pairs() -> dict[str, str]:
-    """Include the owner-gated private QA repo for read-only discussions."""
-    return intake_pairs((*REPOSITORIES, QA_REPOSITORY))
+    """Allow QA snapshots only in worker flows gated by the API owner/flag checks."""
+    return {
+        item.full_name: item.branch for item in (*repositories, QA_REPOSITORY)
+    }

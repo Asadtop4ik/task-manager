@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -89,6 +90,67 @@ def worker(temp: str, opener, command_runner=None) -> IntakeWorker:
 
 
 class IntakeWorkerTests(unittest.TestCase):
+    def test_private_qa_intake_lease_accepts_only_the_fixed_repository_branch(self) -> None:
+        payload = lease()
+        payload["repo_full_name"] = "Asadtop4ik/agent-qa"
+        payload["base_branch"] = "main"
+        identity, images = _validate_lease(payload)
+        self.assertEqual(identity.intake_id, RUN_ID)
+        self.assertEqual(images, [])
+
+        payload["base_branch"] = "master"
+        with self.assertRaisesRegex(ValueError, "approved branch"):
+            _validate_lease(payload)
+
+        payload["repo_full_name"] = "example/private-repo"
+        payload["base_branch"] = "main"
+        with self.assertRaisesRegex(ValueError, "approved repositories"):
+            _validate_lease(payload)
+
+    def test_private_qa_intake_fetches_fixed_snapshot_and_completes(self) -> None:
+        payload = lease(text="Review the QA README")
+        payload["repo_full_name"] = "Asadtop4ik/agent-qa"
+        payload["base_branch"] = "main"
+        responses = [
+            FakeResponse(json.dumps(payload).encode()),
+            FakeResponse(tarball(), mime="application/gzip"),
+            FakeResponse(),
+        ]
+        seen_requests = []
+
+        def run_command(args, **kwargs):
+            if args[-1] == "codex-child":
+                request = json.loads(kwargs["input"])
+                snapshot_readme = Path(request["session_dir"]) / "snapshot" / "README.md"
+                self.assertTrue(snapshot_readme.is_file())
+                output_path = Path(request["session_dir"]) / "codex-result.json"
+                output_path.write_text(json.dumps(ready_result()))
+                return Mock(returncode=0)
+            if args[0] == "git":
+                return subprocess.run(args, **kwargs)
+            self.fail(f"unexpected worker command: {args[0]}")
+
+        def open_response(request, timeout):
+            seen_requests.append(request)
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as temp:
+            outcome = worker(temp, open_response, run_command).poll_once()
+
+        self.assertEqual(outcome, "ready")
+        snapshot_request = next(
+            request
+            for request in seen_requests
+            if request.full_url.startswith("https://api.github.com/")
+        )
+        self.assertEqual(
+            snapshot_request.full_url,
+            "https://api.github.com/repos/Asadtop4ik/agent-qa/tarball/main",
+        )
+        self.assertEqual(
+            snapshot_request.get_header("Authorization"), f"Bearer {GITHUB_TOKEN}"
+        )
+
     def test_public_project_lease_uses_its_approved_branch(self) -> None:
         payload = lease()
         payload["repo_full_name"] = "muradjanov-dev/ketoshop"
