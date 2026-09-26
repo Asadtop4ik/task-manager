@@ -190,9 +190,19 @@ def _check_diff(
     cwd: Path,
     task: Mapping[str, Any],
     image_dir: Path | None,
+    is_public: bool = False,
 ) -> None:
+    kwargs: dict[str, Any] = {"cwd": cwd, "task": dict(task), "image_dir": image_dir}
+    if is_public:
+        # `public_agent_task.check_diff` re-validates repo/branch approval
+        # via `parse_public_task(qa_enabled=...)`; agent-svc's own catalog
+        # (already proven for this `Work` before it ever reaches here) is
+        # the actual approval gate, so this is always explicitly `True`,
+        # never read from an environment variable the trusted script would
+        # otherwise fall back to.
+        kwargs["qa_enabled"] = True
     try:
-        checker(cwd=cwd, task=dict(task), image_dir=image_dir)
+        checker(**kwargs)
     except (ValueError, subprocess.CalledProcessError) as exc:
         raise PublishError(str(exc)) from exc
 
@@ -358,7 +368,7 @@ def publish_implement(
             redactor=ctx.redactor,
         )
         _apply_patch(publish_dir, patch, env, redactor=ctx.redactor)
-        _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir)
+        _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir, is_public=is_public)
         report_stage("patch_validated")
     finally:
         shutil.rmtree(publish_dir, ignore_errors=True)
@@ -379,7 +389,7 @@ def publish_implement(
             redactor=ctx.redactor,
         )
         _apply_patch(publish_dir, final_patch, env, redactor=ctx.redactor)
-        _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir)
+        _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir, is_public=is_public)
         report_stage("preflight_passed")
 
         head_sha = _commit(

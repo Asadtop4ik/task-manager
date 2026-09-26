@@ -90,7 +90,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
 
     route = route_implement(work, ctx.settings)
     base_prompt = (
-        ctx.trusted.public_agent_task.build_prompt(task)
+        ctx.trusted.public_agent_task.build_prompt(task, qa_enabled=True)
         if is_public
         else ctx.trusted.agent_task.build_prompt(task)
     )
@@ -206,7 +206,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
 
 
 def _validate_task(ctx: ServiceContext, work: Work) -> tuple[dict[str, Any], bool]:
-    is_public = work.repo_full_name in ctx.catalog.public_repos
+    is_public = is_public_repo(ctx, work.repo_full_name)
     raw: dict[str, Any] = {
         "task_id": work.task_id,
         "run_id": work.run_id,
@@ -218,10 +218,27 @@ def _validate_task(ctx: ServiceContext, work: Work) -> tuple[dict[str, Any], boo
         "task_revision": work.task_revision,
     }
     if is_public:
-        task = ctx.trusted.public_agent_task.parse_public_task(raw)
+        task = ctx.trusted.public_agent_task.parse_public_task(raw, qa_enabled=True)
     else:
         task = ctx.trusted.agent_task.parse_task(raw)
     return dict(task), is_public
+
+
+def is_public_repo(ctx: ServiceContext, repo_full_name: str) -> bool:
+    """Legacy `public_agent_task.approved_repositories`: the 3 public repos
+    PLUS agent-qa when QA is enabled -- never by GitHub visibility alone.
+    agent-qa is `private=True` in the catalog (its own token/visibility is
+    private), but `qa_only` repos get the same PUBLIC validator/prompt path
+    (the extra AGENTS.md/CLAUDE.md/.github//.codex//.agents/ path blocks
+    `public_agent_task.check_diff` adds) as the 3 genuinely public repos,
+    exactly like the trusted GitHub Actions publisher does. `ctx.api` already
+    proved `repo_full_name` is one of `ctx.catalog`'s approved repos before
+    handing us this `Work`, so there is no separate "is QA enabled" flag to
+    consult here -- if agent-svc leased work for agent-qa at all, QA is
+    enabled.
+    """
+    info = ctx.catalog.get(repo_full_name)
+    return info is not None and (not info.private or info.qa_only)
 
 
 def _download_images(

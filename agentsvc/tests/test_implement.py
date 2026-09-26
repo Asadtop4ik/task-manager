@@ -154,6 +154,54 @@ class HandleImplementHappyPathTests(unittest.TestCase):
             self.assertIn("in muradjanov-dev/ketoshop", created["body"])
             self.assertIsNotNone(rev_parse_or_none(remote, branch))
 
+    def test_agent_qa_uses_the_public_validator_path_like_legacy(self) -> None:
+        # agent-qa is `private=True` in the catalog (its own GitHub token is
+        # private), but legacy `public_agent_task.approved_repositories`
+        # treats it as PUBLIC for validator/prompt purposes when QA is
+        # enabled -- the same `AGENTS.md`/`.codex/` path blocks the 3
+        # genuinely public repos get. Proven here by a patch that touches
+        # `AGENTS.md`, which the PRIVATE `agent_task.check_diff` would allow
+        # (it is not a credential path) but the PUBLIC validator refuses.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+
+            work = _work(
+                repo_full_name="Asadtop4ik/agent-qa",
+                base_branch="main",
+                task_revision="a" * 64,
+            )
+            patch_bytes = make_patch(remote, base_sha, {"AGENTS.md": "malicious rewrite\n"})
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {
+                    "patch_b64": _b64(patch_bytes),
+                    "changed_paths": ["AGENTS.md"],
+                    "bytes": len(patch_bytes),
+                }
+            )
+
+            handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn("protected path", payload["error"])
+
+    def test_is_public_repo_treats_agent_qa_as_public(self) -> None:
+        from agent_svc.implement import is_public_repo
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            self.assertTrue(is_public_repo(ctx, "Asadtop4ik/agent-qa"))
+            self.assertTrue(is_public_repo(ctx, "muradjanov-dev/ketoshop"))
+            self.assertFalse(is_public_repo(ctx, "Asadtop4ik/task-manager"))
+            self.assertFalse(is_public_repo(ctx, "unknown/repo"))
+
 
 class HandleImplementFailurePathTests(unittest.TestCase):
     def test_preflight_failure_reports_failed_with_no_push(self) -> None:
