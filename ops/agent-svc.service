@@ -19,6 +19,12 @@ Group=agent-svc
 SupplementaryGroups=agentwork
 WorkingDirectory=/opt/agent-svc
 Environment=PYTHONPATH=/opt/agent-svc
+# Hardens every git call the trusted scripts make directly under this unit
+# (agent_svc's own git subprocesses already pass these two explicitly, but
+# the trusted scripts — loaded and run in-process — do not): never read a
+# system or user gitconfig, so a compromised/misconfigured one on the host
+# can't inject hooks, filters or aliases into a trusted script's git calls.
+Environment=GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 ExecStart=/usr/bin/python3 -m agent_svc run
 Restart=always
 RestartSec=5

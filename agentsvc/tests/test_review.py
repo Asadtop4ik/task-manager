@@ -306,7 +306,9 @@ class HandleReviewTests(unittest.TestCase):
         # instead of leaving it to expire on its own (see
         # `_release_stale_head_lease`'s docstring).
         work = _work(head_sha="a" * 40)
-        api = FakeApi(review_result_exceptions=[LeaseLost("review does not match current PR head")])
+        api = FakeApi(
+            review_result_exceptions=[LeaseLost("review does not match current PR head")]
+        )
         github = FakeGitHub(pulls=[_pr(sha="b" * 40)])  # head moved
         codex = FakeCodexRunner(_ok_result())
         ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")

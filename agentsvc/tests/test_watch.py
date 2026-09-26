@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from typing import Any
 
+from agent_svc.github import UnknownRepository
 from agent_svc.log import Logger, Redactor
 from agent_svc.repos import Catalog, RepoInfo
 from agent_svc.watch import (
@@ -18,6 +19,7 @@ from agent_svc.watch import (
 
 DISPATCH_REPO = "Owner/task-manager"
 PUBLIC_REPO = "muradjanov-dev/demo"
+QA_REPO = "Owner/agent-qa"
 RUN_ID = "22222222-2222-2222-2222-222222222222"
 
 
@@ -49,6 +51,26 @@ def _catalog() -> Catalog:
                 pr_ci_workflow=".github/workflows/ci.yml",
                 images=(("demo-web", "ghcr.io/muradjanov-dev/demo-web"),),
                 qa_only=False,
+            ),
+        )
+    )
+
+
+def _catalog_with_qa() -> Catalog:
+    base = _catalog()
+    return Catalog(
+        repos=(
+            *base.repos,
+            RepoInfo(
+                project_key="agent-qa",
+                full_name=QA_REPO,
+                branch="main",
+                private=True,
+                ci_jobs=(),
+                pr_ci_jobs=("PR CI",),
+                pr_ci_workflow=".github/workflows/agent-qa.yml",
+                images=(),
+                qa_only=True,
             ),
         )
     )
@@ -573,6 +595,73 @@ class CheckMergeDeployTests(unittest.TestCase):
         checks.check_merge_deploy()  # must not even try get_pull
 
         self.assertEqual([c for c in github.calls if c[0] == "get_pull"], [])
+
+
+class QaRepoWithoutTokenTests(unittest.TestCase):
+    def test_qa_repo_is_skipped_quietly_and_logged_once(self) -> None:
+        stream = io.StringIO()
+        logger = Logger(Redactor([]), stream=stream)
+        api = FakeApi()
+        api.ci_pending_pages = [
+            [
+                _ci_pending_row(
+                    repo=QA_REPO,
+                    pr_number=1,
+                    run_id="66666666-6666-6666-6666-666666666666",
+                )
+            ]
+        ]
+        github = FakeGitHub()
+        github.get_pull_results[(QA_REPO, 1)] = UnknownRepository(QA_REPO)
+        now = [0.0]
+        checks = WatchChecks(
+            _ctx(api=api, github=github, catalog=_catalog_with_qa(), logger=logger),
+            now=lambda: now[0],
+        )
+
+        checks.check_ci()
+        now[0] = 20.0  # past the 15s fast interval: due again
+        checks.check_ci()
+        now[0] = 40.0
+        checks.check_ci()
+
+        self.assertEqual(api.ci_result_calls, [])
+        lines = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+        qa_events = [line for line in lines if line.get("event") == "watch_qa_repo_disabled"]
+        self.assertEqual(len(qa_events), 1)  # logged once, not on every tick
+        self.assertEqual(qa_events[0]["level"], "info")
+        error_events = [line for line in lines if line.get("level") == "error"]
+        self.assertEqual(error_events, [])  # never an error
+
+    def test_qa_repo_does_not_block_other_records(self) -> None:
+        api = FakeApi()
+        api.ci_pending_pages = [
+            [
+                _ci_pending_row(
+                    row_id=1,
+                    repo=QA_REPO,
+                    pr_number=1,
+                    run_id="77777777-7777-7777-7777-777777777777",
+                ),
+                _ci_pending_row(row_id=2, pr_number=5),
+            ]
+        ]
+        github = FakeGitHub()
+        github.get_pull_results[(QA_REPO, 1)] = UnknownRepository(QA_REPO)
+        github.get_pull_results[(PUBLIC_REPO, 5)] = {
+            "state": "open",
+            "head": {"sha": "a" * 40, "ref": "feature", "repo": {"full_name": PUBLIC_REPO}},
+        }
+        github.workflow_runs[(PUBLIC_REPO, "ci.yml", "pull_request", "a" * 40)] = [
+            _completed_run(run_id=100, sha="a" * 40, branch="feature")
+        ]
+        github.jobs[(PUBLIC_REPO, 100)] = [{"name": "check", "conclusion": "success"}]
+        checks = WatchChecks(_ctx(api=api, github=github, catalog=_catalog_with_qa()))
+
+        checks.check_ci()  # must not raise despite the QA record's UnknownRepository
+
+        self.assertEqual(len(api.ci_result_calls), 1)
+        self.assertEqual(api.ci_result_calls[0][0], RUN_ID)
 
 
 class BuildWatchChecksTests(unittest.TestCase):
