@@ -15,6 +15,11 @@ executor needs and the old cron-timer script did not:
   schedule: 15s for the first 15 minutes after it is first seen, then 60s
   (`_RecordScheduler`) -- so a quiet PR does not cost a GitHub call on every
   5-15s watch tick.
+* A QA-repo record when the optional QA GitHub token was never provisioned
+  (`github.build_token_selector` raises `UnknownRepository` for it, by
+  design) is not a "bad record": it is logged once, at info, the first time
+  it is seen, and silently skipped on every tick after that -- never an
+  error on every cycle.
 
 `build_watch_checks(ctx)` returns the list of checks `agent_svc.lanes.WatchLoop`
 runs; `ctx` must expose `api` (`api.TaskManagerApi`), `github`
@@ -32,6 +37,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
+
+from .github import UnknownRepository
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _PAGE_SIZE = 50
@@ -185,6 +192,19 @@ class WatchChecks:
         self._run = command_runner or subprocess.run
         self._ci_schedule = _RecordScheduler(now=now)
         self._deploy_schedule = _RecordScheduler(now=now)
+        # Repos for which we have already logged "no QA token configured"
+        # once; every check after the first is a silent, expected skip.
+        self._qa_disabled_logged: set[str] = set()
+
+    def _skip_if_qa_disabled(self, repo: str, exc: UnknownRepository) -> None:
+        if repo in self._qa_disabled_logged:
+            return
+        self._qa_disabled_logged.add(repo)
+        self._ctx.logger.event(
+            "watch_qa_repo_disabled",
+            level="info",
+            detail=f"no QA GitHub token configured; skipping {repo} ({exc})",
+        )
 
     # ---------------------------------------------------------------
     # CI check (ports `check_ci_once` / `_latest_pr_ci`)
@@ -232,6 +252,8 @@ class WatchChecks:
             return
         try:
             self._apply_ci_record(record)
+        except UnknownRepository as exc:
+            self._skip_if_qa_disabled(record["repo"], exc)
         except Exception as exc:
             logger.error(exc, event="watch_ci_record_failed", run_id=record["run_id"])
 
@@ -344,6 +366,8 @@ class WatchChecks:
             return
         try:
             self._apply_external_record(record)
+        except UnknownRepository as exc:
+            self._skip_if_qa_disabled(record["repo"], exc)
         except Exception as exc:
             logger.error(exc, event="watch_external_record_failed", run_id=record["run_id"])
 

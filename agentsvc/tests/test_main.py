@@ -267,6 +267,40 @@ class SelfCheckTests(unittest.TestCase):
                 self.assertIn("-l", call)  # `sudo -n -l`: report the rule, never execute it
                 self.assertNotIn("--version", call)  # codex_child.py has no such subcommand
 
+    def test_image_state_probe_matches_the_pinned_sudoers_invocation(self) -> None:
+        # ops/agent-svc.sudoers pins exactly `/usr/bin/python3 -I
+        # .../image_state.py *`: the probe must include `-I` right after the
+        # interpreter (matching codex_child's own prefix) or `sudo -n -l`
+        # would report the rule as denied even though it is actually granted.
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp, libexec_has_child=True, libexec_has_image_state=True
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            self_check(
+                settings,
+                None,
+                None,
+                opener=opener,
+                command_runner=runner,
+                stream=io.StringIO(),
+            )
+            image_state_calls = [
+                call for call in runner.calls if "image_state.py" in " ".join(call)
+            ]
+            self.assertEqual(len(image_state_calls), 1)
+            call = image_state_calls[0]
+            python_index = call.index("/usr/bin/python3")
+            self.assertEqual(call[python_index + 1], "-I")
+            # A real catalog container name is used as the probe's trailing
+            # arg (the trusted catalog's first configured container), not a
+            # placeholder string.
+            self.assertEqual(call[-1], "qurbot-web")
+
     def test_config_and_secret_errors_are_reported_without_crashing(self) -> None:
         stream = io.StringIO()
         code = self_check(
