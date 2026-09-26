@@ -311,7 +311,37 @@ class PublishImplementTests(unittest.TestCase):
                     report_stage=lambda _s: None,
                 )
             self.assertIn("protected path", ctx_err.exception.reason)
+            # The exact prefix `public_agent_task.py`'s own CLI wrapper uses.
+            self.assertTrue(
+                ctx_err.exception.reason.startswith("public agent task rejected:")
+            )
             self.assertIsNone(rev_parse_or_none(remote, branch))
+
+    def test_private_check_diff_failure_uses_the_legacy_agent_task_prefix(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            task = {
+                "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                "base_branch": "main", "mode": "pr",
+            }
+            # A credential path check_diff refuses, WITHOUT going through
+            # the empty-patch fast path in _apply_patch.
+            patch_bytes = make_patch(remote, base_sha, {".env": "SECRET=1\n"})
+
+            with self.assertRaises(PublishError) as ctx_err:
+                publish_implement(
+                    ctx, work, base_sha=base_sha, branch=branch, patch=patch_bytes, task=task,
+                    is_public=False, image_dir=None, codex_summary="",
+                    cancel=threading.Event(), report_stage=lambda _s: None,
+                )
+            self.assertTrue(ctx_err.exception.reason.startswith("agent task failed:"))
+            self.assertIn("credential", ctx_err.exception.reason)
 
 
 class PublishCorrectionTests(unittest.TestCase):
@@ -390,6 +420,43 @@ class PublishCorrectionTests(unittest.TestCase):
                     report_stage=lambda _s: None,
                 )
             self.assertIn("moved before publication", ctx_err.exception.reason)
+
+
+class PrBodySummaryWhitespaceTests(unittest.TestCase):
+    def test_codex_summary_keeps_internal_newlines_like_legacy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            multiline_summary = "  Line one.\nLine two.\n\nLine three.  "
+
+            publish_implement(
+                ctx,
+                work,
+                base_sha=base_sha,
+                branch=branch,
+                patch=patch_bytes,
+                cancel=threading.Event(),
+                task={
+                    "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                    "base_branch": "main", "mode": "pr",
+                },
+                is_public=False,
+                image_dir=None,
+                codex_summary=multiline_summary,
+                report_stage=lambda _s: None,
+            )
+
+            body = ctx.github.created_pulls[0]["body"]  # type: ignore[attr-defined]
+            # Only the leading/trailing whitespace is stripped -- internal
+            # newlines/blank lines are kept exactly, unlike the
+            # whitespace-collapsed text used for the short callback note.
+            self.assertIn("Line one.\nLine two.\n\nLine three.", body)
 
 
 class PreflightWiringTests(unittest.TestCase):

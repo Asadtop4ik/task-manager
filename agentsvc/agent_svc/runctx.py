@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import shutil
 import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -28,6 +30,11 @@ from .journal import JournalEntry
 
 HEARTBEAT_INTERVAL_S = 30.0
 _JOIN_TIMEOUT_S = 5.0
+# `callback`/`action-result` are idempotent on the backend (the same
+# terminal report re-sent is a no-op there), so a transient network failure
+# should not cost a run its one chance to report its own outcome: 3 attempts
+# total, 1s then 3s apart.
+DELIVERY_RETRY_BACKOFF_S: tuple[float, ...] = (1.0, 3.0)
 
 
 def _now_iso() -> str:
@@ -44,11 +51,14 @@ class RunScaffold:
         cancel: threading.Event,
         *,
         heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S,
+        delivery_backoff_s: tuple[float, ...] = DELIVERY_RETRY_BACKOFF_S,
     ) -> None:
         self._ctx = ctx
         self._work = work
         self.cancel = cancel
         self._heartbeat_interval_s = heartbeat_interval_s
+        self._delivery_backoff_s = delivery_backoff_s
+        self._delivery_failed = False
         self.run_dir: Path = repos.make_run_dir(ctx.settings.work_root, work.run_id)
         self._started_at = _now_iso()
         self._stop_heartbeat = threading.Event()
@@ -87,7 +97,46 @@ class RunScaffold:
         # Downloaded task attachments are sensitive and only ever needed for
         # the duration of this run.
         shutil.rmtree(self.run_dir / "images", ignore_errors=True)
+        if self._delivery_failed:
+            # `deliver` exhausted every retry reporting this run's own
+            # outcome: keep the journal entry (instead of losing it forever)
+            # so the next `recover()` pass gets another chance to reconcile
+            # it against `/status`.
+            return
         self._ctx.journal.remove(self._work.run_id)
+
+    def deliver(self, fn: Callable[[], None]) -> None:
+        """Call `fn` (one `callback`/`action-result`/etc. POST) up to 3
+        times with backoff before giving up. `LeaseLost` is never retried --
+        the API already decided the outcome, so this only sets `cancel`
+        (see the module docstring). If every attempt fails for any other
+        reason, `__exit__` keeps this run's journal entry instead of
+        removing it.
+        """
+        attempts = 1 + len(self._delivery_backoff_s)
+        for attempt in range(attempts):
+            try:
+                fn()
+                return
+            except LeaseLost as exc:
+                self._ctx.logger.event(
+                    "delivery_lease_lost",
+                    level="warning",
+                    run_id=self._work.run_id,
+                    detail=exc.detail,
+                )
+                self.cancel.set()
+                return
+            except Exception as exc:
+                self._ctx.logger.error(
+                    exc,
+                    event="delivery_attempt_failed",
+                    run_id=self._work.run_id,
+                    attempt=attempt + 1,
+                )
+                if attempt < attempts - 1:
+                    time.sleep(self._delivery_backoff_s[attempt])
+        self._delivery_failed = True
 
     def _cleanup_leftovers(self) -> None:
         try:

@@ -134,6 +134,87 @@ class RunScaffoldTests(unittest.TestCase):
                 self.assertEqual(len(ctx.codex.cleanup_calls), 1)  # type: ignore[attr-defined]
                 self.assertEqual(len(ctx.codex.prepare_calls), 0)  # type: ignore[attr-defined]
 
+    def test_deliver_succeeds_on_first_try_without_sleeping(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            calls: list[int] = []
+            with RunScaffold(
+                ctx, work, cancel, heartbeat_interval_s=1000.0, delivery_backoff_s=(5.0, 5.0)
+            ) as run:
+                run.deliver(lambda: calls.append(1))
+            self.assertEqual(calls, [1])
+            # Journal removed: the delivery succeeded.
+            self.assertIsNone(ctx.journal.read(work.run_id))
+
+    def test_deliver_retries_a_transient_failure_then_succeeds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            attempts = {"count": 0}
+
+            def flaky() -> None:
+                attempts["count"] += 1
+                if attempts["count"] < 2:
+                    raise RuntimeError("network blip")
+
+            with RunScaffold(
+                ctx, work, cancel, heartbeat_interval_s=1000.0, delivery_backoff_s=(0.01, 0.01)
+            ) as run:
+                run.deliver(flaky)
+            self.assertEqual(attempts["count"], 2)
+            self.assertIsNone(ctx.journal.read(work.run_id))
+
+    def test_deliver_keeps_the_journal_entry_after_exhausting_every_retry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            attempts = {"count": 0}
+
+            def always_fails() -> None:
+                attempts["count"] += 1
+                raise RuntimeError("backend unreachable")
+
+            with RunScaffold(
+                ctx, work, cancel, heartbeat_interval_s=1000.0, delivery_backoff_s=(0.01, 0.01)
+            ) as run:
+                run.deliver(always_fails)
+            self.assertEqual(attempts["count"], 3)  # 1 initial + 2 retries
+            # Kept, not removed: a future recover() pass gets another chance.
+            self.assertIsNotNone(ctx.journal.read(work.run_id))
+
+    def test_deliver_lease_lost_cancels_immediately_without_retrying(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            attempts = {"count": 0}
+
+            def lease_lost() -> None:
+                attempts["count"] += 1
+                raise LeaseLost("cancelled")
+
+            with RunScaffold(
+                ctx, work, cancel, heartbeat_interval_s=1000.0, delivery_backoff_s=(5.0, 5.0)
+            ) as run:
+                run.deliver(lease_lost)
+                self.assertTrue(cancel.is_set())
+            self.assertEqual(attempts["count"], 1)  # never retried
+            # LeaseLost is not a delivery failure -- the API already decided;
+            # the journal is still removed normally.
+            self.assertIsNone(ctx.journal.read(work.run_id))
+
     def test_heartbeat_transient_failure_does_not_cancel(self) -> None:
         with TemporaryDirectory() as tmp:
             from agent_svc.runctx import RunScaffold

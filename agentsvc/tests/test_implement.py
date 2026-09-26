@@ -422,7 +422,12 @@ class BranchExistsRecoveryTests(unittest.TestCase):
             ctx.github.open_pull_by_head[("Asadtop4ik/task-manager", branch)] = {  # type: ignore[attr-defined]
                 "number": 55,
                 "html_url": "https://github.com/Asadtop4ik/task-manager/pull/55",
-                "head": {"sha": head_sha},
+                "head": {
+                    "sha": head_sha,
+                    "ref": branch,
+                    "repo": {"full_name": "Asadtop4ik/task-manager"},
+                },
+                "base": {"ref": "main"},
             }
 
             handle_implement(ctx, work, threading.Event())
@@ -434,6 +439,66 @@ class BranchExistsRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(payload["head_sha"], head_sha)
             self.assertEqual(len(ctx.codex.run_exec_calls), 0)  # type: ignore[attr-defined]
+
+    def test_opens_the_pr_when_the_push_succeeded_but_no_pr_was_ever_created(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            work = _work()
+            branch = "codex/task-7-" + RUN_ID
+
+            # The branch was pushed by this exact run (matching trailer),
+            # but agent-svc crashed (or was killed) before opening the PR.
+            push_run_commit(remote, branch, RUN_ID)
+            head_sha = rev_parse_or_none(remote, branch)
+            assert head_sha is not None
+            # No entry in ctx.github.open_pull_by_head: no open PR exists yet.
+
+            handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "pr_opened")
+            self.assertEqual(payload["head_sha"], head_sha)
+            created = ctx.github.created_pulls  # type: ignore[attr-defined]
+            self.assertEqual(len(created), 1)
+            self.assertEqual(created[0]["head"]["ref"], branch)
+            self.assertEqual(created[0]["base"]["ref"], "main")
+            self.assertEqual(payload["pr_url"], created[0]["html_url"])
+            self.assertEqual(len(ctx.codex.run_exec_calls), 0)  # type: ignore[attr-defined]
+
+    def test_fails_when_the_found_pr_does_not_match_this_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            work = _work()
+            branch = "codex/task-7-" + RUN_ID
+
+            push_run_commit(remote, branch, RUN_ID)
+            head_sha = rev_parse_or_none(remote, branch)
+            assert head_sha is not None
+            # A PR was found for this head branch, but its recorded base
+            # does not match this run's base branch -- must not be trusted.
+            ctx.github.open_pull_by_head[("Asadtop4ik/task-manager", branch)] = {  # type: ignore[attr-defined]
+                "number": 55,
+                "html_url": "https://github.com/Asadtop4ik/task-manager/pull/55",
+                "head": {
+                    "sha": head_sha,
+                    "ref": branch,
+                    "repo": {"full_name": "Asadtop4ik/task-manager"},
+                },
+                "base": {"ref": "some-other-branch"},
+            }
+
+            handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn("branch already exists", payload["error"])
+            self.assertEqual(ctx.github.created_pulls, [])  # type: ignore[attr-defined]
 
     def test_fails_when_no_matching_trailer_is_found(self) -> None:
         with TemporaryDirectory() as tmp:

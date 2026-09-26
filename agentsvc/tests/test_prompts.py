@@ -65,8 +65,14 @@ class IsComplexTests(unittest.TestCase):
     def test_explicit_complex(self) -> None:
         self.assertTrue(is_complex(_work(complexity="complex", attempt_index=1)))
 
-    def test_explicit_simple_even_on_a_retry(self) -> None:
-        self.assertFalse(is_complex(_work(complexity="simple", attempt_index=5)))
+    def test_attempt_two_is_complex_even_with_an_explicit_simple_hint(self) -> None:
+        # A "simple" route already failed once; it never gets an identical
+        # second try -- attempt_index >= 2 always routes to the complex
+        # model, regardless of the complexity hint.
+        self.assertTrue(is_complex(_work(complexity="simple", attempt_index=5)))
+
+    def test_explicit_simple_on_the_first_attempt_stays_simple(self) -> None:
+        self.assertFalse(is_complex(_work(complexity="simple", attempt_index=1)))
 
     def test_null_complexity_first_attempt_is_simple(self) -> None:
         self.assertFalse(is_complex(_work(complexity=None, attempt_index=1)))

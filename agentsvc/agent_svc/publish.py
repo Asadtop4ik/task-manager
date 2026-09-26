@@ -204,7 +204,14 @@ def _check_diff(
     try:
         checker(**kwargs)
     except (ValueError, subprocess.CalledProcessError) as exc:
-        raise PublishError(str(exc)) from exc
+        # The exact prefix each trusted script's own CLI wrapper uses --
+        # `public_agent_task.py`'s `__main__` says "public agent task
+        # rejected: ...", `agent_task.py`'s says "agent task failed: ...".
+        # `check_diff` itself never raises anything else, but matching this
+        # text means a callback's `error` field reads identically to what
+        # the legacy GitHub Actions publisher would have reported.
+        prefix = "public agent task rejected" if is_public else "agent task failed"
+        raise PublishError(f"{prefix}: {exc}") from exc
 
 
 def _run_preflight(
@@ -325,7 +332,11 @@ def _pr_body(
             f"Requested: {task['title']}\n\n{task['description']}\n\n"
             "Created by Codex. Review the diff and CI results before merging.\n"
         )
-    summary = " ".join((codex_summary or "").split())[:3000]
+    # Legacy `agent_task.check_diff` only `.strip()`s the Codex result text
+    # before appending it to the PR body -- internal newlines/formatting are
+    # kept, unlike the whitespace-collapsed text `failure_reason` uses for
+    # the short "Codex izohi" callback note.
+    summary = (codex_summary or "").strip()[:3000]
     if summary:
         body += f"\nCodex summary:\n\n{summary}\n"
     body += f"\nTrusted publisher preflight: {preflight_result}.\n"

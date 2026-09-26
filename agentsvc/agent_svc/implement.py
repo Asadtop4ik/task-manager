@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .api import LeaseLost, Work
+from .api import Work
 from .context import ServiceContext
 from .prompts import compose_implement_prompt, route_implement
 from .publish import PublishError, publish_implement
@@ -273,28 +273,77 @@ def _make_images_readable_by_agent_codex(image_dir: Path, paths: list[Path]) -> 
         path.chmod(0o640)
 
 
+def _pr_matches_this_run(pr: Mapping[str, Any], repo: str, branch: str, base_branch: str) -> bool:
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    return (
+        head.get("ref") == branch
+        and (head.get("repo") or {}).get("full_name", "").lower() == repo.lower()
+        and base.get("ref") == base_branch
+    )
+
+
 def _recover_existing_branch(
     ctx: ServiceContext, work: Work, run: RunScaffold, branch: str
 ) -> None:
+    """The branch this run would push already exists: a previous attempt got
+    at least as far as `branch_pushed` before agent-svc crashed, was killed,
+    or otherwise never got to report back. Never push to it (see the branch-
+    exists guard above `_run_implement`); instead prove it is genuinely THIS
+    run's own commit (the exact `Agent-Run-ID` trailer, not merely a branch
+    that happens to share the name) and recover from wherever publication
+    actually stopped: reopen the PR if one is missing (a crash between push
+    and PR creation), or just report the existing one.
+    """
     trailer = f"Agent-Run-ID: {work.run_id}"
     try:
+        head_sha = ctx.github.get_ref(work.repo_full_name, branch)
+        if head_sha is None:
+            raise ValueError("branch disappeared during recovery")
+        message = ctx.github.commit_message(work.repo_full_name, head_sha)
+        if trailer not in message.splitlines():
+            _fail(ctx, work, run, "implement", "branch already exists")
+            return
+
         pr = ctx.github.find_open_pull_by_head(work.repo_full_name, branch)
         if pr is not None:
-            head_sha = pr["head"]["sha"]
-            message = ctx.github.commit_message(work.repo_full_name, head_sha)
-            if trailer in message.splitlines():
-                _callback(
-                    ctx,
-                    work,
-                    run,
-                    {
-                        "run_id": work.run_id,
-                        "status": "pr_opened",
-                        "pr_url": pr.get("html_url"),
-                        "head_sha": head_sha,
-                    },
-                )
+            if not _pr_matches_this_run(pr, work.repo_full_name, branch, work.base_branch):
+                _fail(ctx, work, run, "implement", "branch already exists")
                 return
+            pr_url = pr.get("html_url")
+        else:
+            # The push succeeded but agent-svc never got to (or failed to)
+            # open the PR. Do it now instead of failing a run whose branch
+            # is already live and correctly attributed.
+            created = ctx.github.create_pull(
+                work.repo_full_name,
+                head=branch,
+                base=work.base_branch,
+                title=f"Task #{work.task_id}: Codex change",
+                body=(
+                    f"Task Manager task #{work.task_id}\n\n"
+                    "Recovered after an interrupted publish: the branch was already "
+                    "pushed by this exact run. Review the diff and CI results before "
+                    "merging.\n"
+                ),
+            )
+            number = created.get("number")
+            pr_url = created.get("html_url") or (
+                f"https://github.com/{work.repo_full_name}/pull/{number}"
+            )
+
+        _callback(
+            ctx,
+            work,
+            run,
+            {
+                "run_id": work.run_id,
+                "status": "pr_opened",
+                "pr_url": pr_url,
+                "head_sha": head_sha,
+            },
+        )
+        return
     except Exception as exc:
         ctx.logger.error(exc, event="branch_recovery_failed", run_id=work.run_id)
     _fail(ctx, work, run, "implement", "branch already exists")
@@ -335,11 +384,4 @@ def _callback(
 ) -> None:
     if run.cancel.is_set():
         return
-    try:
-        ctx.api.callback(work.run_id, work.lease_id, payload)
-    except LeaseLost as exc:
-        ctx.logger.event(
-            "callback_lease_lost", level="warning", run_id=work.run_id, detail=exc.detail
-        )
-    except Exception as exc:
-        ctx.logger.error(exc, event="callback_failed", run_id=work.run_id)
+    run.deliver(lambda: ctx.api.callback(work.run_id, work.lease_id, payload))

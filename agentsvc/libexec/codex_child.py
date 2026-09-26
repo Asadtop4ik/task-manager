@@ -264,7 +264,12 @@ def _git_argv(
         # filters that execute arbitrary commands on `git diff`. This is not
         # in the literal spec command line but is required so `package`
         # cannot be tricked into running attacker-controlled programs.
-        command += ["-c", "diff.noTextconv=true", "-c", "core.attributesFile=/dev/null"]
+        # `diff.noTextconv` is not a real git config key (the real knob is
+        # the `--no-textconv` command-line flag, on a per-invocation basis);
+        # `core.attributesFile=/dev/null` alone already fully disables it,
+        # since no path is ever assigned a diff driver with no gitattributes
+        # read at all.
+        command += ["-c", "core.attributesFile=/dev/null"]
     command += list(args)
     return command
 
