@@ -21,6 +21,13 @@ from app.states import AgentCorrection
 router = Router(name="agent_release")
 CARD_LIMIT = 3900
 CORRECTION_LIMIT = 2000
+QA_REPOSITORY = "Asadtop4ik/agent-qa"
+_QA_FAILURE_PREFIX = "QA deployment failed ["
+_QA_FAILURE_LABELS = {
+    "image_pull_failed": "QA image yuklab olinmadi",
+    "deploy_failed": "QA deploy yakunlanmadi",
+    "readiness_failed": "QA /ready tekshiruvi o‘tmadi",
+}
 
 
 def _short(value: Any, limit: int) -> str:
@@ -53,6 +60,25 @@ def _link(label: str, value: Any) -> str | None:
     if parts.scheme != "https" or not parts.netloc or len(url) > 300:
         return None
     return f'<a href="{escape(url, quote=True)}">{escape(label)}</a>'
+
+
+def _qa_failure_reason(value: Any) -> str | None:
+    error = str(value or "")
+    if not error.startswith(_QA_FAILURE_PREFIX):
+        return None
+    code, separator, detail = error[len(_QA_FAILURE_PREFIX) :].partition("]:")
+    label = _QA_FAILURE_LABELS.get(code)
+    if not separator or label is None:
+        return None
+    detail = _short(detail.lstrip(": "), 240)
+    return f"{label}: {detail}" if detail else label
+
+
+def _full_sha(value: Any) -> str | None:
+    sha = str(value or "").lower()
+    if len(sha) != 40 or any(char not in "0123456789abcdef" for char in sha):
+        return None
+    return sha
 
 
 def _evidence_lines(run: dict[str, Any]) -> list[str]:
@@ -125,7 +151,17 @@ def release_card(run: dict[str, Any], *, detailed: bool = False) -> str:
     findings = review.get("findings") or [] if isinstance(review, dict) else []
     ci = run.get("ci_evidence") or run.get("ci") or {}
     ci_state = str(ci.get("state") or "").lower() if isinstance(ci, dict) else ""
-    if merge_available:
+    is_qa_run = run.get("repo_full_name") == QA_REPOSITORY
+    run_status = str(run.get("status") or "").lower()
+    qa_failure_reason = (
+        _qa_failure_reason(run.get("error")) if is_qa_run and run_status == "merged" else None
+    )
+    qa_deployed = is_qa_run and run_status == "deployed"
+    if qa_failure_reason:
+        status_label = "QA deploy xato"
+    elif qa_deployed:
+        status_label = "QA deploy tayyor"
+    elif merge_available:
         status_label = "PR tayyor"
     elif ci_state in {"failure", "failed", "error"}:
         status_label = "CI xato"
@@ -158,9 +194,26 @@ def release_card(run: dict[str, Any], *, detailed: bool = False) -> str:
         f"Holat: {_html_text(status_label, 40)} · <code>{short_sha}</code>",
     ]
     lines.extend(["", f"<b>Xulosa:</b> {summary}", f"<b>Ta’sir:</b> {impact}"])
-    error = run.get("error")
-    if error:
-        lines.append(f"<b>Sabab:</b> {_html_text(error, 500)}")
+    if qa_failure_reason:
+        lines.append(f"<b>Sabab:</b> {_html_text(qa_failure_reason, 320)}")
+    elif run.get("error") and not qa_deployed:
+        lines.append(f"<b>Sabab:</b> {_html_text(run['error'], 500)}")
+    if is_qa_run:
+        merged_sha = _full_sha(run.get("merged_sha"))
+        deployed_sha = _full_sha(run.get("deployed_sha"))
+        ready_sha = _full_sha(run.get("qa_ready_sha"))
+        if merged_sha:
+            lines.append(f"QA merge SHA: <code>{merged_sha}</code>")
+        if qa_deployed and deployed_sha:
+            lines.append(f"QA image SHA: <code>{deployed_sha}</code>")
+        if qa_deployed and run.get("qa_ready_url"):
+            lines.append(f"QA readiness: <code>{_html_text(run['qa_ready_url'], 220)}</code>")
+        if qa_deployed and ready_sha:
+            lines.append(f"QA /ready SHA: <code>{ready_sha}</code>")
+        if (qa_failure_reason or qa_deployed) and run.get("github_run_url"):
+            workflow_link = _link("QA Actions natijasini ochish", run["github_run_url"])
+            if workflow_link:
+                lines.append(workflow_link)
     evidence = _evidence_lines(run)
     if evidence:
         lines.extend(["", "<b>CI va review dalillari:</b>", *evidence])
