@@ -1,3 +1,5 @@
+import hashlib
+import json
 from uuid import uuid4
 
 import pytest
@@ -324,6 +326,176 @@ async def test_transient_dispatch_failure_can_retry_with_same_action_id(
         )
     ).all()
     assert len(actions) == 1 and actions[0].status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_qa_merge_workflow_rejection_retries_with_same_action_id_when_still_ready(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    run = await _open_run(
+        client,
+        session,
+        manager,
+        project,
+        status="pr_ready",
+        ci_status="success",
+        review_status="clean",
+    )
+    run.repo_full_name = "Asadtop4ik/agent-qa"
+    run.base_branch = "main"
+    run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/3"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_repository", "Asadtop4ik/agent-qa")
+    monkeypatch.setattr(settings, "github_agent_token", "task-manager-token")
+    monkeypatch.setattr(settings, "github_agent_qa_token", "qa-read-token")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+
+    head_lookups = 0
+
+    async def current_head(current) -> tuple[str, bool]:
+        nonlocal head_lookups
+        head_lookups += 1
+        assert current.repo_full_name == "Asadtop4ik/agent-qa"
+        if head_lookups == 1:
+            raise agent_runs.httpx.ConnectError("temporary GitHub lookup failure")
+        return _SHA, True
+
+    dispatched: list[str] = []
+
+    async def dispatch(current, action, payload) -> None:
+        dispatched.append(action.action_id)
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", current_head)
+    monkeypatch.setattr(agent_runs, "_dispatch_release_action", dispatch)
+    action_id = str(uuid4())
+    request_data = {"expected_head_sha": _SHA}
+    session.add(
+        AgentRunAction(
+            action_id=action_id,
+            agent_run_id=run.id,
+            kind="merge",
+            request_hash=hashlib.sha256(
+                json.dumps(request_data, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest(),
+            request_data=request_data,
+            status="in_progress",
+        )
+    )
+    await session.commit()
+
+    rejected = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/action-result",
+        json={
+            "action_id": action_id,
+            "status": "rejected",
+            "head_sha": _SHA,
+            "message": "Checks permission unavailable",
+        },
+        headers=_CALLBACK,
+    )
+    assert rejected.status_code == 200
+    action_status = await client.get(
+        f"/api/v1/agent-runs/{run.run_id}/actions/{action_id}", headers=_CALLBACK
+    )
+    assert action_status.json()["status"] == "retryable"
+
+    retried = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/merge",
+        json={"expected_head_sha": _SHA, "action_id": action_id},
+        headers=auth(manager),
+    )
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "in_progress"
+    assert head_lookups == 2
+    assert dispatched == [action_id]
+
+
+@pytest.mark.asyncio
+async def test_stale_qa_merge_rejection_stays_rejected_and_invalidates_evidence(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    run = await _open_run(
+        client,
+        session,
+        manager,
+        project,
+        status="pr_ready",
+        ci_status="success",
+        review_status="clean",
+    )
+    run.repo_full_name = "Asadtop4ik/agent-qa"
+    run.base_branch = "main"
+    run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/3"
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_repository", "Asadtop4ik/agent-qa")
+    monkeypatch.setattr(settings, "github_agent_token", "task-manager-token")
+    monkeypatch.setattr(settings, "github_agent_qa_token", "qa-read-token")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+
+    async def stale_head(current) -> tuple[str, bool]:
+        return "c" * 40, True
+
+    dispatched: list[str] = []
+
+    async def dispatch(current, action, payload) -> None:
+        dispatched.append(action.action_id)
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", stale_head)
+    monkeypatch.setattr(agent_runs, "_dispatch_release_action", dispatch)
+    action_id = str(uuid4())
+    request_data = {"expected_head_sha": _SHA}
+    session.add(
+        AgentRunAction(
+            action_id=action_id,
+            agent_run_id=run.id,
+            kind="merge",
+            request_hash=hashlib.sha256(
+                json.dumps(request_data, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest(),
+            request_data=request_data,
+            status="in_progress",
+        )
+    )
+    await session.commit()
+
+    rejected = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/action-result",
+        json={
+            "action_id": action_id,
+            "status": "rejected",
+            "head_sha": _SHA,
+            "message": "PR head changed",
+        },
+        headers=_CALLBACK,
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "pr_opened"
+    assert rejected.json()["head_sha"] == "c" * 40
+    assert rejected.json()["ci_verified_sha"] is None
+    assert rejected.json()["review_status"] == "pending"
+    action_status = await client.get(
+        f"/api/v1/agent-runs/{run.run_id}/actions/{action_id}", headers=_CALLBACK
+    )
+    assert action_status.json()["status"] == "rejected"
+
+    repeated = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/merge",
+        json={"expected_head_sha": _SHA, "action_id": action_id},
+        headers=auth(manager),
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "rejected"
+    assert dispatched == []
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,180 @@ class AgentReleaseTests(unittest.TestCase):
                 require_open=True,
             )
 
+    def test_qa_merge_uses_exact_workflow_run_and_pr_ci_job_without_check_runs(self) -> None:
+        run_id = "0fb0df87-f3d5-4f36-b45e-223d69670a45"
+        branch = f"codex/task-30-{run_id}"
+        repo = "Asadtop4ik/agent-qa"
+        sha = "a" * 40
+        run = {
+            "run_id": run_id,
+            "task_id": 30,
+            "repo_full_name": repo,
+            "base_branch": "main",
+            "status": "pr_ready",
+            "ci_status": "success",
+            "ci_verified_sha": sha,
+            "review_status": "clean",
+            "review_sha": sha,
+            "pr_url": f"https://github.com/{repo}/pull/3",
+        }
+        action = {"status": "in_progress", "request": {"expected_head_sha": sha}}
+        pr = {
+            "state": "open",
+            "merged": False,
+            "draft": False,
+            "mergeable_state": "clean",
+            "head": {
+                "sha": sha,
+                "ref": branch,
+                "repo": {"full_name": repo},
+            },
+            "base": {"ref": "main"},
+        }
+        workflow_run = {
+            "id": 36182380264,
+            "event": "pull_request",
+            "path": ".github/workflows/agent-qa.yml",
+            "head_sha": sha,
+            "head_branch": branch,
+            "status": "completed",
+            "conclusion": "success",
+            "pull_requests": [
+                {"number": 3, "head": {"sha": sha, "ref": branch}}
+            ],
+        }
+        calls = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            def request(url, **kwargs):
+                calls.append(url)
+                if "/actions/workflows/agent-qa.yml/runs?" in url:
+                    return {"workflow_runs": [workflow_run]}
+                if url.endswith("/actions/runs/36182380264/jobs?per_page=100"):
+                    return {
+                        "jobs": [
+                            {"id": 10, "name": "PR CI", "conclusion": "success"}
+                        ]
+                    }
+                if url.endswith(f"/commits/{sha}/statuses"):
+                    return [
+                        {
+                            "id": 11,
+                            "context": "codex-review",
+                            "sha": sha,
+                            "state": "success",
+                        }
+                    ]
+                raise AssertionError(url)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "AGENT_QA_ENABLED": "true",
+                        "AGENT_QA_REPOSITORY": repo,
+                        "GH_TOKEN": "qa-token",
+                        "GITHUB_OUTPUT": str(Path(temp, "output")),
+                    },
+                ),
+                patch.object(
+                    agent_release,
+                    "_context",
+                    return_value=({}, run, action, run_id, 3, sha),
+                ),
+                patch.object(agent_release, "_pr", return_value=pr),
+                patch.object(agent_release, "_request", side_effect=request),
+            ):
+                agent_release.verify_merge()
+
+            output = Path(temp, "output").read_text(encoding="utf-8")
+        self.assertIn("pull_number=3", output)
+        self.assertIn(f"head_sha={sha}", output)
+        self.assertTrue(any("/statuses" in url for url in calls))
+        self.assertFalse(any("/check-runs" in url for url in calls))
+
+    def test_qa_merge_rejects_wrong_pr_or_failed_pr_ci_job(self) -> None:
+        run_id = "0fb0df87-f3d5-4f36-b45e-223d69670a45"
+        branch = f"codex/task-30-{run_id}"
+        repo = "Asadtop4ik/agent-qa"
+        sha = "a" * 40
+        run = {
+            "run_id": run_id,
+            "task_id": 30,
+            "repo_full_name": repo,
+            "base_branch": "main",
+            "status": "pr_ready",
+            "ci_status": "success",
+            "ci_verified_sha": sha,
+            "review_status": "clean",
+            "review_sha": sha,
+            "pr_url": f"https://github.com/{repo}/pull/3",
+        }
+        action = {"status": "in_progress", "request": {"expected_head_sha": sha}}
+        pr = {
+            "state": "open",
+            "merged": False,
+            "draft": False,
+            "mergeable_state": "clean",
+            "head": {"sha": sha, "ref": branch, "repo": {"full_name": repo}},
+            "base": {"ref": "main"},
+        }
+
+        def context(**kwargs):
+            return ({}, run, action, run_id, 3, sha)
+
+        with tempfile.TemporaryDirectory() as temp:
+            cases = (
+                (4, "success", ".github/workflows/agent-qa.yml"),
+                (3, "failure", ".github/workflows/agent-qa.yml"),
+                (3, "success", ".github/workflows/ci.yml"),
+            )
+            for pull_number, job_conclusion, workflow_path in cases:
+                workflow_run = {
+                    "id": 20,
+                    "event": "pull_request",
+                    "path": workflow_path,
+                    "head_sha": sha,
+                    "head_branch": branch,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "pull_requests": [
+                        {"number": pull_number, "head": {"sha": sha, "ref": branch}}
+                    ],
+                }
+
+                def request(url, **kwargs):
+                    if "/actions/workflows/agent-qa.yml/runs?" in url:
+                        return {"workflow_runs": [workflow_run]}
+                    if url.endswith("/actions/runs/20/jobs?per_page=100"):
+                        return {
+                            "jobs": [
+                                {
+                                    "id": 10,
+                                    "name": "PR CI",
+                                    "conclusion": job_conclusion,
+                                }
+                            ]
+                        }
+                    raise AssertionError(url)
+
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "AGENT_QA_ENABLED": "true",
+                            "AGENT_QA_REPOSITORY": repo,
+                            "GH_TOKEN": "qa-token",
+                            "GITHUB_OUTPUT": str(Path(temp, "output")),
+                        },
+                    ),
+                    patch.object(agent_release, "_context", side_effect=context),
+                    patch.object(agent_release, "_pr", return_value=pr),
+                    patch.object(agent_release, "_request", side_effect=request),
+                    self.assertRaises(ValueError),
+                ):
+                    agent_release.verify_merge()
+
     def test_merge_is_recorded_before_qa_deploy_dispatch(self) -> None:
         run_id = "00000000-0000-0000-0000-000000000007"
         action = {

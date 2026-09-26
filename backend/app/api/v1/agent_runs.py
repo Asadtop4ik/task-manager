@@ -250,6 +250,12 @@ async def _dispatch_external_review(run: AgentRun, pr_number: str) -> None:
         raise HTTPException(status_code=502, detail="GitHub did not accept independent review")
 
 
+def _reject_retryable_action(action: AgentRunAction, message: str) -> None:
+    if action.status == "retryable":
+        action.status = "rejected"
+        action.result = {"message": message}
+
+
 def _duration_summary(values: list[float]) -> MetricDuration:
     seconds = sorted(round(value) for value in values if value >= 0)
     if not seconds:
@@ -427,6 +433,27 @@ def _invalidate_review_and_ci(run: AgentRun, head_sha: str) -> None:
     run.review_summary = None
     run.review_findings = None
     run.notified_at = None
+
+
+async def _merge_rejection_is_retryable(run: AgentRun, action: AgentRunAction) -> bool:
+    expected_head = action.request_data.get("expected_head_sha")
+    if (
+        action.kind != "merge"
+        or run.status != "pr_ready"
+        or expected_head != run.head_sha
+        or not _can_merge(run)
+    ):
+        return False
+    try:
+        current_head, is_open = await _current_pr_head(run)
+    except httpx.HTTPError:
+        return True
+    except HTTPException as error:
+        return error.status_code >= 500
+    if current_head != run.head_sha:
+        _invalidate_review_and_ci(run, current_head)
+        return False
+    return is_open
 
 
 async def _verify_recovered_commit(run: AgentRun, sha: str) -> None:
@@ -1189,16 +1216,38 @@ async def _request_owner_action(
             return _action_response(action, run)
         retry_existing = True
     if not _owner_release_supported(run) or not run.pr_url:
+        if retry_existing:
+            assert action is not None
+            _reject_retryable_action(action, "this run no longer has an owner-controlled PR")
+            await session.commit()
+            return _action_response(action, run)
         return _action_error(
             "not_ready", "this run has no owner-controlled private PR", status_code=409
         )
     current_head, is_open = await _current_pr_head(run)
     if current_head != run.head_sha:
         _invalidate_review_and_ci(run, current_head)
+        if retry_existing:
+            assert action is not None
+            _reject_retryable_action(
+                action, "PR head changed; fetch the current run and retry"
+            )
         await session.commit()
     if not is_open:
+        if retry_existing:
+            assert action is not None
+            _reject_retryable_action(action, "PR is no longer open")
+            await session.commit()
+            return _action_response(action, run)
         return _action_error("not_ready", "PR is no longer open", status_code=409)
     if expected_head_sha != current_head:
+        if retry_existing:
+            assert action is not None
+            _reject_retryable_action(
+                action, "PR head changed; fetch the current run and retry"
+            )
+            await session.commit()
+            return _action_response(action, run)
         return _action_error(
             "stale_head",
             "PR head changed; fetch the current run and retry",
@@ -1206,6 +1255,13 @@ async def _request_owner_action(
             current_head_sha=current_head,
         )
     if kind == "merge" and not _can_merge(run):
+        if retry_existing:
+            assert action is not None
+            _reject_retryable_action(
+                action, "CI and a clean review are not valid on the current head"
+            )
+            await session.commit()
+            return _action_response(action, run)
         return _action_error(
             "not_ready",
             "CI and a clean review must pass on the current head",
@@ -1367,7 +1423,9 @@ async def agent_action_result(
     if action.status == "rejected":
         return AgentRunOut.model_validate(run)
     if payload.status == "rejected":
-        action.status = "rejected"
+        action.status = (
+            "retryable" if await _merge_rejection_is_retryable(run, action) else "rejected"
+        )
         action.result = {"message": payload.message or "GitHub rejected the action"}
         if action.kind == "correction" and run.status == "correction_running":
             run.status = "pr_opened"
