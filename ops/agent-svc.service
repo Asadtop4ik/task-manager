@@ -5,6 +5,11 @@ Wants=network-online.target
 # One-time install steps, users, paths and rollback: docs/AGENT_SVC.md.
 # Installed by ops/install_agent_svc.sh; do not hand-edit on the server.
 
+# Avoid a restart storm burning through the CPU/API quota if agent_svc crashes
+# on every start (e.g. a bad config.json): 5 restarts per 5 minutes, then stop.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=notify
 NotifyAccess=main
@@ -33,23 +38,29 @@ LoadCredential=callback_token:/etc/agent-svc/credentials/callback_token
 LoadCredential=intake_worker_token:/etc/agent-svc/credentials/intake_worker_token
 LoadCredential=github_agent_token:/etc/agent-svc/credentials/github_agent_token
 LoadCredential=github_public_agent_token:/etc/agent-svc/credentials/github_public_agent_token
+# QA is optional, but LoadCredential= has no "ignore if missing" form on this
+# systemd version (255: a leading "-" on the directive itself is rejected as an
+# unknown key, verified with `systemd-analyze verify` — it does not make the
+# credential optional, it silently drops the whole line). So this file is always
+# written by sync_agent_svc_credentials.py, empty when QA is unset; an empty
+# github_qa_token means QA is disabled (docs/AGENT_SVC.md), never a missing file.
 LoadCredential=github_qa_token:/etc/agent-svc/credentials/github_qa_token
 
 # Codex children run for minutes at a time under bubblewrap; they are spawned via the
-# `sudo -n -u codex-runner` rule in /etc/sudoers.d/60-agent-svc and stay in this unit's
+# `sudo -n -u agent-codex` rule in /etc/sudoers.d/60-agent-svc and stay in this unit's
 # control group (KillMode=control-group above reaches them too), so these limits cover
 # agent-svc itself plus every Codex child it currently has running.
 CPUQuota=200%
 MemoryMax=3G
 
-# Hardening modeled on ops/task-manager-intake.service (same sudo-to-codex-runner shape).
-# NoNewPrivileges=no: the sudo(8) rule below requires the setuid bit to take effect.
+# Hardening modeled on ops/task-manager-intake.service (same sudo-to-a-restricted-account
+# shape). NoNewPrivileges=no: the sudo(8) rule below requires the setuid bit to take effect.
 NoNewPrivileges=no
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/agent-svc /srv/agent-svc /home/codex-runner/.codex-code /home/codex-runner/.codex-chat /run/agent-svc
+ReadWritePaths=/var/lib/agent-svc /srv/agent-svc /home/agent-codex/.codex-code /home/agent-codex/.codex-chat /run/agent-svc
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -62,9 +73,14 @@ UMask=0027
 
 # agent-svc must never be able to read Task Manager's own secrets, config or the
 # deploy account's home, even though ProtectHome=read-only would otherwise allow a read.
+# codex-runner is the live GitHub Actions self-hosted runner (its home holds runner
+# credentials, checkout tokens and its own Codex auth) — never Codex's execution
+# account here (see agent-codex above) and never readable by this unit either. The
+# leading "-" tolerates codex-runner's home not existing on some other host.
 # docker.sock is intentionally left reachable: the root-only image_state.py helper
-# (invoked via sudo) needs it, and codex-runner is not in the docker group either way.
-InaccessiblePaths=/srv/stack/env /etc/task-manager /home/deploy
+# (invoked via sudo) needs it, and neither agent-codex nor codex-runner is in the
+# docker group.
+InaccessiblePaths=-/home/codex-runner /srv/stack/env /etc/task-manager /home/deploy
 
 [Install]
 WantedBy=multi-user.target

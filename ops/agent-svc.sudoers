@@ -4,10 +4,15 @@
 # either target command via the environment.
 Defaults:agent-svc !requiretty
 
-# Run the sandboxed Codex child as the unprivileged codex-runner account. Only these
-# four subcommands plus --version are allowed; codex_child.py itself validates every
-# argument it receives on stdin (run_id, lane, model, effort, sandbox, paths).
-agent-svc ALL=(codex-runner) NOPASSWD: /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py cleanup, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py --version
+# Run the sandboxed Codex child as the dedicated agent-codex account — NOT
+# codex-runner, which is the live GitHub Actions self-hosted runner and must never
+# share a uid with anything Codex's sandbox can reach (runner credentials, checkout
+# tokens, its own Codex auth). Only these four subcommands plus --version are
+# allowed; codex_child.py itself validates every argument it receives on stdin
+# (run_id, lane, model, effort, sandbox, paths). The paths below are the stable,
+# root-owned symlinks into the active release (see ops/install_agent_svc.sh); the
+# sudoers rule is pinned to these stable paths, never to a release-specific one.
+agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py cleanup, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py --version
 
 # Read-only Docker state for the project catalog's containers. Runs as root because
 # codex-runner is not in the docker group; image_state.py only calls `docker inspect`
