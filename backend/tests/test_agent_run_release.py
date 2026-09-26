@@ -1,9 +1,10 @@
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -796,21 +797,21 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
 
 
 @pytest.mark.asyncio
-async def test_qa_supersession_uses_merge_time_not_run_creation_order(
+async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
     client: AsyncClient,
     session: AsyncSession,
     manager: User,
     project: Project,
     monkeypatch,
 ) -> None:
+    lower_id_later_merge = "b" * 40
+    higher_id_earlier_merge = "f" * 40
     run = await _open_run(client, session, manager, project, status="merged")
     run.repo_full_name = "Asadtop4ik/agent-qa"
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
     run.merged_sha = "b" * 40
-    merged_earlier = datetime(2026, 9, 25, 12, tzinfo=UTC)
-    merged_later = merged_earlier + timedelta(minutes=1)
-    run.merged_at = merged_later
+    run.merged_at = datetime(2026, 9, 25, 13, tzinfo=UTC)
     run.qa_deploy_dispatch_status = "dispatched"
     action_id = str(uuid4())
     session.add(
@@ -841,8 +842,8 @@ async def test_qa_supersession_uses_merge_time_not_run_creation_order(
         status="merged",
         head_sha="e" * 40,
         pr_url="https://github.com/Asadtop4ik/agent-qa/pull/5",
-        merged_sha="f" * 40,
-        merged_at=merged_earlier,
+        merged_sha=higher_id_earlier_merge,
+        merged_at=datetime(2026, 9, 25, 12, tzinfo=UTC),
         qa_deploy_dispatch_status="dispatched",
     )
     session.add(newer_run)
@@ -855,19 +856,48 @@ async def test_qa_supersession_uses_merge_time_not_run_creation_order(
             request_hash="e" * 64,
             request_data={"expected_head_sha": "e" * 40},
             status="completed",
-            result={"head_sha": "e" * 40, "merge_sha": "f" * 40},
+            result={"head_sha": "e" * 40, "merge_sha": higher_id_earlier_merge},
         )
     )
     await session.commit()
     monkeypatch.setattr(settings, "agent_qa_enabled", True)
     monkeypatch.setattr(settings, "agent_qa_callback_token", "qa-only-token-0123456789abcdef")
+    monkeypatch.setattr(settings, "github_agent_qa_token", "qa-read-token")
 
     async def verify_deployment(current, sha: str) -> str:
         assert current.repo_full_name == "Asadtop4ik/agent-qa"
-        assert sha in {"b" * 40, "f" * 40}
+        assert sha in {lower_id_later_merge, higher_id_earlier_merge}
         return "e" * 40 if sha == "f" * 40 else _SHA
 
+    class CompareResponse:
+        def __init__(self, comparison: str, status_code: int = 200):
+            self.comparison = comparison
+            self.status_code = status_code
+
+        def json(self):
+            return {"status": self.comparison}
+
+    comparisons = {
+        f"{lower_id_later_merge}...{higher_id_earlier_merge}": "behind",
+        f"{higher_id_earlier_merge}...{lower_id_later_merge}": "ahead",
+    }
+    status_code = 200
+
+    class CompareClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            for comparison, state in comparisons.items():
+                if f"/compare/{comparison}" in url:
+                    return CompareResponse(state, status_code)
+            raise AssertionError(url)
+
     monkeypatch.setattr(agent_runs, "_verify_deployment", verify_deployment)
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: CompareClient())
 
     # Run B has the higher run ID, but it merged first; it must not supersede A.
     old_authorization = await client.post(
@@ -918,3 +948,11 @@ async def test_qa_supersession_uses_merge_time_not_run_creation_order(
         headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
     )
     assert deployed.status_code == 409
+
+    for state in ("diverged", "unknown"):
+        comparisons[f"{lower_id_later_merge}...{higher_id_earlier_merge}"] = state
+        assert await agent_runs._has_newer_qa_owner_merge(session, run) is True
+
+    status_code = 403
+    with pytest.raises(HTTPException, match="QA merge ordering verification failed"):
+        await agent_runs._has_newer_qa_owner_merge(session, run)
