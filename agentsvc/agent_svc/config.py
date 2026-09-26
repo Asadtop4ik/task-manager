@@ -14,14 +14,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SECRET_NAMES: tuple[str, ...] = (
+# github_qa_token is optional: its absence means the QA repository/lane is
+# disabled (the token selector refuses it), not a configuration error. Every
+# other secret is required; missing or empty means `ConfigError`.
+REQUIRED_SECRET_NAMES: tuple[str, ...] = (
     "agent_svc_token",
     "callback_token",
     "intake_worker_token",
     "github_agent_token",
     "github_public_agent_token",
-    "github_qa_token",
 )
+OPTIONAL_SECRET_NAMES: tuple[str, ...] = ("github_qa_token",)
+SECRET_NAMES: tuple[str, ...] = REQUIRED_SECRET_NAMES + OPTIONAL_SECRET_NAMES
 
 DEFAULT_CONFIG_PATH = "/etc/agent-svc/config.json"
 
@@ -81,8 +85,7 @@ DEFAULT_TIMEOUTS: dict[str, int] = {
 DEFAULT_IDLE_TIMEOUT_S = 480
 
 # Non-secret keys and their defaults. `None` marks a value derived from other
-# settings (state_dir, libexec_dir) unless the config file overrides it.
-_DERIVED_KEYS = ("mirrors_dir", "runs_dir", "codex_child_prefix")
+# settings (state_dir) unless the config file overrides it.
 DEFAULT_CONFIG: dict[str, Any] = {
     "api_base_url": "https://tasks.standart-eko.uz/api/v1",
     "trusted_dir": "/opt/agent-svc/trusted",
@@ -90,11 +93,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tools_dir": "/opt/agent-svc/tools",
     "state_dir": "/var/lib/agent-svc",
     "work_root": "/srv/agent-svc/work",
-    "mirrors_dir": None,
+    # Mirrors moved out of state_dir (REVISION 2): agent-codex needs to clone
+    # them, so they live under the agentwork-group work tree instead of the
+    # agent-svc-only state directory.
+    "mirrors_dir": "/srv/agent-svc/mirrors",
     "runs_dir": None,
     "codex_child_prefix": None,
-    "codex_home_code": "/home/codex-runner/.codex-code",
-    "codex_home_chat": "/home/codex-runner/.codex-chat",
+    # REVISION 2: Codex runs as its own dedicated user `agent-codex`, never as
+    # `codex-runner` (the live GitHub Actions runner account, which can read
+    # things Codex's sandbox must not reach).
+    "codex_home_code": "/home/agent-codex/.codex-code",
+    "codex_home_chat": "/home/agent-codex/.codex-chat",
     "code_lane_enabled": False,
     "chat_lane_enabled": False,
     "watch_enabled": True,
@@ -115,6 +124,7 @@ _STR_KEYS = (
     "tools_dir",
     "state_dir",
     "work_root",
+    "mirrors_dir",
     "codex_home_code",
     "codex_home_chat",
 )
@@ -212,22 +222,19 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     if not isinstance(merged["timeouts"], dict):
         raise ConfigError("config key 'timeouts' must be an object")
 
-    if merged["mirrors_dir"] is None:
-        merged["mirrors_dir"] = str(Path(merged["state_dir"]) / "mirrors")
-    elif not isinstance(merged["mirrors_dir"], str) or not merged["mirrors_dir"].strip():
-        raise ConfigError("config key 'mirrors_dir' must be a non-empty string")
-
     if merged["runs_dir"] is None:
         merged["runs_dir"] = str(Path(merged["state_dir"]) / "runs")
     elif not isinstance(merged["runs_dir"], str) or not merged["runs_dir"].strip():
         raise ConfigError("config key 'runs_dir' must be a non-empty string")
 
     if merged["codex_child_prefix"] is None:
+        # REVISION 2: sudo to the dedicated `agent-codex` user, not the
+        # `codex-runner` GitHub Actions runner account.
         merged["codex_child_prefix"] = [
             "/usr/bin/sudo",
             "-n",
             "-u",
-            "codex-runner",
+            "agent-codex",
             "--",
             "/usr/bin/python3",
         ]
@@ -241,7 +248,14 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
 
 def load_secrets(credentials_dir: str | Path | None = None) -> dict[str, str]:
-    """Load every required secret from `$CREDENTIALS_DIRECTORY/<name>` files."""
+    """Load every secret from `$CREDENTIALS_DIRECTORY/<name>` files.
+
+    `OPTIONAL_SECRET_NAMES` (currently just `github_qa_token`) may be entirely
+    absent: that means the feature it gates (the QA repo/lane) is disabled,
+    not a misconfiguration, so the result carries `""` for it. A *present but
+    empty/whitespace* file is still treated as invalid for every secret,
+    required or optional, since that indicates a real provisioning mistake.
+    """
     resolved = (
         credentials_dir
         if credentials_dir is not None
@@ -263,6 +277,9 @@ def load_secrets(credentials_dir: str | Path | None = None) -> dict[str, str]:
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            if name in OPTIONAL_SECRET_NAMES:
+                values[name] = ""
+                continue
             missing.append(name)
             continue
         except OSError:

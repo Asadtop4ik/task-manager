@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from agent_svc.repos import Catalog, MirrorManager, load_catalog
+from agent_svc.repos import Catalog, MirrorManager, load_catalog, make_run_dir
 
 _FAKE_AGENT_REPOS = """
 from dataclasses import dataclass
@@ -117,10 +118,13 @@ class MirrorManagerRealGitTests(unittest.TestCase):
             self.assertEqual(sha, expected_sha)
             mirror_path = manager.mirror_path("owner/repo")
             self.assertTrue((mirror_path / "HEAD").is_file())
+            # `& 0o777` would silently ignore the setgid bit; S_IMODE keeps it.
+            self.assertEqual(stat.S_IMODE(mirrors_dir.stat().st_mode), 0o2750)
+            self.assertEqual(stat.S_IMODE(mirror_path.stat().st_mode), 0o2750)
             for item in mirror_path.rglob("*"):
-                mode = item.stat().st_mode & 0o777
+                mode = stat.S_IMODE(item.stat().st_mode)
                 if item.is_dir():
-                    self.assertEqual(mode, 0o750, msg=str(item))
+                    self.assertEqual(mode, 0o2750, msg=str(item))
                 else:
                     self.assertEqual(mode, 0o640, msg=str(item))
 
@@ -209,6 +213,59 @@ class MirrorManagerEnvIsolationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 manager.ensure("owner/repo")
             self.assertIn("boom", str(ctx.exception))
+
+
+RUN_ID = "11111111-1111-1111-1111-111111111111"
+
+
+class MakeRunDirTests(unittest.TestCase):
+    def test_creates_run_dir_and_images_with_explicit_modes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            run_dir = make_run_dir(tmp, RUN_ID)
+            self.assertEqual(run_dir, Path(tmp) / RUN_ID)
+            self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o2770)
+            images_dir = run_dir / "images"
+            self.assertTrue(images_dir.is_dir())
+            self.assertEqual(stat.S_IMODE(images_dir.stat().st_mode), 0o2750)
+
+    def test_is_idempotent_and_re_applies_modes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            first = make_run_dir(tmp, RUN_ID)
+            first.chmod(0o700)  # simulate some other mode; must be reset
+            second = make_run_dir(tmp, RUN_ID)
+            self.assertEqual(first, second)
+            self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o2770)
+
+    def test_creates_missing_work_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "not-yet-created"
+            run_dir = make_run_dir(work_root, RUN_ID)
+            self.assertTrue(run_dir.is_dir())
+
+    def test_rejects_invalid_run_id(self) -> None:
+        with TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            make_run_dir(tmp, "not-a-run-id")
+
+    def test_refuses_a_symlinked_run_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "work"
+            work_root.mkdir()
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            (work_root / RUN_ID).symlink_to(elsewhere, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                make_run_dir(work_root, RUN_ID)
+
+    def test_refuses_a_symlinked_images_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "work"
+            run_dir = work_root / RUN_ID
+            run_dir.mkdir(parents=True)
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            (run_dir / "images").symlink_to(elsewhere, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                make_run_dir(work_root, RUN_ID)
 
 
 if __name__ == "__main__":

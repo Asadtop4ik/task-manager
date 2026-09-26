@@ -3,9 +3,10 @@
 `load_catalog` imports the root-owned `agent_repos.py` by file path, the same
 trust boundary `ops/project_catalog.py` relies on, without mutating
 `sys.path`. `MirrorManager` keeps one bare mirror per approved repo under the
-state directory, fetching only the one approved branch with a token that is
+mirrors directory, fetching only the one approved branch with a token that is
 never written to disk, argv, or a git config file: it lives only in the
-environment of the single `git fetch` subprocess.
+environment of the single `git fetch` subprocess. `make_run_dir` provisions
+the per-run work directory the same way.
 """
 
 from __future__ import annotations
@@ -21,12 +22,22 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from .journal import RUN_ID_RE
+
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _GIT_TIMEOUT_S = 120
 # Achieves the same group-readable outcome as a process-wide umask, without
-# mutating global umask state from multiple lane threads at once.
-_DIR_MODE = 0o750
+# mutating global umask state from multiple lane threads at once. Setgid
+# (02000) so new entries inherit the mirrors tree's group (REVISION 2:
+# `agentwork`, so agent-codex can clone) instead of the creating process's.
+_DIR_MODE = 0o2750
 _FILE_MODE = 0o640
+
+# Work-dir permissions (REVISION 2): the service's own UMask (0027) only
+# strips rwx bits, never sets setgid, so these are always applied explicitly
+# rather than relied on via a directory-creation mode.
+_RUN_DIR_MODE = 0o2770
+_RUN_IMAGES_MODE = 0o2750
 
 
 @dataclass(frozen=True)
@@ -131,6 +142,7 @@ class MirrorManager:
         path = self.mirror_path(repo)
         if not (path / "HEAD").is_file():
             self._mirrors_dir.mkdir(parents=True, exist_ok=True)
+            self._mirrors_dir.chmod(_DIR_MODE)
             self._git(["init", "--bare", str(path)], cwd=None, env=self._base_env())
             self._set_group_readable(path)
         return path
@@ -202,3 +214,30 @@ class MirrorManager:
             except FileNotFoundError:
                 continue
         path.chmod(_DIR_MODE)
+
+
+def make_run_dir(work_root: str | Path, run_id: str) -> Path:
+    """Create `<work_root>/<run_id>/` and its `images/` subdirectory.
+
+    `work_root` itself is provisioned externally (tmpfiles.d, 2750
+    agent-svc:agentwork); this only owns the per-run tree beneath it. Modes
+    are always set explicitly (2770 / 2750) because the service's UMask
+    (0027) never sets the setgid bit a plain `mkdir(mode=...)` would need.
+    Refuses a run directory (or its `images/`) that already exists as a
+    symlink, since `mkdir(exist_ok=True)` would otherwise silently follow it.
+    """
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(f"invalid run_id: {run_id!r}")
+    run_dir = Path(work_root) / run_id
+    if run_dir.is_symlink():
+        raise ValueError(f"refusing a symlinked run directory: {run_dir}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.chmod(_RUN_DIR_MODE)
+
+    images_dir = run_dir / "images"
+    if images_dir.is_symlink():
+        raise ValueError(f"refusing a symlinked images directory: {images_dir}")
+    images_dir.mkdir(exist_ok=True)
+    images_dir.chmod(_RUN_IMAGES_MODE)
+
+    return run_dir
