@@ -112,6 +112,21 @@ def load_catalog(trusted_dir: str | Path) -> Catalog:
     )
 
 
+def git_auth_env(base_env: dict[str, str], token: str) -> dict[str, str]:
+    """Add a one-shot HTTP Basic auth header to `base_env` for one git process.
+
+    Shared by `MirrorManager` (fetch) and `agent_svc.publish` (push) so the
+    token lives only in the environment of the single git subprocess that
+    needs it: never in argv, a git config file on disk, or a log line.
+    """
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env = dict(base_env)
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+    env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {basic}"
+    return env
+
+
 def _mirror_dir_name(repo: str) -> str:
     owner, _, name = repo.partition("/")
     if not owner or not name:
@@ -137,6 +152,19 @@ class MirrorManager:
 
     def mirror_path(self, repo: str) -> Path:
         return self._mirrors_dir / _mirror_dir_name(repo)
+
+    def remote_url_for(self, repo: str) -> str:
+        """The GitHub remote URL `agent_svc.publish` must push to for `repo`.
+
+        Exposes the same `remote_url_for` hook the constructor takes (real
+        GitHub in production, a local `file://` bare repo in tests) so the
+        publisher pushes to exactly the remote this manager fetches from.
+        """
+        return self._remote_url_for(repo)
+
+    def token_for(self, repo: str) -> str:
+        """The push/fetch credential for `repo`, from the same token selector."""
+        return self._token_for(repo)
 
     def ensure(self, repo: str) -> Path:
         path = self.mirror_path(repo)
@@ -175,13 +203,7 @@ class MirrorManager:
     def _fetch_env(self, repo: str) -> dict[str, str]:
         # The token exists only in this one subprocess's environment: never in
         # argv, never in a git config file, never in the remote URL.
-        token = self._token_for(repo)
-        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        env = self._base_env()
-        env["GIT_CONFIG_COUNT"] = "1"
-        env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
-        env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {basic}"
-        return env
+        return git_auth_env(self._base_env(), self._token_for(repo))
 
     def _git(
         self,

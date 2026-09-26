@@ -84,6 +84,16 @@ DEFAULT_TIMEOUTS: dict[str, int] = {
 }
 DEFAULT_IDLE_TIMEOUT_S = 480
 
+# Absolute, pinned preflight tool executables (never resolved from PATH inside
+# an untrusted checkout — see scripts/agent_preflight.py `_resolve_tool`).
+# Two `ruff` versions are pinned because the trusted preflight enforces a
+# different version per repository (see `agent_svc/publish.py`).
+DEFAULT_PREFLIGHT_TOOL_PATHS: dict[str, str] = {
+    "ruff-0.16.0": "/opt/agent-svc/tools/ruff-0.16.0/bin/ruff",
+    "black-26.5.1": "/opt/agent-svc/tools/black-26.5.1/bin/black",
+    "ruff-0.7.4": "/opt/agent-svc/tools/ruff-0.7.4/bin/ruff",
+}
+
 # Non-secret keys and their defaults. `None` marks a value derived from other
 # settings (state_dir) unless the config file overrides it.
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -113,6 +123,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_matrix": DEFAULT_MODEL_MATRIX,
     "timeouts": DEFAULT_TIMEOUTS,
     "idle_timeout_s": DEFAULT_IDLE_TIMEOUT_S,
+    "preflight_tool_paths": DEFAULT_PREFLIGHT_TOOL_PATHS,
 }
 
 _BOOL_KEYS = ("code_lane_enabled", "chat_lane_enabled", "watch_enabled")
@@ -159,6 +170,7 @@ class Settings:
     model_matrix: Mapping[str, Mapping[str, Any]]
     timeouts: Mapping[str, int]
     idle_timeout_s: int
+    preflight_tool_paths: Mapping[str, str]
     agent_svc_token: str
     callback_token: str
     intake_worker_token: str
@@ -221,6 +233,14 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
         raise ConfigError("config key 'model_matrix' must be an object")
     if not isinstance(merged["timeouts"], dict):
         raise ConfigError("config key 'timeouts' must be an object")
+    tool_paths = merged["preflight_tool_paths"]
+    if not isinstance(tool_paths, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) and value.strip()
+        for key, value in tool_paths.items()
+    ):
+        raise ConfigError(
+            "config key 'preflight_tool_paths' must be an object of non-empty strings"
+        )
 
     if merged["runs_dir"] is None:
         merged["runs_dir"] = str(Path(merged["state_dir"]) / "runs")
@@ -326,6 +346,7 @@ def build_settings(config: Mapping[str, Any], secrets: Mapping[str, str]) -> Set
         model_matrix=config["model_matrix"],
         timeouts=config["timeouts"],
         idle_timeout_s=config["idle_timeout_s"],
+        preflight_tool_paths=config["preflight_tool_paths"],
         agent_svc_token=secrets["agent_svc_token"],
         callback_token=secrets["callback_token"],
         intake_worker_token=secrets["intake_worker_token"],

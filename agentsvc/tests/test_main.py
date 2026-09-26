@@ -11,8 +11,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from agent_svc import main as main_module
 from agent_svc.config import ConfigError, build_settings, load_config, load_secrets
 from agent_svc.main import SdNotifier, build_arg_parser, main, self_check
+
+from .support import build_test_context, make_github_remote
+from .test_implement import _work as _implement_work
 
 TRUSTED_DIR = Path(__file__).resolve().parents[2] / "backend" / "app" / "services"
 
@@ -231,6 +235,33 @@ class MainDispatchTests(unittest.TestCase):
                 os.environ.pop("CREDENTIALS_DIRECTORY", None)
                 code = main(["--config", str(Path(tmp) / "absent.json"), "self-check"])
             self.assertEqual(code, 1)  # secrets missing, but it must not crash
+
+
+class CodeLaneHandlersTests(unittest.TestCase):
+    def test_implement_and_correction_are_wired(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_github_remote(root / "remote.git")
+            ctx = build_test_context(root, github_remote=root / "remote.git")
+            handlers = main_module._code_lane_handlers(ctx)
+            self.assertEqual(set(handlers), {"implement", "correction", "review"})
+
+    def test_review_kind_reports_a_stage_error_and_never_raises(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_github_remote(root / "remote.git")
+            ctx = build_test_context(root, github_remote=root / "remote.git")
+            handlers = main_module._code_lane_handlers(ctx)
+            work = _implement_work(kind="review")
+
+            handlers["review"](work)  # must not raise, even without agent_svc.review
+
+            self.assertEqual(len(ctx.api.stages), 1)  # type: ignore[attr-defined]
+            run_id, lease_id, stage, error = ctx.api.stages[0]  # type: ignore[attr-defined]
+            self.assertEqual((run_id, lease_id, stage), (work.run_id, work.lease_id, "leased"))
+            assert error is not None
+            self.assertIn("review handler not installed", error)
+            self.assertEqual(ctx.api.callbacks, [])  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

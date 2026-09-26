@@ -133,6 +133,29 @@ class GitHubClient:
             raise InvalidResponse("GitHub pull response is not an object")
         return payload
 
+    def find_open_pull_by_head(self, repo: str, branch: str) -> dict[str, Any] | None:
+        """The open PR whose head is `branch`, or `None` — for branch-exists recovery."""
+        owner = repo.split("/", 1)[0]
+        response = self._call(
+            "GET",
+            f"/repos/{repo}/pulls?state=open&head={quote(owner)}:{quote(branch, safe='')}",
+            repo=repo,
+        )
+        payload = self._http.json(response)
+        if not isinstance(payload, list):
+            raise InvalidResponse("GitHub pulls listing is not an array")
+        return payload[0] if payload else None
+
+    def commit_message(self, repo: str, sha: str) -> str:
+        response = self._call("GET", f"/repos/{repo}/commits/{sha}", repo=repo)
+        payload = self._http.json(response)
+        if not isinstance(payload, dict):
+            raise InvalidResponse("GitHub commit response is not an object")
+        message = (payload.get("commit") or {}).get("message")
+        if not isinstance(message, str):
+            raise InvalidResponse("GitHub commit response has no message")
+        return message
+
     def pull_diff(self, repo: str, pr_number: int) -> str:
         response = self._call(
             "GET",
