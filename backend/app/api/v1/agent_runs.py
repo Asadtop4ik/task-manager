@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -1179,7 +1179,10 @@ async def agent_run_detail(
     run_id: str, session: DbSession, owner: OwnerUser
 ) -> AgentRunDetailOut:
     run = await session.scalar(
-        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -1925,6 +1928,11 @@ async def agent_qa_run_deployed(
             detail="QA deployment was superseded by a newer owner merge",
         )
     head_sha = await _verify_deployment(run, payload.sha)
+    if await _has_newer_qa_owner_merge(session, run):
+        raise HTTPException(
+            status_code=409,
+            detail="QA deployment was superseded by a newer owner merge",
+        )
     expected_url = f"https://github.com/{settings.agent_qa_repository}/actions/runs/"
     suffix = payload.github_run_url.removeprefix(expected_url)
     if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
@@ -1957,16 +1965,23 @@ async def agent_qa_run_deployed(
 
 
 async def _has_newer_qa_owner_merge(session: DbSession, run: AgentRun) -> bool:
+    if run.merged_at is None or run.merged_sha is None:
+        return True
     newer = await session.scalar(
         select(AgentRun.id)
         .join(AgentRunAction, AgentRunAction.agent_run_id == AgentRun.id)
         .where(
             AgentRun.repo_full_name == settings.agent_qa_repository,
-            AgentRun.id > run.id,
+            AgentRun.merged_at.is_not(None),
+            or_(
+                AgentRun.merged_at > run.merged_at,
+                and_(AgentRun.merged_at == run.merged_at, AgentRun.id > run.id),
+            ),
             AgentRun.status.in_(["merged", "deployed"]),
             AgentRun.merged_sha.is_not(None),
             AgentRunAction.kind == "merge",
             AgentRunAction.status == "completed",
+            AgentRunAction.result["merge_sha"].as_string() == AgentRun.merged_sha,
         )
         .limit(1)
     )
@@ -1996,6 +2011,8 @@ async def agent_qa_deployment_failed(
         run.status != "merged"
         or run.merged_sha != payload.merge_sha
         or run.head_sha != payload.expected_head_sha
+        or run.qa_deploy_dispatch_status != "dispatched"
+        or run.merged_at is None
     ):
         raise HTTPException(status_code=409, detail="QA failure does not match the merged run")
     expected_url = f"https://github.com/{settings.agent_qa_repository}/actions/runs/"
@@ -2112,7 +2129,9 @@ async def authorize_qa_deployment(
 ) -> AgentQaDeploymentAuthorizationOut:
     """Authorize only the exact QA merge dispatched by an owner release action."""
     _qa_deploy_auth(x_agent_qa_callback_token)
-    run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).with_for_update()
+    )
     if run is None or run.repo_full_name != settings.agent_qa_repository:
         raise HTTPException(status_code=404, detail="QA agent run not found")
     if (
@@ -2152,6 +2171,11 @@ async def authorize_qa_deployment(
         raise HTTPException(
             status_code=409,
             detail="QA PR head differs from the owner-approved head",
+        )
+    if await _has_newer_qa_owner_merge(session, run):
+        raise HTTPException(
+            status_code=409,
+            detail="QA deployment was superseded by a newer owner merge",
         )
     return AgentQaDeploymentAuthorizationOut(
         authorized=True,

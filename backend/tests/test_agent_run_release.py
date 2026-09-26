@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -590,6 +591,7 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
     run.merged_sha = "b" * 40
+    run.merged_at = datetime(2026, 9, 25, tzinfo=UTC)
     run.notified_at = run.created_at
     run.owner_notice_chat_id = manager.telegram_id
     run.owner_notice_message_id = 99
@@ -618,6 +620,21 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
 
     monkeypatch.setattr(agent_runs, "_verify_deployment", verify_deployment)
 
+    failure_url = f"/api/v1/agent-runs/{run.run_id}/qa-deployment-failed"
+    failure_body = {
+        "action_id": action_id,
+        "expected_head_sha": _SHA,
+        "merge_sha": "b" * 40,
+        "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/18",
+        "failure_code": "image_pull_failed",
+    }
+    unqueued_failure = await client.post(
+        failure_url,
+        json=failure_body,
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert unqueued_failure.status_code == 409
+
     dispatch_url = f"/api/v1/agent-runs/{run.run_id}/qa-deploy-dispatch-result"
     failed_dispatch = await client.post(
         dispatch_url,
@@ -641,14 +658,6 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     assert retried_dispatch.json()["qa_deploy_dispatch_status"] == "dispatched"
     assert retried_dispatch.json()["qa_deploy_dispatch_error"] is None
 
-    failure_url = f"/api/v1/agent-runs/{run.run_id}/qa-deployment-failed"
-    failure_body = {
-        "action_id": action_id,
-        "expected_head_sha": _SHA,
-        "merge_sha": "b" * 40,
-        "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/18",
-        "failure_code": "image_pull_failed",
-    }
     denied_failure = await client.post(
         failure_url,
         json=failure_body,
@@ -787,7 +796,7 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
 
 
 @pytest.mark.asyncio
-async def test_qa_recovery_is_denied_after_newer_owner_merge(
+async def test_qa_supersession_uses_merge_time_not_run_creation_order(
     client: AsyncClient,
     session: AsyncSession,
     manager: User,
@@ -799,6 +808,9 @@ async def test_qa_recovery_is_denied_after_newer_owner_merge(
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
     run.merged_sha = "b" * 40
+    merged_earlier = datetime(2026, 9, 25, 12, tzinfo=UTC)
+    merged_later = merged_earlier + timedelta(minutes=1)
+    run.merged_at = merged_later
     run.qa_deploy_dispatch_status = "dispatched"
     action_id = str(uuid4())
     session.add(
@@ -830,6 +842,8 @@ async def test_qa_recovery_is_denied_after_newer_owner_merge(
         head_sha="e" * 40,
         pr_url="https://github.com/Asadtop4ik/agent-qa/pull/5",
         merged_sha="f" * 40,
+        merged_at=merged_earlier,
+        qa_deploy_dispatch_status="dispatched",
     )
     session.add(newer_run)
     await session.flush()
@@ -848,14 +862,22 @@ async def test_qa_recovery_is_denied_after_newer_owner_merge(
     monkeypatch.setattr(settings, "agent_qa_enabled", True)
     monkeypatch.setattr(settings, "agent_qa_callback_token", "qa-only-token-0123456789abcdef")
 
-    authorization = await client.post(
+    async def verify_deployment(current, sha: str) -> str:
+        assert current.repo_full_name == "Asadtop4ik/agent-qa"
+        assert sha in {"b" * 40, "f" * 40}
+        return "e" * 40 if sha == "f" * 40 else _SHA
+
+    monkeypatch.setattr(agent_runs, "_verify_deployment", verify_deployment)
+
+    # Run B has the higher run ID, but it merged first; it must not supersede A.
+    old_authorization = await client.post(
         f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization",
         json={"action_id": action_id, "expected_head_sha": _SHA, "merge_sha": "b" * 40},
         headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
     )
-    assert authorization.status_code == 409
+    assert old_authorization.status_code == 200
 
-    deployed = await client.post(
+    old_deployed = await client.post(
         f"/api/v1/agent-runs/{run.run_id}/qa-deployed",
         json={
             "sha": "b" * 40,
@@ -863,6 +885,35 @@ async def test_qa_recovery_is_denied_after_newer_owner_merge(
             "ready_url": "http://127.0.0.1:18082/ready",
             "ready_status": "ready",
             "ready_sha": "b" * 40,
+        },
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert old_deployed.status_code == 200
+
+    # Run A has the lower ID but merged later, so B's recovery is now stale.
+    newer_action = await session.scalar(
+        select(AgentRunAction).where(AgentRunAction.agent_run_id == newer_run.id)
+    )
+    assert newer_action is not None
+    superseded_authorization = await client.post(
+        f"/api/v1/agent-runs/{newer_run.run_id}/qa-deployment-authorization",
+        json={
+            "action_id": newer_action.action_id,
+            "expected_head_sha": "e" * 40,
+            "merge_sha": "f" * 40,
+        },
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert superseded_authorization.status_code == 409
+
+    deployed = await client.post(
+        f"/api/v1/agent-runs/{newer_run.run_id}/qa-deployed",
+        json={
+            "sha": "f" * 40,
+            "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/19",
+            "ready_url": "http://127.0.0.1:18082/ready",
+            "ready_status": "ready",
+            "ready_sha": "f" * 40,
         },
         headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
     )
