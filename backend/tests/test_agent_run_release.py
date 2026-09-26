@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import agent_runs
 from app.core.config import settings
-from app.db.models import AgentRun, AgentRunAction, Project, User
+from app.db.enums import TaskStatus
+from app.db.models import AgentEvent, AgentRun, AgentRunAction, Project, Task, User
 from app.services.agent_repos import repository_for
 from tests.conftest import auth
 
@@ -589,6 +590,9 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
     run.merged_sha = "b" * 40
+    run.notified_at = run.created_at
+    run.owner_notice_chat_id = manager.telegram_id
+    run.owner_notice_message_id = 99
     action_id = str(uuid4())
     session.add(
         AgentRunAction(
@@ -637,6 +641,70 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     assert retried_dispatch.json()["qa_deploy_dispatch_status"] == "dispatched"
     assert retried_dispatch.json()["qa_deploy_dispatch_error"] is None
 
+    failure_url = f"/api/v1/agent-runs/{run.run_id}/qa-deployment-failed"
+    failure_body = {
+        "action_id": action_id,
+        "expected_head_sha": _SHA,
+        "merge_sha": "b" * 40,
+        "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/18",
+        "failure_code": "image_pull_failed",
+    }
+    denied_failure = await client.post(
+        failure_url,
+        json=failure_body,
+        headers={"X-Agent-QA-Callback-Token": "wrong"},
+    )
+    assert denied_failure.status_code == 401
+    wrong_merge_failure = await client.post(
+        failure_url,
+        json=failure_body | {"merge_sha": "d" * 40},
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert wrong_merge_failure.status_code == 409
+    wrong_action_failure = await client.post(
+        failure_url,
+        json=failure_body | {"action_id": str(uuid4())},
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert wrong_action_failure.status_code == 409
+    failed_deploy = await client.post(
+        failure_url,
+        json=failure_body,
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert failed_deploy.status_code == 200
+    assert failed_deploy.json()["status"] == "merged"
+    assert failed_deploy.json()["error"].startswith("QA deployment failed [image_pull_failed]")
+    assert failed_deploy.json()["github_run_url"] == failure_body["github_run_url"]
+    task = await session.get(Task, run.task_id)
+    assert task is not None and task.status != TaskStatus.DONE
+    events = (
+        await session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.agent_run_id == run.id, AgentEvent.phase == "qa_deploy")
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events[-1].status == "qa_deploy_failed"
+    assert events[-1].github_run_url == failure_body["github_run_url"]
+    notifications = await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    card_update = next(
+        notice for notice in notifications.json() if notice["run_id"] == run.run_id
+    )
+    assert card_update["status"] == "merged"
+    assert card_update["error"] == failed_deploy.json()["error"]
+    assert card_update["github_run_url"] == failure_body["github_run_url"]
+    assert card_update["owner_notice_message_id"] == 99
+    assert card_update["merged_sha"] == "b" * 40
+    failure_details = await client.get(
+        f"/api/v1/agent-runs/{run.run_id}", headers=auth(manager)
+    )
+    assert failure_details.status_code == 200
+    assert failure_details.json()["repo_full_name"] == "Asadtop4ik/agent-qa"
+    assert failure_details.json()["merged_sha"] == "b" * 40
+    assert failure_details.json()["error"] == failed_deploy.json()["error"]
+    assert failure_details.json()["github_run_url"] == failure_body["github_run_url"]
+
     authorization_url = f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization"
     authorization_body = {
         "action_id": action_id,
@@ -683,9 +751,119 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     assert deployed.json()["status"] == "deployed"
     assert deployed.json()["qa_ready_sha"] == "b" * 40
     assert deployed.json()["qa_ready_url"] == "http://127.0.0.1:18082/ready"
+    assert deployed.json()["deployed_sha"] == "b" * 40
+    assert deployed.json()["error"] is None
+    assert deployed.json()["github_run_url"] == body["github_run_url"]
+    success_notices = await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    success_card = next(
+        notice for notice in success_notices.json() if notice["run_id"] == run.run_id
+    )
+    assert success_card["status"] == "deployed"
+    assert success_card["merged_sha"] == "b" * 40
+    assert success_card["deployed_sha"] == "b" * 40
+    assert success_card["qa_ready_sha"] == "b" * 40
+    assert success_card["qa_ready_url"] == "http://127.0.0.1:18082/ready"
+    assert success_card["github_run_url"] == body["github_run_url"]
+    details = await client.get(f"/api/v1/agent-runs/{run.run_id}", headers=auth(manager))
+    assert details.status_code == 200
+    assert details.json()["merged_sha"] == "b" * 40
+    assert details.json()["deployed_sha"] == "b" * 40
+    assert details.json()["qa_ready_sha"] == "b" * 40
+    assert details.json()["qa_ready_url"] == "http://127.0.0.1:18082/ready"
+    assert details.json()["error"] is None
     replay = await client.post(
         url,
         json=body,
         headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
     )
     assert replay.status_code == 200 and replay.json()["status"] == "deployed"
+
+    already_deployed_authorization = await client.post(
+        authorization_url,
+        json=authorization_body,
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert already_deployed_authorization.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_qa_recovery_is_denied_after_newer_owner_merge(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    run = await _open_run(client, session, manager, project, status="merged")
+    run.repo_full_name = "Asadtop4ik/agent-qa"
+    run.base_branch = "main"
+    run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
+    run.merged_sha = "b" * 40
+    run.qa_deploy_dispatch_status = "dispatched"
+    action_id = str(uuid4())
+    session.add(
+        AgentRunAction(
+            action_id=action_id,
+            agent_run_id=run.id,
+            kind="merge",
+            request_hash="c" * 64,
+            request_data={"expected_head_sha": _SHA},
+            status="completed",
+            result={"head_sha": _SHA, "merge_sha": "b" * 40},
+        )
+    )
+    await session.commit()
+    newer_task = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "A newer QA release"},
+        headers=auth(manager),
+    )
+    assert newer_task.status_code == 201
+    newer_run = AgentRun(
+        run_id=str(uuid4()),
+        task_id=newer_task.json()["id"],
+        task_revision="d" * 64,
+        repo_full_name="Asadtop4ik/agent-qa",
+        base_branch="main",
+        mode="pr",
+        status="merged",
+        head_sha="e" * 40,
+        pr_url="https://github.com/Asadtop4ik/agent-qa/pull/5",
+        merged_sha="f" * 40,
+    )
+    session.add(newer_run)
+    await session.flush()
+    session.add(
+        AgentRunAction(
+            action_id=str(uuid4()),
+            agent_run_id=newer_run.id,
+            kind="merge",
+            request_hash="e" * 64,
+            request_data={"expected_head_sha": "e" * 40},
+            status="completed",
+            result={"head_sha": "e" * 40, "merge_sha": "f" * 40},
+        )
+    )
+    await session.commit()
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_callback_token", "qa-only-token-0123456789abcdef")
+
+    authorization = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization",
+        json={"action_id": action_id, "expected_head_sha": _SHA, "merge_sha": "b" * 40},
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert authorization.status_code == 409
+
+    deployed = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/qa-deployed",
+        json={
+            "sha": "b" * 40,
+            "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/18",
+            "ready_url": "http://127.0.0.1:18082/ready",
+            "ready_status": "ready",
+            "ready_sha": "b" * 40,
+        },
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert deployed.status_code == 409
