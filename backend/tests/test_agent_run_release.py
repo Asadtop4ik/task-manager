@@ -588,6 +588,8 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
     monkeypatch,
 ) -> None:
     run = await _open_run(client, session, manager, project, status="merged")
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
     run.repo_full_name = "Asadtop4ik/agent-qa"
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
@@ -807,6 +809,8 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
     lower_id_later_merge = "b" * 40
     higher_id_earlier_merge = "f" * 40
     run = await _open_run(client, session, manager, project, status="merged")
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
     run.repo_full_name = "Asadtop4ik/agent-qa"
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
@@ -956,3 +960,41 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
     status_code = 403
     with pytest.raises(HTTPException, match="QA merge ordering verification failed"):
         await agent_runs._has_newer_qa_owner_merge(session, run)
+
+
+@pytest.mark.asyncio
+async def test_qa_callbacks_lock_canonical_project_after_task_move(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    run = await _open_run(client, session, manager, project)
+    run.repo_full_name = "Asadtop4ik/agent-qa"
+    canonical = Project(
+        key="agent-qa", name="QA project", repo_full_name="Asadtop4ik/agent-qa"
+    )
+    moved_project = Project(
+        key="qa-moved", name="Moved QA tasks", repo_full_name="Asadtop4ik/agent-qa"
+    )
+    session.add_all([canonical, moved_project])
+    await session.flush()
+    task = await session.get(Task, run.task_id)
+    assert task is not None
+    task.project_id = moved_project.id
+    await session.commit()
+
+    original_scalar = session.scalar
+    locked_project_keys: list[str] = []
+
+    async def capture_locked_project(statement, *args, **kwargs):
+        result = await original_scalar(statement, *args, **kwargs)
+        if isinstance(result, Project):
+            locked_project_keys.append(result.key)
+        return result
+
+    monkeypatch.setattr(session, "scalar", capture_locked_project)
+
+    assert await agent_runs._lock_qa_project_for_run(session, run.run_id) is True
+    assert locked_project_keys == ["agent-qa"]

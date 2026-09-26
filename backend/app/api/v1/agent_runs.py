@@ -2010,17 +2010,13 @@ async def _has_newer_qa_owner_merge(session: DbSession, run: AgentRun) -> bool:
 
 
 async def _lock_qa_project_for_run(session: DbSession, run_id: str) -> bool:
-    target = await session.execute(
-        select(Project.id, AgentRun.repo_full_name)
-        .join(Task, Task.project_id == Project.id)
-        .join(AgentRun, AgentRun.task_id == Task.id)
-        .where(AgentRun.run_id == run_id)
+    repository = await session.scalar(
+        select(AgentRun.repo_full_name).where(AgentRun.run_id == run_id)
     )
-    row = target.first()
-    if row is None or row.repo_full_name != settings.agent_qa_repository:
+    if repository != settings.agent_qa_repository:
         return False
     project = await session.scalar(
-        select(Project).where(Project.id == row.id).with_for_update()
+        select(Project).where(Project.key == "agent-qa").with_for_update()
     )
     if project is None:
         raise HTTPException(status_code=409, detail="QA project is unavailable")
