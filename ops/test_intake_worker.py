@@ -516,6 +516,33 @@ class IntakeWorkerTests(unittest.TestCase):
         self.assertEqual(CODEX_OUTER_TIMEOUT_SECONDS, 200)
         self.assertGreater(CODEX_OUTER_TIMEOUT_SECONDS, CODEX_TIMEOUT_SECONDS)
 
+    def test_discussion_child_failure_reaches_parent_stderr_redacted(self) -> None:
+        from discussion_appserver import DiscussionError
+
+        leaked = "ghp_" + "a" * 36
+        with tempfile.TemporaryDirectory() as root:
+            session = Path(root) / "discussion-test"
+            (session / "snapshot").mkdir(parents=True)
+            (session / "images").mkdir()
+            request = {
+                "kind": "discussion", "session_dir": str(session), "prompt": "salom",
+                "images": [], "thread_id": None,
+                "diagnostics_discussion_id": None, "diagnostics_lease_id": None,
+            }
+            stderr = io.StringIO()
+            with (
+                patch.object(intake_worker, "INTAKE_TEMP_DIR", root),
+                patch(
+                    "discussion_appserver.run_turn",
+                    side_effect=DiscussionError(f"Codex javobi vaqtida kelmadi\n{leaked}"),
+                ),
+                patch("sys.stderr", stderr),
+            ):
+                code = intake_worker._run_discussion_child(request)
+        self.assertEqual(code, 1)
+        self.assertIn("Codex javobi vaqtida kelmadi", stderr.getvalue())
+        self.assertNotIn(leaked, stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

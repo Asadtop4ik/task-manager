@@ -470,7 +470,10 @@ def _run_discussion_child(request: dict[str, Any]) -> int:
             encoding="utf-8",
         )
         result.chmod(0o640)
-    except (OSError, ValueError, TypeError, DiscussionError):
+    except (OSError, ValueError, TypeError, DiscussionError) as exc:
+        # The parent captures this stderr, so the redacted Codex tail carried by
+        # DiscussionError reaches journald instead of disappearing.
+        print(_redact(str(exc))[:4000], file=sys.stderr, flush=True)
         return 1
     return 0
 
