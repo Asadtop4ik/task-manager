@@ -1628,6 +1628,252 @@ class PackageIntegrationTests(ChildProcessTestCase):
         self.assertEqual(completed.returncode, 3)
 
 
+_FAKE_TRUSTED_PREFLIGHT = '''
+"""Fake trusted `agent_preflight.py` for codex_child preflight tests."""
+from pathlib import Path
+
+
+def run(repo, root, *, tools=None):
+    root = Path(root)
+    if repo == "acme/fails":
+        raise RuntimeError("simulated preflight failure")
+    (root / "PREFLIGHT_RAN.txt").write_text("ran\\n", encoding="utf-8")
+    names = sorted((tools or {}).keys())
+    return f"{repo}: fake preflight ok tools={names}"
+
+
+def failure_reason(exc):
+    return f"trusted failure: {exc}"
+'''
+
+
+class PreflightIntegrationTests(ChildProcessTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.trusted_dir = self.root / "trusted"
+        self.trusted_dir.mkdir()
+        (self.trusted_dir / "agent_preflight.py").write_text(
+            _FAKE_TRUSTED_PREFLIGHT, encoding="utf-8"
+        )
+        self.tools_dir = self.root / "tools"
+        self.tools_dir.mkdir()
+
+    def preflight_env(self, **extra: str) -> dict[str, str]:
+        return {
+            "AGENT_CHILD_TEST_TRUSTED_DIR": str(self.trusted_dir),
+            "AGENT_CHILD_TEST_TOOLS_DIR": str(self.tools_dir),
+            **extra,
+        }
+
+    def prepared_patch(
+        self, repo: str = "acme/pkg", *, edit: str = "hi\nedited\n"
+    ) -> tuple[str, str, str, str]:
+        """Prepare a run, edit README.md, and package it -- returns
+        (run_id, repo, mirror, base_sha, patch_b64) via `package`, exactly
+        the input `publish.py` hands to `preflight` in production."""
+        mirror, sha = build_mirror(self.mirrors_dir, repo, {"README.md": "hi\n"})
+        run_id = new_run_id()
+        prepared = self.run_child(
+            "prepare", {"run_id": run_id, "repo": repo, "mirror": mirror, "base_sha": sha}
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        wt = self.work_root / run_id / "wt"
+        (wt / "README.md").write_text(edit, encoding="utf-8")
+        packaged = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(packaged.returncode, 0, packaged.stderr)
+        patch_b64 = json.loads(packaged.stdout)["patch_b64"]
+        return run_id, mirror, sha, patch_b64
+
+    def test_runs_trusted_preflight_and_returns_the_final_patch(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch()
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+                "tools": {},
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["preflight_result"], "acme/pkg: fake preflight ok tools=[]")
+        self.assertEqual(set(body["changed_paths"]), {"README.md", "PREFLIGHT_RAN.txt"})
+        patch_bytes = base64.b64decode(body["patch_b64"])
+        self.assertIn(b"edited", patch_bytes)
+        self.assertIn(b"PREFLIGHT_RAN.txt", patch_bytes)
+        # The scratch preflight checkout is always removed afterwards.
+        self.assertFalse((self.work_root / run_id / "pf").exists())
+
+    def test_passes_the_validated_tools_map_through(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch()
+        tool_path = self.tools_dir / "ruff"
+        tool_path.write_text("#!/bin/sh\necho ruff\n", encoding="utf-8")
+        tool_path.chmod(0o755)
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+                "tools": {"ruff": str(tool_path)},
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)
+        self.assertEqual(body["preflight_result"], "acme/pkg: fake preflight ok tools=['ruff']")
+
+    def test_trusted_preflight_failure_reports_reason_and_failure_text(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch(repo="acme/fails")
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/fails",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 3)
+        body = json.loads(completed.stdout)
+        self.assertEqual(body["reason"], "trusted preflight failed")
+        self.assertEqual(
+            body["preflight_failure"], "trusted failure: simulated preflight failure"
+        )
+        self.assertFalse((self.work_root / run_id / "pf").exists())
+
+    def test_rejects_tool_path_outside_tools_dir(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch()
+        outside = self.root / "outside-ruff"
+        outside.write_text("#!/bin/sh\n", encoding="utf-8")
+        outside.chmod(0o755)
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+                "tools": {"ruff": str(outside)},
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("tools directory", json.loads(completed.stdout)["reason"])
+
+    def test_rejects_relative_tool_path(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch()
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+                "tools": {"ruff": "ruff"},
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("absolute", json.loads(completed.stdout)["reason"])
+
+    def test_rejects_symlink_mode_in_the_input_patch_before_touching_disk(self) -> None:
+        run_id, mirror, sha, _patch_b64 = self.prepared_patch()
+        evil_patch = (
+            "diff --git a/evil b/evil\n"
+            "new file mode 120000\n"
+            "index 0000000..1234567\n"
+            "--- /dev/null\n"
+            "+++ b/evil\n"
+            "@@ -0,0 +1 @@\n"
+            "+/etc/passwd\n"
+            "\\ No newline at end of file\n"
+        )
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": base64.b64encode(evil_patch.encode()).decode(),
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("symlink", json.loads(completed.stdout)["reason"])
+        # Never even cloned the mirror to check it out.
+        self.assertFalse((self.work_root / run_id / "pf").exists())
+
+    def test_rejects_empty_patch_b64(self) -> None:
+        run_id, mirror, sha, _patch_b64 = self.prepared_patch()
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": "",
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("patch_b64", json.loads(completed.stdout)["reason"])
+
+    def test_rejects_oversized_patch(self) -> None:
+        run_id, mirror, sha, _patch_b64 = self.prepared_patch()
+        huge = base64.b64encode(os.urandom(codex_child.MAX_PATCH_BYTES + 1024)).decode()
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": huge,
+            },
+            env_extra=self.preflight_env(),
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("size", json.loads(completed.stdout)["reason"])
+
+    def test_accepts_a_request_up_to_the_preflight_request_cap(self) -> None:
+        # The default 1 MiB request cap would refuse this; `preflight` alone
+        # is raised to 12 MiB to fit a base64-encoded 5 MB patch.
+        run_id, mirror, sha, _patch_b64 = self.prepared_patch()
+        padding_source = b"A" * (2 * 1024 * 1024)
+        big_patch_b64 = base64.b64encode(padding_source).decode()
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/pkg",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": big_patch_b64,
+            },
+            env_extra=self.preflight_env(),
+            timeout=60,
+        )
+        # Not a valid patch, but it must fail on *git apply*, not on the
+        # request-size cap itself (which a >1 MiB body would trip at 1 MiB).
+        self.assertEqual(completed.returncode, 3)
+        self.assertNotIn("request exceeds the size limit", completed.stdout.decode())
+
+
 class CleanupIntegrationTests(ChildProcessTestCase):
     def test_removes_only_wt_tmp_out(self) -> None:
         run_id = new_run_id()

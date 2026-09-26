@@ -1,12 +1,20 @@
 """Sandboxed Codex process manager. Runs as user agent-codex via sudo.
 
-Subcommands `prepare | exec | package | cleanup` read one JSON request object
-(<=1 MiB) from stdin and print JSON (single object for prepare/package/cleanup,
-JSONL for exec) on stdout. This process trusts nothing from stdin beyond the
-allowlists below: every model/effort/sandbox/lane/cwd value is checked against a
-fixed set, every run_id is checked against a fixed pattern, and every path the
-child touches is resolved and confirmed to live inside
-`<work_root>/<run_id>/` (or inside the mirrors directory for `prepare`'s read).
+Subcommands `prepare | exec | package | preflight | cleanup` read one JSON
+request object (<=1 MiB, 12 MiB for `preflight`) from stdin and print JSON
+(single object for prepare/package/preflight/cleanup, JSONL for exec) on
+stdout. This process trusts nothing from stdin beyond the allowlists below:
+every model/effort/sandbox/lane/cwd value is checked against a fixed set,
+every run_id is checked against a fixed pattern, and every path the child
+touches is resolved and confirmed to live inside `<work_root>/<run_id>/` (or
+inside the mirrors directory for `prepare`'s read, or `TOOLS_DIR` for
+`preflight`'s tool executables).
+
+`preflight` runs the trusted formatter/lint script (ruff/black/compileall) as
+agent-codex, never agent-svc: those tools execute inside a directory whose
+content is entirely attacker-controlled (the agent's own patch), so running
+them as agent-svc would let a malicious patch read every credential agent-svc
+can reach (see agent-svc-design.md security round 2, blocker 1).
 
 `agent-codex` is a dedicated system user for this sandbox only (design spec
 REVISION 2) — it is deliberately NOT `codex-runner`, which is also the live
@@ -572,7 +580,7 @@ def cmd_cleanup(request: dict[str, Any]) -> int:
     try:
         run_id = _validate_run_id(request.get("run_id"))
         run_dir = _run_dir(run_id)
-        for name in ("wt", "tmp", "out"):
+        for name in ("wt", "tmp", "out", "pf"):
             target = run_dir / name
             if target.is_symlink() or (target.exists() and not target.is_dir()):
                 raise ChildRefusal(f"refusing to remove non-directory {name}")
@@ -585,6 +593,146 @@ def cmd_cleanup(request: dict[str, Any]) -> int:
         _emit_error(f"cleanup failed: {exc}")
         return 3
     print(json.dumps({"ok": True}), flush=True)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# preflight: run the trusted formatter/lint step as agent-codex, never
+# agent-svc -- see agent-svc-design.md security round 2, blocker 1. Ruff,
+# Black and (worst of all) `python -m compileall` all execute in a directory
+# whose *content* is fully attacker-controlled (the agent's own patch);
+# running any of them as agent-svc would let a patch read every credential
+# agent-svc can reach. This subcommand clones the mirror, applies the patch,
+# and runs the pinned trusted preflight script -- all as agent-codex, in a
+# scratch directory agent-svc never touches directly.
+# --------------------------------------------------------------------------
+
+
+def _validate_tools(tools: Any) -> dict[str, str]:
+    """A `{name: absolute path}` map, every path pinned inside `TOOLS_DIR`.
+
+    Always returns a real `dict` (never `None`): the trusted
+    ``agent_preflight.run`` treats `tools=None` as "legacy mode" and may
+    `pip install` -- agent-codex must never do that, so an absent/empty
+    request map still becomes `{}`, which keeps it on the local-executor
+    path (resolve-and-version-check only, no installs).
+    """
+    if tools is None:
+        return {}
+    if not isinstance(tools, dict):
+        raise ChildRefusal("invalid tools")
+    tools_root = TOOLS_DIR.resolve()
+    resolved: dict[str, str] = {}
+    for name, raw_path in tools.items():
+        if not isinstance(name, str) or not isinstance(raw_path, str):
+            raise ChildRefusal("invalid tools entry")
+        if not os.path.isabs(raw_path):
+            raise ChildRefusal(f"tool path must be absolute: {name}")
+        path = Path(raw_path).resolve()
+        if path != tools_root and tools_root not in path.parents:
+            raise ChildRefusal(f"tool path is outside the tools directory: {name}")
+        resolved[name] = str(path)
+    return resolved
+
+
+def _load_trusted_preflight() -> Any:
+    path = (TRUSTED_DIR / "agent_preflight.py").resolve()
+    spec = importlib.util.spec_from_file_location(
+        "agent_svc_child._trusted_agent_preflight", path
+    )
+    if spec is None or spec.loader is None:
+        raise ChildRefusal(f"cannot load trusted preflight: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_preflight(request: dict[str, Any]) -> int:
+    pf_dir: Path | None = None
+    try:
+        run_id = _validate_run_id(request.get("run_id"))
+        run_dir = _run_dir(run_id)
+        repo = request.get("repo")
+        mirror = _validate_mirror(request.get("mirror"), repo)
+        base_sha = request.get("base_sha")
+        if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
+            raise ChildRefusal("invalid base_sha")
+        patch_b64 = request.get("patch_b64")
+        if not isinstance(patch_b64, str) or not patch_b64:
+            raise ChildRefusal("invalid patch_b64")
+        try:
+            patch_bytes = base64.b64decode(patch_b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ChildRefusal("invalid patch encoding") from exc
+        if not patch_bytes:
+            raise ChildRefusal("empty patch")
+        if len(patch_bytes) > MAX_PATCH_BYTES:
+            raise ChildRefusal("patch exceeds the size limit")
+        # Reject a symlink/submodule entry in the CALLER's patch before ever
+        # touching disk with it -- the same check `package` runs on its own
+        # output, run here first against the input.
+        bad_mode_path = _scan_patch_for_bad_modes(patch_bytes.decode("utf-8", "replace"))
+        if bad_mode_path is not None:
+            raise ChildRefusal(f"unsupported change (symlink or submodule): {bad_mode_path}")
+        tools = _validate_tools(request.get("tools"))
+
+        pf_dir = run_dir / "pf"
+        _fresh_dir(pf_dir, mode=0o700)
+        env = _git_env()
+        _clone_mirror(mirror, pf_dir, run_dir=run_dir, env=env)
+        _run_git(
+            _git_argv("-C", str(pf_dir), "checkout", "--detach", base_sha),
+            cwd=run_dir,
+            env=env,
+        )
+        _refuse_if_agent_config_present(pf_dir)
+        _run_git(
+            _git_argv("-C", str(pf_dir), "apply", "--index"),
+            cwd=run_dir,
+            env=env,
+            input_bytes=patch_bytes,
+        )
+        _refuse_if_agent_config_present(pf_dir)
+
+        if not isinstance(repo, str):
+            raise ChildRefusal("invalid repo")
+        preflight_module = _load_trusted_preflight()
+        try:
+            preflight_result = preflight_module.run(repo, pf_dir, tools=tools)
+        except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+            # A trusted-preflight failure is not a child refusal: report the
+            # exact legacy failure text the caller forwards to the owner,
+            # alongside a generic `reason` for anything reading only that.
+            failure_text = preflight_module.failure_reason(exc)
+            print(
+                json.dumps({"reason": "trusted preflight failed", "preflight_failure": failure_text}),
+                flush=True,
+            )
+            return 3
+
+        patch_bytes_out, changed_paths = _package_worktree(pf_dir, out_dir=run_dir / "out")
+    except ChildRefusal as exc:
+        _emit_error(str(exc))
+        return 3
+    except OSError as exc:
+        _emit_error(f"preflight failed: {exc}")
+        return 3
+    finally:
+        if pf_dir is not None:
+            shutil.rmtree(pf_dir, ignore_errors=True)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "patch_b64": (
+                    base64.b64encode(patch_bytes_out).decode("ascii") if patch_bytes_out else ""
+                ),
+                "changed_paths": changed_paths,
+                "preflight_result": preflight_result,
+            }
+        ),
+        flush=True,
+    )
     return 0
 
 
@@ -1366,16 +1514,18 @@ SUBCOMMANDS: dict[str, Callable[[dict[str, Any]], int]] = {
     "prepare": cmd_prepare,
     "exec": cmd_exec,
     "package": cmd_package,
+    "preflight": cmd_preflight,
     "cleanup": cmd_cleanup,
 }
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2 or argv[1] not in SUBCOMMANDS:
-        _emit_error("usage: codex_child.py <prepare|exec|package|cleanup>")
+        _emit_error("usage: codex_child.py <prepare|exec|package|preflight|cleanup>")
         return 2
-    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
-    if len(raw) > MAX_REQUEST_BYTES:
+    cap = PREFLIGHT_MAX_REQUEST_BYTES if argv[1] == "preflight" else MAX_REQUEST_BYTES
+    raw = sys.stdin.buffer.read(cap + 1)
+    if len(raw) > cap:
         _emit_error("request exceeds the size limit")
         return 2
     try:
