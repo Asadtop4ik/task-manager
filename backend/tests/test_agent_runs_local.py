@@ -315,6 +315,99 @@ async def test_implement_lease_marks_running_and_increments_attempts_then_skip_l
     assert second.status_code == 204
 
 
+async def test_unedited_task_is_leased_with_the_exact_title_and_description(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _local_setup(monkeypatch)
+
+    async def fail_dispatch(run, task) -> int:
+        raise AssertionError("a local-executor run must never call repository_dispatch")
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fail_dispatch)
+    created = await client.post(
+        "/api/v1/tasks",
+        json={
+            "project_id": project.id,
+            "title": "Exact approved title",
+            "description": "Exact approved body",
+        },
+        headers=auth(manager),
+    )
+    task_id = created.json()["id"]
+    started = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    assert started.status_code == 201
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    assert leased.json()["title"] == "Exact approved title"
+    assert leased.json()["description"] == "Exact approved body"
+
+
+async def test_task_edited_after_dispatch_fails_the_implement_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Security fix: a task stays editable while its run is queued to be
+    leased. Anyone with edit rights changing the title/description after the
+    owner approved dispatch must not have that new text handed to agent-svc
+    as if it were approved — the run must fail instead."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    row = await _run_row(session, run_id)
+    task_id = row.task_id
+
+    edited = await client.patch(
+        f"/api/v1/tasks/{task_id}",
+        json={"title": "Sneaky new scope after approval"},
+        headers=auth(manager),
+    )
+    assert edited.status_code == 200
+
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 204
+
+    failed = await _run_row(session, run_id)
+    assert failed.status == "failed"
+    assert failed.error == "Task tasdiqlangandan keyin o'zgartirildi; qayta yuboring."
+    assert failed.lease_id is None
+    assert failed.notified_at is None
+
+    events = (
+        await session.scalars(
+            select(AgentEvent.status)
+            .join(AgentRun, AgentEvent.agent_run_id == AgentRun.id)
+            .where(AgentRun.run_id == run_id)
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events[-1] == "failed"
+
+
+async def test_stale_task_revision_is_skipped_and_the_next_run_is_leased(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """The lease scan must move on to the next candidate instead of
+    returning the stale run (or 204-ing while good work waits behind it)."""
+    stale_run_id = await _local_run(client, session, manager, project, monkeypatch)
+    good_run_id = await _local_run(client, session, manager, project, monkeypatch)
+
+    stale_row = await _run_row(session, stale_run_id)
+    edited = await client.patch(
+        f"/api/v1/tasks/{stale_row.task_id}",
+        json={"description": "changed after the owner approved it"},
+        headers=auth(manager),
+    )
+    assert edited.status_code == 200
+
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 200
+    assert resp.json()["run_id"] == good_run_id
+
+    failed = await _run_row(session, stale_run_id)
+    assert failed.status == "failed"
+    good = await _run_row(session, good_run_id)
+    assert good.status == "running"
+
+
 async def test_heartbeat_extends_lease_then_detects_mismatch_and_cancellation(
     client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
 ) -> None:
@@ -867,6 +960,54 @@ async def test_local_correction_is_leased_instead_of_dispatched(
     assert body["expected_head_sha"] == _SHA
     row = await _run_row(session, run_id)
     assert row.status == "correction_running"
+
+
+async def test_task_edited_while_a_correction_is_queued_rejects_only_the_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """`_issue_lease` reports the task's current title/description for a
+    correction lease too, so the same staleness check applies. The PR is
+    already open, so only the correction is rejected; the run goes back to
+    `pr_opened` instead of failing."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    action_id = str(uuid4())
+    correction = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": action_id, "instruction": "fix it"},
+        headers=auth(manager),
+    )
+    assert correction.status_code == 200
+
+    row = await _run_row(session, run_id)
+    edited = await client.patch(
+        f"/api/v1/tasks/{row.task_id}",
+        json={"title": "Changed after the correction was requested"},
+        headers=auth(manager),
+    )
+    assert edited.status_code == 200
+
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 204
+
+    kept = await _run_row(session, run_id)
+    assert kept.status == "pr_opened"
+    assert kept.lease_id is None
+
+    action = (
+        await session.scalars(
+            select(AgentRunAction).where(AgentRunAction.action_id == action_id)
+        )
+    ).first()
+    assert action is not None
+    assert action.status == "rejected"
+    assert action.result == {
+        "message": "Task tasdiqlangandan keyin o'zgartirildi; qayta yuboring."
+    }
 
 
 async def test_cancel_and_merge_are_rejected_while_a_local_correction_is_queued(
