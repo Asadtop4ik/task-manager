@@ -73,7 +73,7 @@ run_git = _run
 
 def make_github_remote(path: Path, *, branch: str = "main") -> str:
     """A bare repo with one commit on `branch`, standing in for GitHub. Returns its sha."""
-    _run(["git", "init", "--bare", "--quiet", str(path)])
+    _run(["git", "init", "--bare", "--quiet", "--initial-branch=main", str(path)])
     seed = path.parent / f"{path.name}-seed"
     _run(["git", "clone", "--quiet", str(path), str(seed)])
     (seed / "README.md").write_text("seed\n", encoding="utf-8")

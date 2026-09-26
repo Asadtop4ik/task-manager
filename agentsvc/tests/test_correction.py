@@ -247,7 +247,7 @@ class HandleCorrectionRefusalTests(unittest.TestCase):
 def _advance(remote: Path, branch: str) -> str:
     with TemporaryDirectory() as scratch_str:
         scratch = Path(scratch_str) / "scratch"
-        run_git(["git", "clone", "--quiet", str(remote), str(scratch)])
+        run_git(["git", "clone", "--quiet", "--branch", branch, str(remote), str(scratch)])
         (scratch / "ADVANCE.md").write_text("advanced\n", encoding="utf-8")
         run_git(["git", "add", "-A"], cwd=scratch)
         run_git(["git", "commit", "--quiet", "-m", "advance"], cwd=scratch)

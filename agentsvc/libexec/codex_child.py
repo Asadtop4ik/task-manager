@@ -315,6 +315,36 @@ def _refuse_if_agent_config_present(root: Path) -> None:
             raise ChildRefusal("repository contains .codex, .agents, or .git")
 
 
+def _clone_mirror(mirror: Path, wt: Path, *, run_dir: Path, env: dict[str, str]) -> None:
+    """Clone the agent-svc-owned mirror as agent-codex across the ownership boundary.
+
+    git only honors `safe.directory` from system/global config on older
+    releases (the server's 2.43 ignores `-c safe.directory=`), so this exact
+    mirror path is trusted through a private, single-use global config file
+    that exists only for the duration of the clone. `-c` is kept too for
+    newer git. Nothing else is trusted: no wildcard, no persistent config.
+    """
+    fd, config_path = tempfile.mkstemp(dir=run_dir, prefix=".gitconfig-clone-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f'[safe]\n\tdirectory = "{mirror}"\n')
+        _run_git(
+            _git_argv(
+                "clone",
+                "--no-checkout",
+                "--no-hardlinks",
+                str(mirror),
+                str(wt),
+                safe_directory=str(mirror),
+            ),
+            cwd=run_dir,
+            env={**env, "GIT_CONFIG_GLOBAL": config_path},
+        )
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(config_path)
+
+
 def cmd_prepare(request: dict[str, Any]) -> int:
     try:
         run_id = _validate_run_id(request.get("run_id"))
@@ -329,18 +359,7 @@ def cmd_prepare(request: dict[str, Any]) -> int:
         for name in ("tmp", "images"):
             (run_dir / name).mkdir(parents=True, exist_ok=True, mode=0o770)
         env = _git_env()
-        _run_git(
-            _git_argv(
-                "clone",
-                "--no-checkout",
-                "--no-hardlinks",
-                str(mirror),
-                str(wt),
-                safe_directory=str(mirror),
-            ),
-            cwd=run_dir,
-            env=env,
-        )
+        _clone_mirror(mirror, wt, run_dir=run_dir, env=env)
         _run_git(
             _git_argv("-C", str(wt), "checkout", "--detach", base_sha), cwd=run_dir, env=env
         )

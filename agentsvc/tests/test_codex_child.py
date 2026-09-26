@@ -1039,24 +1039,15 @@ class CloneAcrossOwnersTests(unittest.TestCase):
             self.root, "acme/crossowner", {"README.md": "hi\n"}
         )
 
-    def test_clone_with_safe_directory_survives_dubious_ownership(self) -> None:
+    def test_clone_mirror_survives_dubious_ownership(self) -> None:
+        # Uses the private single-use global config, which also works on git
+        # releases that ignore `-c safe.directory=` (the server runs 2.43).
         dest = self.root / "wt-ok"
         with patch.dict(os.environ, {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
             env = codex_child._git_env()
-            completed = codex_child._run_git(
-                codex_child._git_argv(
-                    "clone",
-                    "--no-checkout",
-                    "--no-hardlinks",
-                    self.mirror,
-                    str(dest),
-                    safe_directory=self.mirror,
-                ),
-                cwd=self.root,
-                env=env,
-            )
-        self.assertEqual(completed.returncode, 0)
+            codex_child._clone_mirror(Path(self.mirror), dest, run_dir=self.root, env=env)
         self.assertTrue(dest.is_dir())
+        self.assertEqual(list(self.root.glob(".gitconfig-clone-*")), [])
 
     def test_clone_without_safe_directory_fails_under_dubious_ownership(self) -> None:
         dest = self.root / "wt-fail"
