@@ -18,7 +18,8 @@ def selected_jobs(paths: list[str] | None) -> dict[str, bool]:
         service, separator, _ = path.partition("/")
         if separator and service in selected:
             selected[service] = True
-        elif path == "README.md" or path.startswith("docs/"):
+        elif path == "README.md" or path.startswith(("docs/", "agentsvc/")):
+            # agentsvc/ is covered by the always-on agent-policy job.
             continue
         else:
             return dict.fromkeys(SERVICES, True)
