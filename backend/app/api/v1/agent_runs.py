@@ -7,6 +7,7 @@ import re
 from datetime import UTC, datetime
 from math import ceil
 from typing import Literal, cast
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import httpx
@@ -1903,11 +1904,15 @@ async def agent_qa_run_deployed(
     session: DbSession,
     x_agent_qa_callback_token: str | None = Header(default=None),
 ) -> AgentRunOut:
-    """Accept deployment completion only for the explicitly enabled QA repo.
+    """Accept completion for the exact image authorized by the QA workflow.
 
     The QA workflow probes its private service, then reports through a token
     scoped to this one repository instead of receiving the production callback
-    credential used by every agent workflow.
+    credential used by every agent workflow. The whole-workflow concurrency
+    group serializes owner merge and deployment mutations. A newer merge may
+    arrive while an already authorized image is deploying, so completion stays
+    bound to that exact merge/readiness evidence; freshness checks apply when a
+    new deployment is authorized or retried.
     """
     _qa_deploy_auth(x_agent_qa_callback_token)
     await _lock_qa_project_for_run(session, run_id)
@@ -1958,7 +1963,11 @@ async def agent_qa_run_deployed(
 
 
 async def _has_newer_qa_owner_merge(session: DbSession, run: AgentRun) -> bool:
-    if not run.merged_sha or not re.fullmatch(r"[0-9a-f]{40}", run.merged_sha):
+    if (
+        not run.merged_sha
+        or not re.fullmatch(r"[0-9a-f]{40}", run.merged_sha)
+        or not run.base_branch
+    ):
         return True
     newer_merge_shas = (
         await session.scalars(
@@ -1978,23 +1987,42 @@ async def _has_newer_qa_owner_merge(session: DbSession, run: AgentRun) -> bool:
             .distinct()
         )
     ).all()
-    for merge_sha in newer_merge_shas:
-        if not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_sha):
+    if not newer_merge_shas:
+        return False
+    if any(
+        not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_sha)
+        for merge_sha in newer_merge_shas
+    ):
+        return True
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{settings.agent_qa_repository}/compare/"
+            f"{run.merged_sha}...{quote(run.base_branch, safe='')}",
+            headers=_headers(settings.agent_qa_repository),
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="QA merge ordering verification failed")
+    comparison = response.json()
+    compare_status = comparison.get("status")
+    if compare_status == "identical":
+        return False
+    if compare_status != "ahead":
+        return True
+    commits = comparison.get("commits")
+    total_commits = comparison.get("total_commits")
+    if (
+        not isinstance(commits, list)
+        or not isinstance(total_commits, int)
+        or total_commits < len(commits)
+        or total_commits > len(commits)
+    ):
+        return True
+    owner_merge_set = set(newer_merge_shas)
+    for commit in commits:
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
             return True
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                f"{_GITHUB}/repos/{settings.agent_qa_repository}/compare/"
-                f"{run.merged_sha}...{merge_sha}",
-                headers=_headers(settings.agent_qa_repository),
-            )
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=502, detail="QA merge ordering verification failed"
-            )
-        comparison = response.json()
-        if comparison.get("status") == "ahead":
-            return True
-        if comparison.get("status") not in {"behind", "identical"}:
+        if sha in owner_merge_set:
             return True
     return False
 
@@ -2170,11 +2198,6 @@ async def authorize_qa_deployment(
         raise HTTPException(
             status_code=409,
             detail="QA deployment was not authorized by the owner merge",
-        )
-    if await _has_newer_qa_owner_merge(session, run):
-        raise HTTPException(
-            status_code=409,
-            detail="QA deployment was superseded by a newer owner merge",
         )
     action = await session.scalar(
         select(AgentRunAction).where(

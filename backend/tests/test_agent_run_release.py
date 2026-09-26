@@ -803,22 +803,23 @@ async def test_qa_deploy_callback_is_scoped_and_requires_matching_readiness_evid
 
 
 @pytest.mark.asyncio
-async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
+async def test_qa_deployment_freshness_is_bounded_and_completion_is_exact(
     client: AsyncClient,
     session: AsyncSession,
     manager: User,
     project: Project,
     monkeypatch,
 ) -> None:
-    lower_id_later_merge = "b" * 40
-    higher_id_earlier_merge = "f" * 40
+    current_merge_sha = "b" * 40
+    later_merge_sha = "f" * 40
     run = await _open_run(client, session, manager, project, status="merged")
     project.key = "agent-qa"
     project.repo_full_name = "Asadtop4ik/agent-qa"
     run.repo_full_name = "Asadtop4ik/agent-qa"
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/4"
-    run.merged_sha = "b" * 40
+    run.head_sha = _SHA
+    run.merged_sha = current_merge_sha
     run.merged_at = datetime(2026, 9, 25, 13, tzinfo=UTC)
     run.qa_deploy_dispatch_status = "dispatched"
     action_id = str(uuid4())
@@ -830,10 +831,62 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
             request_hash="c" * 64,
             request_data={"expected_head_sha": _SHA},
             status="completed",
-            result={"head_sha": _SHA, "merge_sha": "b" * 40},
+            result={"head_sha": _SHA, "merge_sha": current_merge_sha},
         )
     )
     await session.commit()
+    monkeypatch.setattr(settings, "agent_qa_enabled", True)
+    monkeypatch.setattr(settings, "agent_qa_callback_token", "qa-only-token-0123456789abcdef")
+    monkeypatch.setattr(settings, "github_agent_qa_token", "qa-read-token")
+
+    async def verify_deployment(current, sha: str) -> str:
+        assert current.repo_full_name == "Asadtop4ik/agent-qa"
+        assert sha in {current_merge_sha, later_merge_sha}
+        return _SHA
+
+    class CompareResponse:
+        def __init__(self, payload: dict, status_code: int = 200):
+            self.payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self.payload
+
+    compare_payload = {"status": "ahead", "total_commits": 1, "commits": []}
+    status_code = 200
+    compare_calls: list[str] = []
+
+    class CompareClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            assert f"/compare/{current_merge_sha}...main" in url or (
+                f"/compare/{later_merge_sha}...main" in url
+            )
+            compare_calls.append(url)
+            return CompareResponse(compare_payload, status_code)
+
+    monkeypatch.setattr(agent_runs, "_verify_deployment", verify_deployment)
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: CompareClient())
+
+    # There is no later owner merge yet, so initial authorization needs no compare.
+    authorization = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization",
+        json={
+            "action_id": action_id,
+            "expected_head_sha": _SHA,
+            "merge_sha": current_merge_sha,
+        },
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert authorization.status_code == 200
+    assert compare_calls == []
+
+    # Record a newer owner-approved merge while the exact older image deploys.
     newer_task = await client.post(
         "/api/v1/tasks",
         json={"project_id": project.id, "title": "A newer QA release"},
@@ -850,8 +903,8 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
         status="merged",
         head_sha="e" * 40,
         pr_url="https://github.com/Asadtop4ik/agent-qa/pull/5",
-        merged_sha=higher_id_earlier_merge,
-        merged_at=datetime(2026, 9, 25, 12, tzinfo=UTC),
+        merged_sha=later_merge_sha,
+        merged_at=datetime(2026, 9, 25, 14, tzinfo=UTC),
         qa_deploy_dispatch_status="dispatched",
     )
     session.add(newer_run)
@@ -864,88 +917,66 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
             request_hash="e" * 64,
             request_data={"expected_head_sha": "e" * 40},
             status="completed",
-            result={"head_sha": "e" * 40, "merge_sha": higher_id_earlier_merge},
+            result={"head_sha": "e" * 40, "merge_sha": later_merge_sha},
         )
     )
     await session.commit()
-    monkeypatch.setattr(settings, "agent_qa_enabled", True)
-    monkeypatch.setattr(settings, "agent_qa_callback_token", "qa-only-token-0123456789abcdef")
-    monkeypatch.setattr(settings, "github_agent_qa_token", "qa-read-token")
-
-    async def verify_deployment(current, sha: str) -> str:
-        assert current.repo_full_name == "Asadtop4ik/agent-qa"
-        assert sha in {lower_id_later_merge, higher_id_earlier_merge}
-        return "e" * 40 if sha == "f" * 40 else _SHA
-
-    class CompareResponse:
-        def __init__(self, comparison: str, status_code: int = 200):
-            self.comparison = comparison
-            self.status_code = status_code
-
-        def json(self):
-            return {"status": self.comparison}
-
-    comparisons = {
-        f"{lower_id_later_merge}...{higher_id_earlier_merge}": "behind",
-        f"{higher_id_earlier_merge}...{lower_id_later_merge}": "ahead",
+    compare_payload = {
+        "status": "ahead",
+        "total_commits": 2,
+        "commits": [{"sha": later_merge_sha}, {"sha": "c" * 40}],
     }
-    status_code = 200
 
-    class CompareClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, url, **kwargs):
-            for comparison, state in comparisons.items():
-                if f"/compare/{comparison}" in url:
-                    return CompareResponse(state, status_code)
-            raise AssertionError(url)
-
-    monkeypatch.setattr(agent_runs, "_verify_deployment", verify_deployment)
-    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", lambda **kwargs: CompareClient())
-
-    # Run B has the higher run ID, but it merged first; it must not supersede A.
-    old_authorization = await client.post(
-        f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization",
-        json={"action_id": action_id, "expected_head_sha": _SHA, "merge_sha": "b" * 40},
-        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
-    )
-    assert old_authorization.status_code == 200
-
-    # A later owner merge arrives while this authorized deployment is running.
-    comparisons[f"{lower_id_later_merge}...{higher_id_earlier_merge}"] = "ahead"
+    # A fresh authorization/retry of the old run is stale and uses one compare.
     stale_retry_authorization = await client.post(
         f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization",
-        json={"action_id": action_id, "expected_head_sha": _SHA, "merge_sha": "b" * 40},
+        json={
+            "action_id": action_id,
+            "expected_head_sha": _SHA,
+            "merge_sha": current_merge_sha,
+        },
         headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
     )
     assert stale_retry_authorization.status_code == 409
+    assert len(compare_calls) == 1
 
     old_deployed = await client.post(
         f"/api/v1/agent-runs/{run.run_id}/qa-deployed",
         json={
-            "sha": "b" * 40,
+            "sha": current_merge_sha,
             "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/18",
             "ready_url": "http://127.0.0.1:18082/ready",
             "ready_status": "ready",
-            "ready_sha": "b" * 40,
+            "ready_sha": current_merge_sha,
         },
         headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
     )
     assert old_deployed.status_code == 200
-
     assert old_deployed.json()["status"] == "deployed"
-    assert old_deployed.json()["deployed_sha"] == lower_id_later_merge
-    assert await agent_runs._has_newer_qa_owner_merge(session, run) is True
-    comparisons[f"{higher_id_earlier_merge}...{lower_id_later_merge}"] = "behind"
-    assert await agent_runs._has_newer_qa_owner_merge(session, newer_run) is False
+    assert old_deployed.json()["deployed_sha"] == current_merge_sha
+    assert len(compare_calls) == 1  # Completion does not re-run freshness checks.
 
-    for state in ("diverged", "unknown"):
-        comparisons[f"{lower_id_later_merge}...{higher_id_earlier_merge}"] = state
-        assert await agent_runs._has_newer_qa_owner_merge(session, run) is True
+    # Infrastructure commits on main do not supersede the newest owner merge.
+    compare_payload = {"status": "ahead", "total_commits": 1, "commits": [{"sha": "c" * 40}]}
+    assert await agent_runs._has_newer_qa_owner_merge(session, newer_run) is False
+    assert len(compare_calls) == 2
+
+    # GitHub's bounded 250-commit response is accepted only when complete.
+    bounded_history = [{"sha": f"{index:040x}"} for index in range(1, 251)]
+    compare_payload = {
+        "status": "ahead",
+        "total_commits": 250,
+        "commits": bounded_history,
+    }
+    before = len(compare_calls)
+    assert await agent_runs._has_newer_qa_owner_merge(session, newer_run) is False
+    assert len(compare_calls) == before + 1
+
+    compare_payload = compare_payload | {"total_commits": 251}
+    assert await agent_runs._has_newer_qa_owner_merge(session, newer_run) is True
+    for state in ("behind", "diverged", "unknown"):
+        compare_payload = {"status": state, "total_commits": 0, "commits": []}
+        assert await agent_runs._has_newer_qa_owner_merge(session, newer_run) is True
 
     status_code = 403
     with pytest.raises(HTTPException, match="QA merge ordering verification failed"):
