@@ -413,6 +413,10 @@ def check_diff(
     # check.
     scan_dir = Path(os.environ["RUNNER_TEMP"]) / "agent-images" if legacy else image_dir
     scan_dir = Path(scan_dir) if scan_dir is not None else None
+    if not legacy and scan_dir is not None and not scan_dir.is_dir():
+        # A typo or unmounted path must not silently disable the image-copy
+        # check; callers pass None when a task has no reference images.
+        raise ValueError("image_dir must be an existing directory or None")
     digests = (
         {_digest(path) for path in scan_dir.iterdir() if path.is_file()}
         if scan_dir is not None and scan_dir.is_dir()

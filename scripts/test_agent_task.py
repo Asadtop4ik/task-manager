@@ -601,7 +601,7 @@ class ParametrizedCheckDiffTests(unittest.TestCase):
             finally:
                 shutil.rmtree(images_source, ignore_errors=True)
 
-    def test_image_dir_that_does_not_exist_is_treated_as_no_reference_images(self) -> None:
+    def test_image_dir_that_does_not_exist_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self._git_repo(root)
@@ -615,9 +615,9 @@ class ParametrizedCheckDiffTests(unittest.TestCase):
                 "mode": "pr",
             }
             with patch.dict(os.environ, {}, clear=True):
-                self.assertFalse(
+                with self.assertRaises(ValueError):
                     check_diff(cwd=root, task=task, image_dir=root / "does-not-exist")
-                )
+                self.assertFalse(check_diff(cwd=root, task=task, image_dir=None))
 
     def test_image_dir_or_on_fallback_without_task_raises_type_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
