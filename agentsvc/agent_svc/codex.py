@@ -1,12 +1,14 @@
 """Parent-side driver for the sandboxed Codex child (`libexec/codex_child.py`).
 
 Runs as the `agent-svc` user. Every call shells out to
-`sudo -n -u agent-codex -- /usr/bin/python3 <libexec>/codex_child.py <cmd>`
+`sudo -n -u agent-codex -- /usr/bin/python3 -I <libexec>/codex_child.py <cmd>`
 (the command prefix and interpreter/script path are constructor arguments so
 tests can run the child directly with the current Python interpreter,
-bypassing sudo). This module never reads secrets and never has any to leak:
-it only forwards the request the caller builds and the events the child
-prints.
+bypassing sudo; `-I`, isolated mode, is always inserted regardless -- it
+ignores PYTHON*/site customization even if the caller's own environment
+somehow carried any, matching the pinned sudoers command exactly). This
+module never reads secrets and never has any to leak: it only forwards the
+request the caller builds and the events the child prints.
 """
 
 from __future__ import annotations
@@ -29,10 +31,24 @@ DEFAULT_PYTHON_BIN = "/usr/bin/python3"
 DEFAULT_LIBEXEC_DIR = "/opt/agent-svc/libexec"
 
 HARD_WALL_SAFETY_S = 60.0
-SIGKILL_GRACE_S = 15.0
+# A generous grace period: SIGKILL must never be the first signal we send
+# (always SIGTERM, then wait), and a real codex process legitimately needs
+# time to unwind (tree-kill its own sandboxed children, flush the rollout,
+# print its final frame) before it can exit on SIGTERM.
+SIGKILL_GRACE_S = 30.0
 DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
+HEARTBEAT_FAILURE_THRESHOLD = 3
 MAX_STDERR_LINES = 40
 MAX_STDERR_LINE_CHARS = 500
+MAX_LINE_BYTES = 1024 * 1024
+STDOUT_QUEUE_MAXSIZE = 8192
+USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
+
+
+class LeaseLost(Exception):
+    """A `heartbeat` callback raises this to force immediate cancellation
+    (e.g. the run's lease was stolen or explicitly revoked), bypassing the
+    normal debounce for transient heartbeat failures."""
 
 
 class CodexChildError(RuntimeError):
@@ -56,22 +72,88 @@ class CodexResult:
     frame: dict[str, Any] | None
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _put_important(sink: queue.Queue[Any], item: Any) -> None:
+    while True:
+        try:
+            sink.put_nowait(item)
+            return
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                sink.get_nowait()
+
+
 def _pump_stdout(stream: Any, sink: queue.Queue[str | None]) -> None:
     try:
-        for line in stream:
-            sink.put(line.rstrip("\n"))
+        while True:
+            raw_line = stream.readline(MAX_LINE_BYTES)
+            if not raw_line:
+                break
+            text = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            with contextlib.suppress(queue.Full):
+                sink.put_nowait(text)
     except (OSError, ValueError):
         pass
     finally:
-        sink.put(None)
+        _put_important(sink, None)
 
 
 def _pump_stderr(stream: Any, sink: deque[str]) -> None:
     try:
-        for line in stream:
-            sink.append(line.rstrip("\n")[:MAX_STDERR_LINE_CHARS])
+        while True:
+            raw_line = stream.readline(MAX_LINE_BYTES)
+            if not raw_line:
+                break
+            text = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            sink.append(text[:MAX_STDERR_LINE_CHARS])
     except (OSError, ValueError):
         pass
+
+
+def _is_valid_result_frame(event: dict[str, Any]) -> bool:
+    """Type-check a candidate `agent_svc.result` frame before trusting any of
+    its fields. The child is supposed to be the only source of this frame
+    (and now refuses to forward a forged one of its own), but a parent that
+    blindly trusts field types is still one bug away from a crash or a
+    spoofed result; a malformed frame is treated as no frame at all."""
+    exit_code = event.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        return False
+    for key in ("timed_out", "idle_killed"):
+        if not isinstance(event.get(key), bool):
+            return False
+    if not isinstance(event.get("final_message"), str):
+        return False
+    usage = event.get("usage")
+    if usage is not None:
+        if not isinstance(usage, dict):
+            return False
+        if not all(isinstance(key, str) for key in usage):
+            return False
+    stderr_tail = event.get("stderr_tail")
+    if not isinstance(stderr_tail, list) or not all(isinstance(x, str) for x in stderr_tail):
+        return False
+    thread_id = event.get("thread_id")
+    return thread_id is None or isinstance(thread_id, str)
+
+
+def _frame_usage(event: dict[str, Any]) -> dict[str, int] | None:
+    usage = event.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return {key: _safe_int(usage.get(key)) for key in USAGE_KEYS}
 
 
 class CodexRunner:
@@ -84,7 +166,7 @@ class CodexRunner:
         python_bin: str = DEFAULT_PYTHON_BIN,
         libexec_dir: str | Path = DEFAULT_LIBEXEC_DIR,
         runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
-        popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         hard_wall_safety_s: float = HARD_WALL_SAFETY_S,
         sigkill_grace_s: float = SIGKILL_GRACE_S,
     ) -> None:
@@ -103,7 +185,15 @@ class CodexRunner:
         self._sigkill_grace_s = sigkill_grace_s
 
     def _argv(self, subcommand: str) -> list[str]:
-        return [*self._command_prefix, self._python_bin, str(self._child_script), subcommand]
+        # `-I` (isolated mode): no PYTHONPATH/user site/.pth files, matching
+        # the exact command sudoers pins in production.
+        return [
+            *self._command_prefix,
+            self._python_bin,
+            "-I",
+            str(self._child_script),
+            subcommand,
+        ]
 
     def _simple_call(
         self, subcommand: str, request: dict[str, Any], timeout_s: float
@@ -170,8 +260,6 @@ class CodexRunner:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
         )
         assert (
             process.stdin is not None
@@ -179,14 +267,14 @@ class CodexRunner:
             and process.stderr is not None
         )
         try:
-            process.stdin.write(json.dumps(request, ensure_ascii=False))
+            process.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8"))
         except (BrokenPipeError, OSError):
             pass
         finally:
             with contextlib.suppress(OSError):
                 process.stdin.close()
 
-        lines: queue.Queue[str | None] = queue.Queue()
+        lines: queue.Queue[str | None] = queue.Queue(maxsize=STDOUT_QUEUE_MAXSIZE)
         stderr_tail: deque[str] = deque(maxlen=MAX_STDERR_LINES)
         reader = threading.Thread(
             target=_pump_stdout, args=(process.stdout, lines), daemon=True
@@ -203,12 +291,24 @@ class CodexRunner:
         if heartbeat is not None:
 
             def _heartbeat_loop() -> None:
+                consecutive_failures = 0
                 while not stop_heartbeat.wait(heartbeat_interval_s):
                     try:
                         ok = heartbeat()
+                    except LeaseLost:
+                        heartbeat_failed.set()
+                        return
                     except Exception:
                         ok = False
-                    if not ok:
+                    if ok:
+                        consecutive_failures = 0
+                        continue
+                    # A single transient failure (a blip in the lease check
+                    # itself, a momentary network error) must not cancel a
+                    # run that is otherwise healthy; only debounced repeats
+                    # do.
+                    consecutive_failures += 1
+                    if consecutive_failures >= HEARTBEAT_FAILURE_THRESHOLD:
                         heartbeat_failed.set()
                         return
 
@@ -251,17 +351,31 @@ class CodexRunner:
                 if not isinstance(event, dict):
                     continue
                 if event.get("type") == "agent_svc.result":
-                    frame = event
-                    break
+                    # Keep reading to EOF and remember the LAST valid frame,
+                    # rather than trusting (and stopping at) the first one:
+                    # defense in depth against a bug or a forged frame
+                    # slipping through, on top of the child's own filter.
+                    if _is_valid_result_frame(event):
+                        frame = event
+                    continue
                 on_event(event)
         finally:
             stop_heartbeat.set()
             if heartbeat_thread is not None:
                 heartbeat_thread.join(timeout=1)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            # Never SIGKILL first: if the process is still alive for any
+            # reason by the time we get here (including an exception above
+            # that skipped the loop's own SIGTERM+grace handling), always
+            # try SIGTERM and wait before escalating.
+            if process.poll() is None:
+                self._send_sigterm(process)
+                try:
+                    process.wait(timeout=self._sigkill_grace_s)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=5)
+            else:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=5)
             reader.join(timeout=1)
@@ -275,12 +389,12 @@ class CodexRunner:
         timed_out = terminate_reason == "timed_out"
         if frame is not None:
             return CodexResult(
-                exit_code=int(frame.get("exit_code", exit_code)),
+                exit_code=_safe_int(frame.get("exit_code"), exit_code),
                 timed_out=bool(frame.get("timed_out", False)) or timed_out,
                 cancelled=cancelled,
                 idle_killed=bool(frame.get("idle_killed", False)),
                 final_message=str(frame.get("final_message", "")),
-                usage=frame.get("usage"),
+                usage=_frame_usage(frame),
                 stderr_tail=list(stderr_tail),
                 frame=frame,
             )
@@ -296,7 +410,7 @@ class CodexRunner:
         )
 
     @staticmethod
-    def _send_sigterm(process: subprocess.Popen[str]) -> None:
+    def _send_sigterm(process: subprocess.Popen[bytes]) -> None:
         with contextlib.suppress(OSError):
             process.terminate()
 

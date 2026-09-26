@@ -309,7 +309,17 @@ class ExecRequestValidationTests(unittest.TestCase):
     def test_valid_request_with_empty_cwd(self) -> None:
         params = codex_child._validate_exec_request(self.request())
         self.assertEqual(params.cwd_path, self.run_dir / "empty")
+        self.assertEqual(params.cwd_kind, "empty")
         self.assertTrue(params.cwd_path.is_dir())
+        # 0700, agent-codex only, and fresh every call (see test below).
+        self.assertEqual(params.cwd_path.stat().st_mode & 0o777, 0o700)
+
+    def test_empty_cwd_is_recreated_fresh_each_call(self) -> None:
+        empty_dir = self.run_dir / "empty"
+        empty_dir.mkdir(mode=0o700)
+        (empty_dir / "leftover.txt").write_text("stale", encoding="utf-8")
+        codex_child._validate_exec_request(self.request())
+        self.assertEqual(list(empty_dir.iterdir()), [])
 
     def test_requires_prepared_worktree_for_wt(self) -> None:
         with self.assertRaises(codex_child.ChildRefusal):
@@ -317,6 +327,13 @@ class ExecRequestValidationTests(unittest.TestCase):
         (self.run_dir / "wt").mkdir()
         params = codex_child._validate_exec_request(self.request(cwd="wt"))
         self.assertEqual(params.cwd_path, self.run_dir / "wt")
+        self.assertEqual(params.cwd_kind, "wt")
+
+    def test_wt_cwd_reruns_agent_config_refusal(self) -> None:
+        wt = self.run_dir / "wt"
+        (wt / ".codex").mkdir(parents=True)
+        with self.assertRaises(codex_child.ChildRefusal):
+            codex_child._validate_exec_request(self.request(cwd="wt"))
 
     def test_rejects_bad_model(self) -> None:
         with self.assertRaises(codex_child.ChildRefusal):
@@ -360,6 +377,16 @@ class ExecRequestValidationTests(unittest.TestCase):
                 self.request(images=[str(self.run_dir / ".." / "escape.png")])
             )
 
+    def test_rejects_image_outside_images_subdir(self) -> None:
+        # Anywhere else under the run dir (e.g. the worktree itself) must not
+        # count, even though it's technically inside `<run_dir>/`.
+        wt = self.run_dir / "wt"
+        wt.mkdir()
+        sneaky = wt / "a.png"
+        sneaky.write_bytes(b"x")
+        with self.assertRaises(codex_child.ChildRefusal):
+            codex_child._validate_exec_request(self.request(images=[str(sneaky)]))
+
     def test_accepts_image_inside_run_dir(self) -> None:
         image_dir = self.run_dir / "images"
         image_dir.mkdir()
@@ -395,6 +422,7 @@ class BuildCommandTests(unittest.TestCase):
         base = dict(
             run_dir=self.run_dir,
             lane="code",
+            cwd_kind="empty",
             cwd_path=self.run_dir / "empty",
             model="gpt-6-luna",
             effort="high",
@@ -434,7 +462,7 @@ class BuildCommandTests(unittest.TestCase):
             self.assertNotIn("--ephemeral", command)
 
     def test_command_exact_shape_no_schema_no_images(self) -> None:
-        params = self.params(multi_agent=False)
+        params = self.params(multi_agent=False, cwd_kind="empty")
         schema_path = self.run_dir / "out" / "schema.json"
         final_path = self.run_dir / "out" / "final.txt"
         command = codex_child._build_exec_command(params, schema_path, final_path)
@@ -454,10 +482,12 @@ class BuildCommandTests(unittest.TestCase):
                 "--json",
                 "-c",
                 "sandbox_workspace_write.exclude_slash_tmp=true",
+                "--skip-git-repo-check",
                 "-c",
                 "features.multi_agent=false",
                 "--output-last-message",
                 str(final_path),
+                "--",
                 "-",
             ],
         )
@@ -465,6 +495,7 @@ class BuildCommandTests(unittest.TestCase):
     def test_command_includes_schema_and_images_in_order(self) -> None:
         params = self.params(
             multi_agent=True,
+            cwd_kind="wt",
             output_schema={"type": "object"},
             images=[Path("/run/a.png"), Path("/run/b.png")],
         )
@@ -495,9 +526,34 @@ class BuildCommandTests(unittest.TestCase):
                 "/run/a.png",
                 "--image",
                 "/run/b.png",
+                "--",
                 "-",
             ],
         )
+
+    def test_skip_git_repo_check_only_for_empty_cwd(self) -> None:
+        empty_command = codex_child._build_exec_command(
+            self.params(cwd_kind="empty"),
+            self.run_dir / "out/schema.json",
+            self.run_dir / "out/final.txt",
+        )
+        wt_command = codex_child._build_exec_command(
+            self.params(cwd_kind="wt"),
+            self.run_dir / "out/schema.json",
+            self.run_dir / "out/final.txt",
+        )
+        self.assertIn("--skip-git-repo-check", empty_command)
+        self.assertNotIn("--skip-git-repo-check", wt_command)
+
+    def test_double_dash_precedes_trailing_stdin_marker(self) -> None:
+        command = codex_child._build_exec_command(
+            self.params(images=[Path("/run/a.png")]),
+            self.run_dir / "out/schema.json",
+            self.run_dir / "out/final.txt",
+        )
+        # `-i/--image` takes multiple values and would otherwise swallow a
+        # bare trailing `-` as one more image path.
+        self.assertEqual(command[-2:], ["--", "-"])
 
 
 class ExecEnvTests(unittest.TestCase):
@@ -506,6 +562,7 @@ class ExecEnvTests(unittest.TestCase):
         params = codex_child.ExecParams(
             run_dir=run_dir,
             lane="chat",
+            cwd_kind="empty",
             cwd_path=run_dir / "empty",
             model="gpt-6-sol",
             effort="medium",
@@ -538,26 +595,94 @@ class ExecEnvTests(unittest.TestCase):
         self.assertEqual(env["LC_ALL"], "C.UTF-8")
 
 
-class RawDiffParsingTests(unittest.TestCase):
+class RawDiffZParsingTests(unittest.TestCase):
     def test_parses_added_modified_deleted(self) -> None:
         raw = (
-            ":000000 100644 0000000 1111111 A\tnew.txt\n"
-            ":100644 100644 2222222 3333333 M\tchanged.txt\n"
-            ":100644 000000 4444444 0000000 D\tremoved.txt\n"
+            b":000000 100644 0000000 1111111 A\x00new.txt\x00"
+            b":100644 100644 2222222 3333333 M\x00changed.txt\x00"
+            b":100644 000000 4444444 0000000 D\x00removed.txt\x00"
         )
-        paths, bad = codex_child._parse_raw_diff(raw)
-        self.assertIsNone(bad)
+        paths, reason = codex_child._parse_raw_diff_z(raw)
+        self.assertIsNone(reason)
         self.assertEqual(paths, ["new.txt", "changed.txt", "removed.txt"])
 
-    def test_flags_symlink_mode(self) -> None:
-        raw = ":000000 120000 0000000 1111111 A\tlink\n"
-        _paths, bad = codex_child._parse_raw_diff(raw)
-        self.assertEqual(bad, "link")
+    def test_rejects_dot_codex_path_component(self) -> None:
+        raw = b":000000 100644 0000000 1111111 A\x00src/.codex/agents/evil.toml\x00"
+        paths, reason = codex_child._parse_raw_diff_z(raw)
+        self.assertEqual(paths, [])
+        self.assertIn(".codex", reason)
 
-    def test_flags_submodule_mode(self) -> None:
-        raw = ":000000 160000 0000000 1111111 A\tsub\n"
-        _paths, bad = codex_child._parse_raw_diff(raw)
-        self.assertEqual(bad, "sub")
+    def test_rejects_dot_agents_path_component(self) -> None:
+        raw = b":000000 100644 0000000 1111111 A\x00.agents/evil.toml\x00"
+        _paths, reason = codex_child._parse_raw_diff_z(raw)
+        self.assertIn(".agents", reason)
+
+    def test_rejects_nested_dot_git_path_component(self) -> None:
+        raw = b":000000 100644 0000000 1111111 A\x00sub/.git/config\x00"
+        _paths, reason = codex_child._parse_raw_diff_z(raw)
+        self.assertIn(".git", reason)
+
+    def test_rejects_non_utf8_path(self) -> None:
+        raw = b":000000 100644 0000000 1111111 A\x00bad-\xff\xfe-name\x00"
+        paths, reason = codex_child._parse_raw_diff_z(raw)
+        self.assertEqual(paths, [])
+        self.assertIsNotNone(reason)
+        self.assertIn("UTF-8", reason)
+
+    def test_handles_file_literally_named_head(self) -> None:
+        # A tracked file named "HEAD" must not confuse the NUL-delimited
+        # parser (this is purely a parsing-format concern; the ambiguity
+        # with the ref named HEAD is what `--` on the git invocation itself
+        # guards against).
+        raw = b":000000 100644 0000000 1111111 A\x00HEAD\x00"
+        paths, reason = codex_child._parse_raw_diff_z(raw)
+        self.assertIsNone(reason)
+        self.assertEqual(paths, ["HEAD"])
+
+
+class ScanPatchForBadModesTests(unittest.TestCase):
+    def test_no_bad_modes_in_ordinary_patch(self) -> None:
+        patch_text = (
+            "diff --git a/changed.txt b/changed.txt\n"
+            "index 2222222..3333333 100644\n"
+            "--- a/changed.txt\n"
+            "+++ b/changed.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        self.assertIsNone(codex_child._scan_patch_for_bad_modes(patch_text))
+
+    def test_flags_new_file_symlink_mode(self) -> None:
+        patch_text = (
+            "diff --git a/link b/link\n"
+            "new file mode 120000\n"
+            "index 0000000..1111111\n"
+            "--- /dev/null\n"
+            "+++ b/link\n"
+            "@@ -0,0 +1 @@\n"
+            "+target\n"
+            "\\ No newline at end of file\n"
+        )
+        self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), "link")
+
+    def test_flags_new_file_submodule_mode(self) -> None:
+        patch_text = (
+            "diff --git a/sub b/sub\n" "new file mode 160000\n" "index 0000000..abc1234\n"
+        )
+        self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), "sub")
+
+    def test_flags_mode_change_to_symlink(self) -> None:
+        patch_text = (
+            "diff --git a/was_file b/was_file\n" "old mode 100644\n" "new mode 120000\n"
+        )
+        self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), "was_file")
+
+    def test_flags_single_mode_index_line(self) -> None:
+        # git prints a single mode on the `index` line (not separate old/new
+        # mode lines) when the mode is unchanged but the blob is a symlink.
+        patch_text = "diff --git a/link b/link\nindex 1111111..2222222 120000\n"
+        self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), "link")
 
 
 class DescendantPidTests(unittest.TestCase):
@@ -760,6 +885,59 @@ class RolloutUsageTests(unittest.TestCase):
         self.assertEqual(usage, fallback)
         self.assertIsNone(thread_id)
 
+    def test_non_int_usage_values_are_ignored_not_crashed(self) -> None:
+        path = self.sessions_dir / "rollout-bad.jsonl"
+        lines = [
+            {
+                "ordinal": 0,
+                "timestamp": "2026-09-26T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "bad-1", "session_id": "bad-1", "source": "exec"},
+            },
+            {
+                "ordinal": 1,
+                "timestamp": "2026-09-26T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": "not-a-number",
+                            "cached_input_tokens": None,
+                            "output_tokens": [1, 2, 3],
+                        }
+                    },
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+        usage, thread_id = codex_child._collect_and_delete_usage(
+            self.sessions_dir.parent, {"type": "thread.started", "thread_id": "bad-1"}, None
+        )
+        self.assertEqual(thread_id, "bad-1")
+        self.assertEqual(
+            usage, {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        )
+
+
+class SafeIntTests(unittest.TestCase):
+    def test_passes_through_int(self) -> None:
+        self.assertEqual(codex_child._safe_int(5), 5)
+
+    def test_rejects_bool(self) -> None:
+        self.assertEqual(codex_child._safe_int(True, default=7), 7)
+
+    def test_coerces_numeric_string(self) -> None:
+        self.assertEqual(codex_child._safe_int("42"), 42)
+
+    def test_falls_back_on_garbage(self) -> None:
+        self.assertEqual(codex_child._safe_int("not-a-number", default=3), 3)
+        self.assertEqual(codex_child._safe_int(None, default=3), 3)
+        self.assertEqual(codex_child._safe_int([1, 2], default=3), 3)
+
+    def test_truncates_float(self) -> None:
+        self.assertEqual(codex_child._safe_int(4.9), 4)
+
 
 # ---------------------------------------------------------------------------
 # Subprocess-level integration tests
@@ -844,6 +1022,57 @@ class PrepareIntegrationTests(ChildProcessTestCase):
         self.assertEqual(completed.returncode, 3)
 
 
+class CloneAcrossOwnersTests(unittest.TestCase):
+    """`GIT_TEST_ASSUME_DIFFERENT_OWNER=1` makes git treat EVERY repository it
+    touches as dubiously-owned (verified against the installed git 2.54.0),
+    so this exercises `_run_git`/`_git_argv`'s clone call directly rather
+    than the full `prepare` pipeline: `wt` itself would also trip the check
+    once created under that blanket env var, which would falsely suggest
+    `safe.directory` is needed beyond the clone -- it is not (checkout/
+    rev-parse operate on `wt`, which agent-codex owns once it exists)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.mirror, self.sha = build_mirror(
+            self.root, "acme/crossowner", {"README.md": "hi\n"}
+        )
+
+    def test_clone_with_safe_directory_survives_dubious_ownership(self) -> None:
+        dest = self.root / "wt-ok"
+        with patch.dict(os.environ, {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+            env = codex_child._git_env()
+            completed = codex_child._run_git(
+                codex_child._git_argv(
+                    "clone",
+                    "--no-checkout",
+                    "--no-hardlinks",
+                    self.mirror,
+                    str(dest),
+                    safe_directory=self.mirror,
+                ),
+                cwd=self.root,
+                env=env,
+            )
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(dest.is_dir())
+
+    def test_clone_without_safe_directory_fails_under_dubious_ownership(self) -> None:
+        dest = self.root / "wt-fail"
+        with patch.dict(os.environ, {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+            env = codex_child._git_env()
+            with self.assertRaises(codex_child.ChildRefusal) as ctx:
+                codex_child._run_git(
+                    codex_child._git_argv(
+                        "clone", "--no-checkout", "--no-hardlinks", self.mirror, str(dest)
+                    ),
+                    cwd=self.root,
+                    env=env,
+                )
+        self.assertIn("dubious ownership", str(ctx.exception))
+
+
 class ExecAllowlistIntegrationTests(ChildProcessTestCase):
     def test_rejects_bad_model(self) -> None:
         run_id = new_run_id()
@@ -891,6 +1120,21 @@ class ExecAllowlistIntegrationTests(ChildProcessTestCase):
             timeout=10,
         )
         self.assertEqual(completed.returncode, 2)
+
+    def test_setup_oserror_is_a_clean_refusal_not_a_crash(self) -> None:
+        run_id = new_run_id()
+        run_dir = self.make_run_dir(run_id)
+        # r-x only: nothing can create a new "empty" subdirectory inside it.
+        run_dir.chmod(0o500)
+        try:
+            request = self.base_exec_request(run_id)
+            completed = self.run_child("exec", request)
+        finally:
+            run_dir.chmod(0o770)
+        self.assertEqual(completed.returncode, 3, completed.stderr)
+        self.assertEqual(completed.stderr, b"")
+        reason = json.loads(completed.stdout)["reason"]
+        self.assertIn("exec setup failed", reason)
 
 
 class ExecStreamingIntegrationTests(ChildProcessTestCase):
@@ -979,6 +1223,65 @@ class ExecStreamingIntegrationTests(ChildProcessTestCase):
         frame = json.loads(completed.stdout.splitlines()[-1])
         self.assertEqual(frame["exit_code"], 7)
         self.assertIn("simulated failure", "\n".join(frame["stderr_tail"]))
+
+    def test_stale_final_txt_from_a_previous_run_is_not_reported(self) -> None:
+        run_id = new_run_id()
+        run_dir = self.make_run_dir(run_id)
+        stale_out = run_dir / "out"
+        stale_out.mkdir(mode=0o770)
+        (stale_out / "final.txt").write_text("LEFTOVER FROM A PREVIOUS RUN", encoding="utf-8")
+        self.write_control(
+            run_id, {"scenario": "normal", "thread_id": "fresh-1", "final_message": ""}
+        )
+        request = self.base_exec_request(run_id, timeout_s=15, idle_timeout_s=10)
+        completed = self.run_child("exec", request)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        frame = json.loads(completed.stdout.splitlines()[-1])
+        self.assertNotIn("LEFTOVER", frame["final_message"])
+        # `out/` itself is recreated fresh (0700) per exec, not reused.
+        self.assertEqual(stale_out.stat().st_mode & 0o777, 0o700)
+
+    def test_final_message_symlink_is_not_followed(self) -> None:
+        run_id = new_run_id()
+        run_dir = self.make_run_dir(run_id)
+        secret = run_dir.parent / "secret.txt"
+        secret.write_text("do not leak this", encoding="utf-8")
+        out_dir = run_dir / "out"
+        out_dir.mkdir(mode=0o700)
+        # `_fresh_dir` would normally wipe this, but we want to prove the
+        # O_NOFOLLOW read itself refuses a symlink even if one somehow ended
+        # up at exactly the final.txt path right before it's read; simulate
+        # that narrower case directly against `_read_final_message`.
+        final_link = out_dir / "final.txt"
+        final_link.symlink_to(secret)
+        message = codex_child._read_final_message(final_link)
+        self.assertEqual(message, "")
+
+    def test_spoofed_agent_svc_frame_from_codex_is_dropped(self) -> None:
+        run_id = new_run_id()
+        self.make_run_dir(run_id)
+        self.write_control(
+            run_id,
+            {
+                "scenario": "spoof_frame",
+                "thread_id": "spoof-1",
+                "final_message": "real answer",
+                "tokens": 5,
+            },
+        )
+        request = self.base_exec_request(run_id, timeout_s=15, idle_timeout_s=10)
+        completed = self.run_child("exec", request)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        events = [json.loads(line) for line in lines]
+        # Exactly one agent_svc.result frame ever reaches our stdout: the
+        # codex-forged one is dropped before forwarding.
+        result_frames = [event for event in events if event.get("type") == "agent_svc.result"]
+        self.assertEqual(len(result_frames), 1)
+        frame = result_frames[0]
+        self.assertEqual(frame["exit_code"], 0)
+        self.assertEqual(frame["final_message"], "real answer")
+        self.assertNotEqual(frame.get("thread_id"), "attacker-controlled")
 
 
 class ExecTimeoutIntegrationTests(ChildProcessTestCase):
@@ -1089,6 +1392,102 @@ def _pid_alive_for_test(pid: int) -> bool:
     return True
 
 
+class ReapAllDescendantsUnitTests(unittest.TestCase):
+    """Pure-logic coverage for `_reap_all_descendants`, independent of real
+    subreaper kernel behavior (Linux-only; see `ExecDoubleForkIntegrationTests`
+    below for the real, end-to-end proof on Linux)."""
+
+    def test_terminates_and_reaps_descendants_of_own_pid(self) -> None:
+        own_pid = os.getpid()
+        alive = {5001, 5002}
+        signals: list[tuple[int, int]] = []
+        reaped: list[int] = []
+
+        def fake_table():
+            return [(own_pid, 1), (5001, own_pid), (5002, 5001)]
+
+        def fake_signal(pid: int, sig: int) -> None:
+            signals.append((pid, sig))
+            if sig == 9:
+                alive.discard(pid)
+
+        def fake_alive(pid: int) -> bool:
+            return pid in alive
+
+        def fake_reap_if_child(pid: int) -> None:
+            reaped.append(pid)
+
+        with (
+            patch.object(codex_child, "_signal_pid", fake_signal),
+            patch.object(codex_child, "_pid_alive", fake_alive),
+            patch.object(codex_child, "_reap_if_child", fake_reap_if_child),
+        ):
+            codex_child._reap_all_descendants(
+                proc_table_provider=fake_table, grace_s=0.05, sleep=lambda _s: None
+            )
+
+        term = {pid for pid, sig in signals if sig == 15}
+        kill = {pid for pid, sig in signals if sig == 9}
+        self.assertEqual(term, {5001, 5002})
+        self.assertEqual(kill, {5001, 5002})
+        self.assertNotIn(own_pid, term | kill)  # never signal ourselves
+        self.assertIn(5001, reaped)
+        self.assertIn(5002, reaped)
+
+    def test_no_descendants_is_a_no_op(self) -> None:
+        signals: list[tuple[int, int]] = []
+        with patch.object(
+            codex_child, "_signal_pid", lambda pid, sig: signals.append((pid, sig))
+        ):
+            codex_child._reap_all_descendants(
+                proc_table_provider=lambda: [(os.getpid(), 1)],
+                grace_s=0.05,
+                sleep=lambda _s: None,
+            )
+        self.assertEqual(signals, [])
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_CHILD_SUBREAPER is Linux-only")
+class ExecDoubleForkIntegrationTests(ChildProcessTestCase):
+    """The real end-to-end proof of BLOCKER 1: a double-forked, setsid'd
+    grandchild -- orphaned when "codex" exits NORMALLY, no SIGTERM involved
+    at all -- must still not survive `cmd_exec` returning. Only meaningful on
+    Linux: `PR_SET_CHILD_SUBREAPER` has no equivalent on macOS, so an orphan
+    there re-parents to launchd, not to us, and this property genuinely does
+    not hold (a platform limitation, not a bug in this fix)."""
+
+    def test_double_forked_orphan_is_killed_after_normal_exit(self) -> None:
+        run_id = new_run_id()
+        run_dir = self.make_run_dir(run_id)
+        tmp_dir = run_dir / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        marker = tmp_dir / "orphan.pid"
+        (tmp_dir / "fake_codex_control.json").write_text(
+            json.dumps(
+                {
+                    "scenario": "double_fork",
+                    "sleep_s": 60,
+                    "thread_id": "df-1",
+                    "grandchild_marker": str(marker),
+                }
+            ),
+            encoding="utf-8",
+        )
+        request = self.base_exec_request(run_id, timeout_s=30, idle_timeout_s=30)
+        completed = self.run_child("exec", request, timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.1)
+        self.assertTrue(marker.exists(), "fake codex never reported the orphan's pid")
+        orphan_pid = int(marker.read_text().strip())
+        self.assertFalse(
+            _pid_alive_for_test(orphan_pid),
+            "double-forked orphan survived cmd_exec returning after a normal exit",
+        )
+
+
 class PackageIntegrationTests(ChildProcessTestCase):
     def prepared_run(self) -> tuple[str, Path]:
         mirror, sha = build_mirror(
@@ -1135,12 +1534,11 @@ class PackageIntegrationTests(ChildProcessTestCase):
         # `cmd_package` always runs its own `git read-tree HEAD` before `git
         # add -A`, so a gitlink staged directly on the temp index ahead of
         # time (e.g. via `git update-index --add --cacheinfo 160000,<sha>,sub`,
-        # the mechanism `_parse_raw_diff`'s unit test below exercises
-        # directly) would just be wiped by that read-tree. The realistic way
-        # a gitlink shows up in `add -A`'s diff is the same way `git
-        # submodule add` produces one: a nested git repository inside the
-        # worktree. `git add -A` picks that up as a mode 160000 entry on its
-        # own, which is what we assert `cmd_package` refuses here.
+        # the mechanism `ScanPatchForBadModesTests` exercises directly against
+        # synthetic patch text) would just be wiped by that read-tree. The
+        # realistic way a gitlink shows up in `add -A`'s diff is the same way
+        # `git submodule add` produces one: a nested git repository inside
+        # the worktree.
         run_id, wt = self.prepared_run()
         nested = wt / "sub"
         nested.mkdir()
@@ -1165,7 +1563,64 @@ class PackageIntegrationTests(ChildProcessTestCase):
         )
         completed = self.run_child("package", {"run_id": run_id})
         self.assertEqual(completed.returncode, 3)
-        self.assertIn("submodule", json.loads(completed.stdout)["reason"])
+        # A nested git repo is caught by the same "no .codex/.agents/.git
+        # anywhere in the tree" whole-tree rescan that item 4 added -- it
+        # never even reaches the mode-based submodule check, which is
+        # covered directly (independent of git's own behavior) by
+        # `ScanPatchForBadModesTests.test_flags_new_file_submodule_mode`.
+        self.assertIn(".git", json.loads(completed.stdout)["reason"])
+
+    def test_rejects_new_dot_codex_path_in_diff(self) -> None:
+        run_id, wt = self.prepared_run()
+        (wt / ".codex").mkdir()
+        (wt / ".codex" / "agents").mkdir()
+        (wt / ".codex" / "agents" / "evil.toml").write_text("bad = true\n", encoding="utf-8")
+        completed = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn(".codex", json.loads(completed.stdout)["reason"])
+
+    def test_rejects_new_dot_agents_path_in_diff(self) -> None:
+        run_id, wt = self.prepared_run()
+        (wt / ".agents").mkdir()
+        (wt / ".agents" / "evil.toml").write_text("bad = true\n", encoding="utf-8")
+        completed = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn(".agents", json.loads(completed.stdout)["reason"])
+
+    def test_handles_non_ascii_path(self) -> None:
+        run_id, wt = self.prepared_run()
+        (wt / "café.txt").write_text("espresso\n", encoding="utf-8")
+        completed = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)
+        # `-z` output must come back raw (not C-quoted like plain `--raw`
+        # would render a non-ASCII byte, e.g. as "caf\\303\\251.txt").
+        self.assertIn("café.txt", body["changed_paths"])
+
+    def test_handles_file_literally_named_head(self) -> None:
+        # A tracked file named "HEAD" must not confuse `git diff ... HEAD`;
+        # this is exactly what `--` on the git invocation guards against.
+        run_id, wt = self.prepared_run()
+        (wt / "HEAD").write_text("not a ref, just a file\n", encoding="utf-8")
+        completed = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)
+        self.assertIn("HEAD", body["changed_paths"])
+        patch_bytes = base64.b64decode(body["patch_b64"])
+        self.assertIn(b"not a ref, just a file", patch_bytes)
+
+    def test_package_index_dir_is_fresh_and_not_reused(self) -> None:
+        run_id, wt = self.prepared_run()
+        (wt / "a.txt").write_text("first\n", encoding="utf-8")
+        out_dir = self.work_root / run_id / "out"
+        first = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        # The temporary pkg-* index directory is cleaned up after each call.
+        self.assertEqual(list(out_dir.glob("pkg-*")), [])
+        (wt / "b.txt").write_text("second\n", encoding="utf-8")
+        second = self.run_child("package", {"run_id": run_id})
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(list(out_dir.glob("pkg-*")), [])
 
     def test_rejects_patch_over_size_cap(self) -> None:
         run_id, wt = self.prepared_run()

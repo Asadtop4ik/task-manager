@@ -17,6 +17,12 @@ Each `AgentRepository` has an `images: tuple[tuple[str, str], ...]` field of
 tuple. The allowed set is every container_name across `(*REPOSITORIES,
 QA_REPOSITORY)`. `trusted_dir` is a plain path constant so tests can point it
 at a fixture module shaped the same way instead of the real catalog.
+
+Like `codex_child.py`, this script's production invocation is pinned in
+sudoers to run isolated: `/usr/bin/python3 -I /opt/agent-svc/libexec/image_state.py <container-names...>`.
+`-I` is the caller's responsibility (whatever builds that sudo command), not
+this script's -- there is nothing here to change for it, but the sudoers
+entry and any wrapper must include it.
 """
 
 from __future__ import annotations
