@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -150,22 +151,25 @@ def _prepare_checkout(ctx: ServiceContext, run_id: str, mirror_path: Path) -> Pa
     return publish_dir
 
 
+_MODE_LINE_RE = re.compile(
+    rb"^(?:new file mode|deleted file mode|old mode|new mode) (\d{6})$"
+    rb"|^index [0-9a-f]+\.\.[0-9a-f]+ (\d{6})$",
+    re.MULTILINE,
+)
+
+
 def _reject_bad_modes(publish_dir: Path, patch: bytes, env: Mapping[str, str]) -> None:
     """Defense in depth, independent of the sandboxed child's own check: a
     symlink or submodule entry applied directly in agent-svc's OWN checkout
     would create a real filesystem symlink/gitlink owned by agent-svc, before
-    the trusted `check_diff` ever runs. `git apply --summary` parses the
-    patch (never touching the working tree) and lists every file mode it
-    would create/change; scanning that output for the two disallowed modes
-    catches this without agent-svc needing its own patch-format parser."""
-    result = _git(["apply", "--summary"], cwd=publish_dir, env=env, input_bytes=patch)
-    if result.returncode != 0:
-        # An unparseable/inapplicable patch is reported by the real `apply
-        # --index` call right after this; nothing to reject here yet.
-        return
-    summary = result.stdout.decode("utf-8", "replace")
-    if any(mode in summary for mode in _BAD_MODES):
-        raise PublishError("unsupported change (symlink or submodule)")
+    the trusted `check_diff` ever runs. Scan the patch's own mode lines --
+    including `index a..b <mode>`, which is the only place a retargeted
+    existing symlink shows its mode -- rather than `git apply --summary`."""
+    del publish_dir, env  # kept for call-site stability
+    for match in _MODE_LINE_RE.finditer(patch):
+        mode = (match.group(1) or match.group(2)).decode("ascii")
+        if mode in _BAD_MODES:
+            raise PublishError("unsupported change (symlink or submodule)")
 
 
 def _apply_patch(

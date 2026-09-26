@@ -18,7 +18,7 @@ from typing import Any
 from .api import Work
 from .context import ServiceContext
 from .prompts import compose_implement_prompt, route_implement
-from .publish import PublishError, publish_implement
+from .publish import PublishError, _check_not_cancelled, publish_implement
 from .runctx import RunScaffold
 
 _NO_CHANGES_MESSAGE = "agent produced no file changes"
@@ -317,6 +317,7 @@ def _recover_existing_branch(
             # The push succeeded but agent-svc never got to (or failed to)
             # open the PR. Do it now instead of failing a run whose branch
             # is already live and correctly attributed.
+            _check_not_cancelled(ctx, work, run.cancel)
             created = ctx.github.create_pull(
                 work.repo_full_name,
                 head=branch,

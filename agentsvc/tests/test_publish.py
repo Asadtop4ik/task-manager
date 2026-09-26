@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from agent_svc import publish as publish_module
 from agent_svc.api import LeaseLost, Work
 from agent_svc.codex import CodexChildError
 from agent_svc.publish import PublishError, publish_correction, publish_implement
@@ -726,6 +727,26 @@ class BadModeAndRedactionTests(unittest.TestCase):
                     )
             self.assertNotIn(secret, ctx_err.exception.reason)
             self.assertIn("REDACTED", ctx_err.exception.reason)
+
+
+class RejectBadModesUnitTests(unittest.TestCase):
+    def test_retargeted_existing_symlink_is_caught_via_the_index_line(self) -> None:
+        patch = (
+            b"diff --git a/link b/link\n"
+            b"index 1111111..2222222 120000\n"
+            b"--- a/link\n+++ b/link\n@@ -1 +1 @@\n-old\n+/etc/shadow\n"
+        )
+        with self.assertRaises(PublishError):
+            publish_module._reject_bad_modes(Path("."), patch, {})
+
+    def test_a_filename_containing_the_mode_digits_is_not_rejected(self) -> None:
+        patch = (
+            b"diff --git a/f120000.txt b/f120000.txt\n"
+            b"new file mode 100644\n"
+            b"index 0000000..3333333\n"
+            b"--- /dev/null\n+++ b/f120000.txt\n@@ -0,0 +1 @@\n+x\n"
+        )
+        publish_module._reject_bad_modes(Path("."), patch, {})
 
 
 if __name__ == "__main__":

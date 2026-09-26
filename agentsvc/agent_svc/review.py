@@ -7,11 +7,11 @@ whose `fail()` step is a no-op unless `prepare()` had already written its
 target file -- every review `Work` item handled here already carries an
 active `run_id` / `lease_id`, so any failure past the initial PR fetch gets
 the same real "fail()" treatment: an error review result plus an error commit
-status. A pre-run stale/closed head is a variant of that: it posts an error
-review result (not a status), specifically because the backend releases the
-review lease as a side effect of that exact call when the head no longer
-matches -- see `_release_stale_head_lease` -- rather than leaving it to expire
-on a timer. Only the lease being lost mid-run posts nothing at all (posting
+status. A pre-run stale or closed PR posts nothing, like legacy `prepare()`:
+it only records a stage error and lets the lease expire. (Posting an error
+review there would either be refused without releasing the lease -- the
+backend has not seen the new head yet -- or record a spurious review error
+for a closed PR.) The lease being lost mid-run also posts nothing (posting
 after that would race whatever reclaimed the lease).
 
 `ctx` (an `agent_svc.main.ServiceContext`, accepted here as `Any` so this
@@ -98,7 +98,9 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
                 run_id=work.run_id,
                 task_id=work.task_id,
             )
-            _release_stale_head_lease(api, work, logger)
+            _stage_error(
+                api, work, logger, "pull request head changed or closed before review"
+            )
             return
 
         try:
@@ -291,52 +293,6 @@ def _stage_error(api: TaskManagerApi, work: Work, logger: Logger, message: str) 
         api.stage(work.run_id, work.lease_id, "review_started", error=message)
     except LeaseLost as exc:
         logger.event("lease_lost", level="warning", run_id=work.run_id, detail=exc.detail)
-
-
-def _release_stale_head_lease(api: TaskManagerApi, work: Work, logger: Logger) -> None:
-    """Release a pre-run stale-head review lease promptly, not on a timer.
-
-    `POST .../review-result` on the Task Manager backend compares
-    `payload.sha` against the run's *current* head (see
-    `agent_pr_review_result` in `backend/app/api/v1/agent_runs.py`): since
-    `work.head_sha` is the head this run was leased against and the PR has
-    since moved (or closed), the backend rejects this with 409 and -- because
-    we still hold the matching `review` lease -- clears that lease as part of
-    the same request, before ever reaching state/finding validation. That
-    lets the run be re-leased (at its new head, if it still needs a review)
-    immediately, instead of sitting on our now-useless lease for the full 5
-    minutes until it expires on its own. A plain 200 response (the backend's
-    view of the head happened to still match) also clears the lease
-    unconditionally, so that outcome is fine too. `agent_svc.api` maps every
-    409 from a lease-bound call to `LeaseLost`, so that is the expected
-    result here, not a real failure. Only some other, unexpected failure
-    (e.g. a network error) falls back to a stage error and lets the lease
-    expire naturally -- still without burning an implement-style "attempts"
-    counter, since review leases are never subject to that.
-    """
-    assert work.head_sha is not None
-    try:
-        api.review_result(
-            work.run_id,
-            work.lease_id,
-            {
-                "sha": work.head_sha,
-                "state": "error",
-                "summary": "pull request head changed before review",
-                "findings": [],
-            },
-        )
-    except LeaseLost as exc:
-        logger.event(
-            "review_stale_head_lease_released",
-            level="info",
-            run_id=work.run_id,
-            detail=exc.detail,
-        )
-        return
-    except Exception as exc:
-        logger.error(exc, event="review_stale_head_release_failed", run_id=work.run_id)
-        _stage_error(api, work, logger, "pull request head changed before review")
 
 
 def _post_error_review(

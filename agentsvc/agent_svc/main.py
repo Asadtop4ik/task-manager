@@ -30,13 +30,28 @@ from .watch import build_watch_checks
 _JOIN_TIMEOUT_S = 10.0
 
 
+def _run_registered(
+    ctx: ServiceContext,
+    handler: Callable[[ServiceContext, Work, threading.Event], None],
+    work: Work,
+) -> None:
+    """Run a handler that has no `RunScaffold` of its own (review) with a
+    cancel Event registered for shutdown, like implement/correction runs."""
+    cancel = threading.Event()
+    ctx.cancel_registry.register(cancel)
+    try:
+        handler(ctx, work, cancel)
+    finally:
+        ctx.cancel_registry.unregister(cancel)
+
+
 def _code_lane_handlers(ctx: ServiceContext) -> dict[str, Callable[[Work], None]]:
     # A fresh `threading.Event()` per leased run: cancellation is per-run (a
     # lost lease for *this* run_id), never a lane-wide "stop everything" flag.
     return {
         "implement": lambda work: handle_implement(ctx, work, threading.Event()),
         "correction": lambda work: handle_correction(ctx, work, threading.Event()),
-        "review": lambda work: handle_review(ctx, work, threading.Event()),
+        "review": lambda work: _run_registered(ctx, handle_review, work),
     }
 
 
