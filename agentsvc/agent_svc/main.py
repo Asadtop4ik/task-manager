@@ -15,16 +15,29 @@ from typing import Any, TextIO
 from urllib.parse import urlsplit
 
 from . import repos
-from .api import TaskManagerApi
+from .api import TaskManagerApi, Work
 from .config import ConfigError, Settings, build_settings, load_config, load_secrets
-from .github import GitHubClient, build_token_selector
+from .context import ServiceContext, build_context, token_selector
+from .correction import handle_correction
 from .http import JsonHttp
-from .journal import Journal
+from .implement import handle_implement
 from .lanes import ChatLane, CodeLane, WatchLoop
-from .log import Logger, Redactor
+from .log import Redactor
 from .recovery import recover
+from .review import handle_review
+from .watch import build_watch_checks
 
 _JOIN_TIMEOUT_S = 10.0
+
+
+def _code_lane_handlers(ctx: ServiceContext) -> dict[str, Callable[[Work], None]]:
+    # A fresh `threading.Event()` per leased run: cancellation is per-run (a
+    # lost lease for *this* run_id), never a lane-wide "stop everything" flag.
+    return {
+        "implement": lambda work: handle_implement(ctx, work, threading.Event()),
+        "correction": lambda work: handle_correction(ctx, work, threading.Event()),
+        "review": lambda work: handle_review(ctx, work, threading.Event()),
+    }
 
 
 class SdNotifier:
@@ -90,46 +103,9 @@ def _sudo_rule_check(
     return False, name, detail[:200]
 
 
-def _token_selector(settings: Settings, catalog: repos.Catalog) -> Callable[[str], str]:
-    return build_token_selector(
-        dispatch_repo=catalog.dispatch_repo or "",
-        qa_repo=catalog.qa_repo,
-        public_repos=catalog.public_repos,
-        agent_token=settings.github_agent_token,
-        qa_token=settings.github_qa_token,
-        public_token=settings.github_public_agent_token,
-    )
-
-
-def build_context(
-    settings: Settings,
-) -> tuple[Logger, TaskManagerApi, GitHubClient, repos.MirrorManager, repos.Catalog]:
-    redactor = Redactor(settings.secret_values())
-    logger = Logger(redactor)
-    http = JsonHttp(redactor=redactor)
-    catalog = repos.load_catalog(settings.trusted_dir)
-    token_for = _token_selector(settings, catalog)
-    github_client = GitHubClient(token_for=token_for, http=http)
-    mirrors = repos.MirrorManager(
-        settings.mirrors_dir,
-        token_for,
-        approved_branches=catalog.approved_pairs(),
-        redactor=redactor,
-    )
-    api = TaskManagerApi(
-        settings.api_base_url,
-        settings.agent_svc_token,
-        settings.callback_token,
-        settings.intake_worker_token,
-        http=http,
-        catalog=catalog.approved_pairs(),
-        logger=logger,
-    )
-    return logger, api, github_client, mirrors, catalog
-
-
 def run(settings: Settings) -> int:
-    logger, api, _github_client, _mirrors, _catalog = build_context(settings)
+    ctx = build_context(settings)
+    logger = ctx.logger
     stop = threading.Event()
 
     def handle_signal(signum: int, _frame: Any) -> None:
@@ -139,27 +115,26 @@ def run(settings: Settings) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    journal = Journal(settings.runs_dir, logger=logger)
-    for entry in recover(journal, api, logger):
+    for entry in recover(ctx.journal, ctx.api, logger):
         logger.event(
             "recovery_resume_pending", level="warning", run_id=entry.run_id, stage=entry.stage
         )
 
     code_lane = CodeLane(
-        api=api,
-        handlers={},
+        api=ctx.api,
+        handlers=_code_lane_handlers(ctx),
         logger=logger,
         poll_s=settings.poll_interval_s,
         enabled=settings.code_lane_enabled,
     )
     chat_lane = ChatLane(
-        api=api,
+        api=ctx.api,
         logger=logger,
         poll_s=settings.poll_interval_s,
         enabled=settings.chat_lane_enabled,
     )
     watch_loop = WatchLoop(
-        checks=[],
+        checks=build_watch_checks(ctx) if settings.watch_enabled else [],
         logger=logger,
         poll_s=settings.watch_poll_interval_s,
         enabled=settings.watch_enabled,
@@ -323,7 +298,7 @@ def self_check(
         )
 
         if catalog is not None:
-            token_for = _token_selector(settings, catalog)
+            token_for = token_selector(settings, catalog)
             mirrors = repos.MirrorManager(
                 settings.mirrors_dir,
                 token_for,

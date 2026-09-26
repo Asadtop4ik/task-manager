@@ -11,8 +11,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from agent_svc import main as main_module
 from agent_svc.config import ConfigError, build_settings, load_config, load_secrets
 from agent_svc.main import SdNotifier, build_arg_parser, main, self_check
+
+from .support import build_test_context, make_github_remote
+from .test_implement import _work as _implement_work
 
 TRUSTED_DIR = Path(__file__).resolve().parents[2] / "backend" / "app" / "services"
 
@@ -324,6 +328,30 @@ class MainDispatchTests(unittest.TestCase):
                 os.environ.pop("CREDENTIALS_DIRECTORY", None)
                 code = main(["--config", str(Path(tmp) / "absent.json"), "self-check"])
             self.assertEqual(code, 1)  # secrets missing, but it must not crash
+
+
+class CodeLaneHandlersTests(unittest.TestCase):
+    def test_implement_and_correction_are_wired(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_github_remote(root / "remote.git")
+            ctx = build_test_context(root, github_remote=root / "remote.git")
+            handlers = main_module._code_lane_handlers(ctx)
+            self.assertEqual(set(handlers), {"implement", "correction", "review"})
+
+    def test_review_kind_dispatches_to_the_review_handler(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_github_remote(root / "remote.git")
+            ctx = build_test_context(root, github_remote=root / "remote.git")
+            work = _implement_work(kind="review")
+            with patch.object(main_module, "handle_review") as handle_review:
+                main_module._code_lane_handlers(ctx)["review"](work)
+            handle_review.assert_called_once()
+            called_ctx, called_work, cancel = handle_review.call_args.args
+            self.assertIs(called_ctx, ctx)
+            self.assertIs(called_work, work)
+            self.assertFalse(cancel.is_set())
 
 
 if __name__ == "__main__":

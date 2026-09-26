@@ -1,0 +1,105 @@
+"""`ServiceContext`: every dependency a lane handler needs, wired from `Settings`.
+
+`build_context` is the single place that assembles the redactor, logger, HTTP
+client, trusted catalog, GitHub client, mirrors, Task Manager API client,
+journal, Codex runner, and trusted-script loader from one `Settings` object —
+`main.run` and the handler tests both build a `ServiceContext` this way so
+there is exactly one wiring to keep correct.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from . import repos
+from .api import TaskManagerApi
+from .codex import CodexRunner
+from .config import Settings
+from .github import GitHubClient, build_token_selector
+from .http import JsonHttp
+from .journal import Journal
+from .log import Logger, Redactor
+from .trusted import TrustedModules
+
+
+@dataclass(frozen=True)
+class ServiceContext:
+    settings: Settings
+    logger: Logger
+    api: TaskManagerApi
+    github: GitHubClient
+    mirrors: repos.MirrorManager
+    journal: Journal
+    codex: CodexRunner
+    catalog: repos.Catalog
+    trusted: TrustedModules
+
+
+def token_selector(settings: Settings, catalog: repos.Catalog) -> Callable[[str], str]:
+    return build_token_selector(
+        dispatch_repo=catalog.dispatch_repo or "",
+        qa_repo=catalog.qa_repo,
+        public_repos=catalog.public_repos,
+        agent_token=settings.github_agent_token,
+        qa_token=settings.github_qa_token,
+        public_token=settings.github_public_agent_token,
+    )
+
+
+def _build_codex_runner(settings: Settings) -> CodexRunner:
+    """Split `settings.codex_child_prefix` into `CodexRunner`'s prefix/interpreter.
+
+    `codex_child_prefix` (see `config.py`) is the *full* argv prefix through
+    the interpreter (e.g. `sudo -n -u agent-codex -- /usr/bin/python3`), the
+    same convention `main.self_check` already uses verbatim. `CodexRunner`
+    instead wants the sudo prefix and the interpreter as two separate
+    arguments, so the last element becomes `python_bin` and the rest becomes
+    `command_prefix` — for the default prefix this reproduces exactly
+    `CodexRunner()`'s own hardcoded defaults.
+    """
+    prefix = list(settings.codex_child_prefix)
+    kwargs: dict[str, Any] = {"libexec_dir": settings.libexec_dir}
+    if prefix:
+        kwargs["command_prefix"] = prefix[:-1]
+        kwargs["python_bin"] = prefix[-1]
+    return CodexRunner(**kwargs)
+
+
+def build_context(settings: Settings) -> ServiceContext:
+    redactor = Redactor(settings.secret_values())
+    logger = Logger(redactor)
+    http = JsonHttp(redactor=redactor)
+    catalog = repos.load_catalog(settings.trusted_dir)
+    token_for = token_selector(settings, catalog)
+    github_client = GitHubClient(token_for=token_for, http=http)
+    mirrors = repos.MirrorManager(
+        settings.mirrors_dir,
+        token_for,
+        approved_branches=catalog.approved_pairs(),
+        redactor=redactor,
+    )
+    api = TaskManagerApi(
+        settings.api_base_url,
+        settings.agent_svc_token,
+        settings.callback_token,
+        settings.intake_worker_token,
+        http=http,
+        catalog=catalog.approved_pairs(),
+        logger=logger,
+    )
+    journal = Journal(settings.runs_dir, logger=logger)
+    codex = _build_codex_runner(settings)
+    trusted = TrustedModules(settings.trusted_dir)
+    return ServiceContext(
+        settings=settings,
+        logger=logger,
+        api=api,
+        github=github_client,
+        mirrors=mirrors,
+        journal=journal,
+        codex=codex,
+        catalog=catalog,
+        trusted=trusted,
+    )
