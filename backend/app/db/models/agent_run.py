@@ -87,6 +87,13 @@ class AgentRun(Base, TimestampMixin):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_kind: Mapped[str | None] = mapped_column(String(12))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # How many times a local-executor review lease has expired for the head it
+    # is tracking. Reset to 0 whenever `review_attempts_sha` no longer matches
+    # `head_sha` (a new commit means a fresh review, not a retried one).
+    review_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    review_attempts_sha: Mapped[str | None] = mapped_column(String(40))
 
     task: Mapped["Task"] = relationship()
 
@@ -105,3 +112,8 @@ class AgentRunAction(Base, TimestampMixin):
     request_data: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     result: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    # How many times a local-executor correction lease has expired while this
+    # action was "in_progress". Only meaningful for local corrections.
+    attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )

@@ -37,6 +37,21 @@ class IntakeCreate(BaseModel):
 _RELEVANT_FILE_RE = re.compile(r"^[A-Za-z0-9_./-]{1,200}$")
 
 
+def is_safe_relevant_file(path: object) -> bool:
+    """The one rule for a task-repo-relative path in an intake brief.
+
+    Shared by `IntakeBrief`'s own validator and by the lease endpoint, which
+    re-validates a brief read back out of storage rather than trusting it
+    once was written correctly.
+    """
+    return (
+        isinstance(path, str)
+        and ".." not in path
+        and not path.startswith("/")
+        and bool(_RELEVANT_FILE_RE.fullmatch(path))
+    )
+
+
 class IntakeBrief(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     goal: str = Field(min_length=1, max_length=800)
@@ -53,7 +68,7 @@ class IntakeBrief(BaseModel):
     @classmethod
     def _safe_relative_paths(cls, value: list[str]) -> list[str]:
         for path in value:
-            if ".." in path or path.startswith("/") or not _RELEVANT_FILE_RE.fullmatch(path):
+            if not is_safe_relevant_file(path):
                 raise ValueError(f"invalid relevant file path: {path!r}")
         return value
 
