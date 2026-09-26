@@ -14,13 +14,16 @@ instead, purely as a convenience.
 Control fields (all optional, defaults noted):
   scenario            "normal" | "idle" | "hang" | "fail" | "grandchild" |
                        "huge_stdout" (default "normal")
-  thread_id           id reported in `thread.started` (default "fake-parent-thread")
-  parent_thread_id    if set, this run's own rollout claims to be a sub-agent
-                       spawned by that parent thread id
-  child_thread_id     if set, also write a second rollout file whose
-                       session_meta names this run as ITS parent
-  tokens              input_tokens recorded for this run's rollout (default 1000)
-  child_tokens        input_tokens recorded for the child rollout (default 500)
+  thread_id           this run's own (root) thread id, reported in
+                       `thread.started` and as this rollout's own
+                       `session_meta.payload.id`/`session_id` (default
+                       "fake-parent-thread")
+  child_thread_id     if set, also write a second, sub-agent-shaped rollout
+                       file whose `session_meta.payload.session_id` names
+                       THIS run's thread_id as the root (matching real Codex:
+                       every file in the tree stamps the same root session_id)
+  tokens              input_tokens recorded in this run's rollout (default 1000)
+  child_tokens        input_tokens recorded in the child rollout (default 500)
   final_message       text written to --output-last-message (default "final answer")
   exit_code           process exit code for the "normal"/"huge_stdout" paths (default 0)
   sleep_s             sleep duration for "idle"/"hang"/"grandchild" (default 120)
@@ -65,34 +68,99 @@ def _emit(event: dict) -> None:
     sys.stdout.flush()
 
 
-def _write_rollout(thread_id: str, *, parent_thread_id: str | None, tokens: int) -> None:
-    codex_home = os.environ.get("CODEX_HOME")
-    if not codex_home:
-        return
-    sessions_dir = Path(codex_home) / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    rollout = sessions_dir / f"rollout-test-{thread_id}.jsonl"
-    session_meta: dict = {"type": "session_meta", "payload": {"id": thread_id}}
-    if parent_thread_id is not None:
-        session_meta["payload"]["source"] = {
-            "subagent": {"thread_spawn": {"parent_thread_id": parent_thread_id}}
-        }
-    lines = [
-        session_meta,
-        {
+def _token_count_line(ordinal: int, tokens: int) -> dict:
+    # Real Codex 0.156.1 shape: outer type is "event_msg", the token_count
+    # event itself is nested under "payload", and total_token_usage is
+    # cumulative for just this file's own thread (never includes a
+    # sub-agent's or the parent's numbers).
+    output_tokens = max(tokens // 4, 1)
+    return {
+        "ordinal": ordinal,
+        "timestamp": "2026-09-26T00:00:00Z",
+        "type": "event_msg",
+        "payload": {
             "type": "token_count",
             "info": {
                 "total_token_usage": {
                     "input_tokens": tokens,
                     "cached_input_tokens": 0,
-                    "output_tokens": max(tokens // 4, 1),
-                }
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": output_tokens,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": tokens + output_tokens,
+                },
+                "last_token_usage": {
+                    "input_tokens": tokens,
+                    "cached_input_tokens": 0,
+                    "output_tokens": output_tokens,
+                },
             },
         },
-    ]
+    }
+
+
+def _write_lines(rollout: Path, lines: list[dict]) -> None:
+    rollout.parent.mkdir(parents=True, exist_ok=True)
     with rollout.open("w", encoding="utf-8") as handle:
         for line in lines:
             handle.write(json.dumps(line) + "\n")
+
+
+def _write_root_rollout(root_thread_id: str, *, tokens: int) -> None:
+    codex_home = os.environ.get("CODEX_HOME")
+    if not codex_home:
+        return
+    sessions_dir = Path(codex_home) / "sessions"
+    rollout = sessions_dir / f"rollout-test-{root_thread_id}.jsonl"
+    session_meta = {
+        "ordinal": 0,
+        "timestamp": "2026-09-26T00:00:00Z",
+        "type": "session_meta",
+        "payload": {"id": root_thread_id, "session_id": root_thread_id, "source": "exec"},
+    }
+    _write_lines(rollout, [session_meta, _token_count_line(1, tokens)])
+
+
+def _write_subagent_rollout(child_thread_id: str, *, root_thread_id: str, tokens: int) -> None:
+    codex_home = os.environ.get("CODEX_HOME")
+    if not codex_home:
+        return
+    sessions_dir = Path(codex_home) / "sessions"
+    rollout = sessions_dir / f"rollout-test-{child_thread_id}.jsonl"
+    own_session_meta = {
+        "ordinal": 0,
+        "timestamp": "2026-09-26T00:00:01Z",
+        "type": "session_meta",
+        "payload": {
+            "id": child_thread_id,
+            # Every file in the tree -- at any sub-agent depth -- stamps the
+            # SAME root session_id, not its immediate parent's id.
+            "session_id": root_thread_id,
+            "parent_thread_id": root_thread_id,
+            "subagent_history_start_ordinal": 5,
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": root_thread_id,
+                        "depth": 1,
+                        "agent_role": "luna_worker",
+                    }
+                }
+            },
+        },
+    }
+    # The forked parent history: a SECOND session_meta line (ordinal 1),
+    # copied from the parent's own. Real aggregation must ignore it; this
+    # fixture exists so a test can prove that.
+    forked_parent_session_meta = {
+        "ordinal": 1,
+        "timestamp": "2026-09-26T00:00:00Z",
+        "type": "session_meta",
+        "payload": {"id": root_thread_id, "session_id": root_thread_id, "source": "exec"},
+    }
+    _write_lines(
+        rollout, [own_session_meta, forked_parent_session_meta, _token_count_line(2, tokens)]
+    )
 
 
 def main() -> int:
@@ -111,9 +179,6 @@ def main() -> int:
     tokens = int(opt("tokens", "FAKE_CODEX_TOKENS", "1000"))
     exit_code = int(opt("exit_code", "FAKE_CODEX_EXIT_CODE", "0"))
     line_count = int(opt("line_count", "FAKE_CODEX_LINE_COUNT", "3000"))
-    parent_thread_id = control.get("parent_thread_id") or os.environ.get(
-        "FAKE_CODEX_PARENT_THREAD_ID"
-    )
     child_thread_id = control.get("child_thread_id") or os.environ.get(
         "FAKE_CODEX_CHILD_THREAD_ID"
     )
@@ -161,7 +226,7 @@ def main() -> int:
             _emit({"type": "item.completed", "index": index, "pad": "x" * 200})
         if final_path is not None:
             final_path.write_text("done", encoding="utf-8")
-        _write_rollout(thread_id, parent_thread_id=None, tokens=tokens)
+        _write_root_rollout(thread_id, tokens=tokens)
         return exit_code
 
     # "normal"
@@ -171,9 +236,9 @@ def main() -> int:
     _emit({"type": "turn.completed", "usage": usage})
     if final_path is not None:
         final_path.write_text(final_message, encoding="utf-8")
-    _write_rollout(thread_id, parent_thread_id=parent_thread_id, tokens=tokens)
+    _write_root_rollout(thread_id, tokens=tokens)
     if child_thread_id:
-        _write_rollout(child_thread_id, parent_thread_id=thread_id, tokens=child_tokens)
+        _write_subagent_rollout(child_thread_id, root_thread_id=thread_id, tokens=child_tokens)
     return exit_code
 
 

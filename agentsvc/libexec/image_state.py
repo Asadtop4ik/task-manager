@@ -1,19 +1,22 @@
 """Container image/health snapshot. Runs as root via sudo.
 
 argv is a list of docker container names, nothing else. Each name must be one
-of the names the trusted catalog (`agent_repos.py`) lists; anything else is
-refused before any docker command runs. Prints one JSON object on stdout:
-``{name: {"image": <Config.Image or null>, "running": <bool>, "health": <str
-or null>}}``.
+of the container names the trusted catalog (`agent_repos.py`) lists; anything
+else is refused before any docker command runs. Prints one JSON object on
+stdout: ``{name: {"image": <Config.Image or null>, "running": <bool>,
+"health": <str or null>}}``.
 
-Contract with the trusted catalog module: this script expects `agent_repos`
-(loaded from `trusted_dir`, a repo/branch/mirror catalog owned by a different
-work package) to expose the allowed container names as one of a
-`CONTAINER_NAMES` or `CONTAINERS` module attribute, or a zero-argument
-`container_names()` callable. If none of those exist, every name is refused
-and the exit code reports the load failure. `trusted_dir` is a plain path
-constant so tests can point it at a fixture module instead of the real
-catalog.
+Contract with the trusted catalog module: this script loads
+`backend/app/services/agent_repos.py` (by file path, from `trusted_dir` --
+the installer keeps this pointed at the active release) and expects it to
+expose:
+  - `REPOSITORIES`: a tuple of `AgentRepository` dataclass instances
+  - `QA_REPOSITORY`: one more `AgentRepository` instance
+Each `AgentRepository` has an `images: tuple[tuple[str, str], ...]` field of
+(container_name, image_repo) pairs; private repos have an empty `images`
+tuple. The allowed set is every container_name across `(*REPOSITORIES,
+QA_REPOSITORY)`. `trusted_dir` is a plain path constant so tests can point it
+at a fixture module shaped the same way instead of the real catalog.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -36,7 +40,12 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 def _load_agent_repos(trusted_dir: Path) -> ModuleType:
     module_path = trusted_dir / "agent_repos.py"
-    spec = importlib.util.spec_from_file_location("agent_repos", module_path)
+    # A unique module name per load: this is a standalone file load (not a
+    # real package import), so there is no reason to alias it to whatever
+    # "agent_repos" might already mean in sys.modules, and a fixed name would
+    # make repeated loads (e.g. across tests) collide.
+    module_name = f"agent_repos_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {module_path}")
     module = importlib.util.module_from_spec(spec)
@@ -45,20 +54,32 @@ def _load_agent_repos(trusted_dir: Path) -> ModuleType:
 
 
 def _catalog_container_names(module: ModuleType) -> frozenset[str]:
-    for attr in ("CONTAINER_NAMES", "CONTAINERS"):
-        value = getattr(module, attr, None)
-        if value is not None:
-            return frozenset(str(item) for item in value)
-    getter = getattr(module, "container_names", None)
-    if callable(getter):
-        return frozenset(str(item) for item in getter())
-    raise RuntimeError("agent_repos module does not expose container names")
+    repositories = getattr(module, "REPOSITORIES", None)
+    qa_repository = getattr(module, "QA_REPOSITORY", None)
+    if repositories is None or qa_repository is None:
+        raise RuntimeError("agent_repos module does not expose REPOSITORIES/QA_REPOSITORY")
+    names: set[str] = set()
+    for repo in (*repositories, qa_repository):
+        images = getattr(repo, "images", ())
+        for entry in images:
+            if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+                names.add(entry[0])
+    return frozenset(names)
 
 
 def _docker_inspect(name: str, *, runner: Runner) -> dict[str, Any] | None:
     try:
         completed = runner(
-            [DOCKER_BINARY, "inspect", "--format", "{{json .}}", name],
+            [
+                DOCKER_BINARY,
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                "{{json .}}",
+                "--",
+                name,
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=INSPECT_TIMEOUT_S,

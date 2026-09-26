@@ -767,61 +767,81 @@ def _stream_and_wait(
     return outcome
 
 
-def _session_meta(path: Path) -> dict[str, Any] | None:
+# Real Codex 0.156.1 rollout JSONL shape (verified against the live server,
+# see spike-results.md and design-doc REVISION 3): each line is
+# {"ordinal": int, "timestamp": str, "type": str, "payload": {...}}.
+#
+# The FIRST line (ordinal 0) is always session_meta:
+#   {"type": "session_meta", "payload": {
+#       "id": <this file's own thread id>,
+#       "session_id": <ROOT session/thread id -- same for every file in the
+#                       tree, at any sub-agent depth>,
+#       "source": "exec" | {"subagent": {"thread_spawn": {...}}},
+#       "parent_thread_id": ... (sub-agents only),
+#       "subagent_history_start_ordinal": int (sub-agents only), ...}}
+# A sub-agent's rollout ALSO carries a SECOND session_meta line (ordinal 1,
+# the forked parent history) that must be ignored -- so we only ever read the
+# first line for session identity, never scan further for another one.
+#
+# Usage lines are {"type": "event_msg", "payload": {"type": "token_count",
+# "info": {"total_token_usage": {...}, "last_token_usage": {...}}}};
+# total_token_usage is cumulative PER FILE and counts only that thread's own
+# requests (a child's usage is not part of the parent's numbers or vice
+# versa), so summing each matched file's LAST total_token_usage across the
+# whole tree gives the true total. {"type": "token_usage_record", ...} lines
+# carry ids only (thread_id/session_id/turn_id) and are not needed here.
+#
+# Because every file in a run's tree (root + every sub-agent at any depth)
+# stamps the SAME root session_id in its own first line, matching is a flat
+# equality check against that one id -- no parent/child chain walking needed.
+
+
+def _session_meta_first_line(path: Path) -> dict[str, Any] | None:
     try:
         with path.open("r", encoding="utf-8") as handle:
-            for _ in range(5):
-                line = handle.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(value, dict) and value.get("type") == "session_meta":
-                    return value
+            line = handle.readline()
     except OSError:
         return None
-    return None
-
-
-def _own_thread_id(meta: dict[str, Any]) -> str | None:
-    payload = meta.get("payload")
-    if isinstance(payload, dict):
-        value = payload.get("id")
-        if isinstance(value, str):
-            return value
-    return None
-
-
-def _parent_thread_id_of(meta: dict[str, Any]) -> str | None:
-    payload = meta.get("payload")
-    if not isinstance(payload, dict):
+    line = line.strip()
+    if not line:
         return None
-    source = payload.get("source")
-    subagent = source.get("subagent") if isinstance(source, dict) else None
-    thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
-    parent_id = (
-        thread_spawn.get("parent_thread_id") if isinstance(thread_spawn, dict) else None
-    )
-    return parent_id if isinstance(parent_id, str) else None
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or value.get("type") != "session_meta":
+        return None
+    payload = value.get("payload")
+    return payload if isinstance(payload, dict) else None
 
 
-def _relevant_rollouts(sessions_dir: Path, parent_thread_id: str) -> list[Path]:
+def _rollout_is_in_root_tree(payload: dict[str, Any], root_thread_id: str) -> bool:
+    # `session_id` covers the root file and every sub-agent at any depth;
+    # `id` is a fallback for the root's own file in case its session_id ever
+    # differs from its own id.
+    return payload.get("session_id") == root_thread_id or payload.get("id") == root_thread_id
+
+
+def _relevant_rollouts(
+    sessions_dir: Path, root_thread_id: str, *, min_mtime: float | None = None
+) -> list[Path]:
     matches: list[Path] = []
     if not sessions_dir.is_dir():
         return matches
+    # Path shape is <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl;
+    # rglob walks the date subdirectories, and the mtime filter is a cheap
+    # prefilter against unrelated older runs before opening each file.
     for rollout in sorted(sessions_dir.rglob("rollout-*.jsonl")):
-        meta = _session_meta(rollout)
-        if meta is None:
+        if min_mtime is not None:
+            try:
+                if rollout.stat().st_mtime < min_mtime:
+                    continue
+            except OSError:
+                continue
+        payload = _session_meta_first_line(rollout)
+        if payload is None:
             continue
-        if (
-            _own_thread_id(meta) == parent_thread_id
-            or _parent_thread_id_of(meta) == parent_thread_id
-        ):
+        if _rollout_is_in_root_tree(payload, root_thread_id):
             matches.append(rollout)
     return matches
 
@@ -838,9 +858,12 @@ def _last_token_usage(path: Path) -> dict[str, int] | None:
                     value = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(value, dict) or value.get("type") != "token_count":
+                if not isinstance(value, dict) or value.get("type") != "event_msg":
                     continue
-                info = value.get("info")
+                inner = value.get("payload")
+                if not isinstance(inner, dict) or inner.get("type") != "token_count":
+                    continue
+                info = inner.get("info")
                 if not isinstance(info, dict):
                     continue
                 usage = info.get("total_token_usage")
@@ -858,11 +881,13 @@ def _collect_and_delete_usage(
     codex_home: Path,
     thread_started: dict[str, Any] | None,
     fallback_usage: dict[str, int] | None,
+    *,
+    min_mtime: float | None = None,
 ) -> tuple[dict[str, int] | None, str | None]:
     thread_id = thread_started.get("thread_id") if isinstance(thread_started, dict) else None
     if not isinstance(thread_id, str):
         return fallback_usage, None
-    matches = _relevant_rollouts(codex_home / "sessions", thread_id)
+    matches = _relevant_rollouts(codex_home / "sessions", thread_id, min_mtime=min_mtime)
     if not matches:
         return fallback_usage, thread_id
     totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
@@ -904,6 +929,12 @@ def cmd_exec(request: dict[str, Any]) -> int:
     final_path = out_dir / "final.txt"
     if params.output_schema is not None:
         schema_path.write_text(json.dumps(params.output_schema), encoding="utf-8")
+
+    # Wall-clock start, used only as a cheap mtime prefilter when hunting for
+    # this run's rollout files afterwards; a couple of seconds of slack
+    # covers clock/mtime granularity without risking excluding this run's own
+    # files.
+    rollout_min_mtime = time.time() - 2.0
 
     command = _build_exec_command(params, schema_path, final_path)
     env = _exec_env(params)
@@ -960,7 +991,10 @@ def cmd_exec(request: dict[str, Any]) -> int:
     stderr_thread.join(timeout=2)
 
     usage, thread_id = _collect_and_delete_usage(
-        params.codex_home, outcome.thread_started, outcome.fallback_usage
+        params.codex_home,
+        outcome.thread_started,
+        outcome.fallback_usage,
+        min_mtime=rollout_min_mtime,
     )
     final_message = _read_final_message(final_path)
     exit_code = process.returncode if process.returncode is not None else -1

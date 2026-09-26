@@ -627,35 +627,99 @@ class RolloutUsageTests(unittest.TestCase):
         self.sessions_dir = Path(self._tmp.name) / "sessions"
         self.sessions_dir.mkdir()
 
-    def write_rollout(
-        self, name: str, thread_id: str, parent_id: str | None, tokens: int
-    ) -> Path:
-        path = self.sessions_dir / name
-        meta: dict = {"type": "session_meta", "payload": {"id": thread_id}}
-        if parent_id is not None:
-            meta["payload"]["source"] = {
-                "subagent": {"thread_spawn": {"parent_thread_id": parent_id}}
-            }
-        lines = [
-            meta,
-            {
+    def _token_count_line(self, ordinal: int, tokens: int, cached: int = 1) -> dict:
+        # Real shape: outer type is "event_msg", the token_count event is
+        # nested under "payload", and total_token_usage carries more fields
+        # than we sum (cache_write_input_tokens, reasoning_output_tokens,
+        # total_tokens) -- codex_child only sums the three the frame reports.
+        return {
+            "ordinal": ordinal,
+            "timestamp": "2026-09-26T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
                 "type": "token_count",
                 "info": {
                     "total_token_usage": {
                         "input_tokens": tokens,
-                        "cached_input_tokens": 1,
+                        "cached_input_tokens": cached,
+                        "cache_write_input_tokens": 0,
                         "output_tokens": tokens // 2,
-                    }
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": tokens + tokens // 2,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": tokens,
+                        "cached_input_tokens": cached,
+                        "output_tokens": tokens // 2,
+                    },
                 },
             },
+        }
+
+    def write_root_rollout(self, name: str, root_thread_id: str, tokens: int) -> Path:
+        path = self.sessions_dir / name
+        lines = [
+            {
+                "ordinal": 0,
+                "timestamp": "2026-09-26T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": root_thread_id,
+                    "session_id": root_thread_id,
+                    "source": "exec",
+                },
+            },
+            self._token_count_line(1, tokens),
+        ]
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+        return path
+
+    def write_subagent_rollout(
+        self, name: str, own_thread_id: str, root_thread_id: str, tokens: int
+    ) -> Path:
+        path = self.sessions_dir / name
+        lines = [
+            {
+                "ordinal": 0,
+                "timestamp": "2026-09-26T00:00:01Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": own_thread_id,
+                    "session_id": root_thread_id,
+                    "parent_thread_id": root_thread_id,
+                    "subagent_history_start_ordinal": 5,
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": root_thread_id,
+                                "depth": 1,
+                                "agent_role": "luna_worker",
+                            }
+                        }
+                    },
+                },
+            },
+            # The forked parent history: a SECOND session_meta line, copied
+            # from the parent, that aggregation must ignore.
+            {
+                "ordinal": 1,
+                "timestamp": "2026-09-26T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": root_thread_id,
+                    "session_id": root_thread_id,
+                    "source": "exec",
+                },
+            },
+            self._token_count_line(2, tokens),
         ]
         path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
         return path
 
     def test_sums_parent_and_child_and_deletes(self) -> None:
-        parent = self.write_rollout("rollout-parent.jsonl", "parent-1", None, 100)
-        child = self.write_rollout("rollout-child.jsonl", "child-1", "parent-1", 40)
-        unrelated = self.write_rollout("rollout-other.jsonl", "other-1", None, 999)
+        parent = self.write_root_rollout("rollout-parent.jsonl", "parent-1", 100)
+        child = self.write_subagent_rollout("rollout-child.jsonl", "child-1", "parent-1", 40)
+        unrelated = self.write_root_rollout("rollout-other.jsonl", "other-1", 999)
 
         usage, thread_id = codex_child._collect_and_delete_usage(
             self.sessions_dir.parent, {"type": "thread.started", "thread_id": "parent-1"}, None
@@ -667,6 +731,18 @@ class RolloutUsageTests(unittest.TestCase):
         self.assertFalse(parent.exists())
         self.assertFalse(child.exists())
         self.assertTrue(unrelated.exists())
+
+    def test_ignores_second_session_meta_line(self) -> None:
+        # The sub-agent file's ordinal-1 session_meta claims the id of the
+        # ROOT thread; if aggregation looked past the first line it would
+        # wrongly treat this file as the root's own rollout too (it still
+        # matches by session_id either way here, so assert the more direct
+        # thing: the match decision comes from `_session_meta_first_line`,
+        # which only ever returns the first line's payload).
+        child = self.write_subagent_rollout("rollout-child.jsonl", "child-1", "root-9", 40)
+        payload = codex_child._session_meta_first_line(child)
+        self.assertEqual(payload["id"], "child-1")
+        self.assertEqual(payload["session_id"], "root-9")
 
     def test_falls_back_to_turn_usage_without_rollouts(self) -> None:
         fallback = {"input_tokens": 5, "cached_input_tokens": 0, "output_tokens": 1}
@@ -1184,13 +1260,44 @@ class FakeInspectCompleted:
 
 
 class ImageStateTests(unittest.TestCase):
+    """Fixture catalogs mirror the real `backend/app/services/agent_repos.py`
+    shape: `REPOSITORIES` (a tuple of `AgentRepository`-like objects, private
+    repos among them carrying an empty `images` tuple) plus one more
+    `AgentRepository` in `QA_REPOSITORY`, each `images` a tuple of
+    (container_name, image_repo) pairs."""
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.trusted_dir = Path(self._tmp.name)
 
-    def write_catalog(self, body: str) -> None:
-        (self.trusted_dir / "agent_repos.py").write_text(body, encoding="utf-8")
+    def write_catalog(
+        self,
+        *,
+        repo_images: list[tuple[str, str]] | None = None,
+        include_private_repo: bool = False,
+        qa_images: list[tuple[str, str]] | None = None,
+    ) -> None:
+        repo_images = repo_images or []
+        qa_images = qa_images or []
+        lines = [
+            "from dataclasses import dataclass",
+            "",
+            "@dataclass(frozen=True)",
+            "class AgentRepository:",
+            "    images: tuple = ()",
+            "",
+            f"_repo_a = AgentRepository(images={tuple(repo_images)!r})",
+        ]
+        repositories = ["_repo_a"]
+        if include_private_repo:
+            lines.append("_repo_private = AgentRepository(images=())")
+            repositories.append("_repo_private")
+        lines.append(f"REPOSITORIES = ({', '.join(repositories)},)")
+        lines.append(f"QA_REPOSITORY = AgentRepository(images={tuple(qa_images)!r})")
+        (self.trusted_dir / "agent_repos.py").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
 
     def capture_output(self, argv: list[str], *, runner) -> tuple[int, list[str]]:
         captured = io.StringIO()
@@ -1200,7 +1307,7 @@ class ImageStateTests(unittest.TestCase):
         return code, lines
 
     def test_rejects_unknown_container(self) -> None:
-        self.write_catalog("CONTAINER_NAMES = ['agent-code', 'agent-chat']\n")
+        self.write_catalog(repo_images=[("agent-code", "acme/agent-code")])
         code, _ = self.capture_output(
             ["image_state.py", "not-in-catalog"],
             runner=lambda *a, **k: FakeInspectCompleted(""),
@@ -1208,7 +1315,7 @@ class ImageStateTests(unittest.TestCase):
         self.assertEqual(code, 3)
 
     def test_rejects_when_any_name_unknown(self) -> None:
-        self.write_catalog("CONTAINER_NAMES = ['agent-code']\n")
+        self.write_catalog(repo_images=[("agent-code", "acme/agent-code")])
         code, _ = self.capture_output(
             ["image_state.py", "agent-code", "bogus"],
             runner=lambda *a, **k: FakeInspectCompleted(""),
@@ -1216,7 +1323,7 @@ class ImageStateTests(unittest.TestCase):
         self.assertEqual(code, 3)
 
     def test_no_args_is_rejected(self) -> None:
-        self.write_catalog("CONTAINER_NAMES = ['agent-code']\n")
+        self.write_catalog(repo_images=[("agent-code", "acme/agent-code")])
         code, _ = self.capture_output(
             ["image_state.py"], runner=lambda *a, **k: FakeInspectCompleted("")
         )
@@ -1228,8 +1335,43 @@ class ImageStateTests(unittest.TestCase):
         )
         self.assertEqual(code, 3)
 
+    def test_missing_repositories_attribute_refused(self) -> None:
+        (self.trusted_dir / "agent_repos.py").write_text(
+            "SOMETHING_ELSE = 1\n", encoding="utf-8"
+        )
+        code, _ = self.capture_output(
+            ["image_state.py", "agent-code"], runner=lambda *a, **k: FakeInspectCompleted("")
+        )
+        self.assertEqual(code, 3)
+
+    def test_private_repo_contributes_no_names(self) -> None:
+        self.write_catalog(
+            repo_images=[("agent-code", "acme/agent-code")], include_private_repo=True
+        )
+        code, _ = self.capture_output(
+            ["image_state.py", "some-private-container"],
+            runner=lambda *a, **k: FakeInspectCompleted(""),
+        )
+        self.assertEqual(code, 3)
+
+    def test_qa_repository_names_are_allowed(self) -> None:
+        # Names come from both REPOSITORIES and QA_REPOSITORY.
+        self.write_catalog(
+            repo_images=[("agent-code", "acme/agent-code")],
+            qa_images=[("agent-qa", "acme/agent-qa")],
+        )
+        code, buffer = self.capture_output(
+            ["image_state.py", "agent-qa"],
+            runner=lambda *a, **k: FakeInspectCompleted('{"Config": {}, "State": {}}'),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("agent-qa", json.loads(buffer[0]))
+
     def test_parses_docker_inspect_output_via_injected_runner(self) -> None:
-        self.write_catalog("CONTAINER_NAMES = ['agent-code', 'agent-chat']\n")
+        self.write_catalog(
+            repo_images=[("agent-code", "acme/agent-code")],
+            qa_images=[("agent-chat", "acme/agent-chat")],
+        )
         calls: list[list[str]] = []
 
         def fake_runner(argv, **kwargs):
@@ -1252,8 +1394,20 @@ class ImageStateTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 2)
-        for call in calls:
-            self.assertEqual(call[0], image_state.DOCKER_BINARY)
+        for call, name in zip(calls, ("agent-code", "agent-chat"), strict=True):
+            self.assertEqual(
+                call,
+                [
+                    image_state.DOCKER_BINARY,
+                    "inspect",
+                    "--type",
+                    "container",
+                    "--format",
+                    "{{json .}}",
+                    "--",
+                    name,
+                ],
+            )
         result = json.loads(buffer[0])
         self.assertEqual(
             result,
@@ -1268,7 +1422,7 @@ class ImageStateTests(unittest.TestCase):
         )
 
     def test_inspect_failure_yields_null_summary(self) -> None:
-        self.write_catalog("CONTAINER_NAMES = ['agent-code']\n")
+        self.write_catalog(repo_images=[("agent-code", "acme/agent-code")])
         code, buffer = self.capture_output(
             ["image_state.py", "agent-code"],
             runner=lambda *a, **k: FakeInspectCompleted("", returncode=1),
@@ -1279,14 +1433,6 @@ class ImageStateTests(unittest.TestCase):
             {"agent-code": {"image": None, "running": False, "health": None}},
         )
 
-    def test_container_names_callable_contract(self) -> None:
-        self.write_catalog("def container_names():\n    return {'agent-code'}\n")
-        code, _ = self.capture_output(
-            ["image_state.py", "agent-code"],
-            runner=lambda *a, **k: FakeInspectCompleted('{"Config": {}, "State": {}}'),
-        )
-        self.assertEqual(code, 0)
-
     def test_no_shell_true_used(self) -> None:
         import inspect
 
@@ -1296,7 +1442,7 @@ class ImageStateTests(unittest.TestCase):
         # End-to-end (still no real docker): the default `runner=subprocess.run`
         # is exercised against a stand-in "docker" script on PATH, proving
         # `_docker_inspect` invokes it as an argv list, not a shell string.
-        self.write_catalog("CONTAINER_NAMES = ['agent-code']\n")
+        self.write_catalog(repo_images=[("agent-code", "acme/agent-code")])
         fake_docker = self.trusted_dir / "docker"
         fake_docker.write_text(
             "#!/usr/bin/env python3\n"
