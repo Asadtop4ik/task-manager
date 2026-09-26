@@ -105,7 +105,7 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
             logger.error(exc, event="review_diff_fetch_failed", run_id=work.run_id)
             _post_error_review(api, github, work, logger)
             return
-        if not diff or len(diff) >= MAX_DIFF_CHARS:
+        if not diff or len(diff) > MAX_DIFF_CHARS:
             logger.event(
                 "review_diff_too_large",
                 level="warning",

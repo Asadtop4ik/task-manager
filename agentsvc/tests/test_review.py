@@ -324,7 +324,7 @@ class HandleReviewTests(unittest.TestCase):
     def test_oversized_diff_posts_error_review(self) -> None:
         work = _work()
         api = FakeApi()
-        github = FakeGitHub(pulls=[_pr()], diff="x" * 250_000)
+        github = FakeGitHub(pulls=[_pr()], diff="x" * 250_001)
         codex = FakeCodexRunner(_ok_result())
         ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
 

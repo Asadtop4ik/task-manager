@@ -9,6 +9,7 @@ import urllib.request
 from typing import Any
 
 from agent_svc.github import (
+    DiffTooLarge,
     GitHubClient,
     InvalidResponse,
     UnknownRepository,
@@ -160,11 +161,14 @@ class PullDiffTests(unittest.TestCase):
             opener.requests[0].get_header("Accept"), "application/vnd.github.diff"
         )
 
-    def test_truncates_to_250k_chars(self) -> None:
-        big = ("x" * 300_000).encode()
-        client, _opener = _client([FakeResponse(big)])
-        result = client.pull_diff(DISPATCH_REPO, 7)
-        self.assertEqual(len(result), 250_000)
+    def test_refuses_diffs_over_250k_chars_instead_of_truncating(self) -> None:
+        client, _opener = _client([FakeResponse(("x" * 250_001).encode())])
+        with self.assertRaises(DiffTooLarge):
+            client.pull_diff(DISPATCH_REPO, 7)
+
+    def test_accepts_a_diff_of_exactly_250k_chars(self) -> None:
+        client, _opener = _client([FakeResponse(("x" * 250_000).encode())])
+        self.assertEqual(len(client.pull_diff(DISPATCH_REPO, 7)), 250_000)
 
 
 class SetStatusTests(unittest.TestCase):

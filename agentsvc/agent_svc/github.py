@@ -31,6 +31,10 @@ class InvalidResponse(ValueError):
     """GitHub returned a response that does not match the expected shape."""
 
 
+class DiffTooLarge(ValueError):
+    """The PR diff exceeds what a review prompt may carry; never truncate it."""
+
+
 class UnknownRepository(ValueError):
     """No token is configured for this repository; refuse rather than guess one."""
 
@@ -142,7 +146,11 @@ class GitHubClient:
             max_bytes=_MAX_DIFF_FETCH_BYTES,
         )
         text = response.body.decode("utf-8", "replace")
-        return text[:_MAX_DIFF_CHARS]
+        # A truncated diff would be reviewed as if it were complete, so an
+        # oversized one is refused outright (the caller posts an error review).
+        if len(text) > _MAX_DIFF_CHARS:
+            raise DiffTooLarge(f"diff has {len(text)} chars (limit {_MAX_DIFF_CHARS})")
+        return text
 
     def set_status(
         self,
