@@ -60,14 +60,24 @@ class PolicyTests(unittest.TestCase):
             )
         )
 
-    def test_review_status_must_be_latest_and_clean_on_exact_sha(self) -> None:
+    def test_review_status_must_be_latest_and_clean_on_the_requested_commit(self) -> None:
+        sha = "a" * 40
         statuses = [
-            {"id": 1, "context": "codex-review", "sha": "a" * 40, "state": "success"},
-            {"id": 2, "context": "codex-review", "sha": "a" * 40, "state": "failure"},
+            {
+                "id": 1,
+                "context": "codex-review",
+                "state": "success",
+                "url": f"https://api.github.com/repos/Asadtop4ik/task-manager/statuses/{sha}",
+            },
+            {
+                "id": 2,
+                "context": "codex-review",
+                "state": "failure",
+                "url": f"https://api.github.com/repos/Asadtop4ik/task-manager/statuses/{sha}",
+            },
         ]
-        self.assertFalse(clean_review_status(statuses, "a" * 40))
-        self.assertFalse(clean_review_status(statuses[:1], "b" * 40))
-        self.assertTrue(clean_review_status(statuses[:1], "a" * 40))
+        self.assertFalse(clean_review_status(statuses))
+        self.assertTrue(clean_review_status(statuses[:1]))
 
     def test_cancelled_agent_pr_cannot_auto_merge(self) -> None:
         run_id = "00000000-0000-0000-0000-000000000007"

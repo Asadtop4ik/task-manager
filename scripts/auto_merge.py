@@ -73,12 +73,13 @@ def agent_ready(pr: dict, run: dict) -> bool:
     )
 
 
-def clean_review_status(statuses: list[dict], sha: str) -> bool:
+def clean_review_status(statuses: list[dict]) -> bool:
     matching = [row for row in statuses if row.get("context") == "codex-review"]
     if not matching:
         return False
     latest = max(matching, key=lambda row: row.get("id", 0))
-    return latest.get("sha") == sha and latest.get("state") == "success"
+    # Commit status rows omit `sha`; callers query /commits/{expected_sha}/statuses.
+    return latest.get("state") == "success"
 
 
 def _agent_allows_merge(pr: dict) -> bool:
@@ -156,7 +157,7 @@ def main() -> None:
         return
     statuses = _github(f"repos/{repo}/commits/{expected_sha}/statuses")
     assert isinstance(statuses, list)
-    if not clean_review_status(statuses, expected_sha):
+    if not clean_review_status(statuses):
         return
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write(f"eligible=true\nnumber={number}\nsha={expected_sha}\n")
