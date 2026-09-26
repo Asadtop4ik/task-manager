@@ -398,3 +398,12 @@ async def test_owner_failure_notice_edits_existing_card_with_escaped_reason(
         for button in row
     ] == ["Batafsil"]
     bot.send_message.assert_not_awaited()
+
+
+def test_agent_run_notices_poll_every_ten_seconds_not_once_a_minute() -> None:
+    job = next(
+        item
+        for item in worker.WorkerSettings.cron_jobs
+        if item.coroutine is worker.notify_agent_runs
+    )
+    assert job.second == set(range(0, 60, 10))

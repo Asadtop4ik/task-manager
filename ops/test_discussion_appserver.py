@@ -15,9 +15,10 @@ from discussion_appserver import (
 
 
 class FakeProcess:
-    def __init__(self, messages):
+    def __init__(self, messages, stderr_lines=()):
         self.stdin = io.StringIO()
         self.stdout = io.StringIO("".join(json.dumps(item) + "\n" for item in messages))
+        self.stderr = io.StringIO("".join(line + "\n" for line in stderr_lines))
         self.terminated = False
 
     def terminate(self):
@@ -94,9 +95,52 @@ class AppServerTests(unittest.TestCase):
         )
         self.assertEqual(sent[-1]["params"]["sandboxPolicy"]["type"], "readOnly")
         self.assertEqual(sent[-1]["params"]["effort"], "medium")
+        self.assertEqual(sent[-1]["params"]["model"], "gpt-6-luna")
         self.assertEqual(popen.call_args.args[0][0], CODEX_BINARY)
         self.assertIn("node24/bin", popen.call_args.kwargs["env"]["PATH"])
         self.assertTrue(process.terminated)
+
+    def test_new_thread_start_also_uses_the_configured_model(self):
+        process = FakeProcess(
+            [
+                {"id": 1, "result": {}},
+                {"id": 2, "result": {"thread": {"id": "thr_new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn_1"}}},
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "Javob tayyor.",
+                        }
+                    },
+                },
+                {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("discussion_appserver.subprocess.Popen", return_value=process),
+        ):
+            run_turn(snapshot=Path(directory), thread_id=None, prompt="Savol", images=[])
+        sent = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+        start = next(item for item in sent if item["method"] == "thread/start")
+        self.assertEqual(start["params"]["model"], "gpt-6-luna")
+
+    def test_stderr_tail_is_redacted_in_the_raised_error(self):
+        token = "ghp_" + "a" * 36
+        process = FakeProcess([], stderr_lines=[f"warning: token {token} rejected", "second line"])
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("discussion_appserver.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaises(DiscussionError) as ctx:
+                run_turn(snapshot=Path(directory), thread_id=None, prompt="Savol", images=[])
+        message = str(ctx.exception)
+        self.assertIn("codex stderr", message)
+        self.assertIn("second line", message)
+        self.assertNotIn(token, message)
 
     def test_approval_request_is_never_granted(self):
         process = FakeProcess(

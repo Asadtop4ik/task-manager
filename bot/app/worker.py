@@ -114,7 +114,7 @@ async def ping(ctx: dict[str, object]) -> str:
 
 
 async def notify_agent_runs(ctx: dict[str, object]) -> None:
-    """Send durable PR/failure notices; an unacknowledged notice retries next minute."""
+    """Send durable PR/failure notices; an unacknowledged notice retries within 10s."""
     headers = {"X-Agent-Worker-Token": settings.service_token}
     base = f"{settings.api_base_url.rstrip('/')}/api/v1/agent-runs"
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -381,7 +381,7 @@ class WorkerSettings:
         sync_deleted_task_cards,
     ]
     cron_jobs = [  # noqa: RUF012
-        cron(notify_agent_runs, minute=set(range(60))),
+        cron(notify_agent_runs, minute=set(range(60)), second=set(range(0, 60, 10))),
         cron(notify_agent_intakes, minute=set(range(60)), second=set(range(0, 60, 10))),
         cron(notify_project_discussions, minute=set(range(60)), second=set(range(0, 60, 10))),
         cron(sync_deleted_task_cards, minute=set(range(60))),

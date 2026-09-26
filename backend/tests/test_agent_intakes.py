@@ -775,6 +775,48 @@ async def test_expired_worker_lease_reports_failure_instead_of_stalling(
     assert len(notices) == 1 and notices[0]["status"] == "failed"
 
 
+async def test_lease_lasts_five_minutes_so_a_slow_analysis_still_reports(
+    client: AsyncClient, session: AsyncSession, project: Project, manager: User, monkeypatch
+) -> None:
+    await ready_project(session, project, monkeypatch)
+    created = await client.post(
+        "/api/v1/agent-intakes",
+        json={
+            "project_id": project.id,
+            "text": "Slow analysis",
+            "chat_id": manager.telegram_id,
+        },
+        headers=bot_headers(manager),
+    )
+    intake_id = created.json()["id"]
+    lease = (await client.post("/api/v1/agent-intakes/lease", headers=worker_headers())).json()
+    row = await session.get(AgentIntake, intake_id)
+    assert row is not None and row.lease_until is not None
+    granted = row.lease_until - datetime.now(UTC)
+    assert timedelta(minutes=4) < granted <= timedelta(minutes=5)
+
+    # Simulate 3 of the granted 5 minutes already elapsed (2 remaining) — past
+    # the old 2-minute lease, which would have expired and rejected this report.
+    row.lease_until = datetime.now(UTC) + timedelta(minutes=2)
+    await session.commit()
+
+    result = await client.post(
+        f"/api/v1/agent-intakes/{intake_id}/result",
+        json={
+            "revision": lease["revision"],
+            "lease_id": lease["lease_id"],
+            "status": "ready",
+            "brief": {
+                "title": "Slow analysis",
+                "goal": "Finish the review",
+                "acceptance": ["Done"],
+            },
+        },
+        headers=worker_headers(),
+    )
+    assert result.status_code == 200 and result.json()["status"] == "ready"
+
+
 async def test_other_users_cannot_read_or_confirm_an_intake(
     client: AsyncClient,
     session: AsyncSession,

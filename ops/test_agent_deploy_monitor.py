@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import agent_deploy_monitor
 from agent_deploy_monitor import (
     ExternalDeployMonitor,
     _ci_record,
@@ -12,6 +17,7 @@ from agent_deploy_monitor import (
 )
 
 RUN_ID = "00000000-0000-0000-0000-000000000017"
+RUN_ID_2 = "00000000-0000-0000-0000-000000000018"
 SHA = "a" * 40
 NEW_SHA = "b" * 40
 
@@ -583,6 +589,180 @@ class ExternalDeployMonitorTests(unittest.TestCase):
                 "muradjanov-dev/ketoshop", TARGETS["muradjanov-dev/ketoshop"], SHA
             )
         )
+
+    def test_check_ci_once_isolates_one_bad_record_from_the_next(self):
+        posts = []
+
+        def opener(request, timeout):
+            url = request.full_url
+            if "/ci-pending?" in url:
+                return FakeResponse(
+                    [
+                        ci_pending(row_id=1),
+                        ci_pending(row_id=2)
+                        | {
+                            "repo_full_name": "muradjanov-dev/ketoshop",
+                            "base_branch": "master",
+                            "pr_url": "https://github.com/muradjanov-dev/ketoshop/pull/9",
+                        },
+                    ]
+                )
+            if url.endswith("/pulls/8"):
+                raise RuntimeError("github rate limited this PR lookup")
+            if url.endswith("/pulls/9"):
+                return FakeResponse(
+                    {
+                        "head": {
+                            "sha": SHA,
+                            "ref": "master",
+                            "repo": {"full_name": "muradjanov-dev/ketoshop"},
+                        }
+                    }
+                )
+            if "/workflows/ci.yml/runs?" in url:
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 555,
+                                "head_sha": SHA,
+                                "head_branch": "master",
+                                "event": "pull_request",
+                                "path": ".github/workflows/ci.yml",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/actions/runs/555/jobs?per_page=100"):
+                return FakeResponse({"jobs": [{"name": "check", "conclusion": "success"}]})
+            if url.endswith("/ci-result"):
+                posts.append(json.loads(request.data))
+                return FakeResponse({"status": "pr_opened"})
+            raise AssertionError(url)
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback", github_token="github", opener=opener
+        )
+        self.assertEqual(monitor.check_ci_once(), 1)
+        self.assertEqual(monitor.record_errors, 1)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["sha"], SHA)
+
+    def test_run_once_isolates_one_bad_record_from_the_next(self):
+        posts = []
+        deploy_calls = 0
+
+        def opener(request, timeout):
+            nonlocal deploy_calls
+            url = request.full_url
+            if "/external-pending?" in url:
+                return FakeResponse(
+                    [
+                        pending("merged") | {"id": 1, "run_id": RUN_ID},
+                        pending("merged") | {"id": 2, "run_id": RUN_ID_2},
+                    ]
+                )
+            if "/workflows/deploy.yml/runs?" in url:
+                deploy_calls += 1
+                if deploy_calls == 1:
+                    raise RuntimeError("github is unavailable for this lookup")
+                return FakeResponse(
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 123,
+                                "head_sha": SHA,
+                                "head_branch": "master",
+                                "event": "push",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/actions/runs/123/jobs?per_page=100"):
+                return FakeResponse(
+                    {
+                        "jobs": [
+                            {"name": "ci / check", "conclusion": "success"},
+                            {"name": "deploy", "conclusion": "success"},
+                        ]
+                    }
+                )
+            if url.endswith(f"/{RUN_ID_2}/deployed"):
+                posts.append(json.loads(request.data))
+                return FakeResponse({"status": "deployed"})
+            raise AssertionError(url)
+
+        def docker(args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Config": {"Image": f"ghcr.io/muradjanov-dev/ketoshop:{SHA}"},
+                        "State": {"Running": True, "Health": {"Status": "healthy"}},
+                    }
+                ),
+            )
+
+        monitor = ExternalDeployMonitor(
+            callback_token="callback",
+            github_token="github",
+            opener=opener,
+            command_runner=docker,
+        )
+        self.assertEqual(monitor.run_once(), (0, 1))
+        self.assertEqual(monitor.record_errors, 1)
+        self.assertEqual(len(posts), 1)
+
+
+class MainTests(unittest.TestCase):
+    def test_main_prints_record_errors_and_exits_zero_when_the_pass_succeeds(self):
+        def fake_check_ci_once(self):
+            self.record_errors = 2
+            return 3
+
+        def fake_run_once(self):
+            return (1, 0)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"AGENT_CALLBACK_TOKEN": "callback", "GITHUB_AGENT_TOKEN": "github"},
+            ),
+            patch.object(ExternalDeployMonitor, "check_ci_once", fake_check_ci_once),
+            patch.object(ExternalDeployMonitor, "run_once", fake_run_once),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                agent_deploy_monitor.main()
+        self.assertIn("3 updated", output.getvalue())
+        self.assertIn("1 merged", output.getvalue())
+        self.assertIn("2 record errors", output.getvalue())
+
+    def test_main_exits_nonzero_and_redacts_when_the_pass_itself_fails(self):
+        token = "ghp_" + "b" * 30
+
+        def failing_check_ci_once(self):
+            raise ValueError(f"invalid pending CI list near token {token}")
+
+        with (
+            patch.dict(
+                os.environ,
+                {"AGENT_CALLBACK_TOKEN": "callback", "GITHUB_AGENT_TOKEN": "github"},
+            ),
+            patch.object(ExternalDeployMonitor, "check_ci_once", failing_check_ci_once),
+        ):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+                agent_deploy_monitor.main()
+        self.assertEqual(ctx.exception.code, 1)
+        printed = stderr.getvalue()
+        self.assertIn("ValueError", printed)
+        self.assertIn("invalid pending CI list", printed)
+        self.assertNotIn(token, printed)
 
 
 if __name__ == "__main__":

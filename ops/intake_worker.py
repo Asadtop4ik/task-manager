@@ -29,7 +29,10 @@ MAX_EXTRACTED_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_FILES = 20_000
 MAX_RESULT_BYTES = 64 * 1024
 HTTP_TIMEOUT_SECONDS = 30
-CODEX_TIMEOUT_SECONDS = 60
+CODEX_TIMEOUT_SECONDS = 180
+# The outer sudo call gets a small margin over the child's own timeout so the
+# child's timeout (and its clean 124 exit) wins the race, not the outer kill.
+CODEX_OUTER_TIMEOUT_SECONDS = CODEX_TIMEOUT_SECONDS + 20
 POLL_SECONDS = 3
 INTAKE_TEMP_DIR = "/run/task-manager-intake"
 WORKER_SCRIPT = "/opt/task-manager/ops/intake_worker.py"
@@ -67,6 +70,50 @@ ALLOWED_IMAGE_EXTENSIONS = {
     "image/jpeg": "jpg",
     "image/webp": "webp",
 }
+
+
+_SECRET_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"gh[pousr]_[A-Za-z0-9]{20,}",
+        r"github_pat_[A-Za-z0-9_]{20,}",
+        r"Bearer\s+\S+",
+        r"sk-[A-Za-z0-9_-]{16,}",
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+    )
+)
+_SECRET_ENV_VARS = ("INTAKE_WORKER_TOKEN", "GITHUB_AGENT_TOKEN")
+
+
+def _redact(text: str) -> str:
+    """Mask tokens/bearer headers/JWTs and our own env-var secrets before logging."""
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("***", redacted)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            redacted = redacted.replace(value, "***")
+    return redacted
+
+
+def _log_exception(context: str, exc: BaseException) -> None:
+    message = _redact(str(exc))[:300]
+    print(
+        f"intake worker: {context}: {type(exc).__name__}: {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _print_codex_stderr_tail(raw: bytes | str | None) -> None:
+    """Print a redacted tail of Codex's stderr so journald shows why it failed."""
+    if not raw:
+        return
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    text = _redact(text)
+    for line in text.splitlines()[-20:]:
+        print(f"intake worker: codex stderr: {line[:300]}", file=sys.stderr, flush=True)
 
 
 class IntakeError(ValueError):
@@ -310,9 +357,9 @@ def _run_codex_child(
         "--sandbox",
         "read-only",
         "--model",
-        "gpt-6-sol",
+        "gpt-6-luna",
         "-c",
-        "model_reasoning_effort=medium",
+        "model_reasoning_effort=high",
         "--ephemeral",
         "--ignore-user-config",
         "--json",
@@ -333,7 +380,8 @@ def _run_codex_child(
             env=env,
             cwd=snapshot,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # Let Codex's stderr flow to this child's own stderr (inherited),
+            # which the parent's sudo call captures via a pipe.
             timeout=CODEX_TIMEOUT_SECONDS,
             check=False,
         )
@@ -618,20 +666,26 @@ class IntakeWorker:
             WORKER_SCRIPT,
             "codex-child",
         ]
-        completed = self._command_runner(
-            command,
-            input=child_request,
-            text=True,
-            env={"PATH": CODEX_PATH},
-            cwd=session_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=CODEX_TIMEOUT_SECONDS,
-            check=False,
-        )
+        try:
+            completed = self._command_runner(
+                command,
+                input=child_request,
+                text=True,
+                env={"PATH": CODEX_PATH},
+                cwd=session_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=CODEX_OUTER_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _print_codex_stderr_tail(exc.stderr)
+            raise
         if completed.returncode == 124:
+            _print_codex_stderr_tail(completed.stderr)
             raise subprocess.TimeoutExpired(command, CODEX_TIMEOUT_SECONDS)
         if completed.returncode != 0:
+            _print_codex_stderr_tail(completed.stderr)
             raise IntakeError(f"Codex analysis process exited {completed.returncode}")
         raw = result_path.read_bytes()
         if len(raw) > MAX_RESULT_BYTES:
@@ -704,7 +758,8 @@ class IntakeWorker:
             result = {"status": "failed", "error": "Task analysis timed out."}
         except IntakeError as exc:
             result = {"status": "failed", "error": str(exc)}
-        except Exception:
+        except Exception as exc:
+            _log_exception("intake analysis failed", exc)
             result = {"status": "failed", "error": "Task analysis could not be completed."}
         self._post_result(identity, result)
         return result["status"]
@@ -828,19 +883,24 @@ class IntakeWorker:
                     "diagnostics_discussion_id": discussion_id if diagnostics_enabled else None,
                     "diagnostics_lease_id": lease_id if diagnostics_enabled else None,
                 }, ensure_ascii=False)
-                completed = self._command_runner(
-                    [SUDO_BIN, "-n", "-u", "codex-runner", "--", "/usr/bin/python3",
-                     WORKER_SCRIPT, "codex-child"],
-                    input=child_request,
-                    text=True,
-                    env={"PATH": CODEX_PATH},
-                    cwd=session_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=180,
-                    check=False,
-                )
+                try:
+                    completed = self._command_runner(
+                        [SUDO_BIN, "-n", "-u", "codex-runner", "--", "/usr/bin/python3",
+                         WORKER_SCRIPT, "codex-child"],
+                        input=child_request,
+                        text=True,
+                        env={"PATH": CODEX_PATH},
+                        cwd=session_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=180,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    _print_codex_stderr_tail(exc.stderr)
+                    raise
                 if completed.returncode != 0:
+                    _print_codex_stderr_tail(completed.stderr)
                     raise IntakeError("Codex suhbat javobini bera olmadi")
                 raw_result = result_path.read_bytes()
                 if len(raw_result) > MAX_RESULT_BYTES:
@@ -852,7 +912,8 @@ class IntakeWorker:
                     or not isinstance(result.get("response"), str)
                 ):
                     raise IntakeError("invalid Codex discussion result")
-        except Exception:
+        except Exception as exc:
+            _log_exception("discussion failed", exc)
             result = {"error": "Codex suhbat javobini bera olmadi. Xabarni qayta yuboring."}
         body = json.dumps({
             "revision": revision, "lease_id": lease_id, **result,
@@ -887,8 +948,8 @@ def run_forever(worker: IntakeWorker, *, poll_seconds: float = POLL_SECONDS) -> 
                 print(f"intake worker: {outcome}", flush=True)
         except KeyboardInterrupt:
             return
-        except Exception:
-            print("intake worker: poll failed", flush=True)
+        except Exception as exc:
+            _log_exception("poll failed", exc)
         time.sleep(poll_seconds)
 
 
