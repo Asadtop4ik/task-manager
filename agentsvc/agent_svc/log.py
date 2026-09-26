@@ -7,6 +7,7 @@ an HTTP response snippet embedded in an exception.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import sys
@@ -23,6 +24,10 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"Bearer\s+\S+"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){1,2}"),
+    # Catches any "Basic <token>" HTTP-auth header value, whether or not the
+    # underlying secret is one we loaded (e.g. MirrorManager's git
+    # `http.extraHeader`, or a header echoed back in an error body).
+    re.compile(r"(?i)basic\s+\S+"),
 )
 
 _MAX_ERROR_CHARS = 500
@@ -32,11 +37,19 @@ class Redactor:
     """Masks known secret values and secret-shaped substrings in text."""
 
     def __init__(self, secrets: Iterable[str]) -> None:
+        literals: set[str] = set()
+        for value in secrets:
+            if not value:
+                continue
+            literals.add(value)
+            # MirrorManager sends git's `http.extraHeader` as
+            # `base64(f"x-access-token:{token}")`; also cover a plain
+            # base64 of the bare token in case it is logged elsewhere.
+            literals.add(base64.b64encode(value.encode()).decode())
+            literals.add(base64.b64encode(f"x-access-token:{value}".encode()).decode())
         # Longest first, so a secret that is a substring of another is not
         # left partially unmasked.
-        self._literals: tuple[str, ...] = tuple(
-            sorted({value for value in secrets if value}, key=len, reverse=True)
-        )
+        self._literals: tuple[str, ...] = tuple(sorted(literals, key=len, reverse=True))
 
     def redact(self, text: str) -> str:
         if not text:
@@ -112,5 +125,10 @@ class Logger:
 
     def _write(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str, sort_keys=True)
+        # Field-level redaction (`redact_value`) does not reach values that
+        # `json.dumps(..., default=str)` stringifies at serialization time,
+        # nor dict keys. Scrubbing the fully serialized line is the one place
+        # that is guaranteed to catch every one of those.
+        line = self._redactor.redact(line)
         self._stream.write(line + "\n")
         self._stream.flush()

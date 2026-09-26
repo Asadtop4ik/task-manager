@@ -50,7 +50,7 @@ class LoadConfigTests(unittest.TestCase):
             self.assertEqual(config["runs_dir"], str(Path(config["state_dir"]) / "runs"))
             self.assertEqual(
                 config["codex_child_prefix"],
-                ("/usr/bin/sudo", "-n", "-u", "agent-codex", "--", "/usr/bin/python3"),
+                ("/usr/bin/sudo", "-n", "-u", "agent-codex", "--", "/usr/bin/python3", "-I"),
             )
             self.assertEqual(config["codex_home_code"], "/home/agent-codex/.codex-code")
             self.assertEqual(config["codex_home_chat"], "/home/agent-codex/.codex-chat")

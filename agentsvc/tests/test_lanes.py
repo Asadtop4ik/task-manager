@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import unittest
 from datetime import UTC, datetime
 from threading import Event
@@ -199,6 +200,49 @@ class CodeLaneTests(unittest.TestCase):
         lane.tick()
         lane.tick()
         self.assertEqual(processed, ["run-2"])
+
+    def test_leased_record_still_in_backoff_is_never_silently_skipped(self) -> None:
+        # A run whose handler recently failed is still leasable again (its
+        # earlier lease naturally expired); if we just called `isolate()`
+        # blindly, this would vanish with zero log output.
+        work = _work(run_id="run-1")
+        api = FakeApi(leases=[work])
+        stream = io.StringIO()
+        logger = Logger(Redactor([]), stream=stream)
+        calls: list[Work] = []
+        lane = CodeLane(
+            api=api,
+            handlers={"implement": lambda w: calls.append(w)},
+            logger=logger,
+            poll_s=0.0,
+            enabled=True,
+        )
+        # Seed backoff for this exact run_id, as a prior failed attempt would.
+        lane.isolate("run-1", lambda: (_ for _ in ()).throw(RuntimeError("prior failure")))
+        self.assertTrue(lane.in_backoff("run-1"))
+        stream.truncate(0)
+        stream.seek(0)
+
+        lane.tick()
+
+        self.assertEqual(calls, [])  # handler must not run while still backing off
+        events = [json.loads(line)["event"] for line in stream.getvalue().splitlines()]
+        self.assertIn("leased_record_in_backoff", events)
+
+    def test_leased_record_runs_normally_once_backoff_clears(self) -> None:
+        work = _work(run_id="run-1")
+        api = FakeApi(leases=[work])
+        calls: list[Work] = []
+        lane = CodeLane(
+            api=api,
+            handlers={"implement": lambda w: calls.append(w)},
+            logger=_logger(),
+            poll_s=0.0,
+            enabled=True,
+        )
+        self.assertFalse(lane.in_backoff("run-1"))
+        lane.tick()
+        self.assertEqual([w.run_id for w in calls], ["run-1"])
 
 
 class ChatLaneTests(unittest.TestCase):

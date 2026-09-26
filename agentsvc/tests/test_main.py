@@ -51,8 +51,10 @@ class FakeResponse:
 class FakeOpener:
     def __init__(self, results: list[object]) -> None:
         self._results = list(results)
+        self.requests: list[object] = []
 
     def __call__(self, request: object, timeout: float | None = None) -> object:
+        self.requests.append(request)
         result = self._results.pop(0)
         if isinstance(result, BaseException):
             raise result
@@ -67,11 +69,16 @@ class _FakeCommandResult:
 
 
 class _FakeCommandRunner:
-    def __init__(self, *, stdout: str) -> None:
-        self._stdout = stdout
+    """Always "allows" the probed sudo rule; records every argv it was given."""
 
-    def __call__(self, *args: object, **kwargs: object) -> _FakeCommandResult:
-        return _FakeCommandResult(returncode=0, stdout=self._stdout)
+    def __init__(self, *, returncode: int = 0, stdout: str = "") -> None:
+        self._returncode = returncode
+        self._stdout = stdout
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str], **kwargs: object) -> _FakeCommandResult:
+        self.calls.append(list(argv))
+        return _FakeCommandResult(returncode=self._returncode, stdout=self._stdout)
 
 
 def _write_secrets(directory: Path) -> None:
@@ -140,7 +147,13 @@ class ArgParserTests(unittest.TestCase):
 
 
 class SelfCheckTests(unittest.TestCase):
-    def _settings(self, tmp: Path, *, libexec_has_child: bool = False):
+    def _settings(
+        self,
+        tmp: Path,
+        *,
+        libexec_has_child: bool = False,
+        libexec_has_image_state: bool = False,
+    ):
         _write_secrets(tmp)
         config = load_config(tmp / "absent-config.json")
         config = {
@@ -160,6 +173,8 @@ class SelfCheckTests(unittest.TestCase):
         (tmp / "tools" / "some-tool").write_text("v1")
         if libexec_has_child:
             (tmp / "libexec" / "codex_child.py").write_text("# stub\n")
+        if libexec_has_image_state:
+            (tmp / "libexec" / "image_state.py").write_text("# stub\n")
         secrets = load_secrets(tmp)
         return build_settings(config, secrets)
 
@@ -167,30 +182,86 @@ class SelfCheckTests(unittest.TestCase):
         with TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
             settings = self._settings(tmp, libexec_has_child=False)
-            opener = FakeOpener([_http_error(422, {"detail": "invalid lane"})])
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
             stream = io.StringIO()
             code = self_check(settings, None, None, opener=opener, stream=stream)
             output = stream.getvalue()
             self.assertIn("FAIL codex_child missing", output)
             self.assertEqual(code, 1)
 
-    def test_reachable_api_and_catalog_and_tools_report_ok(self) -> None:
+    def test_all_checks_report_ok(self) -> None:
         with TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
-            settings = self._settings(tmp, libexec_has_child=True)
-            opener = FakeOpener([_http_error(422, {"detail": "invalid lane"})])
-            runner = _FakeCommandRunner(stdout="codex_child 0.1")
+            settings = self._settings(
+                tmp, libexec_has_child=True, libexec_has_image_state=True
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
             stream = io.StringIO()
             code = self_check(
                 settings, None, None, opener=opener, command_runner=runner, stream=stream
             )
             output = stream.getvalue()
-            self.assertIn("OK api reachable", output)
+            self.assertIn("OK ready reachable", output)
+            self.assertIn("OK api_auth", output)
             self.assertIn("OK catalog", output)
-            self.assertIn("OK codex_child", output)
+            self.assertIn("OK codex_child sudo rule allows this invocation", output)
+            self.assertIn("OK image_state sudo rule allows this invocation", output)
             self.assertIn("OK tools some-tool", output)
             self.assertIn("OK mirror:Asadtop4ik/task-manager", output)
             self.assertEqual(code, 0)
+
+    def test_never_calls_lease_and_ready_hits_the_bare_origin(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp, libexec_has_child=True, libexec_has_image_state=True
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            self_check(
+                settings,
+                None,
+                None,
+                opener=opener,
+                command_runner=runner,
+                stream=io.StringIO(),
+            )
+            urls = [request.full_url for request in opener.requests]
+            self.assertEqual(urls[0], "https://tasks.standart-eko.uz/ready")
+            for url in urls:
+                self.assertNotIn("/lease", url)
+            methods = {request.get_method() for request in opener.requests}
+            self.assertEqual(methods, {"GET"})
+
+    def test_sudo_probes_use_list_mode_never_execute_the_script(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp, libexec_has_child=True, libexec_has_image_state=True
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            self_check(
+                settings,
+                None,
+                None,
+                opener=opener,
+                command_runner=runner,
+                stream=io.StringIO(),
+            )
+            self.assertEqual(len(runner.calls), 2)
+            for call in runner.calls:
+                self.assertIn("-l", call)  # `sudo -n -l`: report the rule, never execute it
+                self.assertNotIn("--version", call)  # codex_child.py has no such subcommand
 
     def test_config_and_secret_errors_are_reported_without_crashing(self) -> None:
         stream = io.StringIO()
@@ -203,17 +274,39 @@ class SelfCheckTests(unittest.TestCase):
         self.assertIn("FAIL catalog settings unavailable", output)
         self.assertEqual(code, 1)
 
-    def test_unexpected_api_status_is_a_failure(self) -> None:
+    def test_api_auth_reports_failure_when_callback_token_is_rejected(self) -> None:
         with TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
-            settings = self._settings(tmp, libexec_has_child=True)
-            opener = FakeOpener([FakeResponse(b"", status=204)])  # lease "accepted" — bad
-            runner = _FakeCommandRunner(stdout="ok")
+            settings = self._settings(
+                tmp, libexec_has_child=True, libexec_has_image_state=True
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), _http_error(401, {"detail": "bad token"})]
+            )
+            runner = _FakeCommandRunner(returncode=0)
             stream = io.StringIO()
             code = self_check(
                 settings, None, None, opener=opener, command_runner=runner, stream=stream
             )
-            self.assertIn("FAIL api lease accepted an unknown lane", stream.getvalue())
+            self.assertIn("FAIL api_auth", stream.getvalue())
+            self.assertEqual(code, 1)
+
+    def test_sudo_rule_denied_is_reported_as_failure(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp, libexec_has_child=True, libexec_has_image_state=True
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=1, stdout="")
+            stream = io.StringIO()
+            code = self_check(
+                settings, None, None, opener=opener, command_runner=runner, stream=stream
+            )
+            self.assertIn("FAIL codex_child", stream.getvalue())
+            self.assertIn("FAIL image_state", stream.getvalue())
             self.assertEqual(code, 1)
 
 

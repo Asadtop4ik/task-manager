@@ -229,7 +229,9 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
     if merged["codex_child_prefix"] is None:
         # REVISION 2: sudo to the dedicated `agent-codex` user, not the
-        # `codex-runner` GitHub Actions runner account.
+        # `codex-runner` GitHub Actions runner account. `-I` (isolated mode:
+        # ignores PYTHONPATH/user site-packages/etc.) is pinned by the
+        # sudoers rule itself, so it must always be present here too.
         merged["codex_child_prefix"] = [
             "/usr/bin/sudo",
             "-n",
@@ -237,6 +239,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
             "agent-codex",
             "--",
             "/usr/bin/python3",
+            "-I",
         ]
     else:
         prefix = merged["codex_child_prefix"]

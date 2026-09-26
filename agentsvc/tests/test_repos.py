@@ -8,7 +8,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from agent_svc.log import Redactor
 from agent_svc.repos import Catalog, MirrorManager, load_catalog, make_run_dir
+
+APPROVED = {"owner/repo": "main"}
 
 _FAKE_AGENT_REPOS = """
 from dataclasses import dataclass
@@ -112,6 +115,7 @@ class MirrorManagerRealGitTests(unittest.TestCase):
             manager = MirrorManager(
                 mirrors_dir,
                 lambda repo: "dummy-token",
+                approved_branches=APPROVED,
                 remote_url_for=lambda repo: str(source),
             )
             sha = manager.fetch("owner/repo", "main")
@@ -135,7 +139,10 @@ class MirrorManagerRealGitTests(unittest.TestCase):
             _init_source_repo(source)
             mirrors_dir = Path(tmp) / "mirrors"
             manager = MirrorManager(
-                mirrors_dir, lambda repo: "tok", remote_url_for=lambda repo: str(source)
+                mirrors_dir,
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                remote_url_for=lambda repo: str(source),
             )
             first = manager.ensure("owner/repo")
             second = manager.ensure("owner/repo")
@@ -143,9 +150,54 @@ class MirrorManagerRealGitTests(unittest.TestCase):
 
     def test_invalid_repo_name_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
-            manager = MirrorManager(Path(tmp), lambda repo: "tok")
+            manager = MirrorManager(Path(tmp), lambda repo: "tok", approved_branches=APPROVED)
             with self.assertRaises(ValueError):
                 manager.mirror_path("no-slash-here")
+
+    def test_fetch_refuses_an_unapproved_branch_without_running_git(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runner_calls: list[list[str]] = []
+
+            def spy_runner(args: list[str], **kwargs: Any) -> _FakeResult:
+                runner_calls.append(list(args))
+                return _FakeResult()
+
+            manager = MirrorManager(
+                Path(tmp) / "mirrors",
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                command_runner=spy_runner,
+            )
+            with self.assertRaises(ValueError):
+                manager.fetch("owner/repo", "some-random-branch")
+            self.assertEqual(runner_calls, [])
+
+    def test_fetch_refuses_an_unapproved_repository(self) -> None:
+        with TemporaryDirectory() as tmp:
+            manager = MirrorManager(
+                Path(tmp) / "mirrors", lambda repo: "tok", approved_branches=APPROVED
+            )
+            with self.assertRaises(ValueError):
+                manager.fetch("someone-else/unapproved", "main")
+
+    def test_fetch_accepts_an_agent_branch_matching_the_pattern(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            _init_source_repo(source)
+            agent_branch = "codex/task-42-11111111-1111-1111-1111-111111111111"
+            subprocess.run(
+                ["git", "-C", str(source), "checkout", "-b", agent_branch], check=True
+            )
+            mirrors_dir = Path(tmp) / "mirrors"
+            manager = MirrorManager(
+                mirrors_dir,
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                remote_url_for=lambda repo: str(source),
+            )
+            sha = manager.fetch("owner/repo", agent_branch)
+            self.assertTrue(sha)
 
 
 class _FakeResult:
@@ -162,7 +214,12 @@ class _FakeGitRunner:
 
     def __call__(self, args: list[str], **kwargs: Any) -> _FakeResult:
         self.calls.append(
-            {"args": list(args), "env": kwargs.get("env"), "cwd": kwargs.get("cwd")}
+            {
+                "args": list(args),
+                "env": kwargs.get("env"),
+                "cwd": kwargs.get("cwd"),
+                "capture_output": kwargs.get("capture_output"),
+            }
         )
         subcommand = args[1] if len(args) > 1 else ""
         result = self._responses.get(subcommand, _FakeResult())
@@ -181,6 +238,7 @@ class MirrorManagerEnvIsolationTests(unittest.TestCase):
             manager = MirrorManager(
                 Path(tmp) / "mirrors",
                 lambda repo: "the-secret-token",
+                approved_branches=APPROVED,
                 remote_url_for=lambda repo: "https://github.com/owner/repo.git",
                 command_runner=runner,
             )
@@ -208,11 +266,49 @@ class MirrorManagerEnvIsolationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             runner = _FakeGitRunner({"init": _FakeResult(returncode=1, stderr="boom")})
             manager = MirrorManager(
-                Path(tmp) / "mirrors", lambda repo: "tok", command_runner=runner
+                Path(tmp) / "mirrors",
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                command_runner=runner,
             )
             with self.assertRaises(RuntimeError) as ctx:
                 manager.ensure("owner/repo")
             self.assertIn("boom", str(ctx.exception))
+
+    def test_git_failure_stderr_is_redacted_and_captured(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runner = _FakeGitRunner(
+                {"init": _FakeResult(returncode=1, stderr="token super-secret-value leaked")}
+            )
+            manager = MirrorManager(
+                Path(tmp) / "mirrors",
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                command_runner=runner,
+                redactor=Redactor(["super-secret-value"]),
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                manager.ensure("owner/repo")
+            self.assertNotIn("super-secret-value", str(ctx.exception))
+            self.assertIn("[REDACTED]", str(ctx.exception))
+
+    def test_git_stderr_is_captured_not_inherited(self) -> None:
+        # Regression guard: `_git` must always pass `capture_output=True`, or
+        # git's stderr would go straight to our own stderr (journald)
+        # unredacted, and a failure's error message would be empty.
+        with TemporaryDirectory() as tmp:
+            runner = _FakeGitRunner({"init": _FakeResult(returncode=1, stderr="boom")})
+            manager = MirrorManager(
+                Path(tmp) / "mirrors",
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                command_runner=runner,
+            )
+            with self.assertRaises(RuntimeError):
+                manager.ensure("owner/repo")
+            self.assertTrue(runner.calls)
+            for call in runner.calls:
+                self.assertIs(call["capture_output"], True)
 
 
 RUN_ID = "11111111-1111-1111-1111-111111111111"
@@ -223,7 +319,7 @@ class MakeRunDirTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run_dir = make_run_dir(tmp, RUN_ID)
             self.assertEqual(run_dir, Path(tmp) / RUN_ID)
-            self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o3770)
             images_dir = run_dir / "images"
             self.assertTrue(images_dir.is_dir())
             self.assertEqual(stat.S_IMODE(images_dir.stat().st_mode), 0o2750)
@@ -234,7 +330,7 @@ class MakeRunDirTests(unittest.TestCase):
             first.chmod(0o700)  # simulate some other mode; must be reset
             second = make_run_dir(tmp, RUN_ID)
             self.assertEqual(first, second)
-            self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o3770)
 
     def test_creates_missing_work_root(self) -> None:
         with TemporaryDirectory() as tmp:

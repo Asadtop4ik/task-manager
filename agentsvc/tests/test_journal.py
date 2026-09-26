@@ -5,6 +5,7 @@ import stat
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from agent_svc.journal import Journal, JournalEntry
 
@@ -85,6 +86,42 @@ class JournalRoundTripTests(unittest.TestCase):
             journal = Journal(tmp)
             with self.assertRaises(ValueError):
                 journal.write(_entry(run_id="not-a-run-id"))
+
+    def test_list_ignores_a_stray_leftover_temp_file(self) -> None:
+        # `Path.glob` (unlike the stdlib `glob` module) matches dotfiles, so a
+        # `.tmp-*.json` left behind by a crash mid-write must not reach
+        # `read()`, which would raise on its non-run-id stem and crash
+        # startup recovery for every other entry.
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry())
+            stray = Path(tmp) / ".tmp-abandoned.json"
+            stray.write_text('{"not": "a real entry"}')
+            entries = journal.list()  # must not raise
+            self.assertEqual([entry.run_id for entry in entries], [RUN_ID])
+            self.assertTrue(stray.exists())  # left alone, not quarantined
+
+    def test_write_failure_cleans_up_the_temp_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            with (
+                patch("agent_svc.journal.os.fchmod", side_effect=OSError("disk full")),
+                self.assertRaises(OSError),
+            ):
+                journal.write(_entry())
+            leftover = list(Path(tmp).glob(".tmp-*"))
+            self.assertEqual(leftover, [], msg="a failed write must not leak a temp file")
+
+    def test_replace_failure_also_cleans_up_the_temp_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            with (
+                patch("agent_svc.journal.os.replace", side_effect=OSError("boom")),
+                self.assertRaises(OSError),
+            ):
+                journal.write(_entry())
+            leftover = list(Path(tmp).glob(".tmp-*"))
+            self.assertEqual(leftover, [])
 
 
 class JournalCorruptionTests(unittest.TestCase):
