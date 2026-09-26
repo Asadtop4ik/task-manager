@@ -151,20 +151,22 @@ def prepare() -> None:
             or active_run.get("status") not in {"pr_opened", "pr_ready"}
         ):
             raise ValueError("agent run is not active for this exact pull request head")
-        if active_run.get("executor") == "local":
-            # The local executor service reviews the runs it owns itself;
-            # this GitHub-hosted review would double it. Exit cleanly with
-            # nothing published. A workflow update (outside this script) can
-            # gate "Review the exact PR diff with Codex" and "Publish
-            # exact-head review result" on this "skip" output the same way
-            # agent-task.yml gates on `steps.start.outputs.cancelled`.
-            with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-                output.write(f"skip=true\npull_number={number}\nrun_id={run_id}\n")
-            return
     if expected_branch and branch != expected_branch:
         raise ValueError("pull request branch changed before review")
     if branch.startswith("codex/task-") and not run_id:
         raise ValueError("agent branch does not contain a valid run id")
+    if run_id and active_run.get("executor") == "local":
+        # The local executor service reviews the runs it owns itself; this
+        # GitHub-hosted review would double it. Exit cleanly with nothing
+        # published. Checked last -- after every other validation above has
+        # already passed -- so a run can only be skipped once it is fully
+        # confirmed to be this exact, currently active, correctly-branched
+        # pull request. agent-pr-review.yml gates the remaining steps on
+        # this "skip" output the same way agent-task.yml gates on
+        # `steps.start.outputs.cancelled`.
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+            output.write(f"skip=true\npull_number={number}\nrun_id={run_id}\n")
+        return
     diff = _github(
         f"repos/{repo}/pulls/{number}",
         token=token,

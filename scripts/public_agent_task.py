@@ -11,7 +11,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import UUID
 
@@ -50,13 +50,30 @@ BLOCKED_EXACT = {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}
 BLOCKED_PREFIXES = (".github/", ".codex/", ".agents/")
 
 
-def task() -> dict[str, object]:
-    raw = json.loads(os.environ["TASK_JSON"])
+def parse_public_task(
+    raw: Mapping[str, object],
+    *,
+    qa_enabled: bool | None = None,
+    qa_repository: str | None = None,
+) -> dict[str, object]:
+    """Validate and normalize a raw public-pilot task payload.
+
+    ``task()`` calls this with the parsed TASK_JSON environment payload,
+    ``qa_enabled=None`` so repo approval reads AGENT_QA_ENABLED/
+    AGENT_QA_REPOSITORY from the environment, exactly as before. A local
+    executor holding its own already-decoded task payload can call this
+    directly, passing ``qa_enabled``/``qa_repository`` the same way it would
+    to ``approved_repositories``. Every ``task=`` entry point in this module
+    (``check_diff``, ``build_prompt``) re-runs this on whatever ``task`` it
+    is given -- re-running it on an already-validated dict is a no-op -- so
+    none of them can be made to skip repository/branch approval or the
+    PR-only mode requirement by handing in a raw/unvalidated mapping.
+    """
     if not isinstance(raw, dict):
         raise TypeError("agent payload must be an object")
     repository = raw.get("repo_full_name")
     branch = raw.get("base_branch")
-    approved_repos = approved_repositories()
+    approved_repos = approved_repositories(qa_enabled, qa_repository=qa_repository)
     if (
         not isinstance(repository, str)
         or repository not in approved_repos
@@ -86,7 +103,15 @@ def task() -> dict[str, object]:
         "run_id": run_id,
         "title": title.strip(),
         "description": description.strip(),
+        # Carried through (unused downstream) so re-running this on an
+        # already-normalized dict -- as build_prompt/check_diff do -- is a
+        # no-op instead of failing on a field this function itself consumed.
+        "task_revision": revision,
     }
+
+
+def task() -> dict[str, object]:
+    return parse_public_task(json.loads(os.environ["TASK_JSON"]))
 
 
 def _write_env(name: str, value: object) -> None:
@@ -94,8 +119,18 @@ def _write_env(name: str, value: object) -> None:
         output.write(f"{name}={value}\n")
 
 
-def build_prompt(task: Mapping[str, object]) -> str:
-    """The exact Codex prompt text ``prepare`` writes to agent-prompt.txt."""
+def build_prompt(
+    task: Mapping[str, object],
+    *,
+    qa_enabled: bool | None = None,
+    qa_repository: str | None = None,
+) -> str:
+    """The exact Codex prompt text ``prepare`` writes to agent-prompt.txt.
+
+    Re-validates ``task`` via ``parse_public_task`` first -- see
+    ``parse_public_task``.
+    """
+    task = parse_public_task(task, qa_enabled=qa_enabled, qa_repository=qa_repository)
     repo = str(task["repo_full_name"])
     return (
         f"Work on the {repo} repository. Follow its AGENTS.md and existing project rules.\n"
@@ -163,14 +198,18 @@ def check_diff(
     cwd: str | Path | None = None,
     *,
     task: Mapping[str, object] | None = None,
-    image_digests: Iterable[str] = (),
+    image_dir: str | Path | None = None,
+    qa_enabled: bool | None = None,
+    qa_repository: str | None = None,
 ) -> bool:
     """Reject protected public-repo paths, then defer to ``agent_task.check_diff``.
 
     Legacy (GitHub Actions) call: ``check_diff(cwd)`` reads TASK_JSON/RUNNER_TEMP
-    exactly as before. Local-executor call: pass the validated ``task`` mapping
-    (and ``image_digests`` when relevant) to avoid any environment access; see
-    ``agent_task.check_diff`` for what these do.
+    exactly as before. Local-executor call: pass the ``task`` mapping
+    (re-validated here via ``parse_public_task``, so repo/branch approval and
+    PR-only mode cannot be bypassed by an unvalidated mapping) and, when the
+    task has reference images, ``image_dir``; see ``agent_task.check_diff``
+    for what these do.
     """
     paths = _changed_paths(cwd)
     root = Path(cwd or os.getcwd())
@@ -186,7 +225,8 @@ def check_diff(
             raise ValueError(f"public agent cannot publish protected path: {relative}")
     if task is None:
         return check_base_diff(cwd=cwd)
-    return check_base_diff(cwd=cwd, task=task, image_digests=image_digests)
+    validated = parse_public_task(task, qa_enabled=qa_enabled, qa_repository=qa_repository)
+    return check_base_diff(cwd=cwd, task=validated, image_dir=image_dir)
 
 
 if __name__ == "__main__":

@@ -117,6 +117,42 @@ class PrepareLocalExecutorSkipTests(unittest.TestCase):
         self.assertNotIn("skip=true", output)
         self.assertTrue(prompt_written)
 
+    def test_executor_local_still_fails_closed_on_a_branch_mismatch(self) -> None:
+        # The skip is checked last -- after the branch-identity checks -- so
+        # a stale/mismatched run can never be silently "skipped" instead of
+        # rejected just because its status happens to say executor=local.
+        run_id = "00000000-0000-0000-0000-000000000009"
+        sha = "a" * 40
+        actual_branch = f"codex/task-9-{run_id}"
+        pr = _pr(actual_branch, sha)
+        active_run = {
+            "repo_full_name": "Asadtop4ik/task-manager",
+            "base_branch": "main",
+            "head_sha": sha,
+            "pr_url": pr["html_url"],
+            "status": "pr_opened",
+            "executor": "local",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            event_path = Path(temp) / "event.json"
+            # The dispatch event claims a different branch than the PR's
+            # actual head ref.
+            event = _event(run_id, sha, "codex/task-9-mismatched")
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            environment = {
+                "GH_TOKEN": "token",
+                "GITHUB_EVENT_PATH": str(event_path),
+                "GITHUB_OUTPUT": str(Path(temp) / "github-output"),
+                "RUNNER_TEMP": temp,
+            }
+            with patch.dict(os.environ, environment, clear=True), patch(
+                "agent_pr_review._github", return_value=pr
+            ) as github, patch("agent_pr_review._task_api", return_value=active_run):
+                with self.assertRaisesRegex(ValueError, "branch changed"):
+                    prepare()
+            self.assertEqual(github.call_count, 1)  # never reached the diff fetch
+            self.assertFalse((Path(temp) / "github-output").exists())
+
 
 class BuildReviewPromptTests(unittest.TestCase):
     def test_matches_the_prompt_prepare_writes_to_disk(self) -> None:

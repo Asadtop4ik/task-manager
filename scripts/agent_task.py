@@ -14,14 +14,25 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from difflib import SequenceMatcher
 from pathlib import Path
 from uuid import UUID
 
 
-def _task() -> dict[str, object]:
-    raw = json.loads(os.environ["TASK_JSON"])
+def parse_task(raw: Mapping[str, object]) -> dict[str, object]:
+    """Validate and normalize a raw dispatched-task payload.
+
+    ``_task()`` calls this with the parsed TASK_JSON environment payload,
+    exactly as before. A local executor holding its own already-decoded task
+    payload can call this directly instead of round-tripping through
+    TASK_JSON. Every ``task=`` entry point in this module (``check_diff``,
+    ``branch_name``, ``build_prompt``) re-runs this on whatever ``task`` it
+    is given -- re-running it on an already-validated dict is a no-op -- so
+    none of them can be made to skip these checks, silently misread a field
+    (e.g. an uppercase "FAST" mode), or build a git ref/prompt from an
+    unvalidated task ID or run ID.
+    """
     if not isinstance(raw, dict):
         raise TypeError("task payload must be an object")
     task_id = raw.get("task_id")
@@ -52,19 +63,31 @@ def _task() -> dict[str, object]:
     }
 
 
+def _task() -> dict[str, object]:
+    return parse_task(json.loads(os.environ["TASK_JSON"]))
+
+
 def _write_env(name: str, value: str) -> None:
     with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as handle:
         handle.write(f"{name}={value}\n")
 
 
 def branch_name(task: Mapping[str, object]) -> str:
-    """The publisher branch for a task: codex/task-{id}-{run_id} or codex/fast/...."""
-    prefix = "codex/fast" if task["mode"] == "fast" else "codex"
-    return f"{prefix}/task-{task['task_id']}-{task['run_id']}"
+    """The publisher branch for a task: codex/task-{id}-{run_id} or codex/fast/....
+
+    Re-validates ``task`` via ``parse_task`` first -- see ``parse_task``.
+    """
+    validated = parse_task(task)
+    prefix = "codex/fast" if validated["mode"] == "fast" else "codex"
+    return f"{prefix}/task-{validated['task_id']}-{validated['run_id']}"
 
 
 def build_prompt(task: Mapping[str, object]) -> str:
-    """The exact Codex prompt text ``prepare`` writes to agent-prompt.txt."""
+    """The exact Codex prompt text ``prepare`` writes to agent-prompt.txt.
+
+    Re-validates ``task`` via ``parse_task`` first -- see ``parse_task``.
+    """
+    validated = parse_task(task)
     return (
         "Work on the Task Manager repository. Follow AGENTS.md.\n"
         "Implement only the requested behavior. On this 1 CPU runner, do not install "
@@ -75,8 +98,8 @@ def build_prompt(task: Mapping[str, object]) -> str:
         "Sensitive paths require human review and will become a PR instead of direct deployment.\n"
         "If the task needs a business decision, explain exactly what is missing.\n"
         "Do not push, open a PR, deploy, or read credentials. A later workflow step handles GitHub.\n"
-        f"Task #{task['task_id']}: {task['title']}\n"
-        f"Description:\n{task['description']}\n"
+        f"Task #{validated['task_id']}: {validated['title']}\n"
+        f"Description:\n{validated['description']}\n"
     )
 
 
@@ -314,7 +337,7 @@ def check_diff(
     *,
     cwd: str | Path | None = None,
     task: Mapping[str, object] | None = None,
-    image_digests: Iterable[str] = (),
+    image_dir: str | Path | None = None,
     on_fallback: Callable[[str], None] | None = None,
 ) -> bool:
     """Validate the working tree diff and report whether fast mode needs a PR.
@@ -326,14 +349,20 @@ def check_diff(
     result the same way the ``check-diff`` CLI subcommand always has: it
     writes ``FAST_FALLBACK=true|false`` to ``GITHUB_ENV`` and appends the
     Codex result summary (``RUNNER_TEMP/agent-result.txt``) to the PR body
-    (``RUNNER_TEMP/agent-pr-body.md``) once.
+    (``RUNNER_TEMP/agent-pr-body.md``) once. ``image_dir``/``on_fallback``
+    are legacy-mode's own env-derived equivalents (RUNNER_TEMP/agent-images,
+    and the GITHUB_ENV write below) and passing either without ``task``
+    raises ``TypeError``.
 
-    Local-executor call: pass the already-validated ``task`` mapping and,
-    when relevant, ``image_digests`` (sha256 hexdigests of the task's
-    reference images) directly. Neither GITHUB_ENV, RUNNER_TEMP, nor
-    TASK_JSON is read or written in this mode. When the run needs a fast-mode
-    fallback to a PR, ``on_fallback`` (if given) is called with a short
-    human-readable reason instead of writing GITHUB_ENV.
+    Local-executor call: pass the ``task`` mapping (re-validated here via
+    ``parse_task``, so an unvalidated/raw mapping still fails closed) and,
+    when the task has reference images, ``image_dir`` -- the directory
+    holding them, scanned and hashed exactly like the legacy
+    RUNNER_TEMP/agent-images directory is, so there is no separate
+    digest-format input to get wrong or bypass. Neither GITHUB_ENV,
+    RUNNER_TEMP, nor TASK_JSON is read or written in this mode. When the run
+    needs a fast-mode fallback to a PR, ``on_fallback`` (if given) is called
+    with a short human-readable reason instead of writing GITHUB_ENV.
 
     Returns True when a "fast" mode task must fall back to opening a PR
     instead of publishing directly (always False for "pr" mode tasks).
@@ -341,6 +370,8 @@ def check_diff(
     images, or no file changes at all).
     """
     legacy = task is None
+    if legacy and (image_dir is not None or on_fallback is not None):
+        raise TypeError("image_dir/on_fallback require an explicit task")
     tracked = (
         subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z"], cwd=cwd)
         .decode()
@@ -375,23 +406,25 @@ def check_diff(
         )
     # Reference screenshots live outside the checkout and must not be copied
     # into a commit or PR patch. Compare bytes rather than filenames because
-    # an agent could rename the source image before adding it.
-    if legacy:
-        image_dir = Path(os.environ["RUNNER_TEMP"]) / "agent-images"
-        digests = (
-            {_digest(path) for path in image_dir.iterdir() if path.is_file()}
-            if image_dir.is_dir()
-            else set()
-        )
-    else:
-        digests = set(image_digests)
+    # an agent could rename the source image before adding it. Both modes
+    # scan a real directory of image files and hash them the same way, so
+    # there is no separate digest-format input (case, encoding, container
+    # type) that could be malformed, mismatched, or silently disable the
+    # check.
+    scan_dir = Path(os.environ["RUNNER_TEMP"]) / "agent-images" if legacy else image_dir
+    scan_dir = Path(scan_dir) if scan_dir is not None else None
+    digests = (
+        {_digest(path) for path in scan_dir.iterdir() if path.is_file()}
+        if scan_dir is not None and scan_dir.is_dir()
+        else set()
+    )
     if digests:
         root = Path(cwd or os.getcwd())
         for relative in paths:
             candidate = root / relative
             if candidate.is_file() and not candidate.is_symlink() and _digest(candidate) in digests:
                 raise ValueError("task reference images cannot be committed")
-    resolved_task = _task() if legacy else task
+    resolved_task = _task() if legacy else parse_task(task)
     untracked_changed = [path for path in untracked if path]
     fallback = False
     reason: str | None = None
@@ -477,34 +510,41 @@ def failure_reason(
     *,
     failure_phase: str | None,
     codex_step_outcome: str | None,
-    result_text: str | None,
-    policy_error_text: str | None,
-    fast_error_text: str | None,
+    load_result_text: Callable[[], str | None],
+    load_policy_error_text: Callable[[], str | None],
+    load_fast_error_text: Callable[[], str | None],
 ) -> str:
     """Build the callback error text, without touching RUNNER_TEMP or the environment.
 
-    ``callback`` reads ``agent-result.txt``, ``agent-failure.txt``, and
-    ``fast-error.txt`` from RUNNER_TEMP (``None`` when a file does not exist)
-    plus FAILURE_PHASE/CODEX_STEP_OUTCOME, and calls this with those values.
-    A local executor holding the same values already (from its own state)
-    can call this directly.
+    Each ``load_*`` argument is a zero-argument callable returning that
+    source's text, or ``None`` when it does not exist -- called lazily, in
+    the same order and only under the same conditions legacy inline code
+    read these files, so a source legacy would never have touched (e.g. a
+    non-UTF-8 ``agent-result.txt`` when ``fast-error.txt`` alone already
+    explains the failure) still cannot raise and abort the callback before
+    the failure status is ever sent. ``callback`` passes closures reading
+    ``agent-result.txt``, ``agent-failure.txt``, and ``fast-error.txt`` from
+    RUNNER_TEMP plus FAILURE_PHASE/CODEX_STEP_OUTCOME; a local executor
+    holding the same values already (from its own state) can pass
+    ``lambda: value`` closures directly.
     """
-    reason = (fast_error_text or "").strip()
-    if not reason and policy_error_text is not None:
-        reason = policy_error_text.strip()
-    if reason.endswith("agent produced no file changes") and result_text is not None:
-        # The validator is authoritative; the model's last message is only
-        # context for why it chose not to edit. Keep both, distinctly.
-        explanation = " ".join(result_text.split())
-        if explanation:
-            reason += "\nCodex izohi (tasdiqlanmagan): " + explanation[:650]
-    if (
-        not reason
-        and failure_phase == "implement"
-        and codex_step_outcome == "failure"
-        and result_text is not None
-    ):
-        reason = result_text.strip()
+    reason = (load_fast_error_text() or "").strip()
+    if not reason:
+        policy_error_text = load_policy_error_text()
+        if policy_error_text is not None:
+            reason = policy_error_text.strip()
+    if reason.endswith("agent produced no file changes"):
+        result_text = load_result_text()
+        if result_text is not None:
+            # The validator is authoritative; the model's last message is only
+            # context for why it chose not to edit. Keep both, distinctly.
+            explanation = " ".join(result_text.split())
+            if explanation:
+                reason += "\nCodex izohi (tasdiqlanmagan): " + explanation[:650]
+    if not reason and failure_phase == "implement" and codex_step_outcome == "failure":
+        result_text = load_result_text()
+        if result_text is not None:
+            reason = result_text.strip()
     return reason[:900] or (
         "Publisher failed before PR/deploy; inspect the GitHub run."
         if failure_phase == "publish"
@@ -533,15 +573,18 @@ def callback() -> None:
         failure_phase = os.environ.get("FAILURE_PHASE")
         if failure_phase in {"implement", "publish"}:
             payload["failure_phase"] = failure_phase
-        result_file = Path(os.environ["RUNNER_TEMP"]) / "agent-result.txt"
-        policy_error = Path(os.environ["RUNNER_TEMP"]) / "agent-failure.txt"
-        fast_error = Path(os.environ["RUNNER_TEMP"]) / "fast-error.txt"
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+
+        def _load(name: str) -> str | None:
+            path = runner_temp / name
+            return path.read_text(encoding="utf-8") if path.exists() else None
+
         payload["error"] = failure_reason(
             failure_phase=failure_phase,
             codex_step_outcome=os.environ.get("CODEX_STEP_OUTCOME"),
-            result_text=result_file.read_text(encoding="utf-8") if result_file.exists() else None,
-            policy_error_text=policy_error.read_text(encoding="utf-8") if policy_error.exists() else None,
-            fast_error_text=fast_error.read_text(encoding="utf-8") if fast_error.exists() else None,
+            load_result_text=lambda: _load("agent-result.txt"),
+            load_policy_error_text=lambda: _load("agent-failure.txt"),
+            load_fast_error_text=lambda: _load("fast-error.txt"),
         )
     payload.update(usage())
     _send_status(payload)

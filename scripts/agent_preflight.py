@@ -33,33 +33,78 @@ def _tool_version_matches(executable: str, name: str, version: str) -> bool:
     )
 
 
-def ensure_tools(*requirements: str, tools: Mapping[str, str] | None = None) -> None:
+def _resolve_tool(name: str, executable: str) -> str:
+    """Resolve a local-executor ``tools`` entry to a real, executable file.
+
+    Only ever accepts an absolute path: ``run`` invokes the lint commands
+    with ``cwd=root`` -- the untrusted agent checkout -- so a relative path
+    (or a bare tool name, looked up on PATH) could resolve to a completely
+    different file depending on that cwd, including one an agent planted in
+    its own checkout. ``resolve(strict=True)`` also collapses symlinks and
+    fails closed (``RuntimeError``, not a raw ``FileNotFoundError``) when the
+    path does not exist, and the file must be a regular, executable file.
+    The version check and every later invocation of this tool must use this
+    same resolved path, never the raw ``tools`` entry.
+    """
+    if not os.path.isabs(executable):
+        raise RuntimeError(
+            f"{name} executable must be an absolute path, got {executable!r}"
+        )
+    try:
+        resolved = Path(executable).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"{name} executable does not exist: {executable!r}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise RuntimeError(
+            f"{name} executable is not an executable regular file: {executable!r}"
+        )
+    return str(resolved)
+
+
+def ensure_tools(
+    *requirements: str, tools: Mapping[str, str] | None = None
+) -> dict[str, str] | None:
     """Make ``requirements`` (e.g. ``"ruff==0.7.4"``) available for ``run``.
 
     Legacy (GitHub Actions) call: ``ensure_tools(*requirements)`` keeps
     today's behavior exactly -- check PATH, pip-install the pinned versions
     when missing or mismatched, and fail if that still does not match.
+    Returns ``None``.
 
     Local-executor call: pass ``tools`` (e.g. ``{"ruff": "/opt/agent-svc/
-    tools/ruff-0.7.4/bin/ruff"}``) to use those exact executables. pip is
-    never invoked in this mode; a missing executable or a version mismatch
-    raises a clear ``RuntimeError`` instead.
+    tools/ruff-0.7.4/bin/ruff"}``) to use those exact executables. Each entry
+    is resolved via ``_resolve_tool`` -- absolute, existing, executable --
+    before its version is checked; pip is never invoked in this mode, and a
+    missing/relative/mismatched executable raises ``RuntimeError``. Returns
+    a ``{name: resolved_absolute_path}`` mapping that the caller (``run``)
+    must use for every subsequent invocation of that tool.
     """
+    if tools is not None:
+        resolved: dict[str, str] = {}
+        for requirement in requirements:
+            name, _version = requirement.split("==", 1)
+            raw_executable = tools.get(name)
+            if raw_executable is None:
+                raise RuntimeError(
+                    f"no {name} executable was provided for the local publisher"
+                )
+            resolved[name] = _resolve_tool(name, raw_executable)
+        for requirement in requirements:
+            name, version = requirement.split("==", 1)
+            if not _tool_version_matches(resolved[name], name, version):
+                raise RuntimeError(
+                    "publisher formatter version does not match its pinned version"
+                )
+        return resolved
 
     def present() -> bool:
         for requirement in requirements:
             name, version = requirement.split("==", 1)
-            executable = tools.get(name) if tools is not None else shutil.which(name)
+            executable = shutil.which(name)
             if executable is None or not _tool_version_matches(executable, name, version):
                 return False
         return True
 
-    if tools is not None:
-        if not present():
-            raise RuntimeError(
-                "publisher formatter version does not match its pinned version"
-            )
-        return
     if not present():
         subprocess.run(
             [
@@ -76,6 +121,7 @@ def ensure_tools(*requirements: str, tools: Mapping[str, str] | None = None) -> 
             raise RuntimeError(
                 "publisher formatter version does not match its pinned version"
             )
+    return None
 
 
 def run(repo: str, root: Path, *, tools: Mapping[str, str] | None = None) -> str:
@@ -84,17 +130,22 @@ def run(repo: str, root: Path, *, tools: Mapping[str, str] | None = None) -> str
     Legacy (GitHub Actions) call: ``run(repo, root)`` pip-installs the pinned
     tools when needed, exactly as before. Local-executor call: pass ``tools``
     (executable paths keyed by tool name) to use those exact executables and
-    never invoke pip; see ``ensure_tools``.
+    never invoke pip; see ``ensure_tools``. The resolved absolute path
+    ``ensure_tools`` verified the version of is exactly what every command
+    below invokes -- never the raw ``tools`` mapping and never a bare name --
+    so a command run with ``cwd=root`` (the untrusted agent checkout) cannot
+    resolve to a different, checkout-planted executable.
     """
+    resolved_tools: dict[str, str] = {}
 
     def ensure(*requirements: str) -> None:
         if tools is None:
             ensure_tools(*requirements)
         else:
-            ensure_tools(*requirements, tools=tools)
+            resolved_tools.update(ensure_tools(*requirements, tools=tools))
 
     def exe(name: str) -> str:
-        return tools[name] if tools is not None else name
+        return resolved_tools[name] if tools is not None else name
 
     paths = changed_python(root)
     if repo == "Asadtop4ik/agent-qa":

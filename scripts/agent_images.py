@@ -97,7 +97,22 @@ def download_images(
     Legacy (GitHub Actions) call: ``download_images(task_json=..., token=...,
     runner_temp=...)`` -- the run ID is parsed out of the TASK_JSON payload
     and files land under RUNNER_TEMP, exactly as before.
+
+    These two calling styles cannot be mixed (``run_id``/``target_dir``
+    together with ``task_json``/``runner_temp`` raises ``ValueError``), and
+    ``api_base`` must always be an ``https://`` URL -- the callback token is
+    sent to it in a header.
     """
+    style_a = run_id is not None or target_dir is not None
+    style_b = task_json is not None or runner_temp is not None
+    if style_a and style_b:
+        raise ValueError("cannot mix run_id/target_dir with task_json/runner_temp")
+    if run_id is not None and target_dir is None:
+        raise ValueError("target_dir is required together with run_id")
+    if run_id is None and target_dir is not None:
+        raise ValueError("run_id is required together with target_dir")
+    if not api_base.startswith("https://"):
+        raise ValueError("api_base must be an https:// URL")
     if run_id is None:
         try:
             payload = json.loads(task_json)

@@ -1,6 +1,6 @@
-import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -429,6 +429,35 @@ class UsageTests(unittest.TestCase):
                     },
                 )
 
+    def test_usage_reads_an_explicit_events_path_without_runner_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            events = Path(temp) / "custom-events.jsonl"
+            events.write_text(
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 5,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 1,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    usage(events),
+                    {"input_tokens": 5, "cached_input_tokens": 0, "output_tokens": 1},
+                )
+
+    def test_usage_with_an_explicit_missing_path_returns_empty_without_runner_temp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(usage(Path(temp) / "does-not-exist.jsonl"), {})
+
 
 class ParametrizedCheckDiffTests(unittest.TestCase):
     """The local-executor entry point: pass ``task`` and skip every env var."""
@@ -547,12 +576,13 @@ class ParametrizedCheckDiffTests(unittest.TestCase):
             self.assertFalse(result)
             self.assertEqual(calls, [])
 
-    def test_reference_image_digest_is_rejected_without_runner_temp(self) -> None:
+    def test_reference_image_in_image_dir_is_rejected_without_runner_temp(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self._git_repo(root)
             image_bytes = b"\x89PNG\r\n\x1a\nreference-bytes"
-            digest = hashlib.sha256(image_bytes).hexdigest()
+            images_source = Path(tempfile.mkdtemp())
+            (images_source / "source.png").write_bytes(image_bytes)
             copied = root / "frontend/public/renamed.png"
             copied.parent.mkdir(parents=True)
             copied.write_bytes(image_bytes)
@@ -564,20 +594,95 @@ class ParametrizedCheckDiffTests(unittest.TestCase):
                 "base_branch": "main",
                 "mode": "pr",
             }
+            try:
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaisesRegex(ValueError, "reference images"):
+                        check_diff(cwd=root, task=task, image_dir=images_source)
+            finally:
+                shutil.rmtree(images_source, ignore_errors=True)
+
+    def test_image_dir_that_does_not_exist_is_treated_as_no_reference_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            (root / "README.md").write_text("hello\n")
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "pr",
+            }
             with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaisesRegex(ValueError, "reference images"):
-                    check_diff(cwd=root, task=task, image_digests=[digest])
+                self.assertFalse(
+                    check_diff(cwd=root, task=task, image_dir=root / "does-not-exist")
+                )
+
+    def test_image_dir_or_on_fallback_without_task_raises_type_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            (root / "README.md").write_text("hello\n")
+            with self.assertRaises(TypeError):
+                check_diff(cwd=root, image_dir=root)
+            with self.assertRaises(TypeError):
+                check_diff(cwd=root, on_fallback=lambda reason: None)
+
+
+class ParseTaskValidationTests(unittest.TestCase):
+    """``check_diff``/``branch_name``/``build_prompt`` must fail closed, not skip validation."""
+
+    BASE = {
+        "task_id": 3,
+        "run_id": "00000000-0000-0000-0000-000000000003",
+        "title": "Fix menu",
+        "description": "Do the thing",
+        "base_branch": "main",
+    }
+
+    def test_uppercase_fast_is_rejected_not_silently_treated_as_pr(self) -> None:
+        with self.assertRaises(ValueError):
+            branch_name(self.BASE | {"mode": "FAST"})
+        with self.assertRaises(ValueError):
+            build_prompt(self.BASE | {"mode": "FAST"})
+
+    def test_missing_mode_defaults_to_pr_instead_of_a_late_key_error(self) -> None:
+        task = {k: v for k, v in self.BASE.items() if k != "mode"}
+        self.assertEqual(branch_name(task), f"codex/task-3-{self.BASE['run_id']}")
+
+    def test_invalid_task_id_and_run_id_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            branch_name(self.BASE | {"task_id": "../../etc", "mode": "pr"})
+        with self.assertRaises(ValueError):
+            branch_name(self.BASE | {"run_id": "not-a-uuid", "mode": "pr"})
+
+    def test_check_diff_fails_closed_on_an_invalid_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+            (root / "README.md").write_text("hello\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    check_diff(cwd=root, task=self.BASE | {"mode": "FAST"})
 
 
 class BranchNameAndPromptTests(unittest.TestCase):
     def test_branch_name_uses_the_fast_prefix_only_for_fast_mode(self) -> None:
         run_id = "00000000-0000-0000-0000-000000000003"
+        base = {
+            "task_id": 3,
+            "run_id": run_id,
+            "title": "Fix menu",
+            "description": "",
+            "base_branch": "main",
+        }
         self.assertEqual(
-            branch_name({"task_id": 3, "run_id": run_id, "mode": "pr"}),
+            branch_name(base | {"mode": "pr"}),
             f"codex/task-3-{run_id}",
         )
         self.assertEqual(
-            branch_name({"task_id": 3, "run_id": run_id, "mode": "fast"}),
+            branch_name(base | {"mode": "fast"}),
             f"codex/fast/task-3-{run_id}",
         )
 
@@ -602,15 +707,19 @@ class BranchNameAndPromptTests(unittest.TestCase):
         self.assertEqual(written, build_prompt(task))
 
 
+def _const(value):
+    return lambda: value
+
+
 class FailureReasonTests(unittest.TestCase):
     def test_prefers_fast_error_text_over_everything_else(self) -> None:
         self.assertEqual(
             failure_reason(
                 failure_phase=None,
                 codex_step_outcome=None,
-                result_text=None,
-                policy_error_text="ignored",
-                fast_error_text="boom",
+                load_result_text=_const(None),
+                load_policy_error_text=_const("ignored"),
+                load_fast_error_text=_const("boom"),
             ),
             "boom",
         )
@@ -620,9 +729,9 @@ class FailureReasonTests(unittest.TestCase):
             failure_reason(
                 failure_phase="publish",
                 codex_step_outcome=None,
-                result_text=None,
-                policy_error_text=None,
-                fast_error_text=None,
+                load_result_text=_const(None),
+                load_policy_error_text=_const(None),
+                load_fast_error_text=_const(None),
             ),
             "Publisher failed before PR/deploy; inspect the GitHub run.",
         )
@@ -630,9 +739,9 @@ class FailureReasonTests(unittest.TestCase):
             failure_reason(
                 failure_phase="implement",
                 codex_step_outcome=None,
-                result_text=None,
-                policy_error_text=None,
-                fast_error_text=None,
+                load_result_text=_const(None),
+                load_policy_error_text=_const(None),
+                load_fast_error_text=_const(None),
             ),
             "Agent workflow failed; inspect the GitHub run.",
         )
@@ -641,13 +750,245 @@ class FailureReasonTests(unittest.TestCase):
         reason = failure_reason(
             failure_phase="implement",
             codex_step_outcome="success",
-            result_text="Could not verify the price.",
-            policy_error_text="agent produced no file changes",
-            fast_error_text=None,
+            load_result_text=_const("Could not verify the price."),
+            load_policy_error_text=_const("agent produced no file changes"),
+            load_fast_error_text=_const(None),
         )
         self.assertIn("agent produced no file changes", reason)
         self.assertIn("Codex izohi (tasdiqlanmagan)", reason)
         self.assertIn("Could not verify the price", reason)
+
+    def test_never_loads_result_text_when_fast_error_alone_already_answers(self) -> None:
+        def _boom():
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+
+        reason = failure_reason(
+            failure_phase="implement",
+            codex_step_outcome="failure",
+            load_result_text=_boom,
+            load_policy_error_text=_const(None),
+            load_fast_error_text=_const("fast publisher stopped: boom"),
+        )
+        self.assertEqual(reason, "fast publisher stopped: boom")
+
+    def test_never_loads_policy_error_when_fast_error_alone_already_answers(self) -> None:
+        def _boom():
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+
+        reason = failure_reason(
+            failure_phase=None,
+            codex_step_outcome=None,
+            load_result_text=_const(None),
+            load_policy_error_text=_boom,
+            load_fast_error_text=_const("boom"),
+        )
+        self.assertEqual(reason, "boom")
+
+
+class CallbackNonUtf8FileTests(unittest.TestCase):
+    """A non-UTF-8 file legacy would never have read must not crash callback()."""
+
+    def test_a_non_utf8_agent_result_does_not_block_a_fast_error_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            # fast-error.txt alone fully explains the failure; legacy code
+            # would never read agent-result.txt in this case, so a corrupt/
+            # non-UTF-8 agent-result.txt here must not raise UnicodeDecodeError
+            # and abort the callback before the status is ever sent.
+            (Path(temp) / "fast-error.txt").write_text("fast publisher stopped: boom")
+            (Path(temp) / "agent-result.txt").write_bytes(b"\xff\xfe\x00bad")
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "Fix menu",
+                "description": "",
+                "base_branch": "main",
+            }
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                "GITHUB_RUN_ID": "42",
+                "JOB_STATUS": "failure",
+                "FAILURE_PHASE": "publish",
+                "RUNNER_TEMP": temp,
+            }
+            with patch.dict(os.environ, environment), patch(
+                "agent_task._send_status", return_value={"status": "failed"}
+            ) as sent:
+                callback()
+            self.assertEqual(
+                sent.call_args.args[0]["error"], "fast publisher stopped: boom"
+            )
+
+    def test_a_non_utf8_file_that_legacy_would_read_still_raises(self) -> None:
+        # This is legacy's own pre-existing behavior (unchanged): when the
+        # only failure source is itself invalid UTF-8, callback still raises
+        # -- the fix here is only about not eagerly reading sources legacy
+        # would never have touched, not about tolerating corrupt files that
+        # legacy would have read anyway.
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "fast-error.txt").write_bytes(b"\xff\xfe\x00bad")
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "Fix menu",
+                "description": "",
+                "base_branch": "main",
+            }
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "GITHUB_REPOSITORY": "Asadtop4ik/task-manager",
+                "GITHUB_RUN_ID": "42",
+                "JOB_STATUS": "failure",
+                "RUNNER_TEMP": temp,
+            }
+            with patch.dict(os.environ, environment), patch(
+                "agent_task._send_status", return_value={"status": "failed"}
+            ):
+                with self.assertRaises(UnicodeDecodeError):
+                    callback()
+
+
+class LegacyParityTests(unittest.TestCase):
+    """``check_diff(task=...)`` must reach the same decision as the legacy CLI."""
+
+    SCRIPT = Path(__file__).with_name("agent_task.py")
+
+    @staticmethod
+    def _git(root: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    def _init_repo(self, root: Path) -> None:
+        self._git(root, "init", "-q")
+        self._git(root, "config", "user.email", "ci@example.test")
+        self._git(root, "config", "user.name", "CI Test")
+
+    def _run_legacy(self, root: Path, task: dict) -> bool:
+        with tempfile.TemporaryDirectory() as temp:
+            github_env = Path(temp) / "github-env"
+            env = os.environ | {
+                "TASK_JSON": json.dumps(task),
+                "RUNNER_TEMP": temp,
+                "GITHUB_ENV": str(github_env),
+            }
+            subprocess.run(
+                [sys.executable, str(self.SCRIPT), "check-diff"],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            content = github_env.read_text(encoding="utf-8") if github_env.exists() else ""
+        return "FAST_FALLBACK=true" in content
+
+    def _run_new_style(self, root: Path, task: dict) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        with patch.dict(os.environ, {}, clear=True):
+            fallback = check_diff(cwd=root, task=task, on_fallback=reasons.append)
+        return fallback, reasons
+
+    def test_sensitive_untracked_code_falls_back_in_both_modes(self) -> None:
+        task = {
+            "task_id": 7,
+            "run_id": "00000000-0000-0000-0000-000000000007",
+            "title": "Pilot",
+            "description": "",
+            "base_branch": "main",
+            "mode": "fast",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._init_repo(root)
+            (root / "README.md").write_text("base\n")
+            self._git(root, "add", "README.md")
+            self._git(root, "commit", "-qm", "base")
+            source = root / "frontend/src/pages/Neutral.tsx"
+            source.parent.mkdir(parents=True)
+            source.write_text("send_message(chat_id, customer_text)\n")
+            legacy_fallback = self._run_legacy(root, task)
+            new_fallback, reasons = self._run_new_style(root, task)
+        self.assertTrue(legacy_fallback)
+        self.assertTrue(new_fallback)
+        self.assertEqual(len(reasons), 1)
+        self.assertTrue(reasons[0])
+
+    def test_unsafe_logic_edit_falls_back_in_both_modes(self) -> None:
+        task = {
+            "task_id": 7,
+            "run_id": "00000000-0000-0000-0000-000000000007",
+            "title": "Fix menu",
+            "description": "",
+            "base_branch": "main",
+            "mode": "fast",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._init_repo(root)
+            board = root / "frontend/src/pages/Board.tsx"
+            board.parent.mkdir(parents=True)
+            board.write_text("const link = user.is_owner && <Link>Trash</Link>;\n")
+            self._git(root, "add", ".")
+            self._git(root, "commit", "-qm", "base")
+            board.write_text("const link = user.is_owner || <Link>Trash</Link>;\n")
+            legacy_fallback = self._run_legacy(root, task)
+            new_fallback, reasons = self._run_new_style(root, task)
+        self.assertTrue(legacy_fallback)
+        self.assertTrue(new_fallback)
+        self.assertEqual(len(reasons), 1)
+        self.assertTrue(reasons[0])
+
+    def test_safe_presentation_edit_does_not_fall_back_in_either_mode(self) -> None:
+        task = {
+            "task_id": 7,
+            "run_id": "00000000-0000-0000-0000-000000000007",
+            "title": "Fix menu",
+            "description": "",
+            "base_branch": "main",
+            "mode": "fast",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._init_repo(root)
+            board = root / "frontend/src/pages/Board.tsx"
+            board.parent.mkdir(parents=True)
+            board.write_text("const link = user.is_owner && <Link>Trash</Link>;\n")
+            self._git(root, "add", ".")
+            self._git(root, "commit", "-qm", "base")
+            board.write_text(
+                'const link = user.is_owner && <Link title="Show hidden tasks">Trash</Link>;\n'
+            )
+            legacy_fallback = self._run_legacy(root, task)
+            new_fallback, reasons = self._run_new_style(root, task)
+        self.assertFalse(legacy_fallback)
+        self.assertFalse(new_fallback)
+        self.assertEqual(reasons, [])
+
+    def test_untracked_symlink_falls_back_in_both_modes(self) -> None:
+        task = {
+            "task_id": 7,
+            "run_id": "00000000-0000-0000-0000-000000000007",
+            "title": "Pilot",
+            "description": "",
+            "base_branch": "main",
+            "mode": "fast",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._init_repo(root)
+            (root / "README.md").write_text("base\n")
+            self._git(root, "add", "README.md")
+            self._git(root, "commit", "-qm", "base")
+            target = root / "frontend/src/real.tsx"
+            target.parent.mkdir(parents=True)
+            target.write_text("export const x = 1;\n")
+            link = root / "frontend/src/link.tsx"
+            link.symlink_to(target)
+            legacy_fallback = self._run_legacy(root, task)
+            new_fallback, reasons = self._run_new_style(root, task)
+        self.assertTrue(legacy_fallback)
+        self.assertTrue(new_fallback)
+        self.assertEqual(len(reasons), 1)
+        self.assertTrue(reasons[0])
 
 
 if __name__ == "__main__":

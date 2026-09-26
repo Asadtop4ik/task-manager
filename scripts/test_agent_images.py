@@ -197,6 +197,35 @@ class LocalExecutorDownloadImagesTests(unittest.TestCase):
                     download_images(RUN_ID, " ", temp)
                 urlopen.assert_not_called()
 
+    def test_rejects_a_non_https_api_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("agent_images.urllib.request.urlopen") as urlopen:
+                with self.assertRaisesRegex(ValueError, "https://"):
+                    download_images(
+                        RUN_ID, TOKEN, temp, api_base="http://agent-svc.local/api/v1"
+                    )
+                urlopen.assert_not_called()
+
+    def test_rejects_mixing_run_id_style_with_legacy_task_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("agent_images.urllib.request.urlopen") as urlopen:
+                with self.assertRaises(ValueError):
+                    download_images(
+                        RUN_ID, TOKEN, temp, task_json=json.dumps({"run_id": RUN_ID})
+                    )
+                with self.assertRaises(ValueError):
+                    download_images(RUN_ID, TOKEN, temp, runner_temp=temp)
+                urlopen.assert_not_called()
+
+    def test_rejects_target_dir_without_run_id_and_run_id_without_target_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("agent_images.urllib.request.urlopen") as urlopen:
+                with self.assertRaises(ValueError):
+                    download_images(None, TOKEN, temp)
+                with self.assertRaises(ValueError):
+                    download_images(RUN_ID, TOKEN, None)
+                urlopen.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -573,6 +573,76 @@ class CorrectionPromptTests(unittest.TestCase):
         self.assertIn("Owner correction:\nRename the button to Submit.", prompt)
         self.assertIn("Do not push, open a PR, merge, deploy", prompt)
 
+    def test_verify_correction_writes_exactly_what_correction_prompt_builds(self) -> None:
+        run_id = "00000000-0000-0000-0000-000000000012"
+        action_id = "00000000-0000-0000-0000-000000000034"
+        expected_sha = "a" * 40
+        repo = "Asadtop4ik/task-manager"
+        task_id = 9
+        branch = f"codex/task-{task_id}-{run_id}"
+        instruction = "Rename the button to Submit."
+        run = {
+            "run_id": run_id,
+            "repo_full_name": repo,
+            "base_branch": "main",
+            "head_sha": expected_sha,
+            "status": "pr_opened",
+            "pr_url": f"https://github.com/{repo}/pull/9",
+            "task_id": task_id,
+        }
+        action = {
+            "action_id": action_id,
+            "status": "accepted",
+            "kind": "correction",
+            "request": {"expected_head_sha": expected_sha, "instruction": instruction},
+        }
+        pr = {
+            "state": "open",
+            "merged": False,
+            "head": {"sha": expected_sha, "ref": branch, "repo": {"full_name": repo}},
+            "base": {"ref": "main"},
+        }
+
+        def fake_request(url, *, method="GET", token=None, body=None, callback=False):
+            if url.endswith(f"/{run_id}/status"):
+                return run
+            if url.endswith(f"/{run_id}/actions/{action_id}"):
+                return action
+            if url.endswith(f"/repos/{repo}/pulls/9"):
+                return pr
+            raise AssertionError(f"unexpected request: {url}")
+
+        event = {
+            "client_payload": {
+                "run_id": run_id,
+                "action_id": action_id,
+                "repo_full_name": repo,
+                "expected_head_sha": expected_sha,
+                "instruction": instruction,
+                "branch": branch,
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            event_path = Path(temp) / "event.json"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            environment = {
+                "GITHUB_EVENT_PATH": str(event_path),
+                "GH_TOKEN": "token",
+                "AGENT_CALLBACK_TOKEN": "callback-token",
+                "RUNNER_TEMP": temp,
+                "GITHUB_OUTPUT": str(Path(temp) / "github-output"),
+            }
+            with patch.dict(os.environ, environment, clear=True), patch(
+                "agent_release._request", side_effect=fake_request
+            ):
+                agent_release.verify_correction()
+            written = (Path(temp) / "agent-correction-prompt.txt").read_text(
+                encoding="utf-8"
+            )
+        self.assertEqual(
+            written, agent_release.correction_prompt(run, expected_sha, instruction)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -253,48 +253,72 @@ class AgentPreflightTests(unittest.TestCase):
 
         return fake_run
 
+    @staticmethod
+    def _make_fake_tool(directory: Path, name: str) -> Path:
+        """A real, absolute, executable regular file -- what ``_resolve_tool`` requires.
+
+        Its content never runs in most tests (``subprocess.run`` is mocked),
+        only its existence/permissions matter; the one real-execution test
+        below relies on the shebang.
+        """
+        path = directory / name
+        path.write_text(f"#!/bin/sh\necho '{name} 0.0.0'\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
     def test_local_executor_tools_mapping_uses_the_given_executable_and_never_calls_pip(self):
-        tools = {"ruff": "/opt/agent-svc/tools/ruff-0.7.4/bin/ruff"}
-        with patch(
-            "agent_preflight.changed_python",
-            return_value=["app/bot/keyboards/inline.py"],
-        ), patch(
-            "agent_preflight.subprocess.run",
-            side_effect=self._fake_versioned_run({"ruff": "ruff 0.7.4\n"}),
-        ) as command:
-            result = run("muradjanov-dev/qurbot", Path("/tmp/target"), tools=tools)
-        calls = [item.args[0] for item in command.call_args_list]
-        self.assertIn([tools["ruff"], "--version"], calls)
-        self.assertIn(
-            [tools["ruff"], "check", "--fix", "--select", "F401", "--", "app/bot/keyboards/inline.py"],
-            calls,
-        )
-        self.assertIn([tools["ruff"], "format", "--", "app/bot/keyboards/inline.py"], calls)
-        self.assertIn([tools["ruff"], "check", "."], calls)
-        self.assertTrue(
-            all(command[0] != sys.executable or "pip" not in command for command in calls),
-            "the local executor must never invoke pip",
-        )
-        self.assertIn("passed", result)
+        with tempfile.TemporaryDirectory() as directory:
+            tool_path = self._make_fake_tool(Path(directory), "ruff")
+            resolved = str(tool_path.resolve())
+            with patch(
+                "agent_preflight.changed_python",
+                return_value=["app/bot/keyboards/inline.py"],
+            ), patch(
+                "agent_preflight.subprocess.run",
+                side_effect=self._fake_versioned_run({"ruff": "ruff 0.7.4\n"}),
+            ) as command:
+                result = run(
+                    "muradjanov-dev/qurbot",
+                    Path("/tmp/target"),
+                    tools={"ruff": str(tool_path)},
+                )
+            calls = [item.args[0] for item in command.call_args_list]
+            self.assertIn([resolved, "--version"], calls)
+            self.assertIn(
+                [resolved, "check", "--fix", "--select", "F401", "--", "app/bot/keyboards/inline.py"],
+                calls,
+            )
+            self.assertIn([resolved, "format", "--", "app/bot/keyboards/inline.py"], calls)
+            self.assertIn([resolved, "check", "."], calls)
+            self.assertTrue(
+                all(command[0] != sys.executable for command in calls),
+                "the local executor must never invoke pip",
+            )
+            self.assertIn("passed", result)
 
     def test_local_executor_tools_mapping_refuses_a_version_mismatch(self):
-        tools = {"ruff": "/opt/agent-svc/tools/ruff-0.7.4/bin/ruff"}
-        with patch(
-            "agent_preflight.changed_python", return_value=["x.py"]
-        ), patch(
-            "agent_preflight.subprocess.run",
-            side_effect=self._fake_versioned_run({"ruff": "ruff 9.9.9\n"}),
-        ) as command:
-            with self.assertRaises(RuntimeError):
-                run("muradjanov-dev/qurbot", Path("/tmp/target"), tools=tools)
-        calls = [item.args[0] for item in command.call_args_list]
-        self.assertEqual(calls, [[tools["ruff"], "--version"]])
-        self.assertTrue(
-            all(sys.executable not in command for command in calls),
-            "the local executor must never invoke pip",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            tool_path = self._make_fake_tool(Path(directory), "ruff")
+            with patch(
+                "agent_preflight.changed_python", return_value=["x.py"]
+            ), patch(
+                "agent_preflight.subprocess.run",
+                side_effect=self._fake_versioned_run({"ruff": "ruff 9.9.9\n"}),
+            ) as command:
+                with self.assertRaises(RuntimeError):
+                    run(
+                        "muradjanov-dev/qurbot",
+                        Path("/tmp/target"),
+                        tools={"ruff": str(tool_path)},
+                    )
+            calls = [item.args[0] for item in command.call_args_list]
+            self.assertEqual(calls, [[str(tool_path.resolve()), "--version"]])
+            self.assertTrue(
+                all(sys.executable not in command for command in calls),
+                "the local executor must never invoke pip",
+            )
 
-    def test_local_executor_tools_mapping_refuses_a_missing_executable(self):
+    def test_local_executor_tools_mapping_refuses_a_missing_executable_key(self):
         with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
             "agent_preflight.subprocess.run"
         ) as command:
@@ -302,10 +326,110 @@ class AgentPreflightTests(unittest.TestCase):
                 run("muradjanov-dev/qurbot", Path("/tmp/target"), tools={})
         command.assert_not_called()
 
+    def test_local_executor_tools_mapping_refuses_a_relative_path(self):
+        with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+            "agent_preflight.subprocess.run"
+        ) as command:
+            with self.assertRaisesRegex(RuntimeError, "absolute path"):
+                run(
+                    "muradjanov-dev/qurbot",
+                    Path("/tmp/target"),
+                    tools={"ruff": "bin/ruff"},
+                )
+        command.assert_not_called()
+
+    def test_local_executor_tools_mapping_refuses_a_bare_name(self):
+        with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+            "agent_preflight.subprocess.run"
+        ) as command:
+            with self.assertRaisesRegex(RuntimeError, "absolute path"):
+                run("muradjanov-dev/qurbot", Path("/tmp/target"), tools={"ruff": "ruff"})
+        command.assert_not_called()
+
+    def test_local_executor_tools_mapping_refuses_a_nonexistent_absolute_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "does-not-exist" / "ruff")
+            with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+                "agent_preflight.subprocess.run"
+            ) as command:
+                # RuntimeError, never a raw FileNotFoundError leaking out.
+                with self.assertRaises(RuntimeError):
+                    run(
+                        "muradjanov-dev/qurbot",
+                        Path("/tmp/target"),
+                        tools={"ruff": missing},
+                    )
+            command.assert_not_called()
+
+    def test_local_executor_tools_mapping_refuses_a_non_executable_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ruff"
+            path.write_text("not executable\n", encoding="utf-8")
+            path.chmod(0o644)
+            with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+                "agent_preflight.subprocess.run"
+            ) as command:
+                with self.assertRaises(RuntimeError):
+                    run(
+                        "muradjanov-dev/qurbot",
+                        Path("/tmp/target"),
+                        tools={"ruff": str(path)},
+                    )
+            command.assert_not_called()
+
+    def test_local_executor_tools_mapping_refuses_a_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ruff"
+            path.mkdir()
+            with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+                "agent_preflight.subprocess.run"
+            ) as command:
+                with self.assertRaises(RuntimeError):
+                    run(
+                        "muradjanov-dev/qurbot",
+                        Path("/tmp/target"),
+                        tools={"ruff": str(path)},
+                    )
+            command.assert_not_called()
+
+    def test_local_executor_never_resolves_a_planted_checkout_binary(self):
+        # ``run`` invokes every lint command with cwd=root (the untrusted
+        # agent checkout). Even when that checkout plants its own bin/ruff,
+        # a relative tools[] entry is rejected outright rather than being
+        # resolved against root -- there is no cwd under which "bin/ruff"
+        # could ever be accepted.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkout"
+            (root / "bin").mkdir(parents=True)
+            self._make_fake_tool(root / "bin", "ruff")
+            with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+                "agent_preflight.subprocess.run"
+            ) as command:
+                with self.assertRaisesRegex(RuntimeError, "absolute path"):
+                    run("muradjanov-dev/qurbot", root, tools={"ruff": "bin/ruff"})
+            command.assert_not_called()
+
     def test_ensure_tools_with_a_mapping_never_touches_shutil_which_or_pip(self):
-        with patch("agent_preflight.shutil.which") as which, patch(
-            "agent_preflight.subprocess.run",
-            side_effect=self._fake_versioned_run({"black": "black, 26.5.1 (compiled: yes)\n"}),
-        ):
-            ensure_tools("black==26.5.1", tools={"black": "/opt/tools/black"})
-        which.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            tool_path = self._make_fake_tool(Path(directory), "black")
+            with patch("agent_preflight.shutil.which") as which, patch(
+                "agent_preflight.subprocess.run",
+                side_effect=self._fake_versioned_run(
+                    {"black": "black, 26.5.1 (compiled: yes)\n"}
+                ),
+            ):
+                resolved = ensure_tools(
+                    "black==26.5.1", tools={"black": str(tool_path)}
+                )
+            which.assert_not_called()
+            self.assertEqual(resolved, {"black": str(tool_path.resolve())})
+
+    def test_ensure_tools_with_a_mapping_end_to_end_with_a_real_executable(self):
+        # No subprocess mocking: a real absolute, executable file is
+        # resolved and genuinely invoked to check its version.
+        with tempfile.TemporaryDirectory() as directory:
+            tool_path = Path(directory) / "ruff"
+            tool_path.write_text("#!/bin/sh\necho 'ruff 0.7.4'\n", encoding="utf-8")
+            tool_path.chmod(0o755)
+            resolved = ensure_tools("ruff==0.7.4", tools={"ruff": str(tool_path)})
+            self.assertEqual(resolved, {"ruff": str(tool_path.resolve())})
