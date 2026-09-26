@@ -87,6 +87,10 @@ class AgentRun(Base, TimestampMixin):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_kind: Mapped[str | None] = mapped_column(String(12))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the current lease_id was minted. A hard ceiling on top of the
+    # renewable lease_until: an agent-svc that keeps heartbeating without
+    # ever finishing would otherwise hold a lease forever.
+    lease_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # How many times a local-executor review lease has expired for the head it
     # is tracking. Reset to 0 whenever `review_attempts_sha` no longer matches
     # `head_sha` (a new commit means a fresh review, not a retried one).

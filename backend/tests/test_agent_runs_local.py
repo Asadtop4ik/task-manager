@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1 import agent_runs
 from app.core.config import Settings, settings
-from app.db.models import AgentEvent, AgentRun, Project, Task, User
+from app.db.models import AgentEvent, AgentRun, AgentRunAction, Project, Task, User
 from app.schemas.agent_intake import IntakeBrief
 from app.schemas.agent_run import AgentLeaseRequest, AgentWorkOut
 from tests.conftest import auth
@@ -202,6 +202,28 @@ async def test_lease_returns_204_when_nothing_to_do(client: AsyncClient, monkeyp
     assert resp.status_code == 204
 
 
+async def test_lease_rejects_an_invalid_lane_with_no_side_effects(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """agent-svc's own self-check relies on an invalid body never touching
+    the database: FastAPI must reject it before the handler (and its auth
+    check) ever runs."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    resp = await client.post(
+        "/api/v1/agent-runs/lease", json={"lane": "not-code"}, headers=_SVC
+    )
+    assert resp.status_code == 422
+    row = await _run_row(session, run_id)
+    assert row.status == "dispatched"
+    assert row.lease_id is None
+    assert row.attempts == 0
+
+    ok = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert ok.status_code == 200
+    assert ok.json()["run_id"] == run_id
+    assert ok.json()["attempts"] == 1
+
+
 async def test_lease_rejects_a_wrong_token_when_the_feature_is_enabled(
     client: AsyncClient, monkeypatch
 ) -> None:
@@ -345,6 +367,50 @@ async def test_heartbeat_reports_lease_expired_distinctly_from_mismatch(
     )
     assert expired.status_code == 409
     assert expired.json()["detail"] == "lease_expired"
+
+
+async def test_heartbeat_refuses_past_the_total_lease_duration_cap(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """A worker that keeps heartbeating without ever finishing must still be
+    made to give the lease up once its hard total-duration cap passes, even
+    though each individual heartbeat renewed lease_until just fine."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    row = await _run_row(session, run_id)
+    # lease_until is still comfortably in the future; only the issuance time
+    # is old enough to trip the 60-minute cap.
+    row.lease_issued_at = datetime.now(UTC) - timedelta(minutes=61)
+    await session.commit()
+
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/heartbeat",
+        json={"lease_id": lease_id},
+        headers=_SVC,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "lease_expired"
+
+
+async def test_lease_reclaims_a_lease_past_its_total_duration_cap_even_if_renewed(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    row = await _run_row(session, run_id)
+    # lease_until was just renewed (not stale by itself); only the total
+    # duration since issuance has passed the cap.
+    row.lease_until = datetime.now(UTC) + timedelta(minutes=4)
+    row.lease_issued_at = datetime.now(UTC) - timedelta(minutes=61)
+    await session.commit()
+
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 200
+    assert resp.json()["run_id"] == run_id
+    # Reclaimed (attempts=1, below the implement cap) and immediately
+    # re-leased within this same call: attempts is now 2.
+    assert resp.json()["attempts"] == 2
 
 
 async def test_stage_report_is_recorded_and_requires_a_matching_lease(
@@ -510,6 +576,50 @@ async def test_review_result_clears_lease_and_recomputes_pr_ready(
     assert row.lease_id is None
 
 
+async def test_review_result_releases_a_matching_lease_on_a_stale_head(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+
+    result = await client.post(
+        f"/api/v1/agent-runs/{run_id}/review-result",
+        json={"sha": "b" * 40, "state": "clean", "summary": "x", "findings": []},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert result.status_code == 409
+    row = await _run_row(session, run_id)
+    assert row.lease_id is None
+
+
+async def test_review_result_releases_a_matching_lease_on_wrong_status(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Defense in depth for the review-result endpoint itself: even if the
+    run has moved on from under a still-live review lease by some other
+    path than the ones already closed off, a matching lease must never sit
+    there burning a retry when the endpoint 409s."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    row = await _run_row(session, run_id)
+    row.status = "correction_running"
+    await session.commit()
+
+    result = await client.post(
+        f"/api/v1/agent-runs/{run_id}/review-result",
+        json={"sha": _SHA, "state": "clean", "summary": "x", "findings": []},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert result.status_code == 409
+    released = await _run_row(session, run_id)
+    assert released.lease_id is None
+    assert released.status == "correction_running"
+
+
 def _run_stub(**overrides: object) -> AgentRun:
     base: dict[str, object] = {
         "pr_url": _PR_URL,
@@ -535,6 +645,95 @@ def test_review_needed_matches_the_lease_endpoint_sql_condition() -> None:
     assert agent_runs._review_needed(_run_stub(ci_verified_sha="b" * 40)) is False
     assert agent_runs._review_needed(_run_stub(review_sha=_SHA)) is False
     assert agent_runs._review_needed(_run_stub(review_sha="b" * 40)) is True
+
+
+async def _persisted_run(
+    session: AsyncSession, project: Project, **overrides: object
+) -> AgentRun:
+    task = Task(project_id=project.id, title="Race")
+    session.add(task)
+    await session.flush()
+    base: dict[str, object] = {
+        "run_id": str(uuid4()),
+        "task_id": task.id,
+        "task_revision": "r" * 64,
+        "repo_full_name": "Asadtop4ik/task-manager",
+        "base_branch": "main",
+        "mode": "pr",
+        "executor": "local",
+        "status": "pr_opened",
+        "pr_url": _PR_URL,
+        "head_sha": _SHA,
+        "ci_status": "success",
+        "ci_verified_sha": _SHA,
+    }
+    base.update(overrides)
+    run = AgentRun(**base)
+    session.add(run)
+    await session.commit()
+    return await _run_row(session, run.run_id)
+
+
+async def test_reclaim_does_not_finalize_a_review_when_a_correction_has_taken_over(
+    session: AsyncSession, project: Project
+) -> None:
+    """Probed race (a): an owner correction request flips run.status to
+    correction_running independent of any live review lease (a review
+    never holds run.status). If that review lease's own expiry-cap reclaim
+    still ran, it must never clobber the correction back to pr_opened or
+    fabricate a review_status="error" on top of it."""
+    await _ready_project(session, project)
+    run = await _persisted_run(
+        session,
+        project,
+        status="correction_running",
+        review_sha=None,
+        lease_kind="review",
+        lease_id=str(uuid4()),
+        lease_until=datetime.now(UTC) - timedelta(minutes=1),
+        review_attempts=2,
+        review_attempts_sha=_SHA,
+    )
+
+    await agent_runs._reclaim_expired_lease(session, run, datetime.now(UTC))
+    await session.commit()
+
+    row = await _run_row(session, run.run_id)
+    assert row.status == "correction_running"
+    assert row.review_status is None
+    assert row.lease_id is None
+
+
+async def test_reclaim_does_not_mark_a_never_reviewed_new_head_as_review_error(
+    session: AsyncSession, project: Project
+) -> None:
+    """Probed race (b): a new head landed (e.g. a correction completed)
+    while a stale review lease still tracked the old head's attempt count.
+    That new head has never been reviewed at all and must not be finalized
+    as a failed review just because the old lease's cap was reached."""
+    await _ready_project(session, project)
+    new_head = "c" * 40
+    run = await _persisted_run(
+        session,
+        project,
+        status="pr_opened",
+        head_sha=new_head,
+        review_sha=None,
+        lease_kind="review",
+        lease_id=str(uuid4()),
+        lease_until=datetime.now(UTC) - timedelta(minutes=1),
+        review_attempts=2,
+        review_attempts_sha=_SHA,  # the OLD head this lease was tracking
+    )
+    assert run.review_attempts_sha != run.head_sha
+
+    await agent_runs._reclaim_expired_lease(session, run, datetime.now(UTC))
+    await session.commit()
+
+    row = await _run_row(session, run.run_id)
+    assert row.review_status is None
+    assert row.head_sha == new_head
+    assert row.lease_id is None
 
 
 async def test_lease_finds_a_new_reviewable_run_behind_more_than_twenty_reviewed_ones(
@@ -579,6 +778,53 @@ async def test_lease_finds_a_new_reviewable_run_behind_more_than_twenty_reviewed
 
 
 # --------------------------------------------------------------- corrections / cancel
+
+
+async def test_correction_request_releases_a_live_review_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """A live review lease never blocks run.status (it stays pr_opened the
+    whole time), so a correction request can legitimately arrive while one
+    is outstanding. It must release that lease immediately rather than
+    leaving it to expire and later clobber the correction's state."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    review_lease = await client.post(
+        "/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC
+    )
+    assert review_lease.json()["kind"] == "review"
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    action_id = str(uuid4())
+    correction = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": action_id, "instruction": "fix it"},
+        headers=auth(manager),
+    )
+    assert correction.status_code == 200
+    assert correction.json()["status"] == "in_progress"
+
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.lease_id is None  # the review lease was released, not left dangling
+    assert row.lease_kind is None
+
+    # A second correction request is rejected — there is exactly one
+    # in-progress correction action, never two.
+    second = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4()), "instruction": "again"},
+        headers=auth(manager),
+    )
+    assert second.status_code == 409
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    assert leased.json()["kind"] == "correction"
+    assert leased.json()["action_id"] == action_id
 
 
 async def test_local_correction_is_leased_instead_of_dispatched(
@@ -962,6 +1208,47 @@ async def test_watchdog_liveness_rule_spares_a_queued_dispatched_run(
     await client.get("/api/v1/agent-runs/notifications", headers=_worker())
     now_failed = await _run_row(session, queued_run_id)
     assert now_failed.status == "failed"
+
+
+async def test_watchdog_times_out_a_correction_that_was_never_leased(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """agent-svc died before ever calling /lease for a queued local
+    correction: the same liveness-gated timeout as an unclaimed dispatched
+    run rejects the action and releases the run — it does not fail the
+    whole run outright, since there is an open PR to protect."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    action_id = str(uuid4())
+    await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": action_id, "instruction": "fix"},
+        headers=auth(manager),
+    )
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.lease_id is None
+    row.updated_at = datetime.now(UTC) - timedelta(minutes=31)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    timed_out = await _run_row(session, run_id)
+    assert timed_out.status == "pr_opened"
+
+    action = (
+        await session.scalars(
+            select(AgentRunAction).where(
+                AgentRunAction.agent_run_id == timed_out.id,
+                AgentRunAction.action_id == action_id,
+            )
+        )
+    ).first()
+    assert action is not None
+    assert action.status == "rejected"
 
 
 # --------------------------------------------------------------- IntakeBrief validation

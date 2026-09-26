@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -86,6 +86,10 @@ _WATCHDOG_LEASE_MINUTES = 15
 # abandoned when any local run has heartbeat_at (set on both lease issuance
 # and every heartbeat) within this window.
 _WATCHDOG_LIVENESS_MINUTES = 5
+# A hard ceiling on one lease's total lifetime, independent of how many
+# times it has been heartbeat-renewed: an agent-svc that keeps heartbeating
+# without ever finishing must not hold a lease forever.
+_LEASE_MAX_DURATION_MINUTES = 60
 _AGENT_SVC_TIMEOUT_ERROR = "agent-svc javob bermadi"
 
 log = get_logger(__name__)
@@ -347,10 +351,39 @@ def _clear_lease(run: AgentRun) -> None:
     run.lease_until = None
     run.lease_kind = None
     run.heartbeat_at = None
+    run.lease_issued_at = None
 
 
 def _use_local_executor(project_key: str, mode: str) -> bool:
     return mode == "pr" and project_key in settings.agent_local_executor_projects
+
+
+def _stale_lease_condition(lease_until_cutoff: datetime, now: datetime) -> ColumnElement[bool]:
+    """A lease is stale when it missed its own renewal deadline, OR when it
+    has simply run past the hard total-duration cap regardless of how
+    recently it was heartbeat (see `_LEASE_MAX_DURATION_MINUTES`)."""
+    max_duration_cutoff = now - timedelta(minutes=_LEASE_MAX_DURATION_MINUTES)
+    return or_(
+        AgentRun.lease_until < lease_until_cutoff,
+        AgentRun.lease_issued_at < max_duration_cutoff,
+    )
+
+
+def _reject_stale_correction(
+    session: DbSession, run: AgentRun, action: AgentRunAction | None
+) -> None:
+    """A local correction agent-svc never finished: reject it exactly like a
+    GitHub-path rejection and release the run back to `pr_opened`, never
+    touching the PR itself. Shared by the lease-expiry cap (`attempts >= 2`)
+    and the watchdog's "never leased at all" timeout."""
+    if action is not None:
+        action.status = "rejected"
+        action.result = {"message": _AGENT_SVC_TIMEOUT_ERROR}
+    if run.status == "correction_running":
+        run.status = "pr_opened"
+        _refresh_pr_ready(run)
+    run.notified_at = None
+    agent_events.record(session, run, phase="correction", error=_AGENT_SVC_TIMEOUT_ERROR)
 
 
 def _review_needed(run: AgentRun) -> bool:
@@ -449,6 +482,7 @@ async def _issue_lease(
     run.lease_until = now + timedelta(minutes=_LEASE_MINUTES)
     run.lease_kind = kind
     run.heartbeat_at = now
+    run.lease_issued_at = now
     # No event recorded here: `_mark_running`/the correction dispatch mirror
     # already record the GitHub-parity event for this pickup, and agent-svc
     # reports its own "leased" moment through POST /stage.
@@ -533,7 +567,21 @@ async def _reclaim_expired_lease(session: DbSession, run: AgentRun, now: datetim
         _clear_lease(run)
         return
     if run.lease_kind == "review":
-        if run.review_attempts >= 2:
+        # The run can have moved on since this lease was issued: an owner
+        # correction request flips it to correction_running immediately
+        # (independent of any live review lease, since a review never holds
+        # run.status), or a completed correction can have landed a new,
+        # never-reviewed head. Finalizing in either case would either strand
+        # an in-progress correction (clobbering its status back to
+        # pr_opened) or wrongly mark a fresh head as a failed review. Only
+        # finalize when the run is still exactly the same open, unreviewed
+        # PR this lease was tracking; otherwise just release the lease.
+        still_tracking_this_review = (
+            run.status in {"pr_opened", "pr_ready"}
+            and run.review_attempts_sha == run.head_sha
+            and run.review_sha != run.head_sha
+        )
+        if run.review_attempts >= 2 and still_tracking_this_review:
             run.review_status = "error"
             run.review_sha = run.head_sha
             run.review_summary = _AGENT_SVC_TIMEOUT_ERROR
@@ -563,16 +611,8 @@ async def _reclaim_expired_lease(session: DbSession, run: AgentRun, now: datetim
             .with_for_update()
         )
         if action is not None and action.attempts >= 2:
-            action.status = "rejected"
-            action.result = {"message": _AGENT_SVC_TIMEOUT_ERROR}
-            if run.status == "correction_running":
-                run.status = "pr_opened"
-                _refresh_pr_ready(run)
-            run.notified_at = None
+            _reject_stale_correction(session, run, action)
             _clear_lease(run)
-            agent_events.record(
-                session, run, phase="correction", error=_AGENT_SVC_TIMEOUT_ERROR
-            )
             return
         _clear_lease(run)
         return
@@ -950,7 +990,7 @@ async def lease_agent_work(
             .where(
                 AgentRun.executor == "local",
                 AgentRun.lease_id.is_not(None),
-                AgentRun.lease_until < now,
+                _stale_lease_condition(now, now),
             )
             .options(selectinload(AgentRun.task))
             .order_by(AgentRun.id)
@@ -1061,6 +1101,12 @@ async def agent_work_heartbeat(
         raise HTTPException(status_code=409, detail="lease_mismatch")
     if run.lease_until is None or run.lease_until < now:
         raise HTTPException(status_code=409, detail="lease_expired")
+    if run.lease_issued_at is not None and now - run.lease_issued_at > timedelta(
+        minutes=_LEASE_MAX_DURATION_MINUTES
+    ):
+        # Renewable via heartbeat, but not forever: a worker that keeps
+        # heartbeating without ever finishing must still give the lease up.
+        raise HTTPException(status_code=409, detail="lease_expired")
     run.lease_until = now + timedelta(minutes=_LEASE_MINUTES)
     run.heartbeat_at = now
     await session.commit()
@@ -1092,7 +1138,7 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
     `/lease`, because a fully stalled agent-svc never calls `/lease` again to
     trigger that endpoint's own expired-lease cleanup.
 
-    Two independent checks, deliberately not symmetric:
+    Three independent checks, deliberately not symmetric:
 
     - A stale *lease* (any kind) is reclaimed through the exact same
       `_reclaim_expired_lease` helper `/lease` uses. Only an exhausted
@@ -1100,11 +1146,18 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
       finalizes just that piece of work and leaves the PR alone (see that
       helper's docstring).
     - A `dispatched` run that was never leased at all has no per-attempt
-      state to reclaim, so it can only ever be failed outright. But a large
-      queue is not the same as a dead agent-svc: only fail these once no
-      local run has been leased or heartbeat within the liveness window,
-      so work genuinely queued behind other healthy jobs is never punished
-      for its place in line.
+      state to reclaim, so it can only ever be failed outright.
+    - A `correction_running` run whose action never got leased either (the
+      owner asked for a correction, but agent-svc was already dead) has an
+      open PR to protect, so it is released back to `pr_opened` — never
+      failed outright — through the same `_reject_stale_correction` an
+      exhausted correction lease uses.
+
+    Both "never leased" buckets share one liveness gate: a large queue is
+    not the same as a dead agent-svc, so neither fails anything once any
+    local run has been leased or heartbeat within the liveness window —
+    work genuinely queued behind other healthy jobs is never punished for
+    its place in line.
     """
     now = datetime.now(UTC)
     lease_cutoff = now - timedelta(minutes=_WATCHDOG_LEASE_MINUTES)
@@ -1114,7 +1167,7 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
             .where(
                 AgentRun.executor == "local",
                 AgentRun.lease_id.is_not(None),
-                AgentRun.lease_until < lease_cutoff,
+                _stale_lease_condition(lease_cutoff, now),
             )
             .options(selectinload(AgentRun.task))
             .order_by(AgentRun.id)
@@ -1128,7 +1181,7 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
         await session.commit()
 
     dispatched_cutoff = now - timedelta(minutes=_WATCHDOG_DISPATCHED_MINUTES)
-    unclaimed = (
+    unclaimed_dispatched = (
         await session.scalars(
             select(AgentRun)
             .where(
@@ -1143,7 +1196,22 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
             .with_for_update(skip_locked=True)
         )
     ).all()
-    if not unclaimed:
+    unclaimed_corrections = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                AgentRun.executor == "local",
+                AgentRun.status == "correction_running",
+                AgentRun.lease_id.is_(None),
+                AgentRun.updated_at < dispatched_cutoff,
+            )
+            .options(selectinload(AgentRun.task))
+            .order_by(AgentRun.id)
+            .limit(20)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    if not unclaimed_dispatched and not unclaimed_corrections:
         return
     liveness_cutoff = now - timedelta(minutes=_WATCHDOG_LIVENESS_MINUTES)
     agent_svc_alive = await session.scalar(
@@ -1153,7 +1221,18 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
     )
     if agent_svc_alive is not None:
         return
-    for run in unclaimed:
+    for run in unclaimed_corrections:
+        action = await session.scalar(
+            select(AgentRunAction)
+            .where(
+                AgentRunAction.agent_run_id == run.id,
+                AgentRunAction.kind == "correction",
+                AgentRunAction.status == "in_progress",
+            )
+            .with_for_update()
+        )
+        _reject_stale_correction(session, run, action)
+    for run in unclaimed_dispatched:
         run.status = "failed"
         run.error = _AGENT_SVC_TIMEOUT_ERROR
         run.finished_at = now
@@ -1647,12 +1726,30 @@ async def agent_pr_review_result(
         .options(selectinload(AgentRun.task))
         .with_for_update()
     )
-    if run is None or run.status not in {"pr_opened", "pr_ready"} or not run.pr_url:
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    # Computed once, before any mutation below: whether the header names the
+    # review lease this run currently holds. A stale status or head below
+    # must still release that lease rather than let it sit until it times
+    # out on its own and burns one of the two review attempts for nothing.
+    has_matching_review_lease = (
+        run.executor == "local"
+        and run.lease_kind == "review"
+        and run.lease_id is not None
+        and run.lease_id == x_agent_lease_id
+    )
+    if run.status not in {"pr_opened", "pr_ready"} or not run.pr_url:
+        if has_matching_review_lease:
+            _clear_lease(run)
+            await session.commit()
         raise HTTPException(status_code=409, detail="agent PR is not awaiting review")
+    if run.head_sha != payload.sha:
+        if has_matching_review_lease:
+            _clear_lease(run)
+            await session.commit()
+        raise HTTPException(status_code=409, detail="review does not match current PR head")
     if run.executor == "local":
         _require_live_lease(run, x_agent_lease_id, kind="review")
-    if run.head_sha != payload.sha:
-        raise HTTPException(status_code=409, detail="review does not match current PR head")
     pr_number = run.pr_url.rsplit("/", 1)[-1]
     if not pr_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
@@ -1874,6 +1971,15 @@ async def _request_owner_action(
         # otherwise the PR would sit "open" with a queued-but-invisible
         # correction, letting a concurrent merge, cancel, or second
         # correction request interfere before agent-svc ever picks it up.
+        if run.lease_kind == "review" and run.lease_id is not None:
+            # A live review lease never blocks run.status (it stays
+            # pr_opened/pr_ready throughout), so a correction request can
+            # legitimately arrive while one is outstanding. Release it now
+            # instead of leaving it to expire on its own: the review is
+            # about to be invalidated by this correction anyway, and
+            # agent-svc's own heartbeat/review-result call for it will just
+            # 409 harmlessly once it is gone.
+            _clear_lease(run)
         action.status = "in_progress"
         run.status = "correction_running"
         run.notified_at = None

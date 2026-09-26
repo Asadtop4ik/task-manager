@@ -24,6 +24,7 @@ def upgrade() -> None:
     op.add_column("agent_runs", sa.Column("lease_until", sa.DateTime(timezone=True)))
     op.add_column("agent_runs", sa.Column("lease_kind", sa.String(12)))
     op.add_column("agent_runs", sa.Column("heartbeat_at", sa.DateTime(timezone=True)))
+    op.add_column("agent_runs", sa.Column("lease_issued_at", sa.DateTime(timezone=True)))
     op.add_column(
         "agent_runs",
         sa.Column("review_attempts", sa.Integer(), server_default="0", nullable=False),
@@ -49,6 +50,7 @@ def downgrade() -> None:
     op.drop_column("agent_run_actions", "attempts")
     op.drop_column("agent_runs", "review_attempts_sha")
     op.drop_column("agent_runs", "review_attempts")
+    op.drop_column("agent_runs", "lease_issued_at")
     op.drop_column("agent_runs", "heartbeat_at")
     op.drop_column("agent_runs", "lease_kind")
     op.drop_column("agent_runs", "lease_until")
