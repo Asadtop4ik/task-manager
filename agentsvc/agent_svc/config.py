@@ -250,11 +250,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
 def load_secrets(credentials_dir: str | Path | None = None) -> dict[str, str]:
     """Load every secret from `$CREDENTIALS_DIRECTORY/<name>` files.
 
-    `OPTIONAL_SECRET_NAMES` (currently just `github_qa_token`) may be entirely
-    absent: that means the feature it gates (the QA repo/lane) is disabled,
-    not a misconfiguration, so the result carries `""` for it. A *present but
-    empty/whitespace* file is still treated as invalid for every secret,
-    required or optional, since that indicates a real provisioning mistake.
+    `OPTIONAL_SECRET_NAMES` (currently just `github_qa_token`) may be absent
+    or empty: that means the feature it gates (the QA repo/lane) is disabled,
+    so the result carries `""` for it. systemd's LoadCredential= has no
+    optional form, so the installer always writes this file, empty when the
+    QA token is not provisioned. Required secrets must be non-empty.
     """
     resolved = (
         credentials_dir
@@ -287,6 +287,9 @@ def load_secrets(credentials_dir: str | Path | None = None) -> dict[str, str]:
             continue
         value = raw[:-1] if raw.endswith("\n") else raw
         if not value or value.isspace():
+            if name in OPTIONAL_SECRET_NAMES:
+                values[name] = ""
+                continue
             invalid.append(name)
             continue
         values[name] = value

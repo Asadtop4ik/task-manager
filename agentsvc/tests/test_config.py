@@ -154,14 +154,15 @@ class LoadSecretsTests(unittest.TestCase):
             self.assertEqual(secrets["github_qa_token"], "")
             self.assertEqual(set(secrets), set(SECRET_NAMES))
 
-    def test_present_but_empty_optional_qa_secret_is_still_invalid(self) -> None:
-        with TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            _required_secrets_only(directory)
-            (directory / "github_qa_token").write_text("")
-            with self.assertRaises(ConfigError) as ctx:
-                load_secrets(directory)
-            self.assertIn("github_qa_token", str(ctx.exception))
+    def test_present_but_empty_optional_qa_secret_means_disabled(self) -> None:
+        # The installer always writes the QA credential (LoadCredential= has no
+        # optional form); an empty file must disable QA, not stop the service.
+        for content in ("", "\n", "  \n"):
+            with TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                _required_secrets_only(directory)
+                (directory / "github_qa_token").write_text(content)
+                self.assertEqual(load_secrets(directory)["github_qa_token"], "")
 
     def test_required_and_optional_secret_names_partition_secret_names(self) -> None:
         self.assertEqual(
