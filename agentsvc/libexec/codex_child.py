@@ -482,12 +482,19 @@ def _scan_patch_for_bad_modes(patch_text: str) -> str | None:
     return None
 
 
-def _package_worktree(directory: Path, *, out_dir: Path) -> tuple[bytes, list[str]]:
+def _package_worktree(
+    directory: Path, *, out_dir: Path, use_existing_index: bool = False
+) -> tuple[bytes, list[str]]:
     """Diff `directory` (working tree + index) against HEAD: raw -z path
     listing for safety, then the one `--binary` patch actually returned.
     Shared by `package` (against `wt`) and `preflight` (against `pf`, after
     the trusted formatter/lint step has run) so the two can never disagree
-    on what counts as a safe changed path or a bad file mode."""
+    on what counts as a safe changed path or a bad file mode.
+
+    `use_existing_index` (preflight): package exactly what the trusted
+    preflight staged — the applied patch plus its formatter fixes — instead
+    of `git add -A`, so files the tools leave behind (`__pycache__/*.pyc`,
+    caches) are never published."""
     out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     # A fresh, 0700 (agent-codex only) directory for the temporary index:
     # codex's own sandbox is never given `out/` as a writable root, so
@@ -498,8 +505,12 @@ def _package_worktree(directory: Path, *, out_dir: Path) -> tuple[bytes, list[st
     try:
         index_file = pkg_dir / "index"
         env = _git_env({"GIT_INDEX_FILE": str(index_file)})
-        _run_git(_git_argv("read-tree", "HEAD"), cwd=directory, env=env)
-        _run_git(_git_argv("add", "-A"), cwd=directory, env=env)
+        if use_existing_index:
+            # Snapshot the index into our private 0700 dir before reading it.
+            shutil.copyfile(directory / ".git" / "index", index_file)
+        else:
+            _run_git(_git_argv("read-tree", "HEAD"), cwd=directory, env=env)
+            _run_git(_git_argv("add", "-A"), cwd=directory, env=env)
         raw = _run_git(
             _git_argv(
                 "diff",
@@ -704,6 +715,10 @@ def cmd_preflight(request: dict[str, Any]) -> int:
         if not isinstance(repo, str):
             raise ChildRefusal("invalid repo")
         preflight_module = _load_trusted_preflight()
+        # The trusted preflight shells out to git itself; keep it off any
+        # system/user git config, as every other git call here is.
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
         try:
             preflight_result = preflight_module.run(repo, pf_dir, tools=tools)
         except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
@@ -719,7 +734,9 @@ def cmd_preflight(request: dict[str, Any]) -> int:
             )
             return 3
 
-        patch_bytes_out, changed_paths = _package_worktree(pf_dir, out_dir=run_dir / "out")
+        patch_bytes_out, changed_paths = _package_worktree(
+            pf_dir, out_dir=run_dir / "out", use_existing_index=True
+        )
     except ChildRefusal as exc:
         _emit_error(str(exc))
         return 3
