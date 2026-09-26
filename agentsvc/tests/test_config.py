@@ -55,7 +55,7 @@ class LoadConfigTests(unittest.TestCase):
             self.assertEqual(config["codex_home_code"], "/home/agent-codex/.codex-code")
             self.assertEqual(config["codex_home_chat"], "/home/agent-codex/.codex-chat")
             self.assertFalse(config["code_lane_enabled"])
-            self.assertTrue(config["watch_enabled"])
+            self.assertFalse(config["watch_enabled"])
 
     def test_missing_explicit_path_falls_back_to_defaults(self) -> None:
         with TemporaryDirectory() as tmp:
