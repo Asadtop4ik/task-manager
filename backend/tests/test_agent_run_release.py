@@ -915,6 +915,15 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
     )
     assert old_authorization.status_code == 200
 
+    # A later owner merge arrives while this authorized deployment is running.
+    comparisons[f"{lower_id_later_merge}...{higher_id_earlier_merge}"] = "ahead"
+    stale_retry_authorization = await client.post(
+        f"/api/v1/agent-runs/{run.run_id}/qa-deployment-authorization",
+        json={"action_id": action_id, "expected_head_sha": _SHA, "merge_sha": "b" * 40},
+        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
+    )
+    assert stale_retry_authorization.status_code == 409
+
     old_deployed = await client.post(
         f"/api/v1/agent-runs/{run.run_id}/qa-deployed",
         json={
@@ -928,34 +937,11 @@ async def test_qa_supersession_uses_merge_ancestry_not_run_creation_order(
     )
     assert old_deployed.status_code == 200
 
-    # Run A has the lower ID but merged later, so B's recovery is now stale.
-    newer_action = await session.scalar(
-        select(AgentRunAction).where(AgentRunAction.agent_run_id == newer_run.id)
-    )
-    assert newer_action is not None
-    superseded_authorization = await client.post(
-        f"/api/v1/agent-runs/{newer_run.run_id}/qa-deployment-authorization",
-        json={
-            "action_id": newer_action.action_id,
-            "expected_head_sha": "e" * 40,
-            "merge_sha": "f" * 40,
-        },
-        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
-    )
-    assert superseded_authorization.status_code == 409
-
-    deployed = await client.post(
-        f"/api/v1/agent-runs/{newer_run.run_id}/qa-deployed",
-        json={
-            "sha": "f" * 40,
-            "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/19",
-            "ready_url": "http://127.0.0.1:18082/ready",
-            "ready_status": "ready",
-            "ready_sha": "f" * 40,
-        },
-        headers={"X-Agent-QA-Callback-Token": "qa-only-token-0123456789abcdef"},
-    )
-    assert deployed.status_code == 409
+    assert old_deployed.json()["status"] == "deployed"
+    assert old_deployed.json()["deployed_sha"] == lower_id_later_merge
+    assert await agent_runs._has_newer_qa_owner_merge(session, run) is True
+    comparisons[f"{higher_id_earlier_merge}...{lower_id_later_merge}"] = "behind"
+    assert await agent_runs._has_newer_qa_owner_merge(session, newer_run) is False
 
     for state in ("diverged", "unknown"):
         comparisons[f"{lower_id_later_merge}...{higher_id_earlier_merge}"] = state

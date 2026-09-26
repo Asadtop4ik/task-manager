@@ -1925,17 +1925,7 @@ async def agent_qa_run_deployed(
         return AgentRunOut.model_validate(run)
     if run.status != "merged" or run.merged_sha != payload.sha:
         raise HTTPException(status_code=409, detail="QA run is not merged at this SHA")
-    if await _has_newer_qa_owner_merge(session, run):
-        raise HTTPException(
-            status_code=409,
-            detail="QA deployment was superseded by a newer owner merge",
-        )
     head_sha = await _verify_deployment(run, payload.sha)
-    if await _has_newer_qa_owner_merge(session, run):
-        raise HTTPException(
-            status_code=409,
-            detail="QA deployment was superseded by a newer owner merge",
-        )
     expected_url = f"https://github.com/{settings.agent_qa_repository}/actions/runs/"
     suffix = payload.github_run_url.removeprefix(expected_url)
     if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
