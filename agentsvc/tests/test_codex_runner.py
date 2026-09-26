@@ -62,6 +62,7 @@ class SimpleCallTests(unittest.TestCase):
                 "agent-codex",
                 "--",
                 "/usr/bin/python3",
+                "-I",
                 "/opt/agent-svc/libexec/codex_child.py",
                 "prepare",
             ],
@@ -73,8 +74,14 @@ class SimpleCallTests(unittest.TestCase):
         )
         self.assertEqual(
             runner._argv("exec"),
-            ["/usr/bin/python3.12", "/scratch/libexec/codex_child.py", "exec"],
+            ["/usr/bin/python3.12", "-I", "/scratch/libexec/codex_child.py", "exec"],
         )
+
+    def test_argv_always_includes_isolated_mode_flag(self) -> None:
+        # `-I`: no PYTHONPATH/user site/.pth files, matching the exact
+        # command sudoers pins in production, regardless of prefix/python_bin.
+        runner = CodexRunner(command_prefix=[], python_bin="python3", libexec_dir="/x")
+        self.assertIn("-I", runner._argv("cleanup"))
 
     def test_prepare_success(self) -> None:
         calls = []
@@ -89,7 +96,7 @@ class SimpleCallTests(unittest.TestCase):
         result = runner.prepare({"run_id": "r1"})
         self.assertEqual(result, {"ok": True, "head": "abc123"})
         argv, payload = calls[0]
-        self.assertEqual(argv, ["python3", "/x/codex_child.py", "prepare"])
+        self.assertEqual(argv, ["python3", "-I", "/x/codex_child.py", "prepare"])
         self.assertEqual(json.loads(payload), {"run_id": "r1"})
 
     def test_prepare_failure_raises_with_reason(self) -> None:
@@ -142,33 +149,31 @@ class SimpleCallTests(unittest.TestCase):
 
 
 class _FakeStream:
-    """Iterable line source mimicking a Popen text-mode pipe."""
+    """Binary readline()-based line source, mimicking a Popen binary-mode
+    pipe (matching `CodexRunner.run_exec`'s real Popen, which no longer
+    passes `text=True` -- see item 14: readline(limit) + explicit decode)."""
 
     def __init__(self) -> None:
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._queue: queue.Queue[bytes | None] = queue.Queue()
 
     def push(self, line: str) -> None:
-        self._queue.put(line)
+        data = line if line.endswith("\n") else line + "\n"
+        self._queue.put(data.encode("utf-8"))
 
     def close(self) -> None:
         self._queue.put(None)
 
-    def __iter__(self) -> _FakeStream:
-        return self
-
-    def __next__(self) -> str:
+    def readline(self, limit: int = -1) -> bytes:
         item = self._queue.get()
-        if item is None:
-            raise StopIteration
-        return item
+        return b"" if item is None else item
 
 
 class _FakeStdin:
     def __init__(self) -> None:
-        self.written: list[str] = []
+        self.written: list[bytes] = []
         self.closed = False
 
-    def write(self, data: str) -> int:
+    def write(self, data: bytes) -> int:
         self.written.append(data)
         return len(data)
 
@@ -202,8 +207,15 @@ class FakePopen:
         self._exited.set()
 
     def finish(self, returncode: int = 0) -> None:
-        """Test helper: simulate the process exiting on its own."""
+        """Test helper: simulate the process exiting on its own -- which, in
+        a real process, also closes its stdout/stderr, producing EOF for the
+        reader threads. `run_exec` now reads all the way to EOF rather than
+        stopping at the first `agent_svc.result` line (it wants the LAST one
+        seen), so a fake that never signals EOF would hang it until the hard
+        wall timeout instead of returning promptly."""
         self.returncode = returncode
+        self.stdout.close()
+        self.stderr.close()
         self._exited.set()
 
     def wait(self, timeout: float | None = None) -> int:
@@ -212,6 +224,9 @@ class FakePopen:
         if not self._exited.wait(timeout=timeout):
             raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
         return self.returncode if self.returncode is not None else 0
+
+    def poll(self) -> int | None:
+        return self.returncode
 
 
 def make_frame(**overrides) -> dict:
@@ -254,11 +269,12 @@ class FakePopenRunExecTests(unittest.TestCase):
         )
         self.assertIsNotNone(result.frame)
         self.assertEqual(
-            fake.stdin.written, [json.dumps({"timeout_s": 10}, ensure_ascii=False)]
+            fake.stdin.written,
+            [json.dumps({"timeout_s": 10}, ensure_ascii=False).encode("utf-8")],
         )
         self.assertTrue(fake.stdin.closed)
 
-    def test_heartbeat_false_triggers_cancel_and_sigterm(self) -> None:
+    def test_heartbeat_three_consecutive_failures_triggers_cancel(self) -> None:
         fake = FakePopen()
         fake.stdout.push(json.dumps({"type": "thread.started", "thread_id": "t1"}))
         # No frame ever arrives: the fake codex process is "hung".
@@ -268,7 +284,7 @@ class FakePopenRunExecTests(unittest.TestCase):
 
         def heartbeat() -> bool:
             calls.append(1)
-            return len(calls) < 2
+            return False
 
         result = runner.run_exec(
             {"timeout_s": 30},
@@ -282,7 +298,54 @@ class FakePopenRunExecTests(unittest.TestCase):
         self.assertTrue(result.cancelled)
         self.assertFalse(result.timed_out)
         self.assertIsNone(result.frame)
-        self.assertGreaterEqual(len(calls), 2)
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_heartbeat_transient_failure_alone_does_not_cancel(self) -> None:
+        from agent_svc.codex import HEARTBEAT_FAILURE_THRESHOLD
+
+        fake = FakePopen()
+        fake.stdout.push(json.dumps({"type": "thread.started", "thread_id": "t1"}))
+        fake.stdout.push(json.dumps(make_frame(final_message="recovered")))
+        fake.finish(0)
+
+        calls: list[int] = []
+
+        def heartbeat() -> bool:
+            calls.append(1)
+            # One fewer than the threshold, then healthy again: must never
+            # cancel a run over an isolated blip.
+            return not len(calls) < HEARTBEAT_FAILURE_THRESHOLD
+
+        runner = CodexRunner(popen=lambda *a, **k: fake)
+        result = runner.run_exec(
+            {"timeout_s": 10},
+            on_event=lambda _e: None,
+            heartbeat=heartbeat,
+            heartbeat_interval_s=0.05,
+        )
+
+        self.assertFalse(result.cancelled)
+        self.assertEqual(result.final_message, "recovered")
+
+    def test_lease_lost_cancels_immediately_bypassing_the_counter(self) -> None:
+        from agent_svc.codex import LeaseLost
+
+        fake = FakePopen()
+        fake.stdout.push(json.dumps({"type": "thread.started", "thread_id": "t1"}))
+
+        def heartbeat() -> bool:
+            raise LeaseLost("lease stolen")
+
+        runner = CodexRunner(popen=lambda *a, **k: fake, sigkill_grace_s=0.3)
+        result = runner.run_exec(
+            {"timeout_s": 30},
+            on_event=lambda _e: None,
+            heartbeat=heartbeat,
+            heartbeat_interval_s=0.05,
+        )
+
+        self.assertTrue(result.cancelled)
+        self.assertTrue(fake.terminated)
 
     def test_cancel_event_triggers_cancel(self) -> None:
         fake = FakePopen()
@@ -360,6 +423,66 @@ class FakePopenRunExecTests(unittest.TestCase):
 
         self.assertEqual(events, [])
         self.assertIsNotNone(result.frame)
+
+    def test_reads_to_eof_and_uses_the_last_frame(self) -> None:
+        # Defense in depth on top of the child's own anti-spoofing filter:
+        # if more than one agent_svc.result line ever arrives, the LAST one
+        # wins, not the first.
+        fake = FakePopen()
+        fake.stdout.push(json.dumps(make_frame(final_message="first", exit_code=1)))
+        fake.stdout.push(json.dumps(make_frame(final_message="second", exit_code=0)))
+        fake.finish(0)
+
+        runner = CodexRunner(popen=lambda *a, **k: fake)
+        result = runner.run_exec({"timeout_s": 10}, on_event=lambda _e: None)
+
+        self.assertEqual(result.final_message, "second")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_malformed_frame_is_treated_as_no_frame(self) -> None:
+        fake = FakePopen()
+        bad_frame = make_frame()
+        bad_frame["exit_code"] = "not-an-int"
+        fake.stdout.push(json.dumps(bad_frame))
+        fake.finish(3)
+
+        runner = CodexRunner(popen=lambda *a, **k: fake)
+        result = runner.run_exec({"timeout_s": 10}, on_event=lambda _e: None)
+
+        self.assertIsNone(result.frame)
+        # Falls back to the process's own exit status instead of trusting
+        # any field out of the malformed frame.
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.final_message, "")
+        self.assertIsNone(result.usage)
+
+    def test_frame_with_non_string_stderr_tail_entry_is_rejected(self) -> None:
+        fake = FakePopen()
+        bad_frame = make_frame(stderr_tail=["ok", 123])
+        fake.stdout.push(json.dumps(bad_frame))
+        fake.finish(0)
+
+        runner = CodexRunner(popen=lambda *a, **k: fake)
+        result = runner.run_exec({"timeout_s": 10}, on_event=lambda _e: None)
+
+        self.assertIsNone(result.frame)
+
+    def test_finally_always_sigterms_before_sigkill_even_on_exception(self) -> None:
+        fake = FakePopen()
+        fake.stdout.push(json.dumps({"type": "thread.started", "thread_id": "t1"}))
+        # No frame ever arrives, and nothing else drives the main loop's own
+        # SIGTERM path (no cancel/heartbeat/timeout) -- the only way the
+        # process gets signaled at all is `run_exec`'s `finally` block.
+
+        def boom(_event: dict) -> None:
+            raise RuntimeError("boom in on_event")
+
+        runner = CodexRunner(popen=lambda *a, **k: fake, sigkill_grace_s=0.2)
+        with self.assertRaises(RuntimeError):
+            runner.run_exec({"timeout_s": 30}, on_event=boom)
+
+        self.assertTrue(fake.terminated)
+        self.assertTrue(fake.killed)
 
 
 # ---------------------------------------------------------------------------

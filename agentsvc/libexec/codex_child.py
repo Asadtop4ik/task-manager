@@ -1,7 +1,7 @@
 """Sandboxed Codex process manager. Runs as user agent-codex via sudo.
 
 Subcommands `prepare | exec | package | cleanup` read one JSON request object
-(<=256 KiB) from stdin and print JSON (single object for prepare/package/cleanup,
+(<=1 MiB) from stdin and print JSON (single object for prepare/package/cleanup,
 JSONL for exec) on stdout. This process trusts nothing from stdin beyond the
 allowlists below: every model/effort/sandbox/lane/cwd value is checked against a
 fixed set, every run_id is checked against a fixed pattern, and every path the
@@ -12,6 +12,11 @@ child touches is resolved and confirmed to live inside
 REVISION 2) — it is deliberately NOT `codex-runner`, which is also the live
 GitHub Actions self-hosted runner identity and whose home holds credentials
 and tokens that Codex's own sandbox (same uid) could otherwise read.
+
+Production invocation (pinned in sudoers): `/usr/bin/python3 -I
+/opt/agent-svc/libexec/codex_child.py <sub>`. `-I` (isolated mode) is set by
+the caller (`agent_svc.codex.CodexRunner`), not by this script, so that
+running it directly in tests behaves the same as production.
 
 Test overrides: module constants below can be overridden with environment
 variables prefixed `AGENT_CHILD_TEST_`, but ONLY when `AGENT_CHILD_TEST_MODE=1`
@@ -39,15 +44,18 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-MAX_REQUEST_BYTES = 256 * 1024
+MAX_REQUEST_BYTES = 1024 * 1024  # 1 MiB: a 250k-char diff prompt needs headroom.
+MAX_LINE_BYTES = 1024 * 1024  # cap any single stdout/stderr line we ever buffer.
+STDOUT_QUEUE_MAXSIZE = 8192
 MAX_FINAL_MESSAGE_CHARS = 20_000
 MAX_STDERR_LINES = 40
 MAX_STDERR_LINE_CHARS = 500
@@ -65,6 +73,10 @@ EFFORTS = {"low", "medium", "high"}
 SANDBOXES = {"read-only", "workspace-write"}
 CWD_KINDS = {"wt", "empty"}
 BAD_GIT_MODES = {"120000", "160000"}
+BLOCKED_PATH_COMPONENTS = {".codex", ".agents", ".git"}
+
+PR_SET_PDEATHSIG = 1
+PR_SET_CHILD_SUBREAPER = 36
 
 
 def _test_mode_enabled() -> bool:
@@ -149,6 +161,21 @@ def _emit_error(reason: str) -> None:
     print(json.dumps({"reason": reason}), flush=True)
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce a value to int, never raising -- a malformed/spoofed usage
+    field must not crash the whole process."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _validate_run_id(value: Any) -> str:
     if not isinstance(value, str) or not RUN_ID_RE.fullmatch(value):
         raise ChildRefusal("invalid run_id")
@@ -180,12 +207,25 @@ def _positive_number(value: Any, *, maximum: float) -> float:
     return number
 
 
+def _fresh_dir(path: Path, *, mode: int) -> None:
+    """Remove `path` if present and recreate it empty at `mode`, so nothing
+    left over from a previous call (stale output, a symlink planted by an
+    escaped process, ...) is still there."""
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, mode=mode)
+
+
 # --------------------------------------------------------------------------
 # git helpers, shared by prepare and package
 # --------------------------------------------------------------------------
 
 
-def _git_argv(*args: str, no_textconv: bool = False) -> list[str]:
+def _git_argv(
+    *args: str, no_textconv: bool = False, safe_directory: str | None = None
+) -> list[str]:
     command = [
         "git",
         "-c",
@@ -195,18 +235,32 @@ def _git_argv(*args: str, no_textconv: bool = False) -> list[str]:
         "-c",
         "protocol.file.allow=always",
     ]
+    if safe_directory is not None:
+        # agent-svc owns the mirror, agent-codex clones it: modern git
+        # refuses to operate across that ownership boundary ("dubious
+        # ownership") unless explicitly told this exact path is fine.
+        command += ["-c", f"safe.directory={safe_directory}"]
     if no_textconv:
         # Untrusted repositories can configure .gitattributes textconv/diff
         # filters that execute arbitrary commands on `git diff`. This is not
         # in the literal spec command line but is required so `package`
         # cannot be tricked into running attacker-controlled programs.
-        command += ["-c", "diff.noTextconv=true"]
+        command += ["-c", "diff.noTextconv=true", "-c", "core.attributesFile=/dev/null"]
     command += list(args)
     return command
 
 
 def _git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = {**GIT_ENV_BASE, "PATH": PATH_VALUE, "HOME": HOME_DIR}
+    # Test-only passthrough: lets a test simulate git's "dubious ownership"
+    # check firing (mirror owned by agent-svc, cloned by agent-codex)
+    # without needing two real unix users. This only ever makes git MORE
+    # strict, never disables a safety check, and -- like AGENT_CHILD_TEST_*
+    # -- sudo's env_reset strips it from this process's environment in
+    # production regardless.
+    assume_different_owner = os.environ.get("GIT_TEST_ASSUME_DIFFERENT_OWNER")
+    if assume_different_owner:
+        env["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = assume_different_owner
     if extra:
         env.update(extra)
     return env
@@ -253,12 +307,12 @@ def _validate_mirror(mirror: Any, repo: Any) -> Path:
     return path
 
 
-def _refuse_if_agent_config_present(wt: Path) -> None:
-    for root, dirs, files in os.walk(wt):
-        if Path(root) == wt and ".git" in dirs:
+def _refuse_if_agent_config_present(root: Path) -> None:
+    for current, dirs, files in os.walk(root):
+        if Path(current) == root and ".git" in dirs:
             dirs.remove(".git")
-        if ".codex" in dirs or ".agents" in dirs or ".codex" in files or ".agents" in files:
-            raise ChildRefusal("repository contains .codex or .agents")
+        if any(name in dirs or name in files for name in BLOCKED_PATH_COMPONENTS):
+            raise ChildRefusal("repository contains .codex, .agents, or .git")
 
 
 def cmd_prepare(request: dict[str, Any]) -> int:
@@ -272,11 +326,18 @@ def cmd_prepare(request: dict[str, Any]) -> int:
         wt = run_dir / "wt"
         if wt.exists():
             raise ChildRefusal("worktree already exists")
-        for name in ("tmp", "out", "images"):
+        for name in ("tmp", "images"):
             (run_dir / name).mkdir(parents=True, exist_ok=True, mode=0o770)
         env = _git_env()
         _run_git(
-            _git_argv("clone", "--no-checkout", "--no-hardlinks", str(mirror), str(wt)),
+            _git_argv(
+                "clone",
+                "--no-checkout",
+                "--no-hardlinks",
+                str(mirror),
+                str(wt),
+                safe_directory=str(mirror),
+            ),
             cwd=run_dir,
             env=env,
         )
@@ -301,72 +362,151 @@ def cmd_prepare(request: dict[str, Any]) -> int:
 # --------------------------------------------------------------------------
 
 
-def _parse_raw_diff(raw_text: str) -> tuple[list[str], str | None]:
+def _parse_raw_diff_z(raw_bytes: bytes) -> tuple[list[str], str | None]:
+    """Path listing + safety, from `git diff --cached --raw -z --no-renames`.
+
+    `-z` makes git emit each path exactly as it is on disk (NUL-terminated,
+    never C-quoted), so this is the only place changed paths should be read
+    from. Mode/symlink/submodule checking is handled separately, against the
+    single `--binary` patch this run actually returns (see
+    `_scan_patch_for_bad_modes`), not duplicated here.
+    """
+    parts = raw_bytes.split(b"\x00")
+    if parts and parts[-1] == b"":
+        parts = parts[:-1]
     changed_paths: list[str] = []
-    for line in raw_text.splitlines():
-        if not line.startswith(":"):
+    index = 0
+    while index < len(parts):
+        meta = parts[index]
+        index += 1
+        if not meta.startswith(b":"):
             continue
-        parts = line[1:].split("\t", 1)
-        if len(parts) != 2:
-            continue
-        meta, path = parts
-        fields = meta.split()
+        fields = meta[1:].split()
         if len(fields) < 4:
             continue
-        old_mode, new_mode = fields[0], fields[1]
-        if old_mode in BAD_GIT_MODES or new_mode in BAD_GIT_MODES:
-            return [], path
+        if index >= len(parts):
+            break
+        path_bytes = parts[index]
+        index += 1
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return [], "changed path is not valid UTF-8"
+        if any(
+            component in BLOCKED_PATH_COMPONENTS for component in PurePosixPath(path).parts
+        ):
+            return [], f"refuses a blocked path: {path}"
         changed_paths.append(path)
     return changed_paths, None
 
 
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(?:.*) b/(.*)$")
+_MODE_LINE_PATTERNS = (
+    re.compile(r"^new file mode (\d+)$"),
+    re.compile(r"^old mode (\d+)$"),
+    re.compile(r"^new mode (\d+)$"),
+    re.compile(r"^deleted file mode (\d+)$"),
+)
+_INDEX_LINE_RE = re.compile(r"^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+(?: (\d+))?$")
+
+
+def _scan_patch_for_bad_modes(patch_text: str) -> str | None:
+    """Parse the patch's own text headers (`new file mode`, `old mode`, `new
+    mode`, `deleted file mode`, `index <a>..<b> <mode>`) for a symlink
+    (120000) or submodule (160000) entry. Reading this off the one patch we
+    actually return -- instead of a second, separate `--raw` call against the
+    same index -- means the mode check can never disagree with what's in the
+    patch."""
+    current_path = "<unknown>"
+    for line in patch_text.splitlines():
+        header = _DIFF_GIT_HEADER_RE.match(line)
+        if header:
+            current_path = header.group(1)
+            continue
+        for pattern in _MODE_LINE_PATTERNS:
+            match = pattern.match(line)
+            if match and match.group(1) in BAD_GIT_MODES:
+                return current_path
+        match = _INDEX_LINE_RE.match(line)
+        if match and match.group(1) in BAD_GIT_MODES:
+            return current_path
+    return None
+
+
 def cmd_package(request: dict[str, Any]) -> int:
+    pkg_dir: Path | None = None
     try:
         run_id = _validate_run_id(request.get("run_id"))
         run_dir = _run_dir(run_id)
         wt = run_dir / "wt"
         if not wt.is_dir():
             raise ChildRefusal("worktree is not prepared")
-        tmp_dir = run_dir / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o770)
-        index_file = tmp_dir / "index"
+        # The agent's own edits could have added .codex/.agents/.git since
+        # prepare's one-time check; the diff-based check below catches new
+        # ones specifically, this catches anything already sitting in the
+        # tree regardless of whether this call's diff touches it.
+        _refuse_if_agent_config_present(wt)
+
+        out_dir = run_dir / "out"
+        out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # A fresh, 0700 (agent-codex only) directory for the temporary index:
+        # codex's own sandbox is never given `out/` as a writable root, so
+        # nothing spawned during `exec` could race this by writing here.
+        pkg_dir = Path(tempfile.mkdtemp(prefix="pkg-", dir=str(out_dir)))
+        os.chmod(pkg_dir, 0o700)
+        index_file = pkg_dir / "index"
         env = _git_env({"GIT_INDEX_FILE": str(index_file)})
-        try:
-            _run_git(_git_argv("read-tree", "HEAD"), cwd=wt, env=env)
-            _run_git(_git_argv("add", "-A"), cwd=wt, env=env)
-            raw = _run_git(
-                _git_argv("diff", "--cached", "--raw", "--no-renames", "HEAD"), cwd=wt, env=env
-            )
-            raw_text = raw.stdout.decode("utf-8", "replace")
-            changed_paths, bad_mode_path = _parse_raw_diff(raw_text)
-            if bad_mode_path is not None:
-                raise ChildRefusal(
-                    f"unsupported change (symlink or submodule): {bad_mode_path}"
-                )
-            if not changed_paths:
-                print(
-                    json.dumps({"patch_b64": "", "changed_paths": [], "bytes": 0}), flush=True
-                )
-                return 0
-            patch = _run_git(
-                _git_argv(
-                    "diff", "--cached", "--binary", "--no-renames", "HEAD", no_textconv=True
-                ),
-                cwd=wt,
-                env=env,
-            )
-            patch_bytes = patch.stdout
-            if len(patch_bytes) > MAX_PATCH_BYTES:
-                raise ChildRefusal("patch exceeds the size limit")
-        finally:
-            with contextlib.suppress(OSError):
-                index_file.unlink(missing_ok=True)
+        _run_git(_git_argv("read-tree", "HEAD"), cwd=wt, env=env)
+        _run_git(_git_argv("add", "-A"), cwd=wt, env=env)
+        raw = _run_git(
+            _git_argv(
+                "diff",
+                "--cached",
+                "--raw",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "HEAD",
+                "--",
+            ),
+            cwd=wt,
+            env=env,
+        )
+        changed_paths, bad_path_reason = _parse_raw_diff_z(raw.stdout)
+        if bad_path_reason is not None:
+            raise ChildRefusal(bad_path_reason)
+        if not changed_paths:
+            print(json.dumps({"patch_b64": "", "changed_paths": [], "bytes": 0}), flush=True)
+            return 0
+        patch = _run_git(
+            _git_argv(
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-renames",
+                "--no-ext-diff",
+                "HEAD",
+                "--",
+                no_textconv=True,
+            ),
+            cwd=wt,
+            env=env,
+        )
+        patch_bytes = patch.stdout
+        bad_mode_path = _scan_patch_for_bad_modes(patch_bytes.decode("utf-8", "replace"))
+        if bad_mode_path is not None:
+            raise ChildRefusal(f"unsupported change (symlink or submodule): {bad_mode_path}")
+        if len(patch_bytes) > MAX_PATCH_BYTES:
+            raise ChildRefusal("patch exceeds the size limit")
     except ChildRefusal as exc:
         _emit_error(str(exc))
         return 3
     except OSError as exc:
         _emit_error(f"package failed: {exc}")
         return 3
+    finally:
+        if pkg_dir is not None:
+            shutil.rmtree(pkg_dir, ignore_errors=True)
     print(
         json.dumps(
             {
@@ -486,7 +626,27 @@ def _descendant_pids(root_pid: int, table: ProcTable) -> list[int]:
     return result
 
 
+def _proc_state(pid: int) -> str | None:
+    """The process's state code (e.g. "Z" for zombie), Linux only. A zombie
+    still answers `kill(pid, 0)` successfully (its pid is still allocated
+    until reaped), so treating it as "alive" would spin forever waiting for
+    something that already exited."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    close = stat_text.rfind(")")
+    if close == -1:
+        return None
+    rest = stat_text[close + 2 :].split()
+    return rest[0] if rest else None
+
+
 def _pid_alive(pid: int) -> bool:
+    if (_proc_state(pid) or "").upper() == "Z":
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -501,6 +661,11 @@ def _signal_pid(pid: int, sig: int) -> None:
         os.kill(pid, sig)
 
 
+def _reap_if_child(pid: int) -> None:
+    with contextlib.suppress(ChildProcessError, OSError):
+        os.waitpid(pid, os.WNOHANG)
+
+
 def kill_tree(
     root_pid: int,
     *,
@@ -509,9 +674,13 @@ def kill_tree(
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """SIGTERM the whole descendant tree rooted at ``root_pid``, then SIGKILL
-    whatever is still alive after ``grace_s`` seconds. Sandboxed commands run
-    in a different session/process group than the codex process, so we find
-    them by walking the ppid chain rather than by process group."""
+    whatever a FRESH snapshot still finds alive after ``grace_s`` seconds.
+    Sandboxed commands run in a different session/process group than the
+    codex process, so we find them by walking the ppid chain rather than by
+    process group. Only signaling pids a fresh snapshot re-confirms (never
+    the original, now possibly-stale, target list) avoids SIGKILLing an
+    unrelated process that happened to reuse a pid after the real target
+    already exited."""
     table = proc_table_provider()
     targets = [root_pid, *_descendant_pids(root_pid, table)]
     for pid in targets:
@@ -521,12 +690,73 @@ def kill_tree(
         if not any(_pid_alive(pid) for pid in targets):
             return
         sleep(0.2)
-    remaining_table = proc_table_provider()
-    remaining_targets = (
-        set(targets) | set(_descendant_pids(root_pid, remaining_table)) | {root_pid}
-    )
-    for pid in remaining_targets:
-        _signal_pid(pid, signal.SIGKILL)
+    fresh_table = proc_table_provider()
+    fresh_targets = {root_pid, *_descendant_pids(root_pid, fresh_table)}
+    for pid in fresh_targets:
+        if _pid_alive(pid):
+            _signal_pid(pid, signal.SIGKILL)
+
+
+def _reap_all_descendants(
+    *,
+    proc_table_provider: ProcTableProvider = default_proc_table,
+    grace_s: float = TREE_KILL_GRACE_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Terminate and reap every descendant of THIS process -- not just the
+    spawned `codex` pid's own tree. Called on every `cmd_exec` exit path
+    (normal EOF, timeout, idle, SIGTERM, exception).
+
+    With `PR_SET_CHILD_SUBREAPER` set on us (see `cmd_exec`), a
+    double-forked/setsid grandchild that outlives its immediate parent
+    re-parents to US on Linux, not to init, which is what actually makes it
+    reachable by walking descendants of our own pid instead of just the
+    `codex` pid's tree (`kill_tree` above catches the common case fast; this
+    is the catch-all net for anything that slipped past it). Subreaper is
+    Linux-only, so this is a best-effort no-op for genuinely orphaned
+    processes on other platforms -- there is no portable equivalent.
+    """
+    own_pid = os.getpid()
+    table = proc_table_provider()
+    targets = _descendant_pids(own_pid, table)
+    for pid in targets:
+        _signal_pid(pid, signal.SIGTERM)
+        _reap_if_child(pid)
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        for pid in targets:
+            _reap_if_child(pid)
+        if not any(_pid_alive(pid) for pid in targets):
+            break
+        sleep(0.2)
+    fresh_table = proc_table_provider()
+    fresh_targets = _descendant_pids(own_pid, fresh_table)
+    for pid in fresh_targets:
+        if _pid_alive(pid):
+            _signal_pid(pid, signal.SIGKILL)
+    reap_deadline = time.monotonic() + 2.0
+    remaining = set(fresh_targets)
+    while remaining and time.monotonic() < reap_deadline:
+        for pid in list(remaining):
+            try:
+                reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                remaining.discard(pid)
+                continue
+            if reaped_pid == pid:
+                remaining.discard(pid)
+        if remaining:
+            sleep(0.05)
+
+
+def _prctl(option: int, arg2: int = 0) -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(option, arg2, 0, 0, 0) == 0
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +768,7 @@ def kill_tree(
 class ExecParams:
     run_dir: Path
     lane: str
+    cwd_kind: str
     cwd_path: Path
     model: str
     effort: str
@@ -579,10 +810,11 @@ def _validate_exec_request(request: dict[str, Any]) -> ExecParams:
     if not isinstance(raw_images, list) or len(raw_images) > MAX_IMAGES:
         raise ChildRefusal("invalid images")
     images: list[Path] = []
+    images_root = run_dir / "images"
     for raw in raw_images:
         if not isinstance(raw, str):
             raise ChildRefusal("invalid image path")
-        images.append(_ensure_within(Path(raw), run_dir))
+        images.append(_ensure_within(Path(raw), images_root))
     output_schema = request.get("output_schema")
     if output_schema is not None and not isinstance(output_schema, dict):
         raise ChildRefusal("invalid output_schema")
@@ -594,12 +826,17 @@ def _validate_exec_request(request: dict[str, Any]) -> ExecParams:
         cwd_path = run_dir / "wt"
         if not cwd_path.is_dir():
             raise ChildRefusal("worktree is not prepared")
+        # The agent's own previous turn (correction flows re-run exec on the
+        # same worktree) could have added .codex/.agents/.git since prepare
+        # or the last exec; refuse before letting codex run again.
+        _refuse_if_agent_config_present(cwd_path)
     else:
         cwd_path = run_dir / "empty"
-        cwd_path.mkdir(parents=True, exist_ok=True, mode=0o770)
+        _fresh_dir(cwd_path, mode=0o700)
     return ExecParams(
         run_dir=run_dir,
         lane=lane,
+        cwd_kind=cwd_kind,
         cwd_path=cwd_path,
         model=model,
         effort=effort,
@@ -630,6 +867,10 @@ def _build_exec_command(params: ExecParams, schema_path: Path, final_path: Path)
         "-c",
         "sandbox_workspace_write.exclude_slash_tmp=true",
     ]
+    if params.cwd_kind == "empty":
+        # Nothing to check out a git repo from in a fresh scratch dir --
+        # codex would otherwise warn/refuse about not being in one.
+        command.append("--skip-git-repo-check")
     if not params.multi_agent:
         command += ["-c", "features.multi_agent=false"]
     if params.output_schema is not None:
@@ -637,7 +878,10 @@ def _build_exec_command(params: ExecParams, schema_path: Path, final_path: Path)
     command += ["--output-last-message", str(final_path)]
     for image in params.images:
         command += ["--image", str(image)]
-    command.append("-")
+    # `-i/--image` takes multiple values, so it would otherwise greedily
+    # swallow the trailing `-` (read prompt from stdin) as one more image
+    # path; `--` forces everything after it to be positional.
+    command += ["--", "-"]
     return command
 
 
@@ -655,13 +899,7 @@ def _exec_env(params: ExecParams) -> dict[str, str]:
 
 
 def _preexec_pdeathsig() -> None:
-    if not sys.platform.startswith("linux"):
-        return
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        libc.prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG, SIGKILL
-    except OSError:
-        pass
+    _prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
 # --------------------------------------------------------------------------
@@ -669,20 +907,47 @@ def _preexec_pdeathsig() -> None:
 # --------------------------------------------------------------------------
 
 
+def _put_important(sink: queue.Queue[Any], item: Any) -> None:
+    """Enqueue `item` even if the queue is full, evicting the oldest buffered
+    item if necessary. Used only for the EOF sentinel (losing it would hang
+    the consumer forever) -- ordinary lines are dropped instead when full."""
+    while True:
+        try:
+            sink.put_nowait(item)
+            return
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                sink.get_nowait()
+
+
+def _readline_capped(stream: Any, limit: int) -> bytes:
+    return stream.readline(limit)
+
+
 def _pump_stdout_lines(stream: Any, sink: queue.Queue[str | None]) -> None:
     try:
-        for line in stream:
-            sink.put(line.rstrip("\n"))
+        while True:
+            raw_line = _readline_capped(stream, MAX_LINE_BYTES)
+            if not raw_line:
+                break
+            text = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            # The consumer is falling behind; drop, don't block codex.
+            with contextlib.suppress(queue.Full):
+                sink.put_nowait(text)
     except (OSError, ValueError):
         pass
     finally:
-        sink.put(None)
+        _put_important(sink, None)
 
 
 def _pump_stderr(stream: Any, sink: deque[str]) -> None:
     try:
-        for line in stream:
-            sink.append(line.rstrip("\n")[:MAX_STDERR_LINE_CHARS])
+        while True:
+            raw_line = _readline_capped(stream, MAX_LINE_BYTES)
+            if not raw_line:
+                break
+            text = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            sink.append(text[:MAX_STDERR_LINE_CHARS])
     except (OSError, ValueError):
         pass
 
@@ -696,14 +961,14 @@ class StreamOutcome:
 
 
 def _stream_and_wait(
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[bytes],
     timeout_s: float,
     idle_timeout_s: float,
     signaled: threading.Event,
     *,
     kill: Callable[[int], None] = lambda pid: kill_tree(pid),
 ) -> StreamOutcome:
-    lines: queue.Queue[str | None] = queue.Queue()
+    lines: queue.Queue[str | None] = queue.Queue(maxsize=STDOUT_QUEUE_MAXSIZE)
     reader = threading.Thread(
         target=_pump_stdout_lines, args=(process.stdout, lines), daemon=True
     )
@@ -712,6 +977,29 @@ def _stream_and_wait(
     outcome = StreamOutcome()
     deadline = time.monotonic() + timeout_s
     idle_deadline = time.monotonic() + idle_timeout_s
+
+    def _handle_line(line: str) -> None:
+        idle_nonlocal[0] = time.monotonic() + idle_timeout_s
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            event = None
+        event_type = event.get("type") if isinstance(event, dict) else None
+        if isinstance(event_type, str) and event_type.startswith("agent_svc."):
+            # Only our own synthesized result frame may use this namespace;
+            # a compromised/misbehaving codex forging one must not reach the
+            # parent as if it were authoritative.
+            return
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        if event_type == "thread.started":
+            outcome.thread_started = event
+        elif event_type == "turn.completed":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                outcome.fallback_usage = {key: _safe_int(usage.get(key)) for key in USAGE_KEYS}
+
+    idle_nonlocal = [idle_deadline]
 
     while True:
         now = time.monotonic()
@@ -722,11 +1010,11 @@ def _stream_and_wait(
             outcome.timed_out = True
             kill(process.pid)
             break
-        if now >= idle_deadline:
+        if now >= idle_nonlocal[0]:
             outcome.idle_killed = True
             kill(process.pid)
             break
-        remaining = min(deadline, idle_deadline) - now
+        remaining = min(deadline, idle_nonlocal[0]) - now
         wait_for = min(max(remaining, 0.05), 0.5)
         try:
             line = lines.get(timeout=wait_for)
@@ -734,23 +1022,7 @@ def _stream_and_wait(
             continue
         if line is None:
             break
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-        idle_deadline = time.monotonic() + idle_timeout_s
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            event = None
-        if isinstance(event, dict):
-            if event.get("type") == "thread.started":
-                outcome.thread_started = event
-            elif event.get("type") == "turn.completed":
-                usage = event.get("usage")
-                if isinstance(usage, dict):
-                    outcome.fallback_usage = {
-                        key: int(usage.get(key, 0) or 0)
-                        for key in ("input_tokens", "cached_input_tokens", "output_tokens")
-                    }
+        _handle_line(line)
 
     # Drain whatever is already buffered without blocking further.
     while True:
@@ -760,11 +1032,13 @@ def _stream_and_wait(
             break
         if line is None:
             break
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        _handle_line(line)
 
     reader.join(timeout=2)
     return outcome
+
+
+USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
 
 
 # Real Codex 0.156.1 rollout JSONL shape (verified against the live server,
@@ -868,10 +1142,7 @@ def _last_token_usage(path: Path) -> dict[str, int] | None:
                     continue
                 usage = info.get("total_token_usage")
                 if isinstance(usage, dict):
-                    last = {
-                        key: int(usage.get(key, 0) or 0)
-                        for key in ("input_tokens", "cached_input_tokens", "output_tokens")
-                    }
+                    last = {key: _safe_int(usage.get(key)) for key in USAGE_KEYS}
     except OSError:
         return None
     return last
@@ -890,7 +1161,7 @@ def _collect_and_delete_usage(
     matches = _relevant_rollouts(codex_home / "sessions", thread_id, min_mtime=min_mtime)
     if not matches:
         return fallback_usage, thread_id
-    totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    totals = dict.fromkeys(USAGE_KEYS, 0)
     found_any = False
     for rollout in matches:
         usage = _last_token_usage(rollout)
@@ -906,10 +1177,12 @@ def _collect_and_delete_usage(
 
 
 def _read_final_message(path: Path) -> str:
-    if not path.is_file():
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
         return ""
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
             return handle.read(MAX_FINAL_MESSAGE_CHARS)
     except OSError:
         return ""
@@ -921,14 +1194,30 @@ def cmd_exec(request: dict[str, Any]) -> int:
     except ChildRefusal as exc:
         _emit_error(str(exc))
         return 3
+    except OSError as exc:
+        # `_validate_exec_request` itself creates/wipes the "empty" cwd and
+        # re-scans "wt" for blocked paths; either can fail with a plain
+        # OSError (permissions, disk full, ...) that must not crash the
+        # process instead of reporting a clean refusal.
+        _emit_error(f"exec setup failed: {exc}")
+        return 3
 
-    out_dir = params.run_dir / "out"
-    out_dir.mkdir(parents=True, exist_ok=True, mode=0o770)
-    (params.run_dir / "tmp").mkdir(parents=True, exist_ok=True, mode=0o770)
-    schema_path = out_dir / "schema.json"
-    final_path = out_dir / "final.txt"
-    if params.output_schema is not None:
-        schema_path.write_text(json.dumps(params.output_schema), encoding="utf-8")
+    try:
+        _fresh_dir(params.run_dir / "out", mode=0o700)
+        (params.run_dir / "tmp").mkdir(parents=True, exist_ok=True, mode=0o770)
+        out_dir = params.run_dir / "out"
+        schema_path = out_dir / "schema.json"
+        final_path = out_dir / "final.txt"
+        # Belt-and-suspenders: `_fresh_dir` above already guarantees neither
+        # file can pre-exist, but make that explicit rather than implicit.
+        for stale in (schema_path, final_path):
+            with contextlib.suppress(OSError):
+                stale.unlink()
+        if params.output_schema is not None:
+            schema_path.write_text(json.dumps(params.output_schema), encoding="utf-8")
+    except OSError as exc:
+        _emit_error(f"exec setup failed: {exc}")
+        return 3
 
     # Wall-clock start, used only as a cheap mtime prefilter when hunting for
     # this run's rollout files afterwards; a couple of seconds of slack
@@ -948,8 +1237,6 @@ def cmd_exec(request: dict[str, Any]) -> int:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
             start_new_session=True,
             preexec_fn=_preexec_pdeathsig,
         )
@@ -957,60 +1244,75 @@ def cmd_exec(request: dict[str, Any]) -> int:
         _emit_error(f"failed to start codex: {exc}")
         return 3
 
-    assert process.stdin is not None and process.stderr is not None
-    try:
-        process.stdin.write(params.prompt)
-    except (BrokenPipeError, OSError):
-        pass
-    finally:
-        with contextlib.suppress(OSError):
-            process.stdin.close()
-
-    stderr_thread = threading.Thread(
-        target=_pump_stderr, args=(process.stderr, stderr_tail), daemon=True
-    )
-    stderr_thread.start()
-
-    signaled = threading.Event()
-
-    def _handle_sigterm(_signum: int, _frame: Any) -> None:
-        signaled.set()
-
-    previous_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
-    try:
-        outcome = _stream_and_wait(process, params.timeout_s, params.idle_timeout_s, signaled)
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
+    # Mark OURSELVES (codex_child.py's own process, not codex) as a reaper
+    # for our descendants: a double-forked/setsid grandchild that outlives
+    # its immediate parent then re-parents to US (Linux only) instead of
+    # init, so `_reap_all_descendants` below can actually find and kill it
+    # regardless of how deeply it tried to detach itself.
+    _prctl(PR_SET_CHILD_SUBREAPER, 1)
 
     try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        kill_tree(process.pid)
-        with contextlib.suppress(subprocess.TimeoutExpired):
+        assert process.stdin is not None and process.stderr is not None
+        try:
+            process.stdin.write(params.prompt.encode("utf-8"))
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                process.stdin.close()
+
+        stderr_thread = threading.Thread(
+            target=_pump_stderr, args=(process.stderr, stderr_tail), daemon=True
+        )
+        stderr_thread.start()
+
+        signaled = threading.Event()
+
+        def _handle_sigterm(_signum: int, _frame: Any) -> None:
+            signaled.set()
+
+        previous_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
+        try:
+            outcome = _stream_and_wait(
+                process, params.timeout_s, params.idle_timeout_s, signaled
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+        try:
             process.wait(timeout=5)
-    stderr_thread.join(timeout=2)
+        except subprocess.TimeoutExpired:
+            kill_tree(process.pid)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        stderr_thread.join(timeout=2)
 
-    usage, thread_id = _collect_and_delete_usage(
-        params.codex_home,
-        outcome.thread_started,
-        outcome.fallback_usage,
-        min_mtime=rollout_min_mtime,
-    )
-    final_message = _read_final_message(final_path)
-    exit_code = process.returncode if process.returncode is not None else -1
+        usage, thread_id = _collect_and_delete_usage(
+            params.codex_home,
+            outcome.thread_started,
+            outcome.fallback_usage,
+            min_mtime=rollout_min_mtime,
+        )
+        final_message = _read_final_message(final_path)
+        exit_code = process.returncode if process.returncode is not None else -1
 
-    frame = {
-        "type": "agent_svc.result",
-        "exit_code": exit_code,
-        "timed_out": outcome.timed_out,
-        "idle_killed": outcome.idle_killed,
-        "final_message": final_message,
-        "thread_id": thread_id,
-        "usage": usage,
-        "stderr_tail": list(stderr_tail),
-    }
-    print(json.dumps(frame, ensure_ascii=False), flush=True)
-    return 0
+        frame = {
+            "type": "agent_svc.result",
+            "exit_code": exit_code,
+            "timed_out": outcome.timed_out,
+            "idle_killed": outcome.idle_killed,
+            "final_message": final_message,
+            "thread_id": thread_id,
+            "usage": usage,
+            "stderr_tail": list(stderr_tail),
+        }
+        print(json.dumps(frame, ensure_ascii=False), flush=True)
+        return 0
+    finally:
+        # Every exit path -- normal EOF, timeout, idle, SIGTERM, or an
+        # exception above -- reaches here before `cmd_exec` actually
+        # returns, so nothing sandboxed can survive us.
+        _reap_all_descendants()
 
 
 # --------------------------------------------------------------------------
