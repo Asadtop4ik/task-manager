@@ -52,12 +52,17 @@ class LeaseLost(Exception):
 
 
 class CodexChildError(RuntimeError):
-    """Raised when `prepare`/`package`/`cleanup` exit non-zero or return unusable JSON."""
+    """Raised when `prepare`/`package`/`preflight`/`cleanup` exit non-zero or
+    return unusable JSON. `body` is the full parsed JSON the child printed on
+    a clean (well-formed) refusal, when there is one -- `preflight` uses it
+    to carry `preflight_failure`, the trusted script's own failure text,
+    alongside the generic `reason` every subcommand reports."""
 
-    def __init__(self, exit_code: int, reason: str) -> None:
+    def __init__(self, exit_code: int, reason: str, *, body: dict[str, Any] | None = None) -> None:
         super().__init__(reason)
         self.exit_code = exit_code
         self.reason = reason
+        self.body = body
 
 
 @dataclass(frozen=True)
@@ -219,7 +224,9 @@ class CodexRunner:
         if completed.returncode != 0:
             reason = body.get("reason") if isinstance(body, dict) else None
             raise CodexChildError(
-                completed.returncode, reason or f"codex child {subcommand} failed"
+                completed.returncode,
+                reason or f"codex child {subcommand} failed",
+                body=body if isinstance(body, dict) else None,
             )
         if not isinstance(body, dict):
             raise CodexChildError(
@@ -232,6 +239,9 @@ class CodexRunner:
 
     def package(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("package", request, timeout_s)
+
+    def preflight(self, request: dict[str, Any], *, timeout_s: float = 180.0) -> dict[str, Any]:
+        return self._simple_call("preflight", request, timeout_s)
 
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("cleanup", request, timeout_s)
