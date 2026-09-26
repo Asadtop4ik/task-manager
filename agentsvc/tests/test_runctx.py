@@ -53,9 +53,10 @@ class RunScaffoldTests(unittest.TestCase):
                 entry = ctx.journal.read(work.run_id)
                 assert entry is not None
                 self.assertEqual(entry.stage, "leased")
-            # Removed on exit, and codex.cleanup was called.
+            # Removed on exit, and codex.cleanup was called on enter (to
+            # clear any leftover from a previous crashed run) and on exit.
             self.assertIsNone(ctx.journal.read(work.run_id))
-            self.assertEqual(len(ctx.codex.cleanup_calls), 1)  # type: ignore[attr-defined]
+            self.assertEqual(len(ctx.codex.cleanup_calls), 2)  # type: ignore[attr-defined]
 
     def test_stage_updates_journal_and_reports_to_api(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -103,6 +104,35 @@ class RunScaffoldTests(unittest.TestCase):
                 # Once cancelled, stage() must not call the API again.
                 run.stage("codex_started")
             self.assertEqual(api.stages, [])
+
+    def test_enter_removes_a_leftover_publish_dir_before_prepare_would_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            api = FakeApi()
+            ctx = build_test_context(Path(tmp), api=api)
+            work = _implement_work()
+            leftover = Path(ctx.settings.state_dir) / "publish" / work.run_id
+            leftover.mkdir(parents=True)
+            (leftover / "stale.txt").write_text("from a crashed run\n", encoding="utf-8")
+
+            cancel = threading.Event()
+            with RunScaffold(ctx, work, cancel, heartbeat_interval_s=1000.0):
+                # Gone by the time `__enter__` returns -- before any
+                # prepare/exec/publish call for this fresh attempt.
+                self.assertFalse(leftover.exists())
+
+    def test_enter_cleans_up_codex_before_any_other_work(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            api = FakeApi()
+            ctx = build_test_context(Path(tmp), api=api)
+            work = _implement_work()
+            cancel = threading.Event()
+            with RunScaffold(ctx, work, cancel, heartbeat_interval_s=1000.0):
+                self.assertEqual(len(ctx.codex.cleanup_calls), 1)  # type: ignore[attr-defined]
+                self.assertEqual(len(ctx.codex.prepare_calls), 0)  # type: ignore[attr-defined]
 
     def test_heartbeat_transient_failure_does_not_cancel(self) -> None:
         with TemporaryDirectory() as tmp:

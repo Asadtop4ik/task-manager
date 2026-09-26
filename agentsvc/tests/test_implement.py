@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import json
+import stat
 import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from agent_svc.api import Work
 from agent_svc.codex import CodexChildError, CodexResult
@@ -72,6 +75,47 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
+class _FakeImageResponse:
+    """A minimal stand-in for `http.client.HTTPResponse`: a context manager
+    with `.headers.get(...)` and one-shot `.read(n)`, exactly what
+    `agent_images.download_images` needs from `urllib.request.urlopen`."""
+
+    def __init__(self, *, content_type: str, body: bytes) -> None:
+        self.headers = {"Content-Type": content_type}
+        self._body = body
+        self._read = False
+
+    def __enter__(self) -> "_FakeImageResponse":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def read(self, _size: int = -1) -> bytes:
+        if self._read:
+            return b""
+        self._read = True
+        return self._body
+
+
+def _fake_urlopen_for_one_image(run_id: str, image_bytes: bytes):
+    listing_suffix = f"/agent-runs/{run_id}/images"
+    image_suffix = f"/agent-runs/{run_id}/images/1"
+
+    def fake_urlopen(request: object, timeout: float | None = None) -> _FakeImageResponse:
+        url = request.full_url  # type: ignore[attr-defined]
+        if url.endswith(listing_suffix):
+            body = json.dumps(
+                [{"id": 1, "mime": "image/png", "size": len(image_bytes)}]
+            ).encode()
+            return _FakeImageResponse(content_type="application/json", body=body)
+        if url.endswith(image_suffix):
+            return _FakeImageResponse(content_type="image/png", body=image_bytes)
+        raise AssertionError(f"unexpected image URL in test: {url}")
+
+    return fake_urlopen
+
+
 class HandleImplementHappyPathTests(unittest.TestCase):
     def test_private_repo_happy_path(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -117,9 +161,10 @@ class HandleImplementHappyPathTests(unittest.TestCase):
             self.assertIn("Start from these files:", request["prompt"])
             self.assertIn("- NOTES.md", request["prompt"])
 
-            # Journal entry removed, codex workspace cleaned up.
+            # Journal entry removed, codex workspace cleaned up (once on
+            # enter, once on exit).
             self.assertIsNone(ctx.journal.read(RUN_ID))
-            self.assertEqual(len(ctx.codex.cleanup_calls), 1)  # type: ignore[attr-defined]
+            self.assertEqual(len(ctx.codex.cleanup_calls), 2)  # type: ignore[attr-defined]
 
     def test_public_repo_happy_path(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -188,6 +233,61 @@ class HandleImplementHappyPathTests(unittest.TestCase):
             payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
             self.assertEqual(payload["status"], "failed")
             self.assertIn("protected path", payload["error"])
+
+    def test_downloaded_images_are_readable_by_agent_codex_and_reach_exec(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+
+            work = _work(image_count=1)
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {
+                    "patch_b64": _b64(patch_bytes),
+                    "changed_paths": ["NOTES.md"],
+                    "bytes": len(patch_bytes),
+                }
+            )
+
+            png_bytes = b"\x89PNG\r\n\x1a\nfake-png-data"
+            captured: dict[str, list] = {}
+            original_run_exec = ctx.codex.run_exec  # type: ignore[attr-defined]
+
+            def spying_run_exec(request, **kwargs):
+                images = [Path(p) for p in request.get("images", [])]
+                captured["images"] = images
+                captured["modes"] = [
+                    (
+                        stat.S_IMODE(path.stat().st_mode),
+                        stat.S_IMODE(path.parent.stat().st_mode),
+                    )
+                    for path in images
+                ]
+                return original_run_exec(request, **kwargs)
+
+            ctx.codex.run_exec = spying_run_exec  # type: ignore[method-assign,attr-defined]
+
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=_fake_urlopen_for_one_image(RUN_ID, png_bytes),
+            ):
+                handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "pr_opened")
+            self.assertEqual(len(captured["images"]), 1)
+            image_path = captured["images"][0]
+            self.assertEqual(image_path.name, "image-1.png")
+            self.assertIn("agent-images", image_path.parts)
+            file_mode, dir_mode = captured["modes"][0]
+            self.assertEqual(file_mode, 0o640)
+            self.assertEqual(dir_mode, 0o2750)
+            # Downloaded attachments are removed once the run finishes.
+            images_dir = Path(ctx.settings.work_root) / RUN_ID / "images"
+            self.assertFalse(images_dir.exists())
 
     def test_is_public_repo_treats_agent_qa_as_public(self) -> None:
         from agent_svc.implement import is_public_repo

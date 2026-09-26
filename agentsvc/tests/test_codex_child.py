@@ -1021,6 +1021,38 @@ class PrepareIntegrationTests(ChildProcessTestCase):
         )
         self.assertEqual(completed.returncode, 3)
 
+    def test_leftover_worktree_blocks_prepare_until_cleanup_then_reprepare_succeeds(
+        self,
+    ) -> None:
+        """Restart safety: a run interrupted between `prepare` and its own
+        `cleanup` (a crashed agent-svc process, or a re-lease of a run whose
+        lease expired mid-implement) must not get stuck forever. `RunScaffold.
+        __enter__` calls `codex.cleanup` before ever calling `prepare` again
+        for exactly this reason -- this proves the underlying child behavior
+        that makes that necessary, and that it actually fixes it."""
+        mirror, sha = build_mirror(self.mirrors_dir, "acme/widgets", {"README.md": "hi\n"})
+        run_id = new_run_id()
+        request = {"run_id": run_id, "repo": "acme/widgets", "mirror": mirror, "base_sha": sha}
+
+        first = self.run_child("prepare", request)
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        # A second `prepare` for the same run_id, without cleanup first,
+        # refuses -- the leftover `wt/` from the interrupted run is still
+        # there.
+        blocked = self.run_child("prepare", request)
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("already exists", json.loads(blocked.stdout)["reason"])
+
+        cleaned = self.run_child("cleanup", {"run_id": run_id})
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertFalse((self.work_root / run_id / "wt").exists())
+
+        # Re-lease: prepare succeeds again for the exact same run_id.
+        second = self.run_child("prepare", request)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout), {"ok": True, "head": sha})
+
 
 class CloneAcrossOwnersTests(unittest.TestCase):
     """`GIT_TEST_ASSUME_DIFFERENT_OWNER=1` makes git treat EVERY repository it

@@ -15,6 +15,7 @@ must stop without sending any further callback.
 
 from __future__ import annotations
 
+import shutil
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +56,17 @@ class RunScaffold:
 
     def __enter__(self) -> RunScaffold:
         self._write_journal(stage="leased", base_sha=None, branch=self._work.branch)
+        # A previous agent-svc process may have crashed between leasing this
+        # run and its own cleanup (or `recovery.py` skipped it, or this is a
+        # re-lease of a run that timed out mid-implement). `codex.prepare`
+        # refuses outright if `wt/` already exists, so clearing any leftover
+        # sandbox workspace and publish checkout BEFORE it ever runs is what
+        # makes re-leasing the same run_id idempotent rather than stuck.
+        self._cleanup_leftovers()
+        # Registered so a service-wide shutdown (main.run's SIGTERM/SIGINT
+        # handler) can cooperatively cancel this run too, not just stop
+        # leasing new ones.
+        self._ctx.cancel_registry.register(self.cancel)
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop, name=f"heartbeat-{self._work.run_id}", daemon=True
         )
@@ -70,13 +82,20 @@ class RunScaffold:
         self._stop_heartbeat.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=_JOIN_TIMEOUT_S)
+        self._ctx.cancel_registry.unregister(self.cancel)
+        self._cleanup_leftovers()
+        # Downloaded task attachments are sensitive and only ever needed for
+        # the duration of this run.
+        shutil.rmtree(self.run_dir / "images", ignore_errors=True)
+        self._ctx.journal.remove(self._work.run_id)
+
+    def _cleanup_leftovers(self) -> None:
         try:
             self._ctx.codex.cleanup({"run_id": self._work.run_id})
-        except Exception as cleanup_exc:  # cleanup must never mask the real outcome
-            self._ctx.logger.error(
-                cleanup_exc, event="codex_cleanup_failed", run_id=self._work.run_id
-            )
-        self._ctx.journal.remove(self._work.run_id)
+        except Exception as exc:  # cleanup must never mask the real outcome
+            self._ctx.logger.error(exc, event="codex_cleanup_failed", run_id=self._work.run_id)
+        publish_dir = Path(self._ctx.settings.state_dir) / "publish" / self._work.run_id
+        shutil.rmtree(publish_dir, ignore_errors=True)
 
     def _heartbeat_loop(self) -> None:
         while not self._stop_heartbeat.wait(self._heartbeat_interval_s):

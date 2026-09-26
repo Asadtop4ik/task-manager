@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agent_svc.http import HttpError
@@ -13,6 +14,15 @@ from agent_svc.recovery import recover
 
 RUN_A = "11111111-1111-1111-1111-111111111111"
 RUN_B = "22222222-2222-2222-2222-222222222222"
+
+
+class FakeCodex:
+    def __init__(self) -> None:
+        self.cleanup_calls: list[str] = []
+
+    def cleanup(self, request: dict) -> dict:
+        self.cleanup_calls.append(request["run_id"])
+        return {"ok": True}
 
 
 def _entry(
@@ -131,6 +141,75 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual([entry.run_id for entry in resume], [other_ids[1]])
             for run_id in (RUN_A, RUN_B, other_ids[0]):
                 self.assertIsNotNone(journal.read(run_id))  # left alone, not crashed
+
+
+class RecoveryCleansUpLeftoversTests(unittest.TestCase):
+    def test_cleans_up_codex_and_publish_dir_for_a_terminal_entry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry(RUN_A))
+            api = FakeApi({RUN_A: {"status": "deployed"}})
+            codex = FakeCodex()
+            state_dir = Path(tmp) / "state"
+            publish_dir = state_dir / "publish" / RUN_A
+            publish_dir.mkdir(parents=True)
+            (publish_dir / "leftover.txt").write_text("x", encoding="utf-8")
+
+            recover(journal, api, _logger(), codex=codex, state_dir=str(state_dir))
+
+            self.assertEqual(codex.cleanup_calls, [RUN_A])
+            self.assertFalse(publish_dir.exists())
+
+    def test_cleans_up_codex_and_publish_dir_for_a_resumed_entry_too(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry(RUN_A, lease_id="lease-1"))
+            api = FakeApi({RUN_A: {"status": "pr_opened", "lease_id": "lease-1"}})
+            codex = FakeCodex()
+            state_dir = Path(tmp) / "state"
+            publish_dir = state_dir / "publish" / RUN_A
+            publish_dir.mkdir(parents=True)
+
+            resume = recover(journal, api, _logger(), codex=codex, state_dir=str(state_dir))
+
+            self.assertEqual([entry.run_id for entry in resume], [RUN_A])
+            self.assertEqual(codex.cleanup_calls, [RUN_A])
+            self.assertFalse(publish_dir.exists())
+
+    def test_status_failure_never_touches_the_workspace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry(RUN_A))
+            api = FakeApi({RUN_A: TimeoutError("timed out")})
+            codex = FakeCodex()
+            state_dir = Path(tmp) / "state"
+            publish_dir = state_dir / "publish" / RUN_A
+            publish_dir.mkdir(parents=True)
+
+            recover(journal, api, _logger(), codex=codex, state_dir=str(state_dir))
+
+            self.assertEqual(codex.cleanup_calls, [])
+            self.assertTrue(publish_dir.exists())
+
+    def test_a_codex_cleanup_exception_is_logged_and_never_raises(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry(RUN_A))
+            api = FakeApi({RUN_A: {"status": "deployed"}})
+
+            class BoomCodex:
+                def cleanup(self, request: dict) -> dict:
+                    raise RuntimeError("sudo unavailable")
+
+            recover(journal, api, _logger(), codex=BoomCodex(), state_dir=tmp)  # must not raise
+
+    def test_without_codex_or_state_dir_recovery_behaves_exactly_as_before(self) -> None:
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry(RUN_A))
+            api = FakeApi({RUN_A: {"status": "deployed"}})
+            resume = recover(journal, api, _logger())  # no codex=, no state_dir=
+            self.assertEqual(resume, [])
 
 
 if __name__ == "__main__":

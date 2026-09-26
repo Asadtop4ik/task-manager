@@ -10,8 +10,9 @@ there is exactly one wiring to keep correct.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import repos
@@ -23,6 +24,36 @@ from .http import JsonHttp
 from .journal import Journal
 from .log import Logger, Redactor
 from .trusted import TrustedModules
+
+
+class CancelRegistry:
+    """Every currently active run's `cancel` Event.
+
+    A lane thread mid-implement/correction only ever checks its OWN
+    `cancel` Event (set by its own heartbeat losing the lease); a service
+    shutdown (SIGTERM/SIGINT) has no other way to ask every in-flight run to
+    stop cooperatively instead of running to its own timeout. `RunScaffold`
+    registers on `__enter__` and unregisters on `__exit__`; `main.run`'s
+    shutdown path calls `cancel_all()`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: set[threading.Event] = set()
+
+    def register(self, cancel: threading.Event) -> None:
+        with self._lock:
+            self._events.add(cancel)
+
+    def unregister(self, cancel: threading.Event) -> None:
+        with self._lock:
+            self._events.discard(cancel)
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            events = list(self._events)
+        for event in events:
+            event.set()
 
 
 @dataclass(frozen=True)
@@ -37,6 +68,7 @@ class ServiceContext:
     codex: CodexRunner
     catalog: repos.Catalog
     trusted: TrustedModules
+    cancel_registry: CancelRegistry = field(default_factory=CancelRegistry)
 
 
 def token_selector(settings: Settings, catalog: repos.Catalog) -> Callable[[str], str]:

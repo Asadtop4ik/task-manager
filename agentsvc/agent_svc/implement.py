@@ -253,7 +253,24 @@ def _download_images(
         target,
         api_base=ctx.settings.api_base_url,
     )
-    return target / "agent-images", list(paths)
+    image_dir = target / "agent-images"
+    _make_images_readable_by_agent_codex(image_dir, paths)
+    return image_dir, list(paths)
+
+
+def _make_images_readable_by_agent_codex(image_dir: Path, paths: list[Path]) -> None:
+    """`agent_images.download_images` (trusted, runs as agent-svc) creates
+    `image_dir` mode 0700 and each file mode 0600 -- agent-svc only.
+    agent-codex (group `agentwork`) must be able to READ these: they are
+    handed straight to `codex exec --image <path>`, which runs as
+    agent-codex. `image_dir`'s GROUP is already `agentwork` (inherited via
+    the setgid bit on `run_dir/images`, its parent -- see
+    `repos.make_run_dir` -- POSIX propagates a setgid directory's group to
+    everything created under it); only the permission bits need relaxing.
+    """
+    image_dir.chmod(0o2750)
+    for path in paths:
+        path.chmod(0o640)
 
 
 def _recover_existing_branch(
