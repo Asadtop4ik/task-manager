@@ -6,6 +6,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from agent_svc.api import Work
 from agent_svc.codex import CodexResult
@@ -84,10 +85,6 @@ def _exec_result(**overrides: object) -> CodexResult:
     return CodexResult(**base)  # type: ignore[arg-type]
 
 
-def _stub_preflight(ctx, text: str = "stub preflight ok") -> None:
-    ctx.trusted.agent_preflight.run = lambda repo, root, *, tools=None: text  # type: ignore[assignment]
-
-
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
@@ -100,7 +97,6 @@ class HandleCorrectionHappyPathTests(unittest.TestCase):
             base_sha = make_github_remote(remote)
             push_new_branch(remote, base_sha, BRANCH)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
 
             work = _work(expected_head_sha=base_sha)
@@ -163,6 +159,41 @@ class HandleCorrectionRefusalTests(unittest.TestCase):
             self.assertIn("PR head changed", result["message"])
             self.assertEqual(len(ctx.codex.run_exec_calls), 0)  # type: ignore[attr-defined]
 
+    def test_unexpected_publish_exception_uses_the_legacy_text_with_redacted_detail(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            push_new_branch(remote, base_sha, BRANCH)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
+            work = _work(expected_head_sha=base_sha)
+            patch_bytes = make_patch(remote, base_sha, {"FIX.md": "fixed\n"})
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {
+                    "patch_b64": base64.b64encode(patch_bytes).decode(),
+                    "changed_paths": ["FIX.md"],
+                }
+            )
+            secret_token = ctx.settings.github_agent_token
+
+            with patch(
+                "agent_svc.correction.publish_correction",
+                side_effect=RuntimeError(f"boom near token {secret_token}"),
+            ):
+                handle_correction(ctx, work, threading.Event())
+
+            result = ctx.api.action_results[0]  # type: ignore[attr-defined]
+            self.assertEqual(result["status"], "rejected")
+            self.assertTrue(
+                result["message"].startswith("Trusted correction publisher failed:")
+            )
+            self.assertNotIn(secret_token, result["message"])
+            self.assertIn("REDACTED", result["message"])
+
     def test_missing_fields_are_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -216,7 +247,6 @@ class HandleCorrectionRefusalTests(unittest.TestCase):
             base_sha = make_github_remote(remote)
             push_new_branch(remote, base_sha, BRANCH)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
 
             work = _work(expected_head_sha=base_sha)

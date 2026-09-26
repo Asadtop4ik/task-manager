@@ -388,5 +388,27 @@ class CodeLaneHandlersTests(unittest.TestCase):
             self.assertFalse(cancel.is_set())
 
 
+class ShutdownTests(unittest.TestCase):
+    def test_shutdown_sets_stop_and_cancels_every_active_run(self) -> None:
+        import signal
+        import threading
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_github_remote(root / "remote.git")
+            ctx = build_test_context(root, github_remote=root / "remote.git")
+            run_a_cancel = threading.Event()
+            run_b_cancel = threading.Event()
+            ctx.cancel_registry.register(run_a_cancel)
+            ctx.cancel_registry.register(run_b_cancel)
+            stop = threading.Event()
+
+            main_module._shutdown(ctx, stop, signal.SIGTERM)
+
+            self.assertTrue(stop.is_set())
+            self.assertTrue(run_a_cancel.is_set())
+            self.assertTrue(run_b_cancel.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

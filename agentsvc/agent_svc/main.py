@@ -113,19 +113,29 @@ def _first_catalog_container_name(catalog: repos.Catalog | None) -> str | None:
     return None
 
 
+def _shutdown(ctx: ServiceContext, stop: threading.Event, signum: int) -> None:
+    ctx.logger.event("signal_received", level="info", detail=signal.Signals(signum).name)
+    stop.set()
+    # Every in-flight run's own `cancel` Event too: without this, a lane
+    # thread mid-implement/correction has no way to learn about the
+    # shutdown and would keep running until its own Codex timeout.
+    ctx.cancel_registry.cancel_all()
+
+
 def run(settings: Settings) -> int:
     ctx = build_context(settings)
     logger = ctx.logger
     stop = threading.Event()
 
     def handle_signal(signum: int, _frame: Any) -> None:
-        logger.event("signal_received", level="info", detail=signal.Signals(signum).name)
-        stop.set()
+        _shutdown(ctx, stop, signum)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    for entry in recover(ctx.journal, ctx.api, logger):
+    for entry in recover(
+        ctx.journal, ctx.api, logger, codex=ctx.codex, state_dir=ctx.settings.state_dir
+    ):
         logger.event(
             "recovery_resume_pending", level="warning", run_id=entry.run_id, stage=entry.stage
         )

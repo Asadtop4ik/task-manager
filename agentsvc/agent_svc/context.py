@@ -9,8 +9,10 @@ there is exactly one wiring to keep correct.
 
 from __future__ import annotations
 
+import os
+import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import repos
@@ -24,10 +26,41 @@ from .log import Logger, Redactor
 from .trusted import TrustedModules
 
 
+class CancelRegistry:
+    """Every currently active run's `cancel` Event.
+
+    A lane thread mid-implement/correction only ever checks its OWN
+    `cancel` Event (set by its own heartbeat losing the lease); a service
+    shutdown (SIGTERM/SIGINT) has no other way to ask every in-flight run to
+    stop cooperatively instead of running to its own timeout. `RunScaffold`
+    registers on `__enter__` and unregisters on `__exit__`; `main.run`'s
+    shutdown path calls `cancel_all()`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: set[threading.Event] = set()
+
+    def register(self, cancel: threading.Event) -> None:
+        with self._lock:
+            self._events.add(cancel)
+
+    def unregister(self, cancel: threading.Event) -> None:
+        with self._lock:
+            self._events.discard(cancel)
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            events = list(self._events)
+        for event in events:
+            event.set()
+
+
 @dataclass(frozen=True)
 class ServiceContext:
     settings: Settings
     logger: Logger
+    redactor: Redactor
     api: TaskManagerApi
     github: GitHubClient
     mirrors: repos.MirrorManager
@@ -35,6 +68,7 @@ class ServiceContext:
     codex: CodexRunner
     catalog: repos.Catalog
     trusted: TrustedModules
+    cancel_registry: CancelRegistry = field(default_factory=CancelRegistry)
 
 
 def token_selector(settings: Settings, catalog: repos.Catalog) -> Callable[[str], str]:
@@ -68,6 +102,15 @@ def _build_codex_runner(settings: Settings) -> CodexRunner:
 
 
 def build_context(settings: Settings) -> ServiceContext:
+    # Trusted scripts (e.g. `agent_task.check_diff`'s own `git diff`/`git
+    # ls-files` calls) read `os.environ` directly with no explicit override;
+    # setting these here, once, at process startup is what actually hardens
+    # those calls the same way every git subprocess `agent_svc` spawns
+    # directly already is (no system/global git config an attacker-writable
+    # HOME or /etc could otherwise supply).
+    os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+    os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
+
     redactor = Redactor(settings.secret_values())
     logger = Logger(redactor)
     http = JsonHttp(redactor=redactor)
@@ -95,6 +138,7 @@ def build_context(settings: Settings) -> ServiceContext:
     return ServiceContext(
         settings=settings,
         logger=logger,
+        redactor=redactor,
         api=api,
         github=github_client,
         mirrors=mirrors,

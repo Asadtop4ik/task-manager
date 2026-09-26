@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .api import LeaseLost, Work
+from .api import Work
 from .context import ServiceContext
 from .prompts import compose_implement_prompt, route_implement
 from .publish import PublishError, publish_implement
@@ -90,7 +90,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
 
     route = route_implement(work, ctx.settings)
     base_prompt = (
-        ctx.trusted.public_agent_task.build_prompt(task)
+        ctx.trusted.public_agent_task.build_prompt(task, qa_enabled=True)
         if is_public
         else ctx.trusted.agent_task.build_prompt(task)
     )
@@ -173,6 +173,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             is_public=is_public,
             image_dir=image_dir,
             codex_summary=result.final_message,
+            cancel=run.cancel,
             report_stage=lambda name: run.stage(name, base_sha=base_sha, branch=branch),
         )
     except PublishError as exc:
@@ -205,7 +206,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
 
 
 def _validate_task(ctx: ServiceContext, work: Work) -> tuple[dict[str, Any], bool]:
-    is_public = work.repo_full_name in ctx.catalog.public_repos
+    is_public = is_public_repo(ctx, work.repo_full_name)
     raw: dict[str, Any] = {
         "task_id": work.task_id,
         "run_id": work.run_id,
@@ -217,10 +218,27 @@ def _validate_task(ctx: ServiceContext, work: Work) -> tuple[dict[str, Any], boo
         "task_revision": work.task_revision,
     }
     if is_public:
-        task = ctx.trusted.public_agent_task.parse_public_task(raw)
+        task = ctx.trusted.public_agent_task.parse_public_task(raw, qa_enabled=True)
     else:
         task = ctx.trusted.agent_task.parse_task(raw)
     return dict(task), is_public
+
+
+def is_public_repo(ctx: ServiceContext, repo_full_name: str) -> bool:
+    """Legacy `public_agent_task.approved_repositories`: the 3 public repos
+    PLUS agent-qa when QA is enabled -- never by GitHub visibility alone.
+    agent-qa is `private=True` in the catalog (its own token/visibility is
+    private), but `qa_only` repos get the same PUBLIC validator/prompt path
+    (the extra AGENTS.md/CLAUDE.md/.github//.codex//.agents/ path blocks
+    `public_agent_task.check_diff` adds) as the 3 genuinely public repos,
+    exactly like the trusted GitHub Actions publisher does. `ctx.api` already
+    proved `repo_full_name` is one of `ctx.catalog`'s approved repos before
+    handing us this `Work`, so there is no separate "is QA enabled" flag to
+    consult here -- if agent-svc leased work for agent-qa at all, QA is
+    enabled.
+    """
+    info = ctx.catalog.get(repo_full_name)
+    return info is not None and (not info.private or info.qa_only)
 
 
 def _download_images(
@@ -235,31 +253,99 @@ def _download_images(
         target,
         api_base=ctx.settings.api_base_url,
     )
-    return target / "agent-images", list(paths)
+    image_dir = target / "agent-images"
+    _make_images_readable_by_agent_codex(image_dir, paths)
+    return image_dir, list(paths)
+
+
+def _make_images_readable_by_agent_codex(image_dir: Path, paths: list[Path]) -> None:
+    """`agent_images.download_images` (trusted, runs as agent-svc) creates
+    `image_dir` mode 0700 and each file mode 0600 -- agent-svc only.
+    agent-codex (group `agentwork`) must be able to READ these: they are
+    handed straight to `codex exec --image <path>`, which runs as
+    agent-codex. `image_dir`'s GROUP is already `agentwork` (inherited via
+    the setgid bit on `run_dir/images`, its parent -- see
+    `repos.make_run_dir` -- POSIX propagates a setgid directory's group to
+    everything created under it); only the permission bits need relaxing.
+    """
+    image_dir.chmod(0o2750)
+    for path in paths:
+        path.chmod(0o640)
+
+
+def _pr_matches_this_run(
+    pr: Mapping[str, Any], repo: str, branch: str, base_branch: str
+) -> bool:
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    return (
+        head.get("ref") == branch
+        and (head.get("repo") or {}).get("full_name", "").lower() == repo.lower()
+        and base.get("ref") == base_branch
+    )
 
 
 def _recover_existing_branch(
     ctx: ServiceContext, work: Work, run: RunScaffold, branch: str
 ) -> None:
+    """The branch this run would push already exists: a previous attempt got
+    at least as far as `branch_pushed` before agent-svc crashed, was killed,
+    or otherwise never got to report back. Never push to it (see the branch-
+    exists guard above `_run_implement`); instead prove it is genuinely THIS
+    run's own commit (the exact `Agent-Run-ID` trailer, not merely a branch
+    that happens to share the name) and recover from wherever publication
+    actually stopped: reopen the PR if one is missing (a crash between push
+    and PR creation), or just report the existing one.
+    """
     trailer = f"Agent-Run-ID: {work.run_id}"
     try:
+        head_sha = ctx.github.get_ref(work.repo_full_name, branch)
+        if head_sha is None:
+            raise ValueError("branch disappeared during recovery")
+        message = ctx.github.commit_message(work.repo_full_name, head_sha)
+        if trailer not in message.splitlines():
+            _fail(ctx, work, run, "implement", "branch already exists")
+            return
+
         pr = ctx.github.find_open_pull_by_head(work.repo_full_name, branch)
         if pr is not None:
-            head_sha = pr["head"]["sha"]
-            message = ctx.github.commit_message(work.repo_full_name, head_sha)
-            if trailer in message.splitlines():
-                _callback(
-                    ctx,
-                    work,
-                    run,
-                    {
-                        "run_id": work.run_id,
-                        "status": "pr_opened",
-                        "pr_url": pr.get("html_url"),
-                        "head_sha": head_sha,
-                    },
-                )
+            if not _pr_matches_this_run(pr, work.repo_full_name, branch, work.base_branch):
+                _fail(ctx, work, run, "implement", "branch already exists")
                 return
+            pr_url = pr.get("html_url")
+        else:
+            # The push succeeded but agent-svc never got to (or failed to)
+            # open the PR. Do it now instead of failing a run whose branch
+            # is already live and correctly attributed.
+            created = ctx.github.create_pull(
+                work.repo_full_name,
+                head=branch,
+                base=work.base_branch,
+                title=f"Task #{work.task_id}: Codex change",
+                body=(
+                    f"Task Manager task #{work.task_id}\n\n"
+                    "Recovered after an interrupted publish: the branch was already "
+                    "pushed by this exact run. Review the diff and CI results before "
+                    "merging.\n"
+                ),
+            )
+            number = created.get("number")
+            pr_url = created.get("html_url") or (
+                f"https://github.com/{work.repo_full_name}/pull/{number}"
+            )
+
+        _callback(
+            ctx,
+            work,
+            run,
+            {
+                "run_id": work.run_id,
+                "status": "pr_opened",
+                "pr_url": pr_url,
+                "head_sha": head_sha,
+            },
+        )
+        return
     except Exception as exc:
         ctx.logger.error(exc, event="branch_recovery_failed", run_id=work.run_id)
     _fail(ctx, work, run, "implement", "branch already exists")
@@ -300,11 +386,4 @@ def _callback(
 ) -> None:
     if run.cancel.is_set():
         return
-    try:
-        ctx.api.callback(work.run_id, work.lease_id, payload)
-    except LeaseLost as exc:
-        ctx.logger.event(
-            "callback_lease_lost", level="warning", run_id=work.run_id, detail=exc.detail
-        )
-    except Exception as exc:
-        ctx.logger.error(exc, event="callback_failed", run_id=work.run_id)
+    run.deliver(lambda: ctx.api.callback(work.run_id, work.lease_id, payload))

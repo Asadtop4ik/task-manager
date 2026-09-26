@@ -20,7 +20,41 @@ class TrustedModulesTests(unittest.TestCase):
             self.assertTrue(hasattr(trusted.agent_preflight, "run"))
             self.assertTrue(hasattr(trusted.agent_release, "correction_prompt"))
             self.assertTrue(hasattr(trusted.agent_images, "download_images"))
+            self.assertTrue(hasattr(trusted.agent_pr_review, "build_review_prompt"))
             self.assertTrue(hasattr(trusted.agent_repos, "REPOSITORIES"))
+
+    def test_agent_pr_review_loads_for_real_with_everything_the_review_lane_needs(
+        self,
+    ) -> None:
+        """`agent_svc.review.handle_review` calls `trusted.agent_pr_review.
+        build_review_prompt`/`_current_pr`/`_parse_result`/`_review_decision`
+        directly (see `review.py`). Without this accessor the review lane
+        crashes with `AttributeError` the first time it leases work -- this
+        loads the REAL trusted script (copied flat, exactly as
+        `install_agent_svc.sh` lays out `trusted_dir` in production) and
+        proves every one of those names is present and callable-shaped.
+        """
+        with TemporaryDirectory() as tmp:
+            trusted_dir = copy_trusted_dir(Path(tmp) / "trusted")
+            trusted = TrustedModules(trusted_dir)
+            module = trusted.agent_pr_review
+            for name in (
+                "build_review_prompt",
+                "_current_pr",
+                "_parse_result",
+                "_review_decision",
+                "prepare",
+                "finalize",
+                "fail",
+            ):
+                attr = getattr(module, name, None)
+                self.assertTrue(callable(attr), f"agent_pr_review.{name} is not callable")
+            # A real, minimal call: proves the module is genuinely executable,
+            # not just present as an attribute.
+            prompt = module.build_review_prompt(
+                "Asadtop4ik/task-manager", 1, "a" * 40, "diff --git a/x b/x\n"
+            )
+            self.assertIn("Asadtop4ik/task-manager", prompt)
 
     def test_repeated_access_returns_the_same_cached_module_object(self) -> None:
         with TemporaryDirectory() as tmp:

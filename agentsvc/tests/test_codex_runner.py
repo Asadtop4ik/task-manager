@@ -124,6 +124,42 @@ class SimpleCallTests(unittest.TestCase):
         runner = CodexRunner(command_prefix=[], libexec_dir="/x", runner=fake_runner)
         self.assertEqual(runner.cleanup({"run_id": "r1"}), {"ok": True})
 
+    def test_preflight_success(self) -> None:
+        def fake_runner(argv, **kwargs):
+            return FakeCompletedProcess(
+                0,
+                b'{"ok": true, "patch_b64": "", "changed_paths": [], '
+                b'"preflight_result": "ok"}',
+            )
+
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", runner=fake_runner)
+        result = runner.preflight({"run_id": "r1"})
+        self.assertEqual(result["preflight_result"], "ok")
+
+    def test_preflight_failure_carries_the_trusted_failure_text_in_body(self) -> None:
+        def fake_runner(argv, **kwargs):
+            return FakeCompletedProcess(
+                3,
+                b'{"reason": "trusted preflight failed", '
+                b'"preflight_failure": "Ruff tekshiruvi xato berdi"}',
+            )
+
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", runner=fake_runner)
+        with self.assertRaises(CodexChildError) as ctx:
+            runner.preflight({"run_id": "r1"})
+        self.assertEqual(ctx.exception.reason, "trusted preflight failed")
+        assert ctx.exception.body is not None
+        self.assertEqual(ctx.exception.body["preflight_failure"], "Ruff tekshiruvi xato berdi")
+
+    def test_child_error_body_is_none_without_a_parseable_json_body(self) -> None:
+        def fake_runner(argv, **kwargs):
+            return FakeCompletedProcess(1, b"not json at all")
+
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", runner=fake_runner)
+        with self.assertRaises(CodexChildError) as ctx:
+            runner.cleanup({"run_id": "r1"})
+        self.assertIsNone(ctx.exception.body)
+
     def test_simple_call_timeout_raises(self) -> None:
         def fake_runner(argv, **kwargs):
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))

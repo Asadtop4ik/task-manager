@@ -14,7 +14,7 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
-from .api import LeaseLost, Work
+from .api import Work
 from .context import ServiceContext
 from .prompts import compose_correction_prompt, route_correction
 from .publish import PublishError, publish_correction
@@ -162,6 +162,7 @@ def _run_correction(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             work,
             expected_head_sha=work.expected_head_sha,
             patch=patch,
+            cancel=run.cancel,
             report_stage=lambda name: run.stage(
                 name, base_sha=work.expected_head_sha, branch=work.branch
             ),
@@ -171,7 +172,10 @@ def _run_correction(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         return
     except Exception as exc:
         ctx.logger.error(exc, event="publish_unexpected_error", run_id=work.run_id)
-        _reject(ctx, work, run, "Correction publication failed; inspect the agent-svc log.")
+        # Legacy `agent_release.reject_action`'s exact fixed text, plus a
+        # redacted detail legacy's own catch-all never carried.
+        detail = ctx.redactor.redact(str(exc))[:500]
+        _reject(ctx, work, run, f"Trusted correction publisher failed: {detail}")
         return
 
     _complete(
@@ -204,11 +208,4 @@ def _action_result(
     if run.cancel.is_set():
         return
     body: dict[str, Any] = {"action_id": work.action_id, **payload}
-    try:
-        ctx.api.action_result(work.run_id, work.lease_id, body)
-    except LeaseLost as exc:
-        ctx.logger.event(
-            "action_result_lease_lost", level="warning", run_id=work.run_id, detail=exc.detail
-        )
-    except Exception as exc:
-        ctx.logger.error(exc, event="action_result_failed", run_id=work.run_id)
+    run.deliver(lambda: ctx.api.action_result(work.run_id, work.lease_id, body))

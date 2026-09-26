@@ -35,6 +35,7 @@ TRUSTED_SOURCE_FILES: tuple[Path, ...] = (
     REPO_ROOT / "scripts" / "agent_preflight.py",
     REPO_ROOT / "scripts" / "agent_release.py",
     REPO_ROOT / "scripts" / "agent_images.py",
+    REPO_ROOT / "scripts" / "agent_pr_review.py",
     REPO_ROOT / "backend" / "app" / "services" / "agent_repos.py",
 )
 
@@ -291,9 +292,11 @@ class FakeCodexRunner:
         self.prepare_calls: list[dict[str, Any]] = []
         self.run_exec_calls: list[dict[str, Any]] = []
         self.package_calls: list[dict[str, Any]] = []
+        self.preflight_calls: list[dict[str, Any]] = []
         self.cleanup_calls: list[dict[str, Any]] = []
         self._exec_results: list[CodexResult] = []
         self._package_results: list[dict[str, Any]] = []
+        self._preflight_results: list[dict[str, Any] | Exception] = []
         self.prepare_error: Exception | None = None
         self.package_error: Exception | None = None
 
@@ -302,6 +305,9 @@ class FakeCodexRunner:
 
     def queue_package_result(self, result: dict[str, Any]) -> None:
         self._package_results.append(result)
+
+    def queue_preflight_result(self, result: dict[str, Any] | Exception) -> None:
+        self._preflight_results.append(result)
 
     def prepare(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         self.prepare_calls.append(request)
@@ -337,6 +343,25 @@ class FakeCodexRunner:
         if self.package_error is not None:
             raise self.package_error
         return self._package_results.pop(0)
+
+    def preflight(
+        self, request: dict[str, Any], *, timeout_s: float = 180.0
+    ) -> dict[str, Any]:
+        self.preflight_calls.append(request)
+        if self._preflight_results:
+            result = self._preflight_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        # Default: preflight passes the same patch straight through --
+        # matching a real trusted run that found nothing to reformat, so
+        # existing tests that never queue a preflight result keep working.
+        return {
+            "ok": True,
+            "patch_b64": request.get("patch_b64", ""),
+            "changed_paths": [],
+            "preflight_result": "fake preflight ok",
+        }
 
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         self.cleanup_calls.append(request)
@@ -396,6 +421,7 @@ def build_test_context(
     return ServiceContext(
         settings=settings,
         logger=logger,
+        redactor=redactor,
         api=api if api is not None else FakeApi(),  # type: ignore[arg-type]
         github=github if github is not None else FakeGitHub(remote_path=github_remote),  # type: ignore[arg-type]
         mirrors=mirrors,
