@@ -5,13 +5,20 @@
     "tools_dir": "/opt/agent-svc/tools",
     "libexec_dir": "/opt/agent-svc/libexec",
     "state_dir": "/var/lib/agent-svc",
-    "mirrors_dir": "/var/lib/agent-svc/mirrors",
+    "mirrors_dir": "/srv/agent-svc/mirrors",
     "publish_dir": "/var/lib/agent-svc/publish",
     "runs_dir": "/var/lib/agent-svc/runs",
-    "work_dir": "/srv/agent-svc/work",
-    "codex_home_code": "/home/codex-runner/.codex-code",
-    "codex_home_chat": "/home/codex-runner/.codex-chat",
-    "codex_child_sudo": ["sudo", "-n", "-u", "codex-runner", "/usr/bin/python3", "/opt/agent-svc/libexec/codex_child.py"],
+    "work_root": "/srv/agent-svc/work",
+    "codex_child_user": "agent-codex",
+    "codex_homes": {
+      "code": "/home/agent-codex/.codex-code",
+      "chat": "/home/agent-codex/.codex-chat"
+    },
+    "codex_node_dir": "/opt/agent-svc/node24",
+    "codex_cli_dir": "/opt/agent-svc/codex-cli",
+    "codex_binary": "/opt/agent-svc/codex-cli/bin/codex",
+    "codex_child_path": "/opt/agent-svc/node24/bin:/opt/agent-svc/codex-cli/bin:/usr/bin:/bin",
+    "codex_child_sudo": ["sudo", "-n", "-u", "agent-codex", "/usr/bin/python3", "/opt/agent-svc/libexec/codex_child.py"],
     "image_state_sudo": ["sudo", "-n", "-u", "root", "/usr/bin/python3", "/opt/agent-svc/libexec/image_state.py"]
   },
   "lanes": {
