@@ -91,6 +91,7 @@ _WATCHDOG_LIVENESS_MINUTES = 5
 # without ever finishing must not hold a lease forever.
 _LEASE_MAX_DURATION_MINUTES = 60
 _AGENT_SVC_TIMEOUT_ERROR = "agent-svc javob bermadi"
+_TASK_REVISION_STALE_ERROR = "Task tasdiqlangandan keyin o'zgartirildi; qayta yuboring."
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -384,6 +385,62 @@ def _reject_stale_correction(
         _refresh_pr_ready(run)
     run.notified_at = None
     agent_events.record(session, run, phase="correction", error=_AGENT_SVC_TIMEOUT_ERROR)
+
+
+def _reject_correction_for_stale_task_revision(
+    session: DbSession, run: AgentRun, action: AgentRunAction
+) -> None:
+    """The task text changed after a correction was requested. The run
+    already has an open PR, so only the correction is refused (like a
+    GitHub-path rejection) and the run returns to `pr_opened`; the owner can
+    request the correction again against the edited task."""
+    action.status = "rejected"
+    action.result = {"message": _TASK_REVISION_STALE_ERROR}
+    if run.status == "correction_running":
+        run.status = "pr_opened"
+        _refresh_pr_ready(run)
+    _clear_lease(run)
+    run.notified_at = None
+    agent_events.record(session, run, phase="correction", error=_TASK_REVISION_STALE_ERROR)
+
+
+def _fail_run_for_stale_task_revision(
+    session: DbSession,
+    run: AgentRun,
+    now: datetime,
+    *,
+    action: AgentRunAction | None = None,
+) -> None:
+    """The task's approved title/description changed after this run was
+    dispatched: the run's `task_revision` was frozen at dispatch time (see
+    `start_agent_run`), but a task stays editable while a local run is
+    queued, so anyone with edit rights could otherwise change what Codex
+    implements after the owner approved it. Caught right before a lease
+    hands out the current, possibly-edited, task text — treated exactly
+    like a failed callback: BLOCKED + event + notified_at cleared."""
+    if action is not None and action.status == "in_progress":
+        action.status = "rejected"
+        action.result = {"message": _TASK_REVISION_STALE_ERROR}
+    run.status = "failed"
+    run.error = _TASK_REVISION_STALE_ERROR
+    run.finished_at = now
+    run.notified_at = None
+    _clear_lease(run)
+    agent_events.record(session, run, phase="lease", error=run.error)
+    if can_transition(TaskStatus(run.task.status), TaskStatus.BLOCKED):
+        old = run.task.status
+        run.task.status = TaskStatus.BLOCKED
+        activity.record(
+            session,
+            task_id=run.task_id,
+            actor=None,
+            kind=ActivityKind.STATUS_CHANGED,
+            payload={
+                "from": old,
+                "to": TaskStatus.BLOCKED.value,
+                "agent_run_id": run.run_id,
+            },
+        )
 
 
 def _review_needed(run: AgentRun) -> bool:
@@ -1034,7 +1091,15 @@ async def lease_agent_work(
     # at request time (mirroring a successful GitHub dispatch exactly, see
     # `_request_owner_action`), so leasing it here is just picking the work
     # back up — no state to flip, only the attempt counter to advance.
-    correction_row = (
+    #
+    # A task stays editable while its run is queued. `_issue_lease` reports
+    # the task's *current* title/description, so before handing either an
+    # implement or a correction lease out, re-check that text against the
+    # revision frozen at dispatch time (the same `_revision` start_agent_run
+    # compares on retry). A run whose task was edited since it was approved
+    # is failed instead of leased, and the scan moves on to the next
+    # candidate rather than returning stale work.
+    correction_candidates = (
         await session.execute(
             select(AgentRun, AgentRunAction)
             .join(AgentRunAction, AgentRunAction.agent_run_id == AgentRun.id)
@@ -1045,31 +1110,53 @@ async def lease_agent_work(
                 AgentRunAction.kind == "correction",
                 AgentRunAction.status == "in_progress",
             )
-            .options(selectinload(AgentRun.task))
+            .options(selectinload(AgentRun.task).selectinload(Task.project))
             .order_by(AgentRunAction.agent_run_id)
-            .limit(1)
+            .limit(20)
             .with_for_update(of=[AgentRun, AgentRunAction], skip_locked=True)
         )
-    ).first()
-    if correction_row is not None:
-        correction_run, correction_action = correction_row
+    ).all()
+    correction_pick: tuple[AgentRun, AgentRunAction] | None = None
+    for candidate_run, candidate_action in correction_candidates:
+        if _revision(candidate_run.task, candidate_run.mode) != candidate_run.task_revision:
+            _reject_correction_for_stale_task_revision(
+                session, candidate_run, candidate_action
+            )
+            continue
+        correction_pick = (candidate_run, candidate_action)
+        break
+    if correction_candidates:
+        await session.flush()
+    if correction_pick is not None:
+        correction_run, correction_action = correction_pick
         correction_action.attempts += 1
         return await _issue_lease(
             session, correction_run, "correction", now, action=correction_action
         )
 
-    implement_run = await session.scalar(
-        select(AgentRun)
-        .where(
-            AgentRun.executor == "local",
-            AgentRun.status == "dispatched",
-            AgentRun.lease_id.is_(None),
+    implement_candidates = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                AgentRun.executor == "local",
+                AgentRun.status == "dispatched",
+                AgentRun.lease_id.is_(None),
+            )
+            .options(selectinload(AgentRun.task).selectinload(Task.project))
+            .order_by(AgentRun.id)
+            .limit(20)
+            .with_for_update(skip_locked=True)
         )
-        .options(selectinload(AgentRun.task))
-        .order_by(AgentRun.id)
-        .limit(1)
-        .with_for_update(skip_locked=True)
-    )
+    ).all()
+    implement_run = None
+    for candidate in implement_candidates:
+        if _revision(candidate.task, candidate.mode) != candidate.task_revision:
+            _fail_run_for_stale_task_revision(session, candidate, now)
+            continue
+        implement_run = candidate
+        break
+    if implement_candidates:
+        await session.flush()
     if implement_run is not None:
         implement_run.attempts += 1
         changed = implement_run.status != "running"
