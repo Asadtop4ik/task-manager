@@ -433,3 +433,39 @@ class AgentPreflightTests(unittest.TestCase):
             tool_path.chmod(0o755)
             resolved = ensure_tools("ruff==0.7.4", tools={"ruff": str(tool_path)})
             self.assertEqual(resolved, {"ruff": str(tool_path.resolve())})
+
+    def test_ketoshop_runs_compileall_in_isolated_mode(self):
+        with patch(
+            "agent_preflight.changed_python", return_value=["app/main.py"]
+        ), patch("agent_preflight.subprocess.run") as command:
+            result = run("muradjanov-dev/ketoshop", Path("/tmp/target"))
+        self.assertEqual(
+            command.call_args.args[0],
+            [sys.executable, "-I", "-m", "compileall", "-q", "--", "app/main.py"],
+        )
+        self.assertIn("passed", result)
+
+    def test_ketoshop_compileall_shadowing_probe_is_now_harmless(self):
+        """A malicious `compileall.py` planted at the checkout root must never
+        shadow the real stdlib module `-m compileall` resolves.
+
+        Without `-I`, `python -m compileall` prepends the checkout (`cwd`) to
+        `sys.path`, so a same-named file there would run instead of the real
+        module -- as whichever user invokes this. This runs the real
+        subprocess (no mocking) to prove `-I` actually closes that path.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "pwned.txt"
+            (root / "compileall.py").write_text(
+                f"from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('pwned')\n"
+                f"import sys\nsys.exit(1)\n",
+                encoding="utf-8",
+            )
+            good = root / "app.py"
+            good.write_text("VALUE = 1\n", encoding="utf-8")
+            with patch("agent_preflight.changed_python", return_value=["app.py"]):
+                result = run("muradjanov-dev/ketoshop", root)
+            self.assertFalse(marker.exists())
+            self.assertIn("passed", result)

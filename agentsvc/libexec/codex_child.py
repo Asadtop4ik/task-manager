@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import ctypes
+import importlib.util
 import json
 import os
 import pwd
@@ -54,6 +55,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 MAX_REQUEST_BYTES = 1024 * 1024  # 1 MiB: a 250k-char diff prompt needs headroom.
+# `preflight` carries a base64 patch (<=5 MB raw -> ~6.7 MB encoded) plus a
+# tools map; 1 MiB is not enough headroom for that one subcommand.
+PREFLIGHT_MAX_REQUEST_BYTES = 12 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024  # cap any single stdout/stderr line we ever buffer.
 STDOUT_QUEUE_MAXSIZE = 8192
 MAX_FINAL_MESSAGE_CHARS = 20_000
@@ -122,6 +126,13 @@ def _env_float(name: str, default: float) -> float:
 
 WORK_ROOT = _env_path("WORK_ROOT", "/srv/agent-svc/work")
 MIRRORS_DIR = _env_path("MIRRORS_DIR", "/srv/agent-svc/mirrors")
+# `preflight`'s tools map may only point inside here in production: pinned,
+# root-owned executables under a path agent-codex cannot write to.
+TOOLS_DIR = _env_path("TOOLS_DIR", "/opt/agent-svc/tools")
+# `preflight` imports the trusted formatter/lint script from here by file
+# path -- never via `sys.path`/package import -- the same trust boundary
+# `agent_svc.trusted` uses on the agent-svc side.
+TRUSTED_DIR = _env_path("TRUSTED_DIR", "/opt/agent-svc/trusted")
 HOME_DIR = _env_str("HOME", "/home/agent-codex")
 CODEX_BINARY = _env_str("CODEX_BINARY", "/opt/agent-svc/codex-cli/bin/codex")
 PATH_VALUE = _env_str(
@@ -267,13 +278,19 @@ def _git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _run_git(
-    args: list[str], *, cwd: Path, env: dict[str, str], timeout: float = 120.0
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float = 120.0,
+    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     try:
         return subprocess.run(
             args,
             cwd=str(cwd),
             env=env,
+            input=input_bytes,
             capture_output=True,
             timeout=timeout,
             check=True,
@@ -452,31 +469,24 @@ def _scan_patch_for_bad_modes(patch_text: str) -> str | None:
     return None
 
 
-def cmd_package(request: dict[str, Any]) -> int:
-    pkg_dir: Path | None = None
+def _package_worktree(directory: Path, *, out_dir: Path) -> tuple[bytes, list[str]]:
+    """Diff `directory` (working tree + index) against HEAD: raw -z path
+    listing for safety, then the one `--binary` patch actually returned.
+    Shared by `package` (against `wt`) and `preflight` (against `pf`, after
+    the trusted formatter/lint step has run) so the two can never disagree
+    on what counts as a safe changed path or a bad file mode."""
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # A fresh, 0700 (agent-codex only) directory for the temporary index:
+    # codex's own sandbox is never given `out/` as a writable root, so
+    # nothing spawned during `exec`/`preflight` could race this by writing
+    # here.
+    pkg_dir = Path(tempfile.mkdtemp(prefix="pkg-", dir=str(out_dir)))
+    os.chmod(pkg_dir, 0o700)
     try:
-        run_id = _validate_run_id(request.get("run_id"))
-        run_dir = _run_dir(run_id)
-        wt = run_dir / "wt"
-        if not wt.is_dir():
-            raise ChildRefusal("worktree is not prepared")
-        # The agent's own edits could have added .codex/.agents/.git since
-        # prepare's one-time check; the diff-based check below catches new
-        # ones specifically, this catches anything already sitting in the
-        # tree regardless of whether this call's diff touches it.
-        _refuse_if_agent_config_present(wt)
-
-        out_dir = run_dir / "out"
-        out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # A fresh, 0700 (agent-codex only) directory for the temporary index:
-        # codex's own sandbox is never given `out/` as a writable root, so
-        # nothing spawned during `exec` could race this by writing here.
-        pkg_dir = Path(tempfile.mkdtemp(prefix="pkg-", dir=str(out_dir)))
-        os.chmod(pkg_dir, 0o700)
         index_file = pkg_dir / "index"
         env = _git_env({"GIT_INDEX_FILE": str(index_file)})
-        _run_git(_git_argv("read-tree", "HEAD"), cwd=wt, env=env)
-        _run_git(_git_argv("add", "-A"), cwd=wt, env=env)
+        _run_git(_git_argv("read-tree", "HEAD"), cwd=directory, env=env)
+        _run_git(_git_argv("add", "-A"), cwd=directory, env=env)
         raw = _run_git(
             _git_argv(
                 "diff",
@@ -488,15 +498,14 @@ def cmd_package(request: dict[str, Any]) -> int:
                 "HEAD",
                 "--",
             ),
-            cwd=wt,
+            cwd=directory,
             env=env,
         )
         changed_paths, bad_path_reason = _parse_raw_diff_z(raw.stdout)
         if bad_path_reason is not None:
             raise ChildRefusal(bad_path_reason)
         if not changed_paths:
-            print(json.dumps({"patch_b64": "", "changed_paths": [], "bytes": 0}), flush=True)
-            return 0
+            return b"", []
         patch = _run_git(
             _git_argv(
                 "diff",
@@ -508,7 +517,7 @@ def cmd_package(request: dict[str, Any]) -> int:
                 "--",
                 no_textconv=True,
             ),
-            cwd=wt,
+            cwd=directory,
             env=env,
         )
         patch_bytes = patch.stdout
@@ -517,19 +526,34 @@ def cmd_package(request: dict[str, Any]) -> int:
             raise ChildRefusal(f"unsupported change (symlink or submodule): {bad_mode_path}")
         if len(patch_bytes) > MAX_PATCH_BYTES:
             raise ChildRefusal("patch exceeds the size limit")
+        return patch_bytes, changed_paths
+    finally:
+        shutil.rmtree(pkg_dir, ignore_errors=True)
+
+
+def cmd_package(request: dict[str, Any]) -> int:
+    try:
+        run_id = _validate_run_id(request.get("run_id"))
+        run_dir = _run_dir(run_id)
+        wt = run_dir / "wt"
+        if not wt.is_dir():
+            raise ChildRefusal("worktree is not prepared")
+        # The agent's own edits could have added .codex/.agents/.git since
+        # prepare's one-time check; the diff-based check below catches new
+        # ones specifically, this catches anything already sitting in the
+        # tree regardless of whether this call's diff touches it.
+        _refuse_if_agent_config_present(wt)
+        patch_bytes, changed_paths = _package_worktree(wt, out_dir=run_dir / "out")
     except ChildRefusal as exc:
         _emit_error(str(exc))
         return 3
     except OSError as exc:
         _emit_error(f"package failed: {exc}")
         return 3
-    finally:
-        if pkg_dir is not None:
-            shutil.rmtree(pkg_dir, ignore_errors=True)
     print(
         json.dumps(
             {
-                "patch_b64": base64.b64encode(patch_bytes).decode("ascii"),
+                "patch_b64": base64.b64encode(patch_bytes).decode("ascii") if patch_bytes else "",
                 "changed_paths": changed_paths,
                 "bytes": len(patch_bytes),
             }

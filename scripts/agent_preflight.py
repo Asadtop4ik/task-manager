@@ -214,8 +214,13 @@ def run(repo: str, root: Path, *, tools: Mapping[str, str] | None = None) -> str
 
     if repo == "muradjanov-dev/ketoshop":
         if paths:
+            # `-I` (isolated mode) stops Python from prepending `cwd` (the
+            # untrusted checkout, `root`) to `sys.path`: without it, a patch
+            # that adds its own `compileall.py` at the checkout root would
+            # shadow the real stdlib module that `-m compileall` resolves,
+            # running attacker-controlled code as whichever user runs this.
             subprocess.run(
-                [sys.executable, "-m", "compileall", "-q", "--", *paths],
+                [sys.executable, "-I", "-m", "compileall", "-q", "--", *paths],
                 cwd=root,
                 check=True,
             )
