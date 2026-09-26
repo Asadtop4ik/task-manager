@@ -6,6 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agent_svc.config import (
+    OPTIONAL_SECRET_NAMES,
+    REQUIRED_SECRET_NAMES,
     SECRET_NAMES,
     ConfigError,
     build_settings,
@@ -20,7 +22,8 @@ def _write_secrets(directory: Path, **values: str) -> None:
         (directory / name).write_text(value, encoding="utf-8")
 
 
-def _all_secrets(directory: Path) -> None:
+def _required_secrets_only(directory: Path) -> None:
+    """Every required secret, but no optional (`github_qa_token`) file at all."""
     _write_secrets(
         directory,
         agent_svc_token="svc-token\n",
@@ -28,8 +31,12 @@ def _all_secrets(directory: Path) -> None:
         intake_worker_token="intake-token\n",
         github_agent_token="agent-token\n",
         github_public_agent_token="public-token\n",
-        github_qa_token="qa-token\n",
     )
+
+
+def _all_secrets(directory: Path) -> None:
+    _required_secrets_only(directory)
+    _write_secrets(directory, github_qa_token="qa-token\n")
 
 
 class LoadConfigTests(unittest.TestCase):
@@ -37,12 +44,16 @@ class LoadConfigTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             config = load_config(Path(tmp) / "does-not-exist.json")
             self.assertEqual(config["api_base_url"], "https://tasks.standart-eko.uz/api/v1")
-            self.assertEqual(config["mirrors_dir"], str(Path(config["state_dir"]) / "mirrors"))
+            # REVISION 2: mirrors live under the agentwork work tree, not under
+            # state_dir, so agent-codex (not agent-svc) can clone them.
+            self.assertEqual(config["mirrors_dir"], "/srv/agent-svc/mirrors")
             self.assertEqual(config["runs_dir"], str(Path(config["state_dir"]) / "runs"))
             self.assertEqual(
                 config["codex_child_prefix"],
-                ("/usr/bin/sudo", "-n", "-u", "codex-runner", "--", "/usr/bin/python3"),
+                ("/usr/bin/sudo", "-n", "-u", "agent-codex", "--", "/usr/bin/python3"),
             )
+            self.assertEqual(config["codex_home_code"], "/home/agent-codex/.codex-code")
+            self.assertEqual(config["codex_home_chat"], "/home/agent-codex/.codex-chat")
             self.assertFalse(config["code_lane_enabled"])
             self.assertTrue(config["watch_enabled"])
 
@@ -57,9 +68,26 @@ class LoadConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"state_dir": "/custom/state", "poll_interval_s": 2}))
             config = load_config(path)
             self.assertEqual(config["state_dir"], "/custom/state")
-            self.assertEqual(config["mirrors_dir"], "/custom/state/mirrors")
+            self.assertEqual(config["runs_dir"], "/custom/state/runs")
+            # mirrors_dir no longer derives from state_dir (REVISION 2): it
+            # keeps its own fixed default unless explicitly overridden.
+            self.assertEqual(config["mirrors_dir"], "/srv/agent-svc/mirrors")
             self.assertEqual(config["poll_interval_s"], 2.0)
             self.assertIsInstance(config["poll_interval_s"], float)
+
+    def test_mirrors_dir_can_be_overridden_independently(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"mirrors_dir": "/custom/mirrors"}))
+            config = load_config(path)
+            self.assertEqual(config["mirrors_dir"], "/custom/mirrors")
+
+    def test_empty_mirrors_dir_override_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"mirrors_dir": "  "}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
 
     def test_unknown_key_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -106,16 +134,41 @@ class LoadSecretsTests(unittest.TestCase):
             self.assertEqual(secrets["agent_svc_token"], "svc-token")
             self.assertEqual(set(secrets), set(SECRET_NAMES))
 
-    def test_missing_secret_lists_names_only_never_values(self) -> None:
+    def test_missing_required_secret_lists_names_only_never_values(self) -> None:
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             _all_secrets(directory)
-            (directory / "github_qa_token").unlink()
+            (directory / "github_agent_token").unlink()
             with self.assertRaises(ConfigError) as ctx:
                 load_secrets(directory)
             message = str(ctx.exception)
-            self.assertIn("github_qa_token", message)
-            self.assertNotIn("qa-token", message)
+            self.assertIn("github_agent_token", message)
+            self.assertNotIn("agent-token", message)
+
+    def test_missing_optional_qa_secret_means_disabled_not_an_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _required_secrets_only(directory)
+            self.assertFalse((directory / "github_qa_token").exists())
+            secrets = load_secrets(directory)
+            self.assertEqual(secrets["github_qa_token"], "")
+            self.assertEqual(set(secrets), set(SECRET_NAMES))
+
+    def test_present_but_empty_optional_qa_secret_is_still_invalid(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _required_secrets_only(directory)
+            (directory / "github_qa_token").write_text("")
+            with self.assertRaises(ConfigError) as ctx:
+                load_secrets(directory)
+            self.assertIn("github_qa_token", str(ctx.exception))
+
+    def test_required_and_optional_secret_names_partition_secret_names(self) -> None:
+        self.assertEqual(
+            set(REQUIRED_SECRET_NAMES) | set(OPTIONAL_SECRET_NAMES), set(SECRET_NAMES)
+        )
+        self.assertEqual(set(REQUIRED_SECRET_NAMES) & set(OPTIONAL_SECRET_NAMES), set())
+        self.assertEqual(OPTIONAL_SECRET_NAMES, ("github_qa_token",))
 
     def test_empty_secret_file_is_invalid(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -189,6 +242,14 @@ class LoadSettingsIntegrationTests(unittest.TestCase):
             self.assertEqual(settings.api_base_url, "https://example.test/api/v1")
             self.assertEqual(settings.agent_svc_token, "svc-token")
             self.assertEqual(len(settings.secret_values()), len(SECRET_NAMES))
+
+    def test_round_trip_without_qa_secret_disables_qa_without_erroring(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _required_secrets_only(directory)
+            settings = load_settings(Path(tmp) / "absent-config.json", directory)
+            self.assertEqual(settings.github_qa_token, "")
+            self.assertIn("", settings.secret_values())
 
 
 if __name__ == "__main__":

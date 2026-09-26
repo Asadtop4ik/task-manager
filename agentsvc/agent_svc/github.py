@@ -4,7 +4,10 @@ Token selection is per repository, matching the trusted catalog: the private
 dispatch repository and the QA repository each use their own token; every
 other (public) catalog repository shares the public agent token. An
 unrecognized repository is refused rather than silently using a token that
-was not scoped for it.
+was not scoped for it. An empty `qa_token` (the optional `github_qa_token`
+secret was never provisioned) is treated the same as an unrecognized
+repository: the QA repo/lane is disabled rather than calling GitHub with no
+credential.
 """
 
 from __future__ import annotations
@@ -48,6 +51,10 @@ def build_token_selector(
         if repo == dispatch_repo:
             return agent_token
         if qa_repo is not None and repo == qa_repo:
+            if not qa_token:
+                # No QA credential provisioned: treat the QA repo as disabled
+                # rather than authenticating with an empty token.
+                raise UnknownRepository(repo)
             return qa_token
         if repo in public_set:
             return public_token

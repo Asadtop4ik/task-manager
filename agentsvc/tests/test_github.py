@@ -94,6 +94,24 @@ class TokenSelectorTests(unittest.TestCase):
         with self.assertRaises(UnknownRepository):
             self.token_for("someone-else/unapproved")
 
+    def test_qa_repo_is_refused_when_qa_token_is_empty(self) -> None:
+        # An empty github_qa_token means the secret was never provisioned
+        # (config.load_secrets treats it as optional): the QA repo must then
+        # be refused rather than authenticated with an empty credential.
+        token_for = build_token_selector(
+            dispatch_repo=DISPATCH_REPO,
+            qa_repo=QA_REPO,
+            public_repos=PUBLIC_REPOS,
+            agent_token="agent-token",
+            qa_token="",
+            public_token="public-token",
+        )
+        with self.assertRaises(UnknownRepository):
+            token_for(QA_REPO)
+        # Everything else is unaffected by the missing QA token.
+        self.assertEqual(token_for(DISPATCH_REPO), "agent-token")
+        self.assertEqual(token_for(PUBLIC_REPOS[0]), "public-token")
+
 
 class GetRefTests(unittest.TestCase):
     def test_existing_ref_returns_sha(self) -> None:
