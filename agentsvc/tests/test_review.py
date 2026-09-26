@@ -90,12 +90,20 @@ def _pr(
 
 
 class FakeApi:
-    def __init__(self, *, heartbeat_exception: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        heartbeat_exception: BaseException | None = None,
+        review_result_exceptions: list[BaseException | None] | None = None,
+    ) -> None:
         self.stage_calls: list[tuple[str, str, str, str | None]] = []
         self.heartbeat_calls: list[tuple[str, str]] = []
         self.review_result_calls: list[tuple[str, str, dict[str, Any]]] = []
         self._heartbeat_exception = heartbeat_exception
         self._heartbeat_exception_after = 0
+        # Popped one at a time per `review_result` call; once exhausted (or
+        # if never given), calls just succeed and get recorded.
+        self._review_result_exceptions = list(review_result_exceptions or [])
 
     def stage(
         self, run_id: str, lease_id: str, stage: str, *, error: str | None = None
@@ -111,6 +119,10 @@ class FakeApi:
         return datetime.now(UTC)
 
     def review_result(self, run_id: str, lease_id: str, payload: dict[str, Any]) -> None:
+        if self._review_result_exceptions:
+            exc = self._review_result_exceptions.pop(0)
+            if exc is not None:
+                raise exc
         self.review_result_calls.append((run_id, lease_id, dict(payload)))
 
 
@@ -287,19 +299,46 @@ class HandleReviewTests(unittest.TestCase):
         self.assertEqual(len(payload["findings"]), 1)
         self.assertEqual(github.set_status_calls[0][2], "failure")
 
-    def test_stale_head_posts_nothing(self) -> None:
+    def test_stale_head_releases_the_lease_via_review_result(self) -> None:
+        # The backend answers a review-result posted against a moved head
+        # with 409, which `agent_svc.api` raises as `LeaseLost` -- and which
+        # is exactly how the backend releases the review lease promptly
+        # instead of leaving it to expire on its own (see
+        # `_release_stale_head_lease`'s docstring).
         work = _work(head_sha="a" * 40)
-        api = FakeApi()
+        api = FakeApi(
+            review_result_exceptions=[LeaseLost("review does not match current PR head")]
+        )
         github = FakeGitHub(pulls=[_pr(sha="b" * 40)])  # head moved
         codex = FakeCodexRunner(_ok_result())
         ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
 
         handle_review(ctx, work, Event())
 
-        self.assertEqual(api.review_result_calls, [])
         self.assertEqual(github.set_status_calls, [])
         self.assertEqual(github.dispatch_calls, [])
         self.assertEqual(codex.requests, [])  # never even started codex
+        self.assertEqual(api.stage_calls, [])  # the review-result 409 already released it
+        # review_result was attempted with the stale (pre-move) sha, state "error"
+        self.assertEqual(len(api.review_result_calls), 0)  # it raised, so nothing recorded
+
+    def test_stale_head_falls_back_to_stage_error_when_release_fails(self) -> None:
+        # If posting the release call itself fails for some other reason
+        # (e.g. a network error, not the expected 409), fall back to a stage
+        # error so the failure is at least visible; the lease still expires
+        # naturally without burning an "attempts" counter (review leases
+        # never use that counter).
+        work = _work(head_sha="a" * 40)
+        api = FakeApi(review_result_exceptions=[RuntimeError("network down")])
+        github = FakeGitHub(pulls=[_pr(sha="b" * 40)])  # head moved
+        codex = FakeCodexRunner(_ok_result())
+        ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
+
+        handle_review(ctx, work, Event())
+
+        self.assertEqual(github.set_status_calls, [])
+        self.assertEqual(github.dispatch_calls, [])
+        self.assertEqual(codex.requests, [])
         self.assertEqual(len(api.stage_calls), 1)
         run_id, lease_id, stage, error = api.stage_calls[0]
         self.assertEqual(
@@ -308,18 +347,36 @@ class HandleReviewTests(unittest.TestCase):
         assert error is not None
         self.assertIn("head changed", error)
 
-    def test_closed_pr_posts_nothing(self) -> None:
+    def test_closed_pr_releases_the_lease_via_review_result(self) -> None:
         work = _work()
-        api = FakeApi()
+        api = FakeApi(review_result_exceptions=[LeaseLost("agent PR is not awaiting review")])
         github = FakeGitHub(pulls=[_pr(state="closed")])
         codex = FakeCodexRunner(_ok_result())
         ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
 
         handle_review(ctx, work, Event())
 
-        self.assertEqual(api.review_result_calls, [])
         self.assertEqual(github.set_status_calls, [])
         self.assertEqual(codex.requests, [])
+        self.assertEqual(api.stage_calls, [])
+
+    def test_closed_pr_release_accepted_with_a_plain_200_is_also_fine(self) -> None:
+        # A plain success response also clears the lease server-side; either
+        # outcome of the release call is a correct, complete handling here.
+        work = _work()
+        api = FakeApi()  # review_result succeeds normally
+        github = FakeGitHub(pulls=[_pr(state="closed")])
+        codex = FakeCodexRunner(_ok_result())
+        ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
+
+        handle_review(ctx, work, Event())
+
+        self.assertEqual(len(api.review_result_calls), 1)
+        _run_id, _lease_id, payload = api.review_result_calls[0]
+        self.assertEqual(payload["state"], "error")
+        self.assertEqual(payload["sha"], work.head_sha)
+        self.assertEqual(github.set_status_calls, [])  # release path never posts a status
+        self.assertEqual(api.stage_calls, [])
 
     def test_oversized_diff_posts_error_review(self) -> None:
         work = _work()
@@ -380,6 +437,32 @@ class HandleReviewTests(unittest.TestCase):
 
         _run_id, _lease_id, payload = api.review_result_calls[0]
         self.assertEqual(payload["state"], "error")
+
+    def test_review_result_failure_does_not_post_success_status_or_dispatch(self) -> None:
+        # If the real outcome's `review_result` call fails for a reason other
+        # than LeaseLost, the backend never recorded it: the success/failure
+        # status and the dispatch must NOT run against an outcome the
+        # backend doesn't know about. Only the legacy error report should go
+        # out (and it should succeed, since the fake only fails once).
+        work = _work()
+        api = FakeApi(review_result_exceptions=[RuntimeError("network down")])
+        github = FakeGitHub(pulls=[_pr()])
+        codex = FakeCodexRunner(_ok_result())
+        ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
+
+        handle_review(ctx, work, Event())
+
+        # Only the error report's review_result call was actually recorded
+        # (the first, real "clean" one raised and was never appended).
+        self.assertEqual(len(api.review_result_calls), 1)
+        _run_id, _lease_id, payload = api.review_result_calls[0]
+        self.assertEqual(payload["state"], "error")
+        self.assertEqual(payload["summary"], GENERIC_FAILURE_SUMMARY)
+        # The real "clean" success status must never be posted.
+        self.assertEqual(len(github.set_status_calls), 1)
+        self.assertEqual(github.set_status_calls[0][2], "error")
+        # No dispatch either -- the backend has no record of this review.
+        self.assertEqual(github.dispatch_calls, [])
 
     def test_lease_lost_during_run_posts_nothing(self) -> None:
         work = _work()

@@ -1666,10 +1666,20 @@ from pathlib import Path
 
 
 def run(repo, root, *, tools=None):
+    import os
+    import subprocess
+
     root = Path(root)
     if repo == "acme/fails":
         raise RuntimeError("simulated preflight failure")
+    # Like the real preflight: stage what it changed (formatter fixes) ...
     (root / "PREFLIGHT_RAN.txt").write_text("ran\\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "PREFLIGHT_RAN.txt"], cwd=root, check=True)
+    # ... while tool leftovers (bytecode, caches) stay unstaged and must never
+    # be published.
+    (root / "__pycache__").mkdir(exist_ok=True)
+    (root / "__pycache__" / "x.cpython-312.pyc").write_bytes(b"\\x00junk")
+    assert os.environ.get("GIT_CONFIG_GLOBAL") == "/dev/null"
     names = sorted((tools or {}).keys())
     return f"{repo}: fake preflight ok tools={names}"
 
@@ -1738,6 +1748,8 @@ class PreflightIntegrationTests(ChildProcessTestCase):
         patch_bytes = base64.b64decode(body["patch_b64"])
         self.assertIn(b"edited", patch_bytes)
         self.assertIn(b"PREFLIGHT_RAN.txt", patch_bytes)
+        # Only what the trusted preflight staged is published, never leftovers.
+        self.assertNotIn(b"__pycache__", patch_bytes)
         # The scratch preflight checkout is always removed afterwards.
         self.assertFalse((self.work_root / run_id / "pf").exists())
 

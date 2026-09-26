@@ -103,6 +103,16 @@ def _sudo_rule_check(
     return False, name, detail[:200]
 
 
+def _first_catalog_container_name(catalog: repos.Catalog | None) -> str | None:
+    """The first container name across the loaded catalog, if any repo has one."""
+    if catalog is None:
+        return None
+    for item in catalog.repos:
+        for name, _image in item.images:
+            return name
+    return None
+
+
 def _shutdown(ctx: ServiceContext, stop: threading.Event, signum: int) -> None:
     ctx.logger.event("signal_received", level="info", detail=signal.Signals(signum).name)
     stop.set()
@@ -292,9 +302,22 @@ def self_check(
         )
 
         image_state_path = Path(settings.libexec_dir) / "image_state.py"
-        # image_state runs as root, not agent-codex; WP3 does not own its
-        # sudoers rule or exact argv contract, so this probe is best-effort.
-        image_state_prefix = ("/usr/bin/sudo", "-n", "-u", "root", "--", "/usr/bin/python3")
+        # image_state runs as root, not agent-codex, pinned with `-I` exactly
+        # like codex_child.py (see ops/agent-svc.sudoers: both targets use
+        # isolated mode so agent-svc's own environment can't smuggle an
+        # import override into either child). The trailing arg only has to
+        # satisfy the sudoers wildcard, so a real catalog container name
+        # (when one is loaded) is a more faithful probe than a placeholder.
+        image_state_prefix = (
+            "/usr/bin/sudo",
+            "-n",
+            "-u",
+            "root",
+            "--",
+            "/usr/bin/python3",
+            "-I",
+        )
+        probe_container = _first_catalog_container_name(catalog) or "self-check-probe"
         _emit(
             lines,
             ok_flags,
@@ -302,7 +325,7 @@ def self_check(
                 runner,
                 image_state_prefix,
                 image_state_path,
-                "self-check-probe",
+                probe_container,
                 name="image_state",
             ),
         )

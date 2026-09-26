@@ -116,7 +116,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "codex_home_chat": "/home/agent-codex/.codex-chat",
     "code_lane_enabled": False,
     "chat_lane_enabled": False,
-    "watch_enabled": True,
+    # Off by default per the design spec: the old cron-timer monitor
+    # (`ops/agent_deploy_monitor.py`) stays the source of truth for CI/merge/
+    # deploy checks until cutover explicitly enables this lane.
+    "watch_enabled": False,
     "poll_interval_s": 5.0,
     "watch_poll_interval_s": 15.0,
     "sd_watchdog_interval_s": 20.0,
