@@ -125,6 +125,61 @@ def test_release_card_displays_backend_verified_head_sha_field() -> None:
     assert "CI natijasini ochish" in card
 
 
+def test_qa_deploy_failure_card_shows_safe_reason_and_workflow_link() -> None:
+    run = _run() | {
+        "repo_full_name": agent_release.QA_REPOSITORY,
+        "status": "merged",
+        "merged_sha": "b" * 40,
+        "error": "QA deployment failed [readiness_failed]: /ready returned 503 <body>",
+        "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/42",
+    }
+
+    card = agent_release.release_card(run)
+
+    assert "QA deploy xato" in card
+    assert "PR tayyor" not in card
+    assert "QA merge SHA: <code>" + "b" * 40 + "</code>" in card
+    assert "QA /ready tekshiruvi o‘tmadi: /ready returned 503 &lt;body&gt;" in card
+    assert "QA Actions natijasini ochish" in card
+
+
+def test_qa_deployed_card_shows_exact_image_and_readiness_evidence_without_old_error() -> None:
+    run = _run() | {
+        "repo_full_name": agent_release.QA_REPOSITORY,
+        "status": "deployed",
+        "merged_sha": "b" * 40,
+        "deployed_sha": "c" * 40,
+        "qa_ready_sha": "c" * 40,
+        "qa_ready_url": "http://127.0.0.1:18082/ready",
+        "github_run_url": "https://github.com/Asadtop4ik/agent-qa/actions/runs/43",
+        "error": "stale failure must not survive a successful deploy",
+    }
+
+    card = agent_release.release_card(run)
+
+    assert "QA deploy tayyor" in card
+    assert "QA merge SHA: <code>" + "b" * 40 + "</code>" in card
+    assert "QA image SHA: <code>" + "c" * 40 + "</code>" in card
+    assert "QA /ready SHA: <code>" + "c" * 40 + "</code>" in card
+    assert "http://127.0.0.1:18082/ready" in card
+    assert "QA Actions natijasini ochish" in card
+    assert "Sabab:" not in card
+    assert "stale failure" not in card
+
+
+def test_non_qa_run_does_not_use_qa_deploy_failure_label() -> None:
+    card = agent_release.release_card(
+        _run()
+        | {
+            "repo_full_name": "muradjanov-dev/qurbot",
+            "status": "merged",
+            "error": "QA deployment failed [deploy_failed]: test only",
+        }
+    )
+
+    assert "QA deploy xato" not in card
+
+
 async def test_stale_callback_refetches_and_never_merges(monkeypatch) -> None:
     api = MagicMock()
     api.me = AsyncMock(return_value={"is_owner": True})
