@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import quote
 
@@ -168,6 +168,15 @@ class GitHubClient:
                 "description": description,
                 "target_url": target_url,
             },
+        )
+
+    def dispatch(self, repo: str, event_type: str, client_payload: Mapping[str, Any]) -> None:
+        """POST a `repository_dispatch` event (used for `agent_review_completed`)."""
+        self._call(
+            "POST",
+            f"/repos/{repo}/dispatches",
+            repo=repo,
+            body={"event_type": event_type, "client_payload": dict(client_payload)},
         )
 
     def list_workflow_runs(
