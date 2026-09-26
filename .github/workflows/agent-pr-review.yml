@@ -32,6 +32,7 @@ jobs:
           persist-credentials: false
 
       - name: Prepare trusted review input
+        id: prepare
         env:
           GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name != github.repository && secrets.AGENT_PUBLIC_REPO_TOKEN || secrets.AGENT_REPO_TOKEN }}
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
@@ -40,6 +41,8 @@ jobs:
         run: python3 scripts/agent_pr_review.py prepare
 
       - name: Review the exact PR diff with Codex
+        # Runs owned by the local agent-svc executor are reviewed there, not here.
+        if: steps.prepare.outputs.skip != 'true'
         run: |
           set -euo pipefail
           codex exec --sandbox read-only -c approval_policy=never \
@@ -49,6 +52,7 @@ jobs:
             > "$RUNNER_TEMP/agent-review-events.jsonl"
 
       - name: Publish exact-head review result
+        if: steps.prepare.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ vars.AGENT_QA_ENABLED == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name == vars.AGENT_QA_REPOSITORY && secrets.AGENT_QA_REPO_TOKEN || github.event_name == 'repository_dispatch' && github.event.client_payload.repo_full_name != github.repository && secrets.AGENT_PUBLIC_REPO_TOKEN || secrets.AGENT_REPO_TOKEN }}
           AGENT_CALLBACK_TOKEN: ${{ secrets.AGENT_CALLBACK_TOKEN }}
