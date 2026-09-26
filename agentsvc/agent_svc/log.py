@@ -26,8 +26,12 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){1,2}"),
     # Catches any "Basic <token>" HTTP-auth header value, whether or not the
     # underlying secret is one we loaded (e.g. MirrorManager's git
-    # `http.extraHeader`, or a header echoed back in an error body).
-    re.compile(r"(?i)basic\s+\S+"),
+    # `http.extraHeader`, or a header echoed back in an error body). The
+    # base64-charset + minimum-length requirement (a real credential, never
+    # under ~16 chars) keeps this from masking the ordinary English word
+    # "basic" followed by any other word ("a basic setup", "basic auth" as
+    # prose) -- `\S+` alone did exactly that.
+    re.compile(r"(?i)\bbasic\s+[A-Za-z0-9+/]{16,}={0,2}"),
 )
 
 _MAX_ERROR_CHARS = 500

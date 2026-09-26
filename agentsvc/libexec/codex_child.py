@@ -153,6 +153,14 @@ PATH_VALUE = _env_str(
 # everything else above) keeps the suite fast without changing production
 # behavior (the default below matches the spec unless test mode is active).
 TREE_KILL_GRACE_S = _env_float("TREE_KILL_GRACE_S", 10.0)
+# `preflight`'s own internal deadline for the trusted formatter/lint step,
+# strictly less than the parent's own default `preflight` timeout (180s,
+# see `agent_svc/codex.py`): if ruff/black/compileall hangs, this fires
+# FIRST, so the child gets a chance to kill everything and return a clean
+# refusal before the parent starts SIGTERM/SIGKILL-ing `sudo` itself (which
+# would not necessarily kill what `sudo` supervises -- see
+# `CodexRunner._call_with_grace`).
+PREFLIGHT_DEADLINE_S = _env_float("PREFLIGHT_DEADLINE_S", 170.0)
 
 
 def _codex_homes() -> dict[str, str]:
@@ -264,11 +272,16 @@ def _git_argv(
         # filters that execute arbitrary commands on `git diff`. This is not
         # in the literal spec command line but is required so `package`
         # cannot be tricked into running attacker-controlled programs.
-        # `diff.noTextconv` is not a real git config key (the real knob is
-        # the `--no-textconv` command-line flag, on a per-invocation basis);
-        # `core.attributesFile=/dev/null` alone already fully disables it,
-        # since no path is ever assigned a diff driver with no gitattributes
-        # read at all.
+        # `core.attributesFile` only overrides the GLOBAL fallback
+        # attributes file (like `core.excludesFile` for gitignore) -- it
+        # does NOT stop git from reading a `.gitattributes` committed inside
+        # the repository tree itself, which is exactly where attacker
+        # content lives here. That file alone is not the real protection;
+        # the caller must ALSO pass the literal `--no-textconv` flag as one
+        # of its own diff arguments (the only thing that reliably disables
+        # textconv regardless of where a diff driver was assigned from).
+        # `core.attributesFile=/dev/null` stays as a second, harmless layer
+        # against the global-config vector.
         command += ["-c", "core.attributesFile=/dev/null"]
     command += list(args)
     return command
@@ -449,7 +462,14 @@ def _parse_raw_diff_z(raw_bytes: bytes) -> tuple[list[str], str | None]:
     return changed_paths, None
 
 
-_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(?:.*) b/(.*)$")
+# Git quotes the whole `"a/path"`/`"b/path"` token (C-style backslash
+# escapes) whenever a path needs it (non-ASCII bytes by default, embedded
+# quotes/backslashes, ...); the unquoted alternative is tried second so a
+# name genuinely containing a literal `"` still falls back sanely.
+_DIFF_GIT_HEADER_RE = re.compile(
+    r'^diff --git (?:"a/(?:[^"\\]|\\.)*"|a/.*) '
+    r'(?:"b/(?P<quoted>(?:[^"\\]|\\.)*)"|b/(?P<plain>.*))$'
+)
 _MODE_LINE_PATTERNS = (
     re.compile(r"^new file mode (\d+)$"),
     re.compile(r"^old mode (\d+)$"),
@@ -470,7 +490,8 @@ def _scan_patch_for_bad_modes(patch_text: str) -> str | None:
     for line in patch_text.splitlines():
         header = _DIFF_GIT_HEADER_RE.match(line)
         if header:
-            current_path = header.group(1)
+            quoted = header.group("quoted")
+            current_path = quoted if quoted is not None else header.group("plain")
             continue
         for pattern in _MODE_LINE_PATTERNS:
             match = pattern.match(line)
@@ -537,6 +558,7 @@ def _package_worktree(
                 "--binary",
                 "--no-renames",
                 "--no-ext-diff",
+                "--no-textconv",
                 "HEAD",
                 "--",
                 no_textconv=True,
@@ -665,8 +687,67 @@ def _load_trusted_preflight() -> Any:
     return module
 
 
+@contextlib.contextmanager
+def _preflight_sandbox_environment(private_home: Path, private_cache: Path) -> Any:
+    """Diverts real fd 1 to fd 2, and gives the trusted preflight (ruff,
+    black, compileall) a minimal, private environment, for the duration of
+    the wrapped call only.
+
+    Stdout: `agent_preflight.run` shells out to these tools with no
+    `stdout=PIPE` of its own, so their normal, harmless-looking output
+    ("All checks passed!", reformatted-file names, ...) writes straight to
+    fd 1 -- which for THIS process is the JSON protocol channel the parent
+    (`agent_svc.codex.CodexRunner._call_with_grace`) reads one `json.loads`
+    over. Any such text corrupts that single JSON line. Redirecting the
+    real fd (not just `sys.stdout`, since the tools are separate processes
+    that inherit fds, not our Python object) to fd 2 for exactly this call
+    routes it to stderr instead, harmlessly.
+
+    Environment: HOME is never `/home/agent-codex` here (these tools must
+    not read or write anything under the real agent-codex home, e.g. an
+    accidental `~/.cache`), and cache directories are private per-run
+    scratch space, never shared across runs or repos.
+    """
+    overrides = {
+        "HOME": str(private_home),
+        "RUFF_NO_CACHE": "true",
+        "BLACK_CACHE_DIR": str(private_cache / "black"),
+        "XDG_CACHE_HOME": str(private_cache / "xdg"),
+    }
+    saved_env = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    sys.stdout.flush()
+    saved_stdout_fd = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved_stdout_fd, 1)
+        os.close(saved_stdout_fd)
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _preflight_watchdog(
+    done: threading.Event, timed_out: threading.Event, deadline_s: float
+) -> None:
+    """If `done` is not set within `deadline_s`, kill every descendant of
+    this process (the trusted preflight's own tool subprocesses) and record
+    that this was a timeout, not an ordinary tool failure. Requires
+    `PR_SET_CHILD_SUBREAPER` already set on this process, so a subprocess
+    that itself forked is still reachable."""
+    if not done.wait(deadline_s):
+        timed_out.set()
+        _reap_all_descendants()
+
+
 def cmd_preflight(request: dict[str, Any]) -> int:
     pf_dir: Path | None = None
+    run_dir: Path | None = None
     try:
         run_id = _validate_run_id(request.get("run_id"))
         run_dir = _run_dir(run_id)
@@ -719,13 +800,51 @@ def cmd_preflight(request: dict[str, Any]) -> int:
         # system/user git config, as every other git call here is.
         os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
         os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
+
+        private_home = run_dir / "pf-home"
+        private_cache = run_dir / "pf-cache"
+        _fresh_dir(private_home, mode=0o700)
+        _fresh_dir(private_cache, mode=0o700)
+
+        # Mark OURSELVES as a reaper before the trusted preflight ever runs
+        # a tool subprocess, so a hung/runaway one (and anything IT forks)
+        # is reachable by `_reap_all_descendants` regardless of how deep or
+        # how fast it tries to detach.
+        _prctl(PR_SET_CHILD_SUBREAPER, 1)
+        done = threading.Event()
+        timed_out = threading.Event()
+        watchdog = threading.Thread(
+            target=_preflight_watchdog,
+            args=(done, timed_out, PREFLIGHT_DEADLINE_S),
+            daemon=True,
+        )
+        watchdog.start()
+        failure_text: str | None = None
         try:
-            preflight_result = preflight_module.run(repo, pf_dir, tools=tools)
-        except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
-            # A trusted-preflight failure is not a child refusal: report the
-            # exact legacy failure text the caller forwards to the owner,
-            # alongside a generic `reason` for anything reading only that.
-            failure_text = preflight_module.failure_reason(exc)
+            with _preflight_sandbox_environment(private_home, private_cache):
+                try:
+                    preflight_result = preflight_module.run(repo, pf_dir, tools=tools)
+                except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                    preflight_result = None
+                    # A trusted-preflight failure is not a child refusal:
+                    # report the exact legacy failure text the caller
+                    # forwards to the owner, alongside a generic `reason`
+                    # for anything reading only that -- unless the watchdog
+                    # is the one that actually killed the tool, in which
+                    # case that (not whatever ordinary-looking failure text
+                    # a SIGTERM'd tool produces) is the real story.
+                    if timed_out.is_set():
+                        failure_text = "trusted preflight timed out"
+                    else:
+                        failure_text = preflight_module.failure_reason(exc)
+        finally:
+            done.set()
+            watchdog.join(timeout=2)
+            # Always: a tool that forked something it never waited for must
+            # not survive this call regardless of how it ended.
+            _reap_all_descendants()
+
+        if failure_text is not None:
             print(
                 json.dumps(
                     {"reason": "trusted preflight failed", "preflight_failure": failure_text}
@@ -746,6 +865,9 @@ def cmd_preflight(request: dict[str, Any]) -> int:
     finally:
         if pf_dir is not None:
             shutil.rmtree(pf_dir, ignore_errors=True)
+        if run_dir is not None:
+            for extra in (run_dir / "pf-home", run_dir / "pf-cache"):
+                shutil.rmtree(extra, ignore_errors=True)
     print(
         json.dumps(
             {
