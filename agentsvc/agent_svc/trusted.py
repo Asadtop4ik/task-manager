@@ -1,10 +1,11 @@
 """Loads the trusted publisher scripts by file path from `settings.trusted_dir`.
 
 These modules (`agent_task.py`, `public_agent_task.py`, `agent_preflight.py`,
-`agent_release.py`, `agent_images.py`, `agent_repos.py`) are the single source
-of truth for task validation, patch policy, formatting/lint preflight, and
-release/correction bookkeeping — the same code the trusted GitHub Actions
-publisher runs. Handlers must call them, not reimplement their behavior.
+`agent_release.py`, `agent_images.py`, `agent_pr_review.py`, `agent_repos.py`)
+are the single source of truth for task validation, patch policy,
+formatting/lint preflight, PR review parsing/decisions, and release/
+correction bookkeeping — the same code the trusted GitHub Actions publisher
+runs. Handlers must call them, not reimplement their behavior.
 
 They are loaded with `importlib.util.spec_from_file_location` against the
 resolved files under `trusted_dir`, never via a package/`sys.path` import that
@@ -40,6 +41,7 @@ _FILES: dict[str, str] = {
     "agent_preflight": "agent_preflight.py",
     "agent_release": "agent_release.py",
     "agent_images": "agent_images.py",
+    "agent_pr_review": "agent_pr_review.py",
     "agent_repos": "agent_repos.py",
 }
 
@@ -108,6 +110,10 @@ class TrustedModules:
     @property
     def agent_images(self) -> ModuleType:
         return _load(self._dir, "agent_images")
+
+    @property
+    def agent_pr_review(self) -> ModuleType:
+        return _load(self._dir, "agent_pr_review")
 
     @property
     def agent_repos(self) -> ModuleType:
