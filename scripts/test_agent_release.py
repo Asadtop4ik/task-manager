@@ -124,8 +124,8 @@ class AgentReleaseTests(unittest.TestCase):
                         {
                             "id": 11,
                             "context": "codex-review",
-                            "sha": sha,
                             "state": "success",
+                            "url": f"https://api.github.com/repos/{repo}/statuses/{sha}",
                         }
                     ]
                 raise AssertionError(url)
@@ -153,7 +153,7 @@ class AgentReleaseTests(unittest.TestCase):
             output = Path(temp, "output").read_text(encoding="utf-8")
         self.assertIn("pull_number=3", output)
         self.assertIn(f"head_sha={sha}", output)
-        self.assertTrue(any("/statuses" in url for url in calls))
+        self.assertTrue(any(url.endswith(f"/commits/{sha}/statuses") for url in calls))
         self.assertFalse(any("/check-runs" in url for url in calls))
 
     def test_qa_merge_rejects_wrong_pr_or_failed_pr_ci_job(self) -> None:

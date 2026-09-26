@@ -247,7 +247,8 @@ def verify_merge() -> None:
     if not review_statuses:
         raise ValueError("independent review has not completed")
     latest_review = max(review_statuses, key=lambda row: row.get("id", 0))
-    if latest_review.get("sha") != expected or latest_review.get("state") != "success":
+    # Commit status rows do not include `sha`; this list came from the exact-head endpoint above.
+    if latest_review.get("state") != "success":
         raise ValueError("independent review is not clean on the current head")
     _write_output("pull_number", str(number))
     _write_output("head_sha", expected)
