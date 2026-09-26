@@ -11,8 +11,10 @@ d /srv/agent-svc 0750 agent-svc agentwork -
 d /srv/agent-svc/mirrors 2750 agent-svc agentwork -
 d /srv/agent-svc/work 2750 agent-svc agentwork -
 
-# Each /srv/agent-svc/work/<run_id> is created by agent-svc itself (explicit chmod 2770)
-# when a run starts; this "e" line only ages out entries already below the work root
+# Each /srv/agent-svc/work/<run_id> is created by agent-svc itself (explicit chmod 3770:
+# setgid so agent-codex's group-owned writes stay group agentwork, plus the sticky bit
+# so one run's files can't be renamed/deleted by another run in the same group) when a
+# run starts; this "e" line only ages out entries already below the work root
 # (never recreates or re-chmods the root, thanks to the "-" placeholders) so a run
 # directory left behind by a crash is swept after 3 days.
 e /srv/agent-svc/work - - - 3d

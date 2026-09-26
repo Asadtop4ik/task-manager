@@ -1,62 +1,71 @@
 {
   "api_base_url": "https://tasks.standart-eko.uz/api/v1",
-  "paths": {
-    "trusted_dir": "/opt/agent-svc/trusted",
-    "tools_dir": "/opt/agent-svc/tools",
-    "libexec_dir": "/opt/agent-svc/libexec",
-    "state_dir": "/var/lib/agent-svc",
-    "mirrors_dir": "/srv/agent-svc/mirrors",
-    "publish_dir": "/var/lib/agent-svc/publish",
-    "runs_dir": "/var/lib/agent-svc/runs",
-    "work_root": "/srv/agent-svc/work",
-    "codex_child_user": "agent-codex",
-    "codex_homes": {
-      "code": "/home/agent-codex/.codex-code",
-      "chat": "/home/agent-codex/.codex-chat"
-    },
-    "codex_node_dir": "/opt/agent-svc/node24",
-    "codex_cli_dir": "/opt/agent-svc/codex-cli",
-    "codex_binary": "/opt/agent-svc/codex-cli/bin/codex",
-    "codex_child_path": "/opt/agent-svc/node24/bin:/opt/agent-svc/codex-cli/bin:/usr/bin:/bin",
-    "codex_child_sudo": ["sudo", "-n", "-u", "agent-codex", "/usr/bin/python3", "/opt/agent-svc/libexec/codex_child.py"],
-    "image_state_sudo": ["sudo", "-n", "-u", "root", "/usr/bin/python3", "/opt/agent-svc/libexec/image_state.py"]
-  },
-  "lanes": {
-    "code": {
-      "enabled": false,
-      "poll_interval_s": 5,
-      "error_backoff_start_s": 30,
-      "error_backoff_max_s": 600
-    },
+  "trusted_dir": "/opt/agent-svc/trusted",
+  "libexec_dir": "/opt/agent-svc/libexec",
+  "tools_dir": "/opt/agent-svc/tools",
+  "state_dir": "/var/lib/agent-svc",
+  "work_root": "/srv/agent-svc/work",
+  "mirrors_dir": "/srv/agent-svc/mirrors",
+  "runs_dir": null,
+  "codex_child_prefix": null,
+  "codex_home_code": "/home/agent-codex/.codex-code",
+  "codex_home_chat": "/home/agent-codex/.codex-chat",
+  "code_lane_enabled": false,
+  "chat_lane_enabled": false,
+  "watch_enabled": false,
+  "poll_interval_s": 5.0,
+  "watch_poll_interval_s": 15.0,
+  "sd_watchdog_interval_s": 20.0,
+  "model_matrix": {
     "chat": {
-      "enabled": false,
-      "poll_interval_s": 5,
-      "error_backoff_start_s": 30,
-      "error_backoff_max_s": 600
+      "model": "gpt-6-luna",
+      "effort": "medium",
+      "multi_agent": false,
+      "sandbox": "read-only"
     },
-    "watch": {
-      "enabled": false,
-      "poll_interval_s": 15,
-      "error_backoff_start_s": 30,
-      "error_backoff_max_s": 600
+    "intake": {
+      "model": "gpt-6-luna",
+      "effort": "high",
+      "multi_agent": false,
+      "sandbox": "read-only"
+    },
+    "implement_simple": {
+      "model": "gpt-6-luna",
+      "effort": "high",
+      "multi_agent": false,
+      "sandbox": "workspace-write"
+    },
+    "implement_complex": {
+      "model": "gpt-6-sol",
+      "effort": "medium",
+      "multi_agent": true,
+      "sandbox": "workspace-write"
+    },
+    "correction_simple": {
+      "model": "gpt-6-luna",
+      "effort": "high",
+      "multi_agent": false,
+      "sandbox": "workspace-write"
+    },
+    "correction_complex": {
+      "model": "gpt-6-sol",
+      "effort": "medium",
+      "multi_agent": true,
+      "sandbox": "workspace-write"
+    },
+    "review": {
+      "model": "gpt-6-sol",
+      "effort": "medium",
+      "multi_agent": false,
+      "sandbox": "read-only"
     }
   },
-  "heartbeat_interval_s": 30,
-  "models": {
-    "chat": { "model": "gpt-6-luna", "effort": "medium", "sandbox": "workspace-write", "multi_agent": false },
-    "intake": { "model": "gpt-6-luna", "effort": "high", "sandbox": "read-only", "multi_agent": false },
-    "implement_simple": { "model": "gpt-6-luna", "effort": "high", "sandbox": "workspace-write", "multi_agent": false },
-    "implement_complex": { "model": "gpt-6-sol", "effort": "medium", "sandbox": "workspace-write", "multi_agent": true },
-    "correction_simple": { "model": "gpt-6-luna", "effort": "high", "sandbox": "workspace-write", "multi_agent": false },
-    "correction_complex": { "model": "gpt-6-sol", "effort": "medium", "sandbox": "workspace-write", "multi_agent": true },
-    "review": { "model": "gpt-6-sol", "effort": "medium", "sandbox": "read-only", "multi_agent": false }
-  },
-  "timeouts_s": {
+  "timeouts": {
     "intake": 180,
     "implement_simple": 1200,
     "implement_complex": 2100,
     "correction": 1200,
-    "review": 480,
-    "idle": 480
-  }
+    "review": 480
+  },
+  "idle_timeout_s": 480
 }

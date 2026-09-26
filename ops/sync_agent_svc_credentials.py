@@ -20,22 +20,22 @@ those lines is treated as a parse error rather than guessed at, because a
 silently mis-parsed token (e.g. with a trailing comment folded into the value)
 would otherwise ship a broken credential without any visible error.
 
-Callers that also rewrite /srv/stack/env/task-manager.env (update_public_agent_token.py
-today) should take the same `<env file>.lock` flock before reading or writing
-it, so a concurrent run of either script can't interleave a read with the
+Every caller that reads or rewrites /srv/stack/env/task-manager.env
+(update_public_agent_token.py too) takes the same `env_file_lock.locked_env_file`
+flock, so a concurrent run of either script can't interleave a read with the
 other's write.
 """
 
 from __future__ import annotations
 
-import fcntl
 import os
 import re
 import secrets
 import tempfile
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from pathlib import Path
+
+from env_file_lock import locked_env_file
 
 TASK_MANAGER_ENV_FILE = Path("/srv/stack/env/task-manager.env")
 CREDENTIALS_DIR = Path("/etc/agent-svc/credentials")
@@ -116,23 +116,6 @@ def _parse_env_values(contents: str, env_file: Path) -> dict[str, str]:
     return values
 
 
-@contextmanager
-def _locked(env_file: Path) -> Iterator[None]:
-    # Locks a fixed sibling file rather than env_file itself: env_file is
-    # replaced via atomic rename (a new inode each time it changes), and
-    # flock()ing a path that gets renamed away from under you does not
-    # serialize against the next writer. A lock file that is never replaced
-    # avoids that hazard.
-    lock_path = env_file.with_name(env_file.name + ".lock")
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
-
 def _atomic_write(
     path: Path,
     content: str,
@@ -197,7 +180,7 @@ def sync_agent_svc_credentials(
     if not task_manager_env_file.is_file():
         raise FileNotFoundError("task-manager environment file is missing")
 
-    with _locked(task_manager_env_file):
+    with locked_env_file(task_manager_env_file):
         contents = task_manager_env_file.read_text(encoding="utf-8")
         values = _parse_env_values(contents, task_manager_env_file)
 
