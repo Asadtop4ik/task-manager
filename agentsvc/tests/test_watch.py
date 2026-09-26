@@ -172,11 +172,17 @@ def _completed_run(
     }
 
 
-def _ctx(*, api: FakeApi, github: FakeGitHub, catalog: Catalog | None = None) -> Any:
+def _ctx(
+    *,
+    api: FakeApi,
+    github: FakeGitHub,
+    catalog: Catalog | None = None,
+    logger: Logger | None = None,
+) -> Any:
     return SimpleNamespace(
         api=api,
         github=github,
-        logger=_logger(),
+        logger=logger or _logger(),
         catalog=catalog or _catalog(),
         settings=SimpleNamespace(libexec_dir="/opt/agent-svc/libexec"),
     )
