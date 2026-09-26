@@ -7,7 +7,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from public_agent_task import check_diff, prepare, task
+from public_agent_task import (
+    approved_repositories,
+    build_prompt,
+    check_diff,
+    parse_public_task,
+    prepare,
+    task,
+)
 
 PAYLOAD = {
     "repo_full_name": "muradjanov-dev/qurbot",
@@ -134,6 +141,134 @@ class PublicAgentTaskTests(unittest.TestCase):
                 },
             ):
                 check_diff(temp)
+
+
+class ParametrizedCheckDiffTests(unittest.TestCase):
+    """The local-executor entry point: pass ``task`` and skip every env var."""
+
+    def test_agents_md_is_rejected_without_any_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "AGENTS.md").write_text("changed\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "protected path"):
+                    check_diff(root, task=PAYLOAD)
+
+    def test_github_workflow_directory_is_rejected_without_any_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("changed\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "protected path"):
+                    check_diff(root, task=PAYLOAD)
+
+    def test_symlink_is_rejected_without_any_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            target = root / "real.txt"
+            target.write_text("data\n")
+            link = root / "link.txt"
+            link.symlink_to(target)
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "protected path"):
+                    check_diff(root, task=PAYLOAD)
+
+    def test_ordinary_patch_is_allowed_and_reaches_the_base_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            source = root / "app/main.py"
+            source.parent.mkdir()
+            source.write_text("LABEL = 'new'\n")
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(check_diff(root, task=PAYLOAD))
+
+    def test_build_prompt_matches_the_prompt_prepare_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            environment = {
+                "TASK_JSON": json.dumps(PAYLOAD),
+                "RUNNER_TEMP": temp,
+                "GITHUB_ENV": str(Path(temp) / "github-env"),
+            }
+            with patch.dict(os.environ, environment):
+                prepare()
+            written = (Path(temp) / "agent-prompt.txt").read_text(encoding="utf-8")
+        normalized = PAYLOAD | {
+            "title": PAYLOAD["title"].strip(),
+            "description": PAYLOAD["description"].strip(),
+        }
+        self.assertEqual(written, build_prompt(normalized))
+
+    def test_qa_enabled_argument_bypasses_the_environment(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn("Asadtop4ik/agent-qa", approved_repositories())
+            self.assertNotIn("Asadtop4ik/agent-qa", approved_repositories(False))
+            self.assertIn("Asadtop4ik/agent-qa", approved_repositories(True))
+            self.assertNotIn(
+                "Asadtop4ik/agent-qa",
+                approved_repositories(True, qa_repository="someone-else/other"),
+            )
+
+
+class ParsePublicTaskFailsClosedTests(unittest.TestCase):
+    """``check_diff``/``build_prompt`` must not skip ``parse_public_task``'s checks."""
+
+    def test_fast_mode_is_rejected_by_parse_public_task(self) -> None:
+        with self.assertRaisesRegex(ValueError, "PR mode"):
+            parse_public_task(PAYLOAD | {"mode": "fast"})
+
+    def test_check_diff_rejects_fast_mode_even_though_the_path_check_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            source = root / "app/main.py"
+            source.parent.mkdir()
+            source.write_text("LABEL = 'new'\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    check_diff(root, task=PAYLOAD | {"mode": "fast"})
+
+    def test_build_prompt_rejects_fast_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            build_prompt(PAYLOAD | {"mode": "fast"})
+
+    def test_check_diff_rejects_an_unapproved_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "app").mkdir()
+            (root / "app/main.py").write_text("LABEL = 'new'\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    check_diff(root, task=PAYLOAD | {"repo_full_name": "attacker/repo"})
+
+    def test_check_diff_rejects_an_invalid_task_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "app").mkdir()
+            (root / "app/main.py").write_text("LABEL = 'new'\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    check_diff(root, task=PAYLOAD | {"task_revision": "not-hex"})
+
+    def test_qa_repository_needs_qa_enabled_even_via_task(self) -> None:
+        qa_payload = PAYLOAD | {"repo_full_name": "Asadtop4ik/agent-qa", "base_branch": "main"}
+        with self.assertRaises(ValueError):
+            parse_public_task(qa_payload)
+        self.assertEqual(
+            parse_public_task(qa_payload, qa_enabled=True)["repo_full_name"],
+            "Asadtop4ik/agent-qa",
+        )
+
+    def test_re_validating_an_already_normalized_task_is_a_no_op(self) -> None:
+        normalized = parse_public_task(PAYLOAD)
+        self.assertEqual(parse_public_task(normalized), normalized)
 
 
 if __name__ == "__main__":
