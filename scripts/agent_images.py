@@ -64,9 +64,9 @@ def _image_metadata(value: Any) -> tuple[int, str, int | None]:
     return image_id, mime, size
 
 
-def _prepare_output_paths(runner_temp: Path) -> tuple[Path, Path]:
-    image_dir = runner_temp / "agent-images"
-    manifest = runner_temp / "agent-image-paths.txt"
+def _prepare_output_paths(target_dir: Path) -> tuple[Path, Path]:
+    image_dir = target_dir / "agent-images"
+    manifest = target_dir / "agent-image-paths.txt"
     if image_dir.is_symlink():
         image_dir.unlink()
     elif image_dir.exists():
@@ -81,26 +81,48 @@ def _prepare_output_paths(runner_temp: Path) -> tuple[Path, Path]:
 
 
 def download_images(
-    *, task_json: str, token: str, runner_temp: str | Path
+    run_id: str | None = None,
+    token: str | None = None,
+    target_dir: str | Path | None = None,
+    *,
+    api_base: str = API_BASE_URL,
+    task_json: str | None = None,
+    runner_temp: str | Path | None = None,
 ) -> list[Path]:
-    """Fetch and validate task images, returning paths safe for Codex CLI args."""
-    try:
-        payload = json.loads(task_json)
-    except json.JSONDecodeError as exc:
-        raise ValueError("invalid task payload") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("invalid task payload")
-    try:
-        run_id = str(UUID(str(payload.get("run_id"))))
-    except (ValueError, AttributeError) as exc:
-        raise ValueError("invalid agent run ID") from exc
-    if not token.strip():
+    """Fetch and validate task images, returning paths safe for Codex CLI args.
+
+    Local-executor call: ``download_images(run_id, token, target_dir)``,
+    optionally overriding ``api_base``. Nothing is read from the environment.
+
+    Legacy (GitHub Actions) call: ``download_images(task_json=..., token=...,
+    runner_temp=...)`` -- the run ID is parsed out of the TASK_JSON payload
+    and files land under RUNNER_TEMP, exactly as before.
+    """
+    if run_id is None:
+        try:
+            payload = json.loads(task_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid task payload") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("invalid task payload")
+        try:
+            run_id = str(UUID(str(payload.get("run_id"))))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("invalid agent run ID") from exc
+        target = runner_temp
+    else:
+        try:
+            run_id = str(UUID(str(run_id)))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("invalid agent run ID") from exc
+        target = target_dir
+    if not token or not token.strip():
         raise ValueError("agent callback token is missing")
 
-    runner_temp_path = Path(runner_temp)
-    runner_temp_path.mkdir(parents=True, exist_ok=True)
-    image_dir, manifest = _prepare_output_paths(runner_temp_path)
-    listing_url = f"{API_BASE_URL}/agent-runs/{run_id}/images"
+    target_path = Path(target)
+    target_path.mkdir(parents=True, exist_ok=True)
+    image_dir, manifest = _prepare_output_paths(target_path)
+    listing_url = f"{api_base}/agent-runs/{run_id}/images"
     listing_request = _authenticated_get(listing_url, token)
     with urllib.request.urlopen(
         listing_request, timeout=REQUEST_TIMEOUT_SECONDS
@@ -125,7 +147,7 @@ def download_images(
     succeeded = False
     try:
         for image_id, expected_mime, expected_size in validated_records:
-            url = f"{API_BASE_URL}/agent-runs/{run_id}/images/{image_id}"
+            url = f"{api_base}/agent-runs/{run_id}/images/{image_id}"
             request = _authenticated_get(url, token)
             with urllib.request.urlopen(
                 request, timeout=REQUEST_TIMEOUT_SECONDS

@@ -1,11 +1,12 @@
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_preflight import changed_python, failure_reason, run
+from agent_preflight import changed_python, ensure_tools, failure_reason, run
 
 
 class AgentPreflightTests(unittest.TestCase):
@@ -241,3 +242,70 @@ class AgentPreflightTests(unittest.TestCase):
         ) as command, self.assertRaises(ValueError):
             run("attacker/repository", Path("/tmp/target"))
         command.assert_not_called()
+
+    @staticmethod
+    def _fake_versioned_run(version_lines: dict[str, str]):
+        def fake_run(command, **kwargs):
+            if len(command) >= 2 and command[1] == "--version":
+                name = Path(command[0]).name
+                return subprocess.CompletedProcess(command, 0, stdout=version_lines[name])
+            return subprocess.CompletedProcess(command, 0)
+
+        return fake_run
+
+    def test_local_executor_tools_mapping_uses_the_given_executable_and_never_calls_pip(self):
+        tools = {"ruff": "/opt/agent-svc/tools/ruff-0.7.4/bin/ruff"}
+        with patch(
+            "agent_preflight.changed_python",
+            return_value=["app/bot/keyboards/inline.py"],
+        ), patch(
+            "agent_preflight.subprocess.run",
+            side_effect=self._fake_versioned_run({"ruff": "ruff 0.7.4\n"}),
+        ) as command:
+            result = run("muradjanov-dev/qurbot", Path("/tmp/target"), tools=tools)
+        calls = [item.args[0] for item in command.call_args_list]
+        self.assertIn([tools["ruff"], "--version"], calls)
+        self.assertIn(
+            [tools["ruff"], "check", "--fix", "--select", "F401", "--", "app/bot/keyboards/inline.py"],
+            calls,
+        )
+        self.assertIn([tools["ruff"], "format", "--", "app/bot/keyboards/inline.py"], calls)
+        self.assertIn([tools["ruff"], "check", "."], calls)
+        self.assertTrue(
+            all(command[0] != sys.executable or "pip" not in command for command in calls),
+            "the local executor must never invoke pip",
+        )
+        self.assertIn("passed", result)
+
+    def test_local_executor_tools_mapping_refuses_a_version_mismatch(self):
+        tools = {"ruff": "/opt/agent-svc/tools/ruff-0.7.4/bin/ruff"}
+        with patch(
+            "agent_preflight.changed_python", return_value=["x.py"]
+        ), patch(
+            "agent_preflight.subprocess.run",
+            side_effect=self._fake_versioned_run({"ruff": "ruff 9.9.9\n"}),
+        ) as command:
+            with self.assertRaises(RuntimeError):
+                run("muradjanov-dev/qurbot", Path("/tmp/target"), tools=tools)
+        calls = [item.args[0] for item in command.call_args_list]
+        self.assertEqual(calls, [[tools["ruff"], "--version"]])
+        self.assertTrue(
+            all(sys.executable not in command for command in calls),
+            "the local executor must never invoke pip",
+        )
+
+    def test_local_executor_tools_mapping_refuses_a_missing_executable(self):
+        with patch("agent_preflight.changed_python", return_value=["x.py"]), patch(
+            "agent_preflight.subprocess.run"
+        ) as command:
+            with self.assertRaises(RuntimeError):
+                run("muradjanov-dev/qurbot", Path("/tmp/target"), tools={})
+        command.assert_not_called()
+
+    def test_ensure_tools_with_a_mapping_never_touches_shutil_which_or_pip(self):
+        with patch("agent_preflight.shutil.which") as which, patch(
+            "agent_preflight.subprocess.run",
+            side_effect=self._fake_versioned_run({"black": "black, 26.5.1 (compiled: yes)\n"}),
+        ):
+            ensure_tools("black==26.5.1", tools={"black": "/opt/tools/black"})
+        which.assert_not_called()

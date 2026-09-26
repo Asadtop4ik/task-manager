@@ -558,5 +558,21 @@ class AgentReviewTests(unittest.TestCase):
         )
 
 
+class CorrectionPromptTests(unittest.TestCase):
+    def test_matches_the_prompt_verify_correction_would_write(self) -> None:
+        run = {
+            "task_id": 12,
+            "run_id": "00000000-0000-0000-0000-000000000012",
+            "pr_url": "https://github.com/Asadtop4ik/task-manager/pull/9",
+        }
+        expected_head_sha = "a" * 40
+        instruction = "Rename the button to Submit."
+        prompt = agent_release.correction_prompt(run, expected_head_sha, instruction)
+        self.assertIn("Task #12: https://github.com/Asadtop4ik/task-manager/pull/9", prompt)
+        self.assertIn(f"Current PR head: {expected_head_sha}", prompt)
+        self.assertIn("Owner correction:\nRename the button to Submit.", prompt)
+        self.assertIn("Do not push, open a PR, merge, deploy", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

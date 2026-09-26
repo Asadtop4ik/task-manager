@@ -165,5 +165,38 @@ class AgentImageDownloadTests(unittest.TestCase):
                 urlopen.assert_not_called()
 
 
+class LocalExecutorDownloadImagesTests(unittest.TestCase):
+    """The local-executor entry point: pass ``run_id``/``target_dir`` directly."""
+
+    def test_downloads_using_run_id_target_dir_and_a_custom_api_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            responses = [
+                listing({"id": 4, "mime": "image/png", "size": 3}),
+                image(b"abc", "image/png"),
+            ]
+            with patch(
+                "agent_images.urllib.request.urlopen", side_effect=responses
+            ) as urlopen:
+                paths = download_images(
+                    RUN_ID, TOKEN, temp, api_base="https://agent-svc.local/api/v1"
+                )
+            self.assertEqual([path.name for path in paths], ["image-4.png"])
+            self.assertEqual(paths[0].read_bytes(), b"abc")
+            self.assertTrue(
+                request_url(urlopen.call_args_list[0]).startswith(
+                    "https://agent-svc.local/api/v1/agent-runs/"
+                )
+            )
+
+    def test_rejects_a_bad_run_id_and_a_missing_token_before_network_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("agent_images.urllib.request.urlopen") as urlopen:
+                with self.assertRaises(ValueError):
+                    download_images("not-a-uuid", TOKEN, temp)
+                with self.assertRaises(ValueError):
+                    download_images(RUN_ID, " ", temp)
+                urlopen.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

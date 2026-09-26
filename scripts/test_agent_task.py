@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -11,9 +12,13 @@ from agent_task import (
     _changed_fragments,
     _safe_fast_patch,
     _task,
+    branch_name,
+    build_prompt,
     callback,
     check_diff,
+    failure_reason,
     fast_needs_pr,
+    prepare,
     started,
     usage,
 )
@@ -423,6 +428,226 @@ class UsageTests(unittest.TestCase):
                         "output_tokens": 280,
                     },
                 )
+
+
+class ParametrizedCheckDiffTests(unittest.TestCase):
+    """The local-executor entry point: pass ``task`` and skip every env var."""
+
+    @staticmethod
+    def _git_repo(root: Path) -> None:
+        for args in (
+            ("init", "-q"),
+            ("config", "user.email", "ci@example.test"),
+            ("config", "user.name", "CI Test"),
+        ):
+            subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    def test_blocked_credential_path_is_rejected_without_any_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            (root / ".env").write_text("SECRET=1\n")
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "pr",
+            }
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "credential files"):
+                    check_diff(cwd=root, task=task)
+
+    def test_no_change_fails_closed_without_any_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "pr",
+            }
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "no file changes"):
+                    check_diff(cwd=root, task=task)
+
+    def test_pr_mode_never_needs_a_fast_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            (root / "README.md").write_text("hello\n")
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "pr",
+            }
+            calls: list[str] = []
+            with patch.dict(os.environ, {}, clear=True):
+                result = check_diff(cwd=root, task=task, on_fallback=calls.append)
+            self.assertFalse(result)
+            self.assertEqual(calls, [])
+
+    def test_fast_fallback_calls_on_fallback_without_writing_github_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            (root / "README.md").write_text("base\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "base"], cwd=root, check=True, capture_output=True
+            )
+            (root / "backend/app/core").mkdir(parents=True)
+            (root / "backend/app/core/security.py").write_text("OLD = True\n")
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "fast",
+            }
+            reasons: list[str] = []
+            with patch.dict(os.environ, {}, clear=True):
+                result = check_diff(cwd=root, task=task, on_fallback=reasons.append)
+            self.assertTrue(result)
+            self.assertEqual(len(reasons), 1)
+
+    def test_fast_mode_with_a_safe_edit_needs_no_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            board = root / "frontend/src/pages/Board.tsx"
+            board.parent.mkdir(parents=True)
+            board.write_text("const link = user.is_owner && <Link>Trash</Link>;\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "base"], cwd=root, check=True, capture_output=True
+            )
+            board.write_text(
+                'const link = user.is_owner && <Link title="Show hidden tasks">Trash</Link>;\n'
+            )
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "fast",
+            }
+            calls: list[str] = []
+            with patch.dict(os.environ, {}, clear=True):
+                result = check_diff(cwd=root, task=task, on_fallback=calls.append)
+            self.assertFalse(result)
+            self.assertEqual(calls, [])
+
+    def test_reference_image_digest_is_rejected_without_runner_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git_repo(root)
+            image_bytes = b"\x89PNG\r\n\x1a\nreference-bytes"
+            digest = hashlib.sha256(image_bytes).hexdigest()
+            copied = root / "frontend/public/renamed.png"
+            copied.parent.mkdir(parents=True)
+            copied.write_bytes(image_bytes)
+            task = {
+                "task_id": 7,
+                "run_id": "00000000-0000-0000-0000-000000000007",
+                "title": "T",
+                "description": "",
+                "base_branch": "main",
+                "mode": "pr",
+            }
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "reference images"):
+                    check_diff(cwd=root, task=task, image_digests=[digest])
+
+
+class BranchNameAndPromptTests(unittest.TestCase):
+    def test_branch_name_uses_the_fast_prefix_only_for_fast_mode(self) -> None:
+        run_id = "00000000-0000-0000-0000-000000000003"
+        self.assertEqual(
+            branch_name({"task_id": 3, "run_id": run_id, "mode": "pr"}),
+            f"codex/task-3-{run_id}",
+        )
+        self.assertEqual(
+            branch_name({"task_id": 3, "run_id": run_id, "mode": "fast"}),
+            f"codex/fast/task-3-{run_id}",
+        )
+
+    def test_build_prompt_matches_the_prompt_prepare_writes(self) -> None:
+        task = {
+            "task_id": 9,
+            "run_id": "00000000-0000-0000-0000-000000000009",
+            "title": "Fix menu",
+            "description": "Do the thing",
+            "base_branch": "main",
+            "mode": "pr",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            environment = {
+                "TASK_JSON": json.dumps(task),
+                "RUNNER_TEMP": temp,
+                "GITHUB_ENV": str(Path(temp) / "github-env"),
+            }
+            with patch.dict(os.environ, environment):
+                prepare()
+            written = (Path(temp) / "agent-prompt.txt").read_text(encoding="utf-8")
+        self.assertEqual(written, build_prompt(task))
+
+
+class FailureReasonTests(unittest.TestCase):
+    def test_prefers_fast_error_text_over_everything_else(self) -> None:
+        self.assertEqual(
+            failure_reason(
+                failure_phase=None,
+                codex_step_outcome=None,
+                result_text=None,
+                policy_error_text="ignored",
+                fast_error_text="boom",
+            ),
+            "boom",
+        )
+
+    def test_falls_back_to_a_phase_specific_default_message(self) -> None:
+        self.assertEqual(
+            failure_reason(
+                failure_phase="publish",
+                codex_step_outcome=None,
+                result_text=None,
+                policy_error_text=None,
+                fast_error_text=None,
+            ),
+            "Publisher failed before PR/deploy; inspect the GitHub run.",
+        )
+        self.assertEqual(
+            failure_reason(
+                failure_phase="implement",
+                codex_step_outcome=None,
+                result_text=None,
+                policy_error_text=None,
+                fast_error_text=None,
+            ),
+            "Agent workflow failed; inspect the GitHub run.",
+        )
+
+    def test_labels_the_no_change_explanation_from_the_agent_result(self) -> None:
+        reason = failure_reason(
+            failure_phase="implement",
+            codex_step_outcome="success",
+            result_text="Could not verify the price.",
+            policy_error_text="agent produced no file changes",
+            fast_error_text=None,
+        )
+        self.assertIn("agent produced no file changes", reason)
+        self.assertIn("Codex izohi (tasdiqlanmagan)", reason)
+        self.assertIn("Could not verify the price", reason)
 
 
 if __name__ == "__main__":
