@@ -16,16 +16,22 @@ import importlib.util
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from .journal import RUN_ID_RE
+from .log import Redactor
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _GIT_TIMEOUT_S = 120
+_STDERR_TAIL_CHARS = 500
+# Agent-opened PR branches: `codex/task-<task_id>-<run_id>` (see the backend's
+# `_run_branch`). MirrorManager.fetch never pulls anything else besides a
+# repo's approved base branch.
+_AGENT_BRANCH_RE = re.compile(r"^codex/task-\d+-[0-9a-f-]{36}$")
 # Achieves the same group-readable outcome as a process-wide umask, without
 # mutating global umask state from multiple lane threads at once. Setgid
 # (02000) so new entries inherit the mirrors tree's group (REVISION 2:
@@ -34,9 +40,13 @@ _DIR_MODE = 0o2750
 _FILE_MODE = 0o640
 
 # Work-dir permissions (REVISION 2): the service's own UMask (0027) only
-# strips rwx bits, never sets setgid, so these are always applied explicitly
-# rather than relied on via a directory-creation mode.
-_RUN_DIR_MODE = 0o2770
+# strips rwx/setgid/sticky bits inconsistently, so these are always applied
+# explicitly rather than relied on via a directory-creation mode.
+# Sticky (01000) + setgid (02000): agent-codex (group agentwork, write access
+# to create/edit its own files) cannot rename or delete agent-svc-owned
+# entries inside the run dir, only its own.
+_RUN_DIR_MODE = 0o3770
+# images/ stays agent-svc-owned only; agent-codex does not write here.
 _RUN_IMAGES_MODE = 0o2750
 
 
@@ -125,15 +135,19 @@ class MirrorManager:
         mirrors_dir: str | Path,
         token_for: Callable[[str], str],
         *,
+        approved_branches: Mapping[str, str],
         remote_url_for: Callable[[str], str] | None = None,
         command_runner: Callable[..., Any] | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self._mirrors_dir = Path(mirrors_dir)
         self._token_for = token_for
+        self._approved_branches = dict(approved_branches)
         self._remote_url_for = remote_url_for or (
             lambda repo: f"https://github.com/{repo}.git"
         )
         self._run = command_runner or subprocess.run
+        self._redactor = redactor
 
     def mirror_path(self, repo: str) -> Path:
         return self._mirrors_dir / _mirror_dir_name(repo)
@@ -147,7 +161,16 @@ class MirrorManager:
             self._set_group_readable(path)
         return path
 
+    def _validate_branch(self, repo: str, branch: str) -> None:
+        approved_base = self._approved_branches.get(repo)
+        if approved_base is None:
+            raise ValueError(f"refusing to fetch from an unapproved repository: {repo}")
+        if branch == approved_base or _AGENT_BRANCH_RE.fullmatch(branch):
+            return
+        raise ValueError(f"refusing to fetch unapproved branch {branch!r} for {repo}")
+
     def fetch(self, repo: str, branch: str) -> str:
+        self._validate_branch(repo, branch)
         path = self.ensure(repo)
         refspec = f"+refs/heads/{branch}:refs/heads/{branch}"
         self._git(
@@ -157,7 +180,7 @@ class MirrorManager:
         )
         self._set_group_readable(path)
         result = self._git(
-            ["rev-parse", f"refs/heads/{branch}"], cwd=path, env=self._base_env(), capture=True
+            ["rev-parse", f"refs/heads/{branch}"], cwd=path, env=self._base_env()
         )
         sha = (result.stdout or "").strip()
         if not _SHA_RE.fullmatch(sha):
@@ -183,27 +206,25 @@ class MirrorManager:
         env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {basic}"
         return env
 
-    def _git(
-        self,
-        args: list[str],
-        *,
-        cwd: Path | None,
-        env: dict[str, str],
-        capture: bool = False,
-    ) -> Any:
+    def _git(self, args: list[str], *, cwd: Path | None, env: dict[str, str]) -> Any:
+        # Always capture: uncaptured stderr would otherwise inherit our fds
+        # and reach journald unredacted, and a failure's error message would
+        # be empty instead of carrying the (redacted) reason.
         result = self._run(
             ["git", *args],
             cwd=str(cwd) if cwd is not None else None,
             env=env,
-            capture_output=capture,
+            capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
             check=False,
         )
         if result.returncode != 0:
             stderr = (getattr(result, "stderr", None) or "").strip()
+            if self._redactor is not None:
+                stderr = self._redactor.redact(stderr)
             raise RuntimeError(
-                f"git {args[0]} failed (exit {result.returncode}): {stderr[-500:]}"
+                f"git {args[0]} failed (exit {result.returncode}): {stderr[-_STDERR_TAIL_CHARS:]}"
             )
         return result
 
@@ -221,8 +242,11 @@ def make_run_dir(work_root: str | Path, run_id: str) -> Path:
 
     `work_root` itself is provisioned externally (tmpfiles.d, 2750
     agent-svc:agentwork); this only owns the per-run tree beneath it. Modes
-    are always set explicitly (2770 / 2750) because the service's UMask
-    (0027) never sets the setgid bit a plain `mkdir(mode=...)` would need.
+    are always set explicitly (3770 / 2750) because the service's UMask
+    (0027) never sets the setgid/sticky bits a plain `mkdir(mode=...)` would
+    need. The run dir is sticky (in addition to setgid) so agent-codex, which
+    only needs group-write to create/edit its own files, cannot rename or
+    delete an agent-svc-owned entry (e.g. swap out a subdirectory) inside it.
     Refuses a run directory (or its `images/`) that already exists as a
     symlink, since `mkdir(exist_ok=True)` would otherwise silently follow it.
     """

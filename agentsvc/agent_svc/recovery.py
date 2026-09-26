@@ -14,7 +14,6 @@ from __future__ import annotations
 from typing import Any
 
 from .api import TaskManagerApi
-from .http import HttpError
 from .journal import Journal, JournalEntry
 from .log import Logger
 
@@ -28,12 +27,13 @@ def recover(journal: Journal, api: TaskManagerApi, logger: Logger) -> list[Journ
     for entry in journal.list():
         try:
             status_payload = api.status(entry.run_id)
-        except HttpError as exc:
+            if _clean_or_resume(entry, status_payload, journal, logger):
+                resume.append(entry)
+        except Exception as exc:
+            # `api.status` can fail in more ways than `HttpError` (a timeout,
+            # a malformed JSON body, a dropped connection, ...); one bad
+            # entry must log and move on, never abort startup recovery.
             logger.error(exc, event="recovery_status_failed", run_id=entry.run_id)
-            continue
-        if not _clean_or_resume(entry, status_payload, journal, logger):
-            continue
-        resume.append(entry)
     return resume
 
 

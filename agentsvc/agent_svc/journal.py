@@ -111,13 +111,15 @@ class Journal:
         data = json.dumps(entry.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8")
         fd, tmp_name = tempfile.mkstemp(dir=str(self._dir), prefix=".tmp-", suffix=".json")
         try:
-            os.write(fd, data)
-            os.fchmod(fd, _ENTRY_MODE)
-        finally:
-            os.close(fd)
-        try:
+            try:
+                os.write(fd, data)
+                os.fchmod(fd, _ENTRY_MODE)
+            finally:
+                os.close(fd)
             os.replace(tmp_name, path)
-        except OSError:
+        except BaseException:
+            # Whatever failed (write, fchmod, or the final replace), never
+            # leave a stray `.tmp-*.json` behind for `list()` to trip over.
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp_name)
             raise
@@ -136,6 +138,11 @@ class Journal:
     def list(self) -> list[JournalEntry]:
         entries: list[JournalEntry] = []
         for path in sorted(self._dir.glob("*.json")):
+            # `Path.glob` (unlike the stdlib `glob` module) matches dotfiles,
+            # so a leftover `.tmp-*.json` from an interrupted `write()` would
+            # otherwise reach `read()` and blow up on an invalid run_id.
+            if not RUN_ID_RE.fullmatch(path.stem):
+                continue
             entry = self.read(path.stem)
             if entry is not None:
                 entries.append(entry)

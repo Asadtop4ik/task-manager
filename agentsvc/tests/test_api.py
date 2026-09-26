@@ -13,13 +13,15 @@ from agent_svc.http import JsonHttp
 
 CATALOG = {"Asadtop4ik/task-manager": "main"}
 BASE_URL = "https://tasks.example.test/api/v1"
+# The contract sets lease_id via uuid4(); every method now validates it as one.
+LEASE_ID = "22222222-2222-2222-2222-222222222222"
 
 
 def _work_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "run_id": "11111111-1111-1111-1111-111111111111",
         "kind": "implement",
-        "lease_id": "lease-abc",
+        "lease_id": LEASE_ID,
         "lease_until": "2026-09-26T12:00:00+00:00",
         "attempts": 1,
         "attempt_index": 1,
@@ -136,67 +138,103 @@ class LeaseTests(unittest.TestCase):
         with self.assertRaises(InvalidWork):
             api.lease("code")
 
+    def test_non_uuid_lease_id_rejected(self) -> None:
+        bad = _work_payload(lease_id="not-a-uuid")
+        api, _opener = _api([FakeResponse(json.dumps(bad).encode(), status=200)])
+        with self.assertRaises(InvalidWork):
+            api.lease("code")
+
+    def test_fast_mode_is_rejected(self) -> None:
+        # `!fast` runs always stay on the GitHub executor; a local lease
+        # response claiming mode="fast" must never be accepted.
+        bad = _work_payload(mode="fast")
+        api, _opener = _api([FakeResponse(json.dumps(bad).encode(), status=200)])
+        with self.assertRaises(InvalidWork):
+            api.lease("code")
+
 
 class HeartbeatTests(unittest.TestCase):
     def test_success_returns_lease_until(self) -> None:
         body = json.dumps({"lease_until": "2026-09-26T12:05:00+00:00"}).encode()
         api, opener = _api([FakeResponse(body, status=200)])
-        lease_until = api.heartbeat("run-1", "lease-1")
+        lease_until = api.heartbeat("run-1", LEASE_ID)
         self.assertEqual(lease_until.isoformat(), "2026-09-26T12:05:00+00:00")
-        self.assertEqual(opener.requests[0].get_header("X-agent-lease-id"), "lease-1")
+        self.assertEqual(opener.requests[0].get_header("X-agent-lease-id"), LEASE_ID)
 
     def test_409_raises_lease_lost_with_detail(self) -> None:
         api, _opener = _api([_http_error(409, {"detail": "lease_expired"})])
         with self.assertRaises(LeaseLost) as ctx:
-            api.heartbeat("run-1", "lease-1")
+            api.heartbeat("run-1", LEASE_ID)
         self.assertEqual(ctx.exception.detail, "lease_expired")
+
+    def test_non_uuid_lease_id_rejected_before_any_request(self) -> None:
+        api, opener = _api([])
+        with self.assertRaises(ValueError):
+            api.heartbeat("run-1", "not-a-uuid")
+        self.assertEqual(opener.requests, [])
 
 
 class StageTests(unittest.TestCase):
     def test_unknown_stage_rejected_before_any_request(self) -> None:
         api, opener = _api([])
         with self.assertRaises(ValueError):
-            api.stage("run-1", "lease-1", "not-a-real-stage")
+            api.stage("run-1", LEASE_ID, "not-a-real-stage")
         self.assertEqual(opener.requests, [])
 
     def test_valid_stage_sends_lease_header_and_body(self) -> None:
         api, opener = _api([FakeResponse(b"", status=204)])
-        api.stage("run-1", "lease-1", "codex_started", error=None)
+        api.stage("run-1", LEASE_ID, "codex_started", error=None)
         request = opener.requests[0]
-        self.assertEqual(request.get_header("X-agent-lease-id"), "lease-1")
+        self.assertEqual(request.get_header("X-agent-lease-id"), LEASE_ID)
         sent = json.loads(request.data)
-        self.assertEqual(
-            sent, {"lease_id": "lease-1", "stage": "codex_started", "error": None}
-        )
+        self.assertEqual(sent, {"lease_id": LEASE_ID, "stage": "codex_started", "error": None})
 
     def test_409_raises_lease_lost(self) -> None:
         api, _opener = _api([_http_error(409, {"detail": "cancelled"})])
         with self.assertRaises(LeaseLost) as ctx:
-            api.stage("run-1", "lease-1", "leased")
+            api.stage("run-1", LEASE_ID, "leased")
         self.assertEqual(ctx.exception.detail, "cancelled")
+
+    def test_non_uuid_lease_id_rejected_before_any_request(self) -> None:
+        api, opener = _api([])
+        with self.assertRaises(ValueError):
+            api.stage("run-1", "not-a-uuid", "leased")
+        self.assertEqual(opener.requests, [])
 
 
 class CallbackFamilyTests(unittest.TestCase):
     def test_callback_uses_callback_token_and_lease_header(self) -> None:
         api, opener = _api([FakeResponse(b"", status=204)])
-        result = api.callback("run-1", "lease-1", {"status": "running"})
+        result = api.callback("run-1", LEASE_ID, {"status": "running"})
         self.assertIsNone(result)
         request = opener.requests[0]
         self.assertEqual(request.get_header("X-agent-callback-token"), "callback-token")
-        self.assertEqual(request.get_header("X-agent-lease-id"), "lease-1")
+        self.assertEqual(request.get_header("X-agent-lease-id"), LEASE_ID)
         self.assertEqual(json.loads(request.data), {"status": "running"})
+
+    def test_callback_rejects_a_non_uuid_lease_id_before_any_request(self) -> None:
+        api, opener = _api([])
+        with self.assertRaises(ValueError):
+            api.callback("run-1", "not-a-uuid", {"status": "running"})
+        self.assertEqual(opener.requests, [])
 
     def test_review_result_409_raises_lease_lost(self) -> None:
         api, _opener = _api([_http_error(409, {"detail": "lease_mismatch"})])
         with self.assertRaises(LeaseLost):
-            api.review_result("run-1", "lease-1", {"sha": "a" * 40})
+            api.review_result("run-1", LEASE_ID, {"sha": "a" * 40})
+
+    def test_action_result_rejects_a_non_uuid_lease_id_before_any_request(self) -> None:
+        api, opener = _api([])
+        with self.assertRaises(ValueError):
+            api.action_result("run-1", "not-a-uuid", {"action_id": "a1"})
+        self.assertEqual(opener.requests, [])
 
     def test_action_result_returns_parsed_body(self) -> None:
         api, _opener = _api(
             [FakeResponse(json.dumps({"run_id": "run-1"}).encode(), status=200)]
         )
         result = api.action_result(
-            "run-1", "lease-1", {"action_id": "a1", "status": "completed"}
+            "run-1", LEASE_ID, {"action_id": "a1", "status": "completed"}
         )
         self.assertEqual(result, {"run_id": "run-1"})
 

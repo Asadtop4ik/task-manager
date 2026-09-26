@@ -42,6 +42,10 @@ class LoopRunner:
                 self._logger.error(exc, event="lane_tick_failed", lane=self.name)
             stop.wait(self._poll_s)
 
+    def in_backoff(self, record_id: str) -> bool:
+        """True while `record_id` is still cooling down after a recent failure."""
+        return time.monotonic() < self._ready_at.get(record_id, 0.0)
+
     def isolate(self, record_id: str, fn: Callable[[], None]) -> bool:
         """Run `fn`, skipping it while `record_id` is in backoff. True on success."""
         now = time.monotonic()
@@ -103,6 +107,25 @@ class CodeLane(LoopRunner):
             )
             return
         if work is None:
+            return
+        if self.in_backoff(work.run_id):
+            # The backend just granted us a real, exclusive lease on this
+            # run (it already ticked `attempts`/`_mark_running`); silently
+            # calling `isolate()` here would swallow it with no log line at
+            # all, and the lease would just expire unused. Make the skip
+            # loud instead: an operator needs to see this, not lose the run.
+            self._logger.event(
+                "leased_record_in_backoff",
+                level="warning",
+                lane=self.name,
+                run_id=work.run_id,
+                task_id=work.task_id,
+                stage="leased",
+                detail=(
+                    "this run recently failed and is still cooling down; not "
+                    "re-invoking its handler now, the lease will expire on its own"
+                ),
+            )
             return
         handler = self._handlers.get(work.kind, self._default_handler)
         self.isolate(work.run_id, lambda: handler(work))

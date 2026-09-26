@@ -12,12 +12,13 @@ import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import urlsplit
 
 from . import repos
 from .api import TaskManagerApi
 from .config import ConfigError, Settings, build_settings, load_config, load_secrets
 from .github import GitHubClient, build_token_selector
-from .http import HttpError, JsonHttp
+from .http import JsonHttp
 from .journal import Journal
 from .lanes import ChatLane, CodeLane, WatchLoop
 from .log import Logger, Redactor
@@ -52,6 +53,43 @@ class SdNotifier:
             self._sock.close()
 
 
+def _ready_url(api_base_url: str) -> str:
+    """The bare-origin `/ready` endpoint, stripping the `/api/v1`-style prefix."""
+    parts = urlsplit(api_base_url)
+    return f"{parts.scheme}://{parts.netloc}/ready"
+
+
+def _sudo_rule_check(
+    runner: Callable[..., Any],
+    prefix: Sequence[str],
+    script_path: Path,
+    *args: str,
+    name: str,
+) -> tuple[bool, str, str]:
+    """Check a sudoers rule with `sudo -n -l`, never executing `script_path`.
+
+    `prefix` must have the shape `[sudo, -n, -u, USER, --, python, *flags]`
+    (as `codex_child_prefix` does); anything else is reported as
+    unprobeable rather than guessed at.
+    """
+    if not script_path.is_file():
+        return False, name, f"missing: {script_path}"
+    prefix = list(prefix)
+    if len(prefix) < 5 or prefix[1] != "-n" or prefix[2] != "-u" or "--" not in prefix:
+        return False, name, f"cannot probe sudo rule: unexpected prefix shape {prefix!r}"
+    sudo_bin, user = prefix[0], prefix[3]
+    python_argv = prefix[prefix.index("--") + 1 :]
+    argv = [sudo_bin, "-n", "-l", "-u", user, *python_argv, str(script_path), *args]
+    try:
+        result = runner(argv, capture_output=True, text=True, timeout=10, check=False)
+    except Exception as exc:
+        return False, name, f"{type(exc).__name__}: {exc}"
+    if result.returncode == 0:
+        return True, name, "sudo rule allows this invocation"
+    detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+    return False, name, detail[:200]
+
+
 def _token_selector(settings: Settings, catalog: repos.Catalog) -> Callable[[str], str]:
     return build_token_selector(
         dispatch_repo=catalog.dispatch_repo or "",
@@ -72,7 +110,12 @@ def build_context(
     catalog = repos.load_catalog(settings.trusted_dir)
     token_for = _token_selector(settings, catalog)
     github_client = GitHubClient(token_for=token_for, http=http)
-    mirrors = repos.MirrorManager(settings.mirrors_dir, token_for)
+    mirrors = repos.MirrorManager(
+        settings.mirrors_dir,
+        token_for,
+        approved_branches=catalog.approved_pairs(),
+        redactor=redactor,
+    )
     api = TaskManagerApi(
         settings.api_base_url,
         settings.agent_svc_token,
@@ -214,6 +257,16 @@ def self_check(
             except OSError as exc:
                 _emit(lines, ok_flags, False, name, f"{path}: {exc}")
 
+        # Public reachability probe: no token, no lane, no side effects.
+        try:
+            plain_http = JsonHttp(opener=opener)
+            plain_http.send(plain_http.build_request("GET", _ready_url(settings.api_base_url)))
+            _emit(lines, ok_flags, True, "ready", "reachable")
+        except Exception as exc:
+            _emit(lines, ok_flags, False, "ready", f"{type(exc).__name__}: {exc}")
+
+        # Authenticated but side-effect-free: `ci-pending` is a plain GET that
+        # only lists rows, unlike `lease` (a real, mutating claim on a run).
         if secrets_error is None:
             try:
                 redactor = Redactor(settings.secret_values())
@@ -226,42 +279,56 @@ def self_check(
                     http=http,
                     catalog=catalog.approved_pairs() if catalog is not None else {},
                 )
-                try:
-                    probe.lease("check")
-                except HttpError as exc:
-                    if exc.status in (400, 422):
-                        _emit(lines, ok_flags, True, "api", f"reachable (HTTP {exc.status})")
-                    else:
-                        _emit(lines, ok_flags, False, "api", f"unexpected HTTP {exc.status}")
-                else:
-                    _emit(lines, ok_flags, False, "api", "lease accepted an unknown lane")
+                probe.ci_pending(after_id=0)
+                _emit(
+                    lines,
+                    ok_flags,
+                    True,
+                    "api_auth",
+                    "callback token accepted (GET ci-pending)",
+                )
             except Exception as exc:
-                _emit(lines, ok_flags, False, "api", f"{type(exc).__name__}: {exc}")
+                _emit(lines, ok_flags, False, "api_auth", f"{type(exc).__name__}: {exc}")
         else:
-            _emit(lines, ok_flags, False, "api", "secrets unavailable")
+            _emit(lines, ok_flags, False, "api_auth", "secrets unavailable")
 
+        # Neither codex_child.py nor image_state.py has a harmless
+        # subcommand to actually run (codex_child has no `--version`, and
+        # image_state acts on live containers) — `sudo -n -l` reports
+        # whether the sudoers rule would allow the exact invocation, without
+        # ever executing the script.
         child_path = Path(settings.libexec_dir) / "codex_child.py"
-        if not child_path.is_file():
-            _emit(lines, ok_flags, False, "codex_child", f"missing: {child_path}")
-        else:
-            try:
-                argv = [*settings.codex_child_prefix, str(child_path), "--version"]
-                result = runner(argv, capture_output=True, text=True, timeout=10, check=False)
-                if result.returncode == 0:
-                    _emit(
-                        lines, ok_flags, True, "codex_child", (result.stdout or "ok").strip()
-                    )
-                else:
-                    detail = (
-                        result.stderr or result.stdout or f"exit {result.returncode}"
-                    ).strip()
-                    _emit(lines, ok_flags, False, "codex_child", detail[:200])
-            except Exception as exc:
-                _emit(lines, ok_flags, False, "codex_child", f"{type(exc).__name__}: {exc}")
+        _emit(
+            lines,
+            ok_flags,
+            *_sudo_rule_check(
+                runner, settings.codex_child_prefix, child_path, "prepare", name="codex_child"
+            ),
+        )
+
+        image_state_path = Path(settings.libexec_dir) / "image_state.py"
+        # image_state runs as root, not agent-codex; WP3 does not own its
+        # sudoers rule or exact argv contract, so this probe is best-effort.
+        image_state_prefix = ("/usr/bin/sudo", "-n", "-u", "root", "--", "/usr/bin/python3")
+        _emit(
+            lines,
+            ok_flags,
+            *_sudo_rule_check(
+                runner,
+                image_state_prefix,
+                image_state_path,
+                "self-check-probe",
+                name="image_state",
+            ),
+        )
 
         if catalog is not None:
             token_for = _token_selector(settings, catalog)
-            mirrors = repos.MirrorManager(settings.mirrors_dir, token_for)
+            mirrors = repos.MirrorManager(
+                settings.mirrors_dir,
+                token_for,
+                approved_branches=catalog.approved_pairs(),
+            )
             for item in catalog.repos:
                 check_name = f"mirror:{item.full_name}"
                 try:

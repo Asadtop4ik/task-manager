@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import unittest
@@ -51,6 +52,24 @@ class RedactorTests(unittest.TestCase):
         redactor = Redactor(["s3cr3t"])
         self.assertEqual(redactor.redact_value(42), 42)
         self.assertIsNone(redactor.redact_value(None))
+
+    def test_masks_base64_of_bare_token(self) -> None:
+        token = "the-github-token-value"
+        redactor = Redactor([token])
+        blob = base64.b64encode(token.encode()).decode()
+        self.assertNotIn(blob, redactor.redact(f"leaked b64: {blob}"))
+
+    def test_masks_base64_of_x_access_token_form(self) -> None:
+        # MirrorManager's git http.extraHeader value: base64(x-access-token:TOKEN).
+        token = "the-github-token-value"
+        redactor = Redactor([token])
+        blob = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        self.assertNotIn(blob, redactor.redact(f"AUTHORIZATION: basic {blob}"))
+
+    def test_masks_basic_auth_pattern_even_for_an_unknown_secret(self) -> None:
+        redactor = Redactor([])  # no loaded secrets at all
+        result = redactor.redact("AUTHORIZATION: Basic dW5rbm93bjpzZWNyZXQ=")
+        self.assertNotIn("dW5rbm93bjpzZWNyZXQ=", result)
 
 
 class LoggerTests(unittest.TestCase):
@@ -105,6 +124,25 @@ class LoggerTests(unittest.TestCase):
         logger.error(exc)
         record = json.loads(stream.getvalue())
         self.assertNotIn("hunter2", record["error"])
+
+    def test_final_serialized_line_catches_what_default_str_would_otherwise_leak(
+        self,
+    ) -> None:
+        secret = "leak-me-1234567890"
+
+        class _Weird:
+            def __str__(self) -> str:
+                return f"wrapped({secret})"
+
+        logger, stream = self._logger([secret])
+        logger.event("odd_value", detail=_Weird())
+        self.assertNotIn(secret, stream.getvalue())
+
+    def test_final_serialized_line_catches_a_secret_used_as_a_dict_key(self) -> None:
+        secret = "key-shaped-secret-value"
+        logger, stream = self._logger([secret])
+        logger.event("odd_key", payload={secret: "value"})
+        self.assertNotIn(secret, stream.getvalue())
 
     def test_writes_are_flushed_immediately(self) -> None:
         logger, stream = self._logger([])

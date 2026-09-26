@@ -22,7 +22,6 @@ _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _RELEVANT_FILE_RE = re.compile(r"[A-Za-z0-9_./-]{1,200}")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 _KINDS = frozenset({"implement", "review", "correction"})
-_MODES = frozenset({"pr", "fast"})
 _COMPLEXITIES = frozenset({"simple", "complex"})
 _MAX_RELEVANT_FILES = 12
 
@@ -74,7 +73,7 @@ class Work:
     task_revision: int | str
     repo_full_name: str
     base_branch: str
-    mode: Literal["pr", "fast"]
+    mode: Literal["pr"]
     title: str
     description: str
     image_count: int
@@ -101,6 +100,22 @@ def _valid_branch(value: str) -> bool:
         and not value.startswith(("/", "-"))
         and not value.endswith(("/", ".lock", "."))
     )
+
+
+def _valid_lease_id(value: Any) -> str | None:
+    """Return the canonical uuid4 string form of `value`, or None if invalid.
+
+    The contract sets `lease_id` via `uuid4()`; validating this strictly (not
+    just "non-empty string") before it is ever placed into an
+    `X-Agent-Lease-ID` header keeps a malformed or hostile value out of an
+    HTTP header entirely.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -132,8 +147,8 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     kind = payload.get("kind")
     if kind not in _KINDS:
         fail("lease response has an invalid kind")
-    lease_id = payload.get("lease_id")
-    if not isinstance(lease_id, str) or not lease_id.strip():
+    lease_id = _valid_lease_id(payload.get("lease_id"))
+    if lease_id is None:
         fail("lease response has an invalid lease_id")
     lease_until = _parse_iso(payload.get("lease_until"))
     if lease_until is None:
@@ -160,8 +175,11 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
         fail("lease response repository is not in the approved catalog")
     assert isinstance(base_branch, str)
     mode = payload.get("mode")
-    if mode not in _MODES:
-        fail("lease response has an invalid mode")
+    if mode != "pr":
+        # `!fast` runs always stay on the GitHub executor per the contract;
+        # a local lease response claiming mode="fast" is either a backend
+        # bug or a hostile payload, either way not something to act on.
+        fail("lease response has an invalid mode (local execution is pr-mode only)")
     title = payload.get("title")
     if not isinstance(title, str) or not title.strip() or len(title) > 255:
         fail("lease response has an invalid title")
@@ -266,6 +284,14 @@ def _reraise_lease_conflict(exc: HttpError) -> NoReturn:
     raise exc
 
 
+def _require_lease_id(lease_id: str) -> str:
+    """Validate a caller-supplied lease_id as a uuid before it reaches a header."""
+    valid = _valid_lease_id(lease_id)
+    if valid is None:
+        raise ValueError(f"invalid lease_id: {lease_id!r}")
+    return valid
+
+
 class TaskManagerApi:
     def __init__(
         self,
@@ -328,6 +354,7 @@ class TaskManagerApi:
         return self.lease("code")
 
     def heartbeat(self, run_id: str, lease_id: str) -> datetime:
+        lease_id = _require_lease_id(lease_id)
         try:
             response = self._svc_call(
                 "POST",
@@ -350,6 +377,7 @@ class TaskManagerApi:
     ) -> None:
         if stage not in STAGES:
             raise ValueError(f"unknown stage: {stage!r}")
+        lease_id = _require_lease_id(lease_id)
         try:
             self._svc_call(
                 "POST",
@@ -361,6 +389,7 @@ class TaskManagerApi:
             _reraise_lease_conflict(exc)
 
     def callback(self, run_id: str, lease_id: str, payload: Mapping[str, Any]) -> Any:
+        lease_id = _require_lease_id(lease_id)
         try:
             response = self._callback_call(
                 "POST", f"/{run_id}/callback", lease_id=lease_id, body=dict(payload)
@@ -370,6 +399,7 @@ class TaskManagerApi:
         return None if response.status == 204 else self._http.json(response)
 
     def review_result(self, run_id: str, lease_id: str, payload: Mapping[str, Any]) -> Any:
+        lease_id = _require_lease_id(lease_id)
         try:
             response = self._callback_call(
                 "POST", f"/{run_id}/review-result", lease_id=lease_id, body=dict(payload)
@@ -379,6 +409,7 @@ class TaskManagerApi:
         return None if response.status == 204 else self._http.json(response)
 
     def action_result(self, run_id: str, lease_id: str, payload: Mapping[str, Any]) -> Any:
+        lease_id = _require_lease_id(lease_id)
         try:
             response = self._callback_call(
                 "POST", f"/{run_id}/action-result", lease_id=lease_id, body=dict(payload)

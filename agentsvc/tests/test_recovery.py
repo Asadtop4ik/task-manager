@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import http.client
 import io
+import json
 import unittest
 from tempfile import TemporaryDirectory
 
@@ -102,6 +104,33 @@ class RecoveryTests(unittest.TestCase):
             resume = recover(journal, api, _logger())
             self.assertEqual([entry.run_id for entry in resume], [RUN_B])
             self.assertIsNotNone(journal.read(RUN_A))  # left alone for the next attempt
+
+    def test_non_http_errors_are_caught_and_recovery_continues(self) -> None:
+        # `api.status` can fail with more than `HttpError`: a socket timeout,
+        # a dropped connection, or a malformed JSON body all reach here as
+        # different exception types. None of them may crash startup recovery.
+        with TemporaryDirectory() as tmp:
+            journal = Journal(tmp)
+            journal.write(_entry(RUN_A))
+            journal.write(_entry(RUN_B))
+            other_ids = [
+                "33333333-3333-3333-3333-333333333333",
+                "44444444-4444-4444-4444-444444444444",
+            ]
+            for run_id in other_ids:
+                journal.write(_entry(run_id))
+            api = FakeApi(
+                {
+                    RUN_A: TimeoutError("timed out"),
+                    RUN_B: json.JSONDecodeError("bad json", "{", 0),
+                    other_ids[0]: http.client.RemoteDisconnected("connection closed"),
+                    other_ids[1]: {"status": "pr_opened", "lease_id": "lease-1"},
+                }
+            )
+            resume = recover(journal, api, _logger())
+            self.assertEqual([entry.run_id for entry in resume], [other_ids[1]])
+            for run_id in (RUN_A, RUN_B, other_ids[0]):
+                self.assertIsNotNone(journal.read(run_id))  # left alone, not crashed
 
 
 if __name__ == "__main__":
