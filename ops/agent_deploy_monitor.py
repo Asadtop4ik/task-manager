@@ -19,6 +19,29 @@ GITHUB = "https://api.github.com"
 MAX_RESPONSE = 1024 * 1024
 TIMEOUT = 15
 
+_SECRET_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"gh[pousr]_[A-Za-z0-9]{20,}",
+        r"github_pat_[A-Za-z0-9_]{20,}",
+        r"Bearer\s+\S+",
+        r"sk-[A-Za-z0-9_-]{16,}",
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+    )
+)
+_SECRET_ENV_VARS = ("GITHUB_AGENT_TOKEN", "GITHUB_AGENT_QA_TOKEN", "AGENT_CALLBACK_TOKEN")
+
+
+def _redact(text: str) -> str:
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("***", redacted)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            redacted = redacted.replace(value, "***")
+    return redacted[:300]
+
 
 @dataclass(frozen=True)
 class Target:
@@ -180,6 +203,9 @@ class ExternalDeployMonitor:
             raise ValueError("monitor credentials are required")
         self.callback_token = callback_token
         self.github_token = github_token
+        # One bad record must not abort the whole pass; each call tallies its
+        # own per-record failures here for main()'s summary line.
+        self.record_errors = 0
         self.opener = opener or urllib.request.urlopen
         self.command_runner = command_runner or subprocess.run
         self.ci_targets = ci_targets(qa_enabled=qa_enabled)
@@ -286,39 +312,49 @@ class ExternalDeployMonitor:
                 if record["id"] <= after_id:
                     raise ValueError("pending CI cursor did not advance")
                 after_id = record["id"]
-                pr = self._github(
-                    f"/repos/{record['repo']}/pulls/{record['pr_number']}",
-                    repo=record["repo"],
-                )
-                if pr.get("state") == "closed" and not pr.get("merged"):
-                    continue
-                head = pr.get("head") or {}
-                sha = head.get("sha")
-                branch = head.get("ref")
-                if (
-                    not _valid_sha(sha)
-                    or not isinstance(branch, str)
-                    or (head.get("repo") or {}).get("full_name", "").lower()
-                    != record["repo"].lower()
-                ):
-                    continue
-                conclusion, url = self._latest_pr_ci(record, sha, branch)
-                if (
-                    record["head_sha"] == sha
-                    and record["ci_status"] == conclusion
-                    and record["ci_url"] == url
-                    and (conclusion != "success" or record["ci_verified_sha"] == sha)
-                ):
-                    continue
-                self._internal(
-                    f"/{record['run_id']}/ci-result",
-                    {
-                        "sha": sha,
-                        "conclusion": conclusion,
-                        "github_run_url": url,
-                    },
-                )
-                updated += 1
+                try:
+                    pr = self._github(
+                        f"/repos/{record['repo']}/pulls/{record['pr_number']}",
+                        repo=record["repo"],
+                    )
+                    if pr.get("state") == "closed" and not pr.get("merged"):
+                        continue
+                    head = pr.get("head") or {}
+                    sha = head.get("sha")
+                    branch = head.get("ref")
+                    if (
+                        not _valid_sha(sha)
+                        or not isinstance(branch, str)
+                        or (head.get("repo") or {}).get("full_name", "").lower()
+                        != record["repo"].lower()
+                    ):
+                        continue
+                    conclusion, url = self._latest_pr_ci(record, sha, branch)
+                    if (
+                        record["head_sha"] == sha
+                        and record["ci_status"] == conclusion
+                        and record["ci_url"] == url
+                        and (conclusion != "success" or record["ci_verified_sha"] == sha)
+                    ):
+                        continue
+                    self._internal(
+                        f"/{record['run_id']}/ci-result",
+                        {
+                            "sha": sha,
+                            "conclusion": conclusion,
+                            "github_run_url": url,
+                        },
+                    )
+                    updated += 1
+                except Exception as error:
+                    # One repo/PR's transient failure (rate limit, deleted
+                    # branch, ...) must not stall CI status for every other row.
+                    self.record_errors += 1
+                    print(
+                        f"external deploy monitor: run {record['id']}: "
+                        f"{type(error).__name__}: {_redact(str(error))}",
+                        file=sys.stderr,
+                    )
             if len(pending) < 50:
                 break
         return updated
@@ -386,25 +422,35 @@ class ExternalDeployMonitor:
                 if not record["notified"]:
                     # Deliver the PR/merge notice before advancing to the next state.
                     continue
-                repo = record["repo"]
-                target = record["target"]
-                if record["status"] == "pr_ready":
-                    pr = self._github(
-                        f"/repos/{repo}/pulls/{record['pr_number']}", repo=repo
+                try:
+                    repo = record["repo"]
+                    target = record["target"]
+                    if record["status"] == "pr_ready":
+                        pr = self._github(
+                            f"/repos/{repo}/pulls/{record['pr_number']}", repo=repo
+                        )
+                        sha = pr.get("merge_commit_sha")
+                        if pr.get("merged") and _valid_sha(sha):
+                            self._internal(f"/{record['run_id']}/merged", {"sha": sha})
+                            merged += 1
+                        continue
+                    sha = record["sha"]
+                    run_url = self._successful_deploy_run(repo, target, sha)
+                    if run_url and self._production_matches(target, sha):
+                        self._internal(
+                            f"/{record['run_id']}/deployed",
+                            {"sha": sha, "github_run_url": run_url},
+                        )
+                        deployed += 1
+                except Exception as error:
+                    # One run's transient failure must not stall merge/deploy
+                    # detection for every other pending row.
+                    self.record_errors += 1
+                    print(
+                        f"external deploy monitor: run {record['id']}: "
+                        f"{type(error).__name__}: {_redact(str(error))}",
+                        file=sys.stderr,
                     )
-                    sha = pr.get("merge_commit_sha")
-                    if pr.get("merged") and _valid_sha(sha):
-                        self._internal(f"/{record['run_id']}/merged", {"sha": sha})
-                        merged += 1
-                    continue
-                sha = record["sha"]
-                run_url = self._successful_deploy_run(repo, target, sha)
-                if run_url and self._production_matches(target, sha):
-                    self._internal(
-                        f"/{record['run_id']}/deployed",
-                        {"sha": sha, "github_run_url": run_url},
-                    )
-                    deployed += 1
             if len(pending) < 50:
                 break
         return merged, deployed
@@ -420,12 +466,18 @@ def main() -> None:
         ci_updated = monitor.check_ci_once()
         merged, deployed = monitor.run_once()
     except Exception as error:
+        # The pass itself failed (invalid list, cursor stuck, API unreachable):
+        # exit non-zero so the timer's failure is visible.
         print(
-            f"external deploy monitor failed: {type(error).__name__}", file=sys.stderr
+            f"external deploy monitor failed: {type(error).__name__}: {_redact(str(error))}",
+            file=sys.stderr,
         )
         raise SystemExit(1) from None
+    # Per-record failures are already isolated above; keep the timer green so
+    # it keeps polling the rows that did succeed.
     print(
-        f"agent CI: {ci_updated} updated; external runs: {merged} merged, {deployed} deployed"
+        f"agent CI: {ci_updated} updated; external runs: {merged} merged, {deployed} deployed; "
+        f"{monitor.record_errors} record errors"
     )
 
 

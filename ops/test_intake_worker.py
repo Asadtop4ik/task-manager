@@ -9,7 +9,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import intake_worker
 from intake_worker import (
+    CODEX_OUTER_TIMEOUT_SECONDS,
     CODEX_TIMEOUT_SECONDS,
     IntakeWorker,
     OUTPUT_SCHEMA,
@@ -279,8 +281,8 @@ class IntakeWorkerTests(unittest.TestCase):
 
         def run_command(args, **kwargs):
             if args[-1] == "codex-child":
-                self.assertEqual(kwargs["timeout"], CODEX_TIMEOUT_SECONDS)
-                raise TimeoutExpired(args, CODEX_TIMEOUT_SECONDS)
+                self.assertEqual(kwargs["timeout"], CODEX_OUTER_TIMEOUT_SECONDS)
+                raise TimeoutExpired(args, CODEX_OUTER_TIMEOUT_SECONDS)
             return Mock(returncode=0)
 
         def open_response(request, timeout):
@@ -295,6 +297,105 @@ class IntakeWorkerTests(unittest.TestCase):
         self.assertEqual(outcome, "failed")
         self.assertEqual(submitted[0]["error"], "Task analysis timed out.")
         self.assertNotIn("Do not log this task", json.dumps(submitted[0]))
+
+    def test_timeout_stderr_tail_is_redacted_and_printed_for_journald(self) -> None:
+        from subprocess import TimeoutExpired
+
+        payload = lease()
+        responses = [
+            FakeResponse(json.dumps(payload).encode()),
+            FakeResponse(tarball(), mime="application/gzip"),
+            FakeResponse(status=204),
+        ]
+        token = "ghp_" + "c" * 36
+        stderr_blob = f"codex: rate limited using {token}\nsecond diagnostic line".encode()
+
+        def run_command(args, **kwargs):
+            if args[-1] == "codex-child":
+                self.assertEqual(kwargs["timeout"], CODEX_OUTER_TIMEOUT_SECONDS)
+                raise TimeoutExpired(args, CODEX_OUTER_TIMEOUT_SECONDS, stderr=stderr_blob)
+            return Mock(returncode=0)
+
+        def open_response(request, timeout):
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as temp, patch("builtins.print") as log:
+            outcome = worker(temp, open_response, run_command).poll_once()
+
+        self.assertEqual(outcome, "failed")
+        printed = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("codex stderr", printed)
+        self.assertIn("second diagnostic line", printed)
+        self.assertNotIn(token, printed)
+
+    def test_non_zero_codex_exit_prints_redacted_stderr_tail(self) -> None:
+        payload = lease()
+        responses = [
+            FakeResponse(json.dumps(payload).encode()),
+            FakeResponse(tarball(), mime="application/gzip"),
+            FakeResponse(status=204),
+        ]
+        token = "github_pat_" + "d" * 25
+
+        def run_command(args, **kwargs):
+            if args[-1] == "codex-child":
+                return Mock(
+                    returncode=1,
+                    stderr=f"fatal: bad credentials {token}\nretrying",
+                )
+            return Mock(returncode=0)
+
+        def open_response(request, timeout):
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as temp, patch("builtins.print") as log:
+            outcome = worker(temp, open_response, run_command).poll_once()
+
+        self.assertEqual(outcome, "failed")
+        printed = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("codex stderr", printed)
+        self.assertIn("retrying", printed)
+        self.assertNotIn(token, printed)
+
+    def test_run_forever_logs_exception_type_and_message(self) -> None:
+        class FailingWorker:
+            def poll_once(self):
+                raise RuntimeError("boom")
+
+        with (
+            patch("intake_worker.time.sleep", side_effect=KeyboardInterrupt),
+            patch("builtins.print") as log,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                intake_worker.run_forever(FailingWorker(), poll_seconds=0)
+
+        printed = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("intake worker: poll failed: RuntimeError: boom", printed)
+
+    def test_redact_masks_known_secret_shapes_and_worker_env_tokens(self) -> None:
+        from intake_worker import _redact
+
+        with patch.dict(
+            "os.environ",
+            {"INTAKE_WORKER_TOKEN": "own-intake-secret", "GITHUB_AGENT_TOKEN": "own-github-secret"},
+        ):
+            text = (
+                "ghp_" + "a" * 36 + " "
+                "github_pat_" + "b" * 30 + " "
+                "Bearer sometoken123 "
+                "sk-" + "c" * 20 + " "
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature "
+                "own-intake-secret own-github-secret"
+            )
+            redacted = _redact(text)
+        self.assertNotIn("a" * 36, redacted)
+        self.assertNotIn("b" * 30, redacted)
+        self.assertNotIn("sometoken123", redacted)
+        self.assertNotIn("c" * 20, redacted)
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", redacted)
+        self.assertNotIn("own-intake-secret", redacted)
+        self.assertNotIn("own-github-secret", redacted)
+        self.assertIn("***", redacted)
 
     def test_downloads_and_passes_valid_image_with_lease_headers(self) -> None:
         payload = lease(images=[{"file_id": "telegram-file-secret", "mime": "image/png", "size": 4}])
@@ -369,8 +470,8 @@ class IntakeWorkerTests(unittest.TestCase):
         command, kwargs = calls[0]
         self.assertEqual(status, 0)
         self.assertIn("read-only", command)
-        self.assertIn("gpt-6-sol", command)
-        self.assertIn("model_reasoning_effort=medium", command)
+        self.assertIn("gpt-6-luna", command)
+        self.assertIn("model_reasoning_effort=high", command)
         self.assertIn("--image", command)
         self.assertNotIn("task prompt must only be stdin", command)
         self.assertEqual(kwargs["input"], "task prompt must only be stdin")
@@ -379,6 +480,9 @@ class IntakeWorkerTests(unittest.TestCase):
         self.assertNotIn(INTAKE_TOKEN, json.dumps(kwargs["env"]))
         self.assertNotIn(GITHUB_TOKEN, json.dumps(kwargs["env"]))
         self.assertEqual(kwargs["timeout"], CODEX_TIMEOUT_SECONDS)
+        # Codex's own stderr must flow to this child's inherited stderr (not
+        # DEVNULL) so the parent's sudo call can capture and log it.
+        self.assertNotIn("stderr", kwargs)
 
     def test_bad_image_metadata_is_rejected_before_image_download(self) -> None:
         payload = lease(images=[{"file_id": "x", "mime": "image/gif", "size": 1}])
@@ -406,6 +510,38 @@ class IntakeWorkerTests(unittest.TestCase):
         self.assertIn("<task>", prompt)
         self.assertIn("Return only the JSON object", prompt)
         self.assertEqual(OUTPUT_SCHEMA["type"], "object")
+
+    def test_codex_timeouts_give_the_outer_sudo_call_a_margin(self) -> None:
+        self.assertEqual(CODEX_TIMEOUT_SECONDS, 180)
+        self.assertEqual(CODEX_OUTER_TIMEOUT_SECONDS, 200)
+        self.assertGreater(CODEX_OUTER_TIMEOUT_SECONDS, CODEX_TIMEOUT_SECONDS)
+
+    def test_discussion_child_failure_reaches_parent_stderr_redacted(self) -> None:
+        from discussion_appserver import DiscussionError
+
+        leaked = "ghp_" + "a" * 36
+        with tempfile.TemporaryDirectory() as root:
+            session = Path(root) / "discussion-test"
+            (session / "snapshot").mkdir(parents=True)
+            (session / "images").mkdir()
+            request = {
+                "kind": "discussion", "session_dir": str(session), "prompt": "salom",
+                "images": [], "thread_id": None,
+                "diagnostics_discussion_id": None, "diagnostics_lease_id": None,
+            }
+            stderr = io.StringIO()
+            with (
+                patch.object(intake_worker, "INTAKE_TEMP_DIR", root),
+                patch(
+                    "discussion_appserver.run_turn",
+                    side_effect=DiscussionError(f"Codex javobi vaqtida kelmadi\n{leaked}"),
+                ),
+                patch("sys.stderr", stderr),
+            ):
+                code = intake_worker._run_discussion_child(request)
+        self.assertEqual(code, 1)
+        self.assertIn("Codex javobi vaqtida kelmadi", stderr.getvalue())
+        self.assertNotIn(leaked, stderr.getvalue())
 
 
 if __name__ == "__main__":

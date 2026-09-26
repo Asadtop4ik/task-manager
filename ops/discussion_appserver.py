@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import re
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,40 @@ CODEX_PATH = (
 )
 DIAGNOSTIC_PROXY = "/opt/task-manager/ops/diagnostic_proxy.py"
 DIAGNOSTIC_SOCKET = "/run/task-manager-diagnostics/diagnostics.sock"
+
+# Duplicated from intake_worker's own copy (that module imports this one lazily,
+# so this stays the one dependency direction) — kept tiny on purpose.
+_SECRET_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"gh[pousr]_[A-Za-z0-9]{20,}",
+        r"github_pat_[A-Za-z0-9_]{20,}",
+        r"Bearer\s+\S+",
+        r"sk-[A-Za-z0-9_-]{16,}",
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+    )
+)
+_SECRET_ENV_VARS = ("INTAKE_WORKER_TOKEN", "GITHUB_AGENT_TOKEN")
+
+
+def _redact(text: str) -> str:
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("***", redacted)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            redacted = redacted.replace(value, "***")
+    return redacted
+
+
+def _stderr_tail(lines: "deque[str]") -> str:
+    return _redact("\n".join(list(lines)[-20:]))
+
+
+def _fail(message: str, lines: "deque[str]") -> None:
+    tail = _stderr_tail(lines)
+    raise DiscussionError(f"{message}\ncodex stderr:\n{tail}" if tail else message)
 
 
 def _app_server_command(
@@ -59,6 +96,14 @@ def _messages(stdout: Any, output: queue.Queue[Any]) -> None:
         output.put(None)
 
 
+def _drain_stderr(stderr: Any, lines: "deque[str]") -> None:
+    try:
+        for line in stderr:
+            lines.append(line.rstrip("\n"))
+    except (OSError, ValueError):
+        pass
+
+
 def run_turn(
     *,
     snapshot: Path,
@@ -86,14 +131,19 @@ def run_turn(
         env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
     )
-    assert process.stdin is not None and process.stdout is not None
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
     output: queue.Queue[Any] = queue.Queue()
     reader = threading.Thread(target=_messages, args=(process.stdout, output), daemon=True)
     reader.start()
+    stderr_lines: "deque[str]" = deque(maxlen=200)
+    stderr_reader = threading.Thread(
+        target=_drain_stderr, args=(process.stderr, stderr_lines), daemon=True
+    )
+    stderr_reader.start()
     deadline = time.monotonic() + timeout
 
     def send(method: str, request_id: int | None, params: dict[str, Any]) -> None:
@@ -106,26 +156,26 @@ def run_turn(
     def read() -> dict[str, Any]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise DiscussionError("Codex javobi vaqtida kelmadi")
+            _fail("Codex javobi vaqtida kelmadi", stderr_lines)
         try:
             message = output.get(timeout=remaining)
         except queue.Empty:
-            raise DiscussionError("Codex javobi vaqtida kelmadi") from None
+            _fail("Codex javobi vaqtida kelmadi", stderr_lines)
         if message is None or not isinstance(message, dict):
-            raise DiscussionError("Codex suhbat aloqasi uzildi")
+            _fail("Codex suhbat aloqasi uzildi", stderr_lines)
         return message
 
     def response(request_id: int) -> dict[str, Any]:
         while True:
             message = read()
             if "id" in message and "method" in message:
-                raise DiscussionError("Codex qo‘shimcha ruxsat so‘radi")
+                _fail("Codex qo‘shimcha ruxsat so‘radi", stderr_lines)
             if message.get("id") == request_id:
                 if "error" in message:
-                    raise DiscussionError("Codex suhbatni boshlay olmadi")
+                    _fail("Codex suhbatni boshlay olmadi", stderr_lines)
                 result = message.get("result")
                 if not isinstance(result, dict):
-                    raise DiscussionError("Codex noto‘g‘ri javob berdi")
+                    _fail("Codex noto‘g‘ri javob berdi", stderr_lines)
                 return result
 
     try:
@@ -138,12 +188,12 @@ def run_turn(
             send("thread/resume", 2, {"threadId": thread_id, "cwd": str(snapshot)})
         else:
             send("thread/start", 2, {
-                "model": "gpt-6-sol", "cwd": str(snapshot), "approvalPolicy": "never",
+                "model": "gpt-6-luna", "cwd": str(snapshot), "approvalPolicy": "never",
                 "sandbox": "read-only", "serviceName": "task_manager_discussion",
             })
         opened = response(2).get("thread")
         if not isinstance(opened, dict) or not isinstance(opened.get("id"), str):
-            raise DiscussionError("Codex suhbatni saqlay olmadi")
+            _fail("Codex suhbatni saqlay olmadi", stderr_lines)
         saved_thread_id = opened["id"]
         inputs: list[dict[str, str]] = [{"type": "text", "text": prompt}]
         inputs.extend({"type": "localImage", "path": str(image)} for image in images)
@@ -153,7 +203,7 @@ def run_turn(
             "cwd": str(snapshot),
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly"},
-            "model": "gpt-6-sol", "effort": "medium", "summary": "concise",
+            "model": "gpt-6-luna", "effort": "medium", "summary": "concise",
         })
         response(3)
         answer = ""
@@ -166,11 +216,11 @@ def run_turn(
             elif message.get("method") == "turn/completed":
                 turn = (message.get("params") or {}).get("turn") or {}
                 if turn.get("status") != "completed" or not answer.strip():
-                    raise DiscussionError("Codex suhbat javobini tugata olmadi")
+                    _fail("Codex suhbat javobini tugata olmadi", stderr_lines)
                 return saved_thread_id, answer.strip()[:4000]
             elif "id" in message and "method" in message:
                 # Never grant tool or network approvals to an automated chat.
-                raise DiscussionError("Codex qo‘shimcha ruxsat so‘radi")
+                _fail("Codex qo‘shimcha ruxsat so‘radi", stderr_lines)
     finally:
         process.terminate()
         try:

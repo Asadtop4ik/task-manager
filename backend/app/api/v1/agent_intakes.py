@@ -270,7 +270,9 @@ async def lease_intake(
         return Response(status_code=204)
     row.status = "analyzing"
     agent_events.record(session, row)
-    row.lease_until = now + timedelta(minutes=2)
+    # Must exceed the worker's Codex timeout (180s child + 20s outer margin)
+    # plus snapshot/network time, or a real analysis outruns its own lease.
+    row.lease_until = now + timedelta(minutes=5)
     row.lease_id = str(uuid4())
     row.attempts += 1
     await session.commit()
