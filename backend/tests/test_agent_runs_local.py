@@ -1,0 +1,1361 @@
+"""The local agent-svc executor: leasing, heartbeats, stage reports, and the
+GitHub-path divergences (`/callback`, `/ci-result`, corrections, `/cancel`)
+that only apply to a run with `executor == "local"`."""
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from httpx import AsyncClient
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.api.v1 import agent_runs
+from app.core.config import Settings, settings
+from app.db.models import AgentEvent, AgentRun, AgentRunAction, Project, Task, User
+from app.schemas.agent_intake import IntakeBrief
+from app.schemas.agent_run import AgentLeaseRequest, AgentWorkOut
+from tests.conftest import auth
+
+_SHA = "a" * 40
+_PR_URL = "https://github.com/Asadtop4ik/task-manager/pull/9"
+_CALLBACK = {"X-Agent-Callback-Token": "test-callback-token"}
+_SVC = {"X-Agent-Svc-Token": "x" * 32}
+
+
+def _worker() -> dict[str, str]:
+    return {"X-Agent-Worker-Token": settings.service_token}
+
+
+async def _ready_project(session: AsyncSession, project: Project) -> None:
+    project.key = "task-manager"
+    project.repo_full_name = "Asadtop4ik/task-manager"
+    project.default_branch = "main"
+    await session.commit()
+
+
+def _local_setup(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "github_agent_token", "test-github-token")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+    monkeypatch.setattr(settings, "agent_svc_token", "x" * 32)
+    monkeypatch.setattr(settings, "agent_local_executor_projects", frozenset({"task-manager"}))
+
+
+async def _run_row(session: AsyncSession, run_id: str) -> AgentRun:
+    row = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    assert row is not None
+    return row
+
+
+async def _local_run(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> str:
+    """Create a task and delegate it; assert it took the local-executor path."""
+    await _ready_project(session, project)
+    _local_setup(monkeypatch)
+
+    async def fail_dispatch(run, task) -> int:
+        raise AssertionError("a local-executor run must never call repository_dispatch")
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fail_dispatch)
+    created = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix the menu"},
+        headers=auth(manager),
+    )
+    task_id = created.json()["id"]
+    started = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    assert started.status_code == 201
+    assert started.json()["executor"] == "local"
+    assert started.json()["status"] == "dispatched"
+    return started.json()["run_id"]
+
+
+async def _open_local_pr(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> tuple[str, str]:
+    """Create a local run, take its implement lease, and report pr_opened."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    lease_id = leased.json()["lease_id"]
+
+    async def fake_verify_pr(run, number, sha) -> None:
+        assert sha == _SHA
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify_pr)
+    opened = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json={"run_id": run_id, "status": "pr_opened", "pr_url": _PR_URL, "head_sha": _SHA},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert opened.status_code == 200
+    assert opened.json()["status"] == "pr_opened"
+    return run_id, lease_id
+
+
+async def _mark_ci_green(client: AsyncClient, monkeypatch, run_id: str) -> None:
+    async def fake_verify_pr(run, number, sha) -> None:
+        assert sha == _SHA
+
+    async def fake_verify_pr_ci(run, sha, conclusion, url) -> None:
+        return None
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify_pr)
+    monkeypatch.setattr(agent_runs, "_verify_pr_ci", fake_verify_pr_ci)
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/ci-result",
+        json={
+            "sha": _SHA,
+            "conclusion": "success",
+            "github_run_url": "https://github.com/Asadtop4ik/task-manager/actions/runs/1",
+        },
+        headers=_CALLBACK,
+    )
+    assert resp.status_code == 200
+
+
+# --------------------------------------------------------------- executor selection
+
+
+async def test_local_project_dispatches_locally_without_github(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _local_run(client, session, manager, project, monkeypatch)
+
+
+async def test_flag_off_keeps_the_github_path(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    monkeypatch.setattr(settings, "github_agent_token", "test-github-token")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+    # agent_local_executor_projects left at its default: empty.
+    assert settings.agent_local_executor_projects == frozenset()
+
+    async def fake_dispatch(run, task) -> int:
+        return 204
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    created = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix the menu"},
+        headers=auth(manager),
+    )
+    task_id = created.json()["id"]
+    started = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    assert started.status_code == 201
+    assert started.json()["executor"] == "github"
+
+
+async def test_fast_mode_never_uses_the_local_executor(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    _local_setup(monkeypatch)
+    monkeypatch.setattr(settings, "agent_fast_enabled", True)
+    dispatched: list[str] = []
+
+    async def fake_dispatch(run, task) -> int:
+        dispatched.append(run.run_id)
+        return 204
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    created = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix the menu"},
+        headers=auth(manager),
+    )
+    task_id = created.json()["id"]
+    started = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", json={"mode": "fast"}, headers=auth(manager)
+    )
+    assert started.status_code == 201
+    assert started.json()["executor"] == "github"
+    assert dispatched == [started.json()["run_id"]]
+
+
+# --------------------------------------------------------------- lease endpoint
+
+
+async def test_lease_is_hidden_when_the_token_setting_is_empty(
+    client: AsyncClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "agent_svc_token", "")
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 404
+
+
+async def test_lease_returns_204_when_nothing_to_do(client: AsyncClient, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "agent_svc_token", "x" * 32)
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 204
+
+
+async def test_lease_rejects_an_invalid_lane_with_no_side_effects(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """agent-svc's own self-check relies on an invalid body never touching
+    the database: FastAPI must reject it before the handler (and its auth
+    check) ever runs."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    resp = await client.post(
+        "/api/v1/agent-runs/lease", json={"lane": "not-code"}, headers=_SVC
+    )
+    assert resp.status_code == 422
+    row = await _run_row(session, run_id)
+    assert row.status == "dispatched"
+    assert row.lease_id is None
+    assert row.attempts == 0
+
+    ok = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert ok.status_code == 200
+    assert ok.json()["run_id"] == run_id
+    assert ok.json()["attempts"] == 1
+
+
+async def test_lease_rejects_a_wrong_token_when_the_feature_is_enabled(
+    client: AsyncClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "agent_svc_token", "x" * 32)
+    resp = await client.post(
+        "/api/v1/agent-runs/lease",
+        json={"lane": "code"},
+        headers={"X-Agent-Svc-Token": "y" * 32},
+    )
+    assert resp.status_code == 401
+
+
+def test_agent_svc_auth_rejects_a_non_ascii_token_without_crashing(monkeypatch) -> None:
+    # httpx (and most real clients/proxies) refuse to even transmit a
+    # non-ASCII header value, so this exercises the auth function directly:
+    # hmac.compare_digest raises TypeError for a non-ASCII `str` operand,
+    # and that must become a 401, not an unhandled 500.
+    monkeypatch.setattr(settings, "agent_svc_token", "x" * 32)
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        agent_runs._agent_svc_auth("café" + "x" * 28)
+    assert excinfo.value.status_code == 401
+
+
+async def test_two_concurrent_lease_calls_only_one_wins(
+    client: AsyncClient,
+    engine,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+) -> None:
+    """Two independent DB sessions racing `with_for_update(skip_locked=True)`
+    against the same real Postgres must never hand out the same run twice."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+
+    maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with maker() as s1, maker() as s2:
+        results = await asyncio.gather(
+            agent_runs.lease_agent_work(AgentLeaseRequest(lane="code"), s1, "x" * 32),
+            agent_runs.lease_agent_work(AgentLeaseRequest(lane="code"), s2, "x" * 32),
+        )
+    outcomes = [
+        "leased" if isinstance(result, AgentWorkOut) else result.status_code
+        for result in results
+    ]
+    assert sorted(outcomes, key=str) == sorted(["leased", 204], key=str)
+    leased_result = next(result for result in results if isinstance(result, AgentWorkOut))
+    assert leased_result.run_id == run_id
+
+
+async def test_implement_lease_marks_running_and_increments_attempts_then_skip_locked(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    body = leased.json()
+    assert body["kind"] == "implement"
+    assert body["run_id"] == run_id
+    assert body["attempts"] == 1
+    assert body["attempt_index"] == 1
+    assert body["branch"]
+    assert body["pr_url"] is None
+    assert body["head_sha"] is None
+    assert body["action_id"] is None
+    assert body["complexity"] is None
+    assert body["relevant_files"] == []
+
+    row = await _run_row(session, run_id)
+    assert row.status == "running"
+    assert row.lease_id == body["lease_id"]
+    assert row.runner_started_at is not None
+
+    events = (
+        await session.scalars(
+            select(AgentEvent.status)
+            .join(AgentRun, AgentEvent.agent_run_id == AgentRun.id)
+            .where(AgentRun.run_id == run_id)
+            .order_by(AgentEvent.id)
+        )
+    ).all()
+    assert events == ["pending", "dispatched", "running"]
+
+    # The only local run now holds a live lease: a second lease call must
+    # skip it (SKIP LOCKED / no-live-lease filter) and find nothing else.
+    second = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert second.status_code == 204
+
+
+async def test_heartbeat_extends_lease_then_detects_mismatch_and_cancellation(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    old_until = leased.json()["lease_until"]
+
+    ok = await client.post(
+        f"/api/v1/agent-runs/{run_id}/heartbeat",
+        json={"lease_id": lease_id},
+        headers=_SVC,
+    )
+    assert ok.status_code == 200
+    assert ok.json()["lease_until"] >= old_until
+
+    mismatch = await client.post(
+        f"/api/v1/agent-runs/{run_id}/heartbeat",
+        json={"lease_id": "not-the-lease"},
+        headers=_SVC,
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"] == "lease_mismatch"
+
+    cancelled = await client.post(f"/api/v1/agent-runs/{run_id}/cancel", headers=auth(manager))
+    assert cancelled.status_code == 200
+    after_cancel = await client.post(
+        f"/api/v1/agent-runs/{run_id}/heartbeat",
+        json={"lease_id": lease_id},
+        headers=_SVC,
+    )
+    assert after_cancel.status_code == 409
+    assert after_cancel.json()["detail"] == "cancelled"
+
+
+async def test_heartbeat_reports_lease_expired_distinctly_from_mismatch(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(seconds=1)
+    await session.commit()
+
+    expired = await client.post(
+        f"/api/v1/agent-runs/{run_id}/heartbeat",
+        json={"lease_id": lease_id},
+        headers=_SVC,
+    )
+    assert expired.status_code == 409
+    assert expired.json()["detail"] == "lease_expired"
+
+
+async def test_heartbeat_refuses_past_the_total_lease_duration_cap(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """A worker that keeps heartbeating without ever finishing must still be
+    made to give the lease up once its hard total-duration cap passes, even
+    though each individual heartbeat renewed lease_until just fine."""
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    row = await _run_row(session, run_id)
+    # lease_until is still comfortably in the future; only the issuance time
+    # is old enough to trip the 60-minute cap.
+    row.lease_issued_at = datetime.now(UTC) - timedelta(minutes=61)
+    await session.commit()
+
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/heartbeat",
+        json={"lease_id": lease_id},
+        headers=_SVC,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "lease_expired"
+
+
+async def test_lease_reclaims_a_lease_past_its_total_duration_cap_even_if_renewed(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    row = await _run_row(session, run_id)
+    # lease_until was just renewed (not stale by itself); only the total
+    # duration since issuance has passed the cap.
+    row.lease_until = datetime.now(UTC) + timedelta(minutes=4)
+    row.lease_issued_at = datetime.now(UTC) - timedelta(minutes=61)
+    await session.commit()
+
+    resp = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert resp.status_code == 200
+    assert resp.json()["run_id"] == run_id
+    # Reclaimed (attempts=1, below the implement cap) and immediately
+    # re-leased within this same call: attempts is now 2.
+    assert resp.json()["attempts"] == 2
+
+
+async def test_stage_report_is_recorded_and_requires_a_matching_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+
+    ok = await client.post(
+        f"/api/v1/agent-runs/{run_id}/stage",
+        json={"lease_id": lease_id, "stage": "workspace_ready"},
+        headers=_SVC,
+    )
+    assert ok.status_code == 204
+    rows = (
+        await session.scalars(
+            select(AgentEvent)
+            .join(AgentRun, AgentEvent.agent_run_id == AgentRun.id)
+            .where(AgentRun.run_id == run_id, AgentEvent.phase == "stage")
+        )
+    ).all()
+    assert len(rows) == 1 and rows[0].status == "workspace_ready"
+
+    mismatch = await client.post(
+        f"/api/v1/agent-runs/{run_id}/stage",
+        json={"lease_id": "wrong", "stage": "codex_started"},
+        headers=_SVC,
+    )
+    assert mismatch.status_code == 409
+
+
+async def test_expired_implement_lease_is_retried_then_fails_after_two_attempts(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    first = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert first.json()["attempts"] == 1
+
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    await session.commit()
+
+    second = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert second.status_code == 200
+    assert second.json()["kind"] == "implement"
+    assert second.json()["attempts"] == 2
+    assert second.json()["run_id"] == run_id
+
+    row2 = await _run_row(session, run_id)
+    row2.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    await session.commit()
+
+    third = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert third.status_code == 204
+    failed = await _run_row(session, run_id)
+    assert failed.status == "failed"
+    assert failed.error == "agent-svc javob bermadi"
+    assert failed.lease_id is None
+
+
+# --------------------------------------------------------------- callback / ci / review
+
+
+async def test_callback_requires_the_matching_lease_for_local_runs(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+
+    async def fake_verify_pr(run, number, sha) -> None:
+        return None
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify_pr)
+    body = {"run_id": run_id, "status": "pr_opened", "pr_url": _PR_URL, "head_sha": _SHA}
+
+    missing = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback", json=body, headers=_CALLBACK
+    )
+    assert missing.status_code == 409
+
+    wrong = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json=body,
+        headers={**_CALLBACK, "X-Agent-Lease-ID": "not-it"},
+    )
+    assert wrong.status_code == 409
+
+    ok = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json=body,
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "pr_opened"
+    row = await _run_row(session, run_id)
+    assert row.lease_id is None
+
+
+async def test_callback_rejects_an_expired_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(seconds=1)
+    await session.commit()
+
+    body = {"run_id": run_id, "status": "pr_opened", "pr_url": _PR_URL, "head_sha": _SHA}
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/callback",
+        json=body,
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert resp.status_code == 409
+    unchanged = await _run_row(session, run_id)
+    assert unchanged.pr_url is None
+
+
+async def test_ci_result_on_local_run_skips_external_review_and_review_lease_follows(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fail_external_review(run, pr_number) -> None:
+        raise AssertionError("a local run must not dispatch an independent review")
+
+    monkeypatch.setattr(agent_runs, "_dispatch_external_review", fail_external_review)
+    await _mark_ci_green(client, monkeypatch, run_id)
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    body = leased.json()
+    assert body["kind"] == "review"
+    assert body["run_id"] == run_id
+    assert body["head_sha"] == _SHA
+    assert body["pr_url"] == _PR_URL
+    assert body["action_id"] is None
+
+
+async def test_review_result_clears_lease_and_recomputes_pr_ready(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+
+    async def fake_verify_pr(run, number, sha) -> None:
+        return None
+
+    monkeypatch.setattr(agent_runs, "_verify_pr", fake_verify_pr)
+    result = await client.post(
+        f"/api/v1/agent-runs/{run_id}/review-result",
+        json={"sha": _SHA, "state": "clean", "summary": "Looks fine.", "findings": []},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert result.status_code == 200
+    assert result.json()["status"] == "pr_ready"
+    row = await _run_row(session, run_id)
+    assert row.lease_id is None
+
+
+async def test_review_result_releases_a_matching_lease_on_a_stale_head(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+
+    result = await client.post(
+        f"/api/v1/agent-runs/{run_id}/review-result",
+        json={"sha": "b" * 40, "state": "clean", "summary": "x", "findings": []},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert result.status_code == 409
+    row = await _run_row(session, run_id)
+    assert row.lease_id is None
+
+
+async def test_review_result_releases_a_matching_lease_on_wrong_status(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Defense in depth for the review-result endpoint itself: even if the
+    run has moved on from under a still-live review lease by some other
+    path than the ones already closed off, a matching lease must never sit
+    there burning a retry when the endpoint 409s."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    row = await _run_row(session, run_id)
+    row.status = "correction_running"
+    await session.commit()
+
+    result = await client.post(
+        f"/api/v1/agent-runs/{run_id}/review-result",
+        json={"sha": _SHA, "state": "clean", "summary": "x", "findings": []},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert result.status_code == 409
+    released = await _run_row(session, run_id)
+    assert released.lease_id is None
+    assert released.status == "correction_running"
+
+
+def _run_stub(**overrides: object) -> AgentRun:
+    base: dict[str, object] = {
+        "pr_url": _PR_URL,
+        "status": "pr_opened",
+        "ci_status": "success",
+        "ci_verified_sha": _SHA,
+        "head_sha": _SHA,
+        "review_sha": None,
+    }
+    base.update(overrides)
+    return AgentRun(**base)
+
+
+def test_review_needed_matches_the_lease_endpoint_sql_condition() -> None:
+    # This is the exact boundary `/lease` step 2 encodes in SQL; kept here as
+    # a plain-Python pin so the two definitions cannot silently drift apart.
+    assert agent_runs._review_needed(_run_stub()) is True
+    assert agent_runs._review_needed(_run_stub(status="pr_ready")) is True
+    assert agent_runs._review_needed(_run_stub(pr_url=None)) is False
+    assert agent_runs._review_needed(_run_stub(status="correction_running")) is False
+    assert agent_runs._review_needed(_run_stub(ci_status="pending")) is False
+    assert agent_runs._review_needed(_run_stub(ci_verified_sha=None)) is False
+    assert agent_runs._review_needed(_run_stub(ci_verified_sha="b" * 40)) is False
+    assert agent_runs._review_needed(_run_stub(review_sha=_SHA)) is False
+    assert agent_runs._review_needed(_run_stub(review_sha="b" * 40)) is True
+
+
+async def _persisted_run(
+    session: AsyncSession, project: Project, **overrides: object
+) -> AgentRun:
+    task = Task(project_id=project.id, title="Race")
+    session.add(task)
+    await session.flush()
+    base: dict[str, object] = {
+        "run_id": str(uuid4()),
+        "task_id": task.id,
+        "task_revision": "r" * 64,
+        "repo_full_name": "Asadtop4ik/task-manager",
+        "base_branch": "main",
+        "mode": "pr",
+        "executor": "local",
+        "status": "pr_opened",
+        "pr_url": _PR_URL,
+        "head_sha": _SHA,
+        "ci_status": "success",
+        "ci_verified_sha": _SHA,
+    }
+    base.update(overrides)
+    run = AgentRun(**base)
+    session.add(run)
+    await session.commit()
+    return await _run_row(session, run.run_id)
+
+
+async def test_reclaim_does_not_finalize_a_review_when_a_correction_has_taken_over(
+    session: AsyncSession, project: Project
+) -> None:
+    """Probed race (a): an owner correction request flips run.status to
+    correction_running independent of any live review lease (a review
+    never holds run.status). If that review lease's own expiry-cap reclaim
+    still ran, it must never clobber the correction back to pr_opened or
+    fabricate a review_status="error" on top of it."""
+    await _ready_project(session, project)
+    run = await _persisted_run(
+        session,
+        project,
+        status="correction_running",
+        review_sha=None,
+        lease_kind="review",
+        lease_id=str(uuid4()),
+        lease_until=datetime.now(UTC) - timedelta(minutes=1),
+        review_attempts=2,
+        review_attempts_sha=_SHA,
+    )
+
+    await agent_runs._reclaim_expired_lease(session, run, datetime.now(UTC))
+    await session.commit()
+
+    row = await _run_row(session, run.run_id)
+    assert row.status == "correction_running"
+    assert row.review_status is None
+    assert row.lease_id is None
+
+
+async def test_reclaim_does_not_mark_a_never_reviewed_new_head_as_review_error(
+    session: AsyncSession, project: Project
+) -> None:
+    """Probed race (b): a new head landed (e.g. a correction completed)
+    while a stale review lease still tracked the old head's attempt count.
+    That new head has never been reviewed at all and must not be finalized
+    as a failed review just because the old lease's cap was reached."""
+    await _ready_project(session, project)
+    new_head = "c" * 40
+    run = await _persisted_run(
+        session,
+        project,
+        status="pr_opened",
+        head_sha=new_head,
+        review_sha=None,
+        lease_kind="review",
+        lease_id=str(uuid4()),
+        lease_until=datetime.now(UTC) - timedelta(minutes=1),
+        review_attempts=2,
+        review_attempts_sha=_SHA,  # the OLD head this lease was tracking
+    )
+    assert run.review_attempts_sha != run.head_sha
+
+    await agent_runs._reclaim_expired_lease(session, run, datetime.now(UTC))
+    await session.commit()
+
+    row = await _run_row(session, run.run_id)
+    assert row.review_status is None
+    assert row.head_sha == new_head
+    assert row.lease_id is None
+
+
+async def test_lease_finds_a_new_reviewable_run_behind_more_than_twenty_reviewed_ones(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Regression for a Python-side filter after a bounded SQL LIMIT: with 20
+    already-reviewed local runs ahead of it in id order, a fresh reviewable
+    run must still be found (the condition now lives entirely in SQL)."""
+    await _ready_project(session, project)
+    _local_setup(monkeypatch)
+    for i in range(20):
+        task = Task(project_id=project.id, title=f"Reviewed {i}")
+        session.add(task)
+        await session.flush()
+        session.add(
+            AgentRun(
+                run_id=str(uuid4()),
+                task_id=task.id,
+                task_revision="r" * 64,
+                repo_full_name="Asadtop4ik/task-manager",
+                base_branch="main",
+                mode="pr",
+                status="pr_ready",
+                executor="local",
+                ci_status="success",
+                ci_verified_sha=_SHA,
+                head_sha=_SHA,
+                pr_url=f"https://github.com/Asadtop4ik/task-manager/pull/{100 + i}",
+                review_status="clean",
+                review_sha=_SHA,
+            )
+        )
+    await session.commit()
+
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    assert leased.json()["kind"] == "review"
+    assert leased.json()["run_id"] == run_id
+
+
+# --------------------------------------------------------------- corrections / cancel
+
+
+async def test_correction_request_releases_a_live_review_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """A live review lease never blocks run.status (it stays pr_opened the
+    whole time), so a correction request can legitimately arrive while one
+    is outstanding. It must release that lease immediately rather than
+    leaving it to expire and later clobber the correction's state."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    review_lease = await client.post(
+        "/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC
+    )
+    assert review_lease.json()["kind"] == "review"
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    action_id = str(uuid4())
+    correction = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": action_id, "instruction": "fix it"},
+        headers=auth(manager),
+    )
+    assert correction.status_code == 200
+    assert correction.json()["status"] == "in_progress"
+
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.lease_id is None  # the review lease was released, not left dangling
+    assert row.lease_kind is None
+
+    # A second correction request is rejected — there is exactly one
+    # in-progress correction action, never two.
+    second = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4()), "instruction": "again"},
+        headers=auth(manager),
+    )
+    assert second.status_code == 409
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    assert leased.json()["kind"] == "correction"
+    assert leased.json()["action_id"] == action_id
+
+
+async def test_local_correction_is_leased_instead_of_dispatched(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fail_dispatch_release(run, action, payload) -> None:
+        raise AssertionError("a local correction must not use repository_dispatch")
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_dispatch_release_action", fail_dispatch_release)
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+
+    action_id = str(uuid4())
+    req = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={
+            "expected_head_sha": _SHA,
+            "action_id": action_id,
+            "instruction": "Please rename this helper.",
+        },
+        headers=auth(manager),
+    )
+    assert req.status_code == 200
+    # The run/action transition immediately, exactly like a successful
+    # GitHub dispatch would — agent-svc has not leased it yet.
+    assert req.json()["status"] == "in_progress"
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    body = leased.json()
+    assert body["kind"] == "correction"
+    assert body["action_id"] == action_id
+    assert body["instruction"] == "Please rename this helper."
+    assert body["expected_head_sha"] == _SHA
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+
+
+async def test_cancel_and_merge_are_rejected_while_a_local_correction_is_queued(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """A local correction must transition the run immediately (blocker fix):
+    otherwise the PR sits "open" while queued, and a concurrent cancel,
+    merge, or second correction request could interfere before agent-svc
+    ever gets to lease it."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+    review_result = await client.post(
+        f"/api/v1/agent-runs/{run_id}/review-result",
+        json={"sha": _SHA, "state": "clean", "summary": "Looks fine.", "findings": []},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert review_result.status_code == 200
+    assert review_result.json()["status"] == "pr_ready"
+
+    correction_id = str(uuid4())
+    correction = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": correction_id, "instruction": "fix it"},
+        headers=auth(manager),
+    )
+    assert correction.status_code == 200
+    assert correction.json()["status"] == "in_progress"
+
+    cancel = await client.post(f"/api/v1/agent-runs/{run_id}/cancel", headers=auth(manager))
+    assert cancel.status_code == 409
+
+    merge = await client.post(
+        f"/api/v1/agent-runs/{run_id}/merge",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4())},
+        headers=auth(manager),
+    )
+    assert merge.status_code == 409
+
+    second_correction = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4()), "instruction": "again"},
+        headers=auth(manager),
+    )
+    assert second_correction.status_code == 409
+
+
+async def test_local_correction_action_result_requires_lease_then_clears_it(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_dispatch_release_action", lambda *a: None)
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    action_id = str(uuid4())
+    await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": action_id, "instruction": "fix it"},
+        headers=auth(manager),
+    )
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    lease_id = leased.json()["lease_id"]
+
+    result_body = {"action_id": action_id, "status": "completed", "head_sha": _SHA}
+    missing = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result", json=result_body, headers=_CALLBACK
+    )
+    assert missing.status_code == 409
+
+    ok = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result",
+        json=result_body,
+        headers={**_CALLBACK, "X-Agent-Lease-ID": lease_id},
+    )
+    assert ok.status_code == 200
+    row = await _run_row(session, run_id)
+    assert row.lease_id is None
+
+    # An idempotent replay after the lease is gone must not need it again.
+    replay = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result", json=result_body, headers=_CALLBACK
+    )
+    assert replay.status_code == 200
+
+
+async def test_cancel_local_run_never_calls_github_cancel(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+
+    async def fail_cancel(run) -> None:
+        raise AssertionError("a local run must not call GitHub to cancel a workflow run")
+
+    monkeypatch.setattr(agent_runs, "_cancel_github", fail_cancel)
+    resp = await client.post(f"/api/v1/agent-runs/{run_id}/cancel", headers=auth(manager))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancelled"
+    row = await _run_row(session, run_id)
+    assert row.lease_id is None
+
+
+# --------------------------------------------------------------- watchdog
+
+
+async def test_watchdog_fails_a_dispatched_run_that_agent_svc_never_leased(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    row = await _run_row(session, run_id)
+    row.created_at = datetime.now(UTC) - timedelta(minutes=31)
+    await session.commit()
+
+    resp = await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    assert resp.status_code == 200
+    failed = await _run_row(session, run_id)
+    assert failed.status == "failed"
+    assert failed.error == "agent-svc javob bermadi"
+
+
+async def test_watchdog_leaves_github_runs_alone_no_matter_how_stale(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    await _ready_project(session, project)
+    monkeypatch.setattr(settings, "github_agent_token", "test-github-token")
+    monkeypatch.setattr(settings, "agent_callback_token", "test-callback-token")
+
+    async def fake_dispatch(run, task) -> int:
+        return 204
+
+    monkeypatch.setattr(agent_runs, "_dispatch", fake_dispatch)
+    created = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Fix the menu"},
+        headers=auth(manager),
+    )
+    task_id = created.json()["id"]
+    started = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
+    assert started.json()["executor"] == "github"
+    run_id = started.json()["run_id"]
+
+    row = await _run_row(session, run_id)
+    row.created_at = datetime.now(UTC) - timedelta(hours=2)
+    row.lease_id = "not-a-real-lease"
+    row.lease_until = datetime.now(UTC) - timedelta(hours=1)
+    row.lease_kind = "implement"
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    unchanged = await _run_row(session, run_id)
+    assert unchanged.status == "dispatched"
+    assert unchanged.lease_id == "not-a-real-lease"
+
+
+async def test_watchdog_releases_a_single_stale_implement_lease_without_failing(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.json()["attempts"] == 1
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    released = await _run_row(session, run_id)
+    assert released.status == "dispatched"
+    assert released.lease_id is None
+    assert released.attempts == 1
+
+
+async def test_watchdog_fails_an_implement_run_after_two_stale_leases(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+
+    second = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert second.json()["attempts"] == 2
+    row2 = await _run_row(session, run_id)
+    row2.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    failed = await _run_row(session, run_id)
+    assert failed.status == "failed"
+    assert failed.error == "agent-svc javob bermadi"
+    assert failed.lease_id is None
+
+
+async def test_watchdog_releases_a_single_stale_review_lease_leaving_the_pr_open(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.json()["kind"] == "review"
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    released = await _run_row(session, run_id)
+    assert released.lease_id is None
+    assert released.status == "pr_opened"
+    assert released.review_status != "error"
+    assert released.review_attempts == 1
+
+
+async def test_watchdog_marks_review_error_after_two_stale_review_leases(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+
+    second = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert second.json()["kind"] == "review"
+    row2 = await _run_row(session, run_id)
+    row2.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    finalized = await _run_row(session, run_id)
+    assert finalized.lease_id is None
+    assert finalized.status == "pr_opened"
+    assert finalized.review_status == "error"
+    assert finalized.review_sha == _SHA
+
+
+async def test_watchdog_releases_a_single_stale_correction_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4()), "instruction": "fix"},
+        headers=auth(manager),
+    )
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.json()["kind"] == "correction"
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    released = await _run_row(session, run_id)
+    assert released.lease_id is None
+    assert released.status == "correction_running"
+
+
+async def test_watchdog_rejects_correction_after_two_stale_correction_leases(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4()), "instruction": "fix"},
+        headers=auth(manager),
+    )
+    await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+
+    second = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert second.json()["kind"] == "correction"
+    row2 = await _run_row(session, run_id)
+    row2.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    finalized = await _run_row(session, run_id)
+    assert finalized.lease_id is None
+    assert finalized.status == "pr_opened"
+
+
+async def test_watchdog_liveness_rule_spares_a_queued_dispatched_run(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """A run queued behind other healthy local work must not be failed just
+    because it has waited past the age threshold."""
+    busy_run_id = await _local_run(client, session, manager, project, monkeypatch)
+    await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    busy = await _run_row(session, busy_run_id)
+    assert busy.heartbeat_at is not None  # freshly leased: still "alive" evidence
+
+    created = await client.post(
+        "/api/v1/tasks",
+        json={"project_id": project.id, "title": "Second"},
+        headers=auth(manager),
+    )
+    queued_task_id = created.json()["id"]
+    queued = await client.post(
+        f"/api/v1/agent-runs/tasks/{queued_task_id}", headers=auth(manager)
+    )
+    queued_run_id = queued.json()["run_id"]
+    row = await _run_row(session, queued_run_id)
+    row.created_at = datetime.now(UTC) - timedelta(minutes=31)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    still_queued = await _run_row(session, queued_run_id)
+    assert still_queued.status == "dispatched"
+
+    # Once the busy job's heartbeat is also stale, agent-svc looks dead and
+    # the queued run is failed.
+    busy_row = await _run_row(session, busy_run_id)
+    busy_row.heartbeat_at = datetime.now(UTC) - timedelta(minutes=10)
+    busy_row.lease_until = datetime.now(UTC) - timedelta(minutes=16)
+    await session.commit()
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    now_failed = await _run_row(session, queued_run_id)
+    assert now_failed.status == "failed"
+
+
+async def test_watchdog_times_out_a_correction_that_was_never_leased(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """agent-svc died before ever calling /lease for a queued local
+    correction: the same liveness-gated timeout as an unclaimed dispatched
+    run rejects the action and releases the run — it does not fail the
+    whole run outright, since there is an open PR to protect."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    action_id = str(uuid4())
+    await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": action_id, "instruction": "fix"},
+        headers=auth(manager),
+    )
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.lease_id is None
+    row.updated_at = datetime.now(UTC) - timedelta(minutes=31)
+    await session.commit()
+
+    await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    timed_out = await _run_row(session, run_id)
+    assert timed_out.status == "pr_opened"
+
+    action = (
+        await session.scalars(
+            select(AgentRunAction).where(
+                AgentRunAction.agent_run_id == timed_out.id,
+                AgentRunAction.action_id == action_id,
+            )
+        )
+    ).first()
+    assert action is not None
+    assert action.status == "rejected"
+
+
+# --------------------------------------------------------------- IntakeBrief validation
+
+
+def _brief(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {"title": "T", "goal": "G", "acceptance": ["ok"]}
+    base.update(overrides)
+    return base
+
+
+def test_intake_brief_accepts_valid_relevant_files_and_complexity() -> None:
+    brief = IntakeBrief(
+        **_brief(complexity="simple", relevant_files=["app/main.py", "a/b-c.txt"])
+    )
+    assert brief.complexity == "simple"
+    assert brief.relevant_files == ["app/main.py", "a/b-c.txt"]
+
+
+def test_intake_brief_defaults_when_absent() -> None:
+    brief = IntakeBrief(**_brief())
+    assert brief.complexity is None
+    assert brief.relevant_files == []
+
+
+@pytest.mark.parametrize(
+    "bad_path", ["../etc/passwd", "/etc/passwd", "app/../secret", "bad path.py", ""]
+)
+def test_intake_brief_rejects_unsafe_relevant_file_paths(bad_path: str) -> None:
+    with pytest.raises(ValidationError):
+        IntakeBrief(**_brief(relevant_files=[bad_path]))
+
+
+def test_intake_brief_rejects_more_than_twelve_relevant_files() -> None:
+    with pytest.raises(ValidationError):
+        IntakeBrief(**_brief(relevant_files=[f"f{i}.py" for i in range(13)]))
+
+
+def test_intake_brief_rejects_unknown_complexity() -> None:
+    with pytest.raises(ValidationError):
+        IntakeBrief(**_brief(complexity="medium"))
+
+
+# --------------------------------------------------------------- settings validation
+
+
+# These construct Settings straight from the process environment (not from
+# constructor kwargs) with monkeypatch.setenv, because pydantic-settings
+# reads and JSON-decodes real env vars through a different path than plain
+# kwargs — a plain comma list like "task-manager" is not valid JSON, and the
+# whole API failed to boot the moment this env var was set to anything at
+# all before NoDecode was added (see app/core/config.py). A kwargs-only test
+# would not have caught that.
+
+
+def test_local_executor_env_unset_keeps_the_feature_off(monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_LOCAL_EXECUTOR_PROJECTS", raising=False)
+    result = Settings(_env_file=None)
+    assert result.agent_local_executor_projects == frozenset()
+
+
+def test_local_executor_env_empty_string_keeps_the_feature_off(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_LOCAL_EXECUTOR_PROJECTS", "")
+    result = Settings(_env_file=None)
+    assert result.agent_local_executor_projects == frozenset()
+
+
+def test_local_executor_env_single_project_key(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_LOCAL_EXECUTOR_PROJECTS", "task-manager")
+    monkeypatch.setenv("AGENT_SVC_TOKEN", "x" * 32)
+    result = Settings(_env_file=None)
+    assert result.agent_local_executor_projects == frozenset({"task-manager"})
+
+
+def test_local_executor_env_comma_list_with_spaces(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_LOCAL_EXECUTOR_PROJECTS", "task-manager, agent-qa")
+    monkeypatch.setenv("AGENT_SVC_TOKEN", "x" * 32)
+    result = Settings(_env_file=None)
+    assert result.agent_local_executor_projects == frozenset({"task-manager", "agent-qa"})
+
+
+def test_local_executor_env_unknown_project_key_fails(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_LOCAL_EXECUTOR_PROJECTS", "not-a-real-project")
+    monkeypatch.setenv("AGENT_SVC_TOKEN", "x" * 32)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_local_executor_env_short_token_fails(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_LOCAL_EXECUTOR_PROJECTS", "task-manager")
+    monkeypatch.setenv("AGENT_SVC_TOKEN", "short")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_local_executor_settings_reject_a_short_token() -> None:
+    with pytest.raises(ValidationError):
+        Settings(AGENT_LOCAL_EXECUTOR_PROJECTS="task-manager", AGENT_SVC_TOKEN="short")
+
+
+def test_local_executor_settings_reject_an_unknown_project_key() -> None:
+    with pytest.raises(ValidationError):
+        Settings(AGENT_LOCAL_EXECUTOR_PROJECTS="not-a-real-project", AGENT_SVC_TOKEN="x" * 32)
+
+
+def test_local_executor_settings_accept_known_project_keys() -> None:
+    result = Settings(
+        AGENT_LOCAL_EXECUTOR_PROJECTS="task-manager,agent-qa", AGENT_SVC_TOKEN="x" * 32
+    )
+    assert result.agent_local_executor_projects == frozenset({"task-manager", "agent-qa"})
