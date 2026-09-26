@@ -162,6 +162,7 @@ def _run_correction(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             work,
             expected_head_sha=work.expected_head_sha,
             patch=patch,
+            cancel=run.cancel,
             report_stage=lambda name: run.stage(
                 name, base_sha=work.expected_head_sha, branch=work.branch
             ),

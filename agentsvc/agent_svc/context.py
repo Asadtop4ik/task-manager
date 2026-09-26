@@ -9,6 +9,7 @@ there is exactly one wiring to keep correct.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +29,7 @@ from .trusted import TrustedModules
 class ServiceContext:
     settings: Settings
     logger: Logger
+    redactor: Redactor
     api: TaskManagerApi
     github: GitHubClient
     mirrors: repos.MirrorManager
@@ -68,6 +70,15 @@ def _build_codex_runner(settings: Settings) -> CodexRunner:
 
 
 def build_context(settings: Settings) -> ServiceContext:
+    # Trusted scripts (e.g. `agent_task.check_diff`'s own `git diff`/`git
+    # ls-files` calls) read `os.environ` directly with no explicit override;
+    # setting these here, once, at process startup is what actually hardens
+    # those calls the same way every git subprocess `agent_svc` spawns
+    # directly already is (no system/global git config an attacker-writable
+    # HOME or /etc could otherwise supply).
+    os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+    os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
+
     redactor = Redactor(settings.secret_values())
     logger = Logger(redactor)
     http = JsonHttp(redactor=redactor)
@@ -95,6 +106,7 @@ def build_context(settings: Settings) -> ServiceContext:
     return ServiceContext(
         settings=settings,
         logger=logger,
+        redactor=redactor,
         api=api,
         github=github_client,
         mirrors=mirrors,

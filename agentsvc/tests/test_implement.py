@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agent_svc.api import Work
-from agent_svc.codex import CodexResult
+from agent_svc.codex import CodexChildError, CodexResult
 from agent_svc.implement import handle_implement
 
 from .support import (
@@ -68,10 +68,6 @@ def _exec_result(**overrides: object) -> CodexResult:
     return CodexResult(**base)  # type: ignore[arg-type]
 
 
-def _stub_preflight(ctx, text: str = "stub preflight ok") -> None:
-    ctx.trusted.agent_preflight.run = lambda repo, root, *, tools=None: text  # type: ignore[assignment]
-
-
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
@@ -83,7 +79,6 @@ class HandleImplementHappyPathTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
 
             work = _work(relevant_files=["NOTES.md"])
             branch = "codex/task-7-" + RUN_ID
@@ -132,7 +127,6 @@ class HandleImplementHappyPathTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote, branch="master")
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
 
             work = _work(
                 repo_full_name="muradjanov-dev/ketoshop",
@@ -168,11 +162,11 @@ class HandleImplementFailurePathTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote)
             ctx = build_test_context(root, github_remote=remote)
-
-            def boom(repo, root_dir, *, tools=None):
-                raise RuntimeError("boom")
-
-            ctx.trusted.agent_preflight.run = boom  # type: ignore[assignment]
+            ctx.codex.queue_preflight_result(  # type: ignore[attr-defined]
+                CodexChildError(
+                    3, "trusted preflight failed", body={"preflight_failure": "boom"}
+                )
+            )
 
             work = _work()
             branch = "codex/task-7-" + RUN_ID
@@ -192,7 +186,7 @@ class HandleImplementFailurePathTests(unittest.TestCase):
             payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["failure_phase"], "publish")
-            self.assertIn("ishonchli tekshiruv xato berdi", payload["error"])
+            self.assertIn("boom", payload["error"])
             self.assertIsNone(rev_parse_or_none(remote, branch))
 
     def test_empty_patch_reports_no_file_changes(self) -> None:

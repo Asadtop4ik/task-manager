@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import base64
 import subprocess
+import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from agent_svc.api import Work
+from agent_svc.api import LeaseLost, Work
+from agent_svc.codex import CodexChildError
 from agent_svc.publish import PublishError, publish_correction, publish_implement
 
 from .support import (
@@ -51,10 +54,6 @@ def _work(**overrides: object) -> Work:
     return Work(**base)  # type: ignore[arg-type]
 
 
-def _stub_preflight(ctx, text: str = "stub preflight ok") -> None:
-    ctx.trusted.agent_preflight.run = lambda repo, root, *, tools=None: text  # type: ignore[assignment]
-
-
 class PublishImplementTests(unittest.TestCase):
     def test_happy_path_pushes_and_opens_a_pr(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -62,7 +61,6 @@ class PublishImplementTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
 
             work = _work()
@@ -84,6 +82,7 @@ class PublishImplementTests(unittest.TestCase):
                 base_sha=base_sha,
                 branch=branch,
                 patch=patch_bytes,
+                cancel=threading.Event(),
                 task=task,
                 is_public=False,
                 image_dir=None,
@@ -107,7 +106,7 @@ class PublishImplementTests(unittest.TestCase):
             # The PR body carries the Codex summary and the preflight line.
             created = ctx.github.created_pulls[0]  # type: ignore[attr-defined]
             self.assertIn("Added a notes file", created["body"])
-            self.assertIn("Trusted publisher preflight: stub preflight ok.", created["body"])
+            self.assertIn("Trusted publisher preflight: fake preflight ok.", created["body"])
             self.assertEqual(created["title"], "Task #42: Codex change")
 
     def test_token_never_appears_in_push_argv_or_env_key_values(self) -> None:
@@ -116,7 +115,6 @@ class PublishImplementTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
             # `build_test_context` wires a fixed dummy token; swap in a secret
             # marker so we can prove it never leaks into argv.
@@ -147,6 +145,7 @@ class PublishImplementTests(unittest.TestCase):
                     base_sha=base_sha,
                     branch=branch,
                     patch=patch_bytes,
+                    cancel=threading.Event(),
                     task=task,
                     is_public=False,
                     image_dir=None,
@@ -164,7 +163,6 @@ class PublishImplementTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
 
             work = _work()
@@ -188,6 +186,7 @@ class PublishImplementTests(unittest.TestCase):
                     base_sha=base_sha,
                     branch=branch,
                     patch=patch_bytes,
+                    cancel=threading.Event(),
                     task=task,
                     is_public=False,
                     image_dir=None,
@@ -203,11 +202,13 @@ class PublishImplementTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote)
             ctx = build_test_context(root, github_remote=remote)
-
-            def boom(repo, root_dir, *, tools=None):
-                raise RuntimeError("ruff exploded")
-
-            ctx.trusted.agent_preflight.run = boom  # type: ignore[assignment]
+            ctx.codex.queue_preflight_result(  # type: ignore[attr-defined]
+                CodexChildError(
+                    3,
+                    "trusted preflight failed",
+                    body={"preflight_failure": "ruff tekshiruvi xato berdi (ishonchli)"},
+                )
+            )
             ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
 
             work = _work()
@@ -230,6 +231,7 @@ class PublishImplementTests(unittest.TestCase):
                     base_sha=base_sha,
                     branch=branch,
                     patch=patch_bytes,
+                    cancel=threading.Event(),
                     task=task,
                     is_public=False,
                     image_dir=None,
@@ -237,7 +239,7 @@ class PublishImplementTests(unittest.TestCase):
                     report_stage=stages.append,
                 )
             # The trusted `failure_reason` text, not a raw traceback.
-            self.assertIn("ishonchli tekshiruv xato berdi", ctx_err.exception.reason)
+            self.assertIn("ishonchli", ctx_err.exception.reason)
             self.assertEqual(stages, ["patch_validated"])  # never reached preflight_passed
             self.assertIsNone(rev_parse_or_none(remote, branch))
 
@@ -256,6 +258,7 @@ class PublishImplementTests(unittest.TestCase):
                     base_sha=base_sha,
                     branch="codex/task-42-" + work.run_id,
                     patch=b"",
+                    cancel=threading.Event(),
                     task={
                         "task_id": 42,
                         "run_id": work.run_id,
@@ -277,7 +280,6 @@ class PublishImplementTests(unittest.TestCase):
             remote = root / "remote.git"
             base_sha = make_github_remote(remote, branch="master")
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.mirrors.fetch("muradjanov-dev/qurbot", "master")
 
             work = _work(repo_full_name="muradjanov-dev/qurbot", base_branch="master")
@@ -301,6 +303,7 @@ class PublishImplementTests(unittest.TestCase):
                     base_sha=base_sha,
                     branch=branch,
                     patch=patch_bytes,
+                    cancel=threading.Event(),
                     task=task,
                     is_public=True,
                     image_dir=None,
@@ -320,7 +323,6 @@ class PublishCorrectionTests(unittest.TestCase):
             branch = "codex/task-9-22222222-2222-2222-2222-222222222222"
             push_new_branch(remote, base_sha, branch)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.mirrors.fetch("Asadtop4ik/task-manager", branch)
 
             work = _work(
@@ -341,6 +343,7 @@ class PublishCorrectionTests(unittest.TestCase):
                 work,
                 expected_head_sha=base_sha,
                 patch=patch_bytes,
+                cancel=threading.Event(),
                 report_stage=stages.append,
             )
 
@@ -363,7 +366,6 @@ class PublishCorrectionTests(unittest.TestCase):
             branch = "codex/task-9-22222222-2222-2222-2222-222222222222"
             push_new_branch(remote, base_sha, branch)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.mirrors.fetch("Asadtop4ik/task-manager", branch)
 
             work = _work(
@@ -384,9 +386,241 @@ class PublishCorrectionTests(unittest.TestCase):
                     work,
                     expected_head_sha=base_sha,
                     patch=patch_bytes,
+                    cancel=threading.Event(),
                     report_stage=lambda _s: None,
                 )
             self.assertIn("moved before publication", ctx_err.exception.reason)
+
+
+class PreflightWiringTests(unittest.TestCase):
+    """Proves `publish_implement` never runs ruff/black/compileall itself:
+    the sandboxed `codex.preflight` call receives the request agent-codex
+    needs, and the FINAL (post-preflight) patch it returns -- not the
+    original -- is what actually gets committed and pushed."""
+
+    def test_preflight_request_carries_repo_mirror_base_sha_patch_and_tools(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+
+            publish_implement(
+                ctx,
+                work,
+                base_sha=base_sha,
+                branch=branch,
+                patch=patch_bytes,
+                cancel=threading.Event(),
+                task={
+                    "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                    "base_branch": "main", "mode": "pr",
+                },
+                is_public=False,
+                image_dir=None,
+                codex_summary="",
+                report_stage=lambda _s: None,
+            )
+
+            self.assertEqual(len(ctx.codex.preflight_calls), 1)  # type: ignore[attr-defined]
+            request = ctx.codex.preflight_calls[0]  # type: ignore[attr-defined]
+            self.assertEqual(request["repo"], "Asadtop4ik/task-manager")
+            self.assertEqual(request["base_sha"], base_sha)
+            self.assertEqual(base64.b64decode(request["patch_b64"]), patch_bytes)
+            self.assertIn("ruff", request["tools"])
+            self.assertIn("black", request["tools"])
+            self.assertEqual(
+                str(ctx.mirrors.mirror_path("Asadtop4ik/task-manager")), request["mirror"]
+            )
+
+    def test_pushed_commit_carries_the_final_post_preflight_patch(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            original_patch = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            reformatted_patch = make_patch(remote, base_sha, {"NOTES.md": "hello, reformatted\n"})
+            ctx.codex.queue_preflight_result(  # type: ignore[attr-defined]
+                {
+                    "ok": True,
+                    "patch_b64": base64.b64encode(reformatted_patch).decode(),
+                    "changed_paths": ["NOTES.md"],
+                    "preflight_result": "reformatted",
+                }
+            )
+
+            publish_implement(
+                ctx,
+                work,
+                base_sha=base_sha,
+                branch=branch,
+                patch=original_patch,
+                cancel=threading.Event(),
+                task={
+                    "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                    "base_branch": "main", "mode": "pr",
+                },
+                is_public=False,
+                image_dir=None,
+                codex_summary="",
+                report_stage=lambda _s: None,
+            )
+
+            log = subprocess.run(
+                ["git", "-C", str(remote), "show", f"refs/heads/{branch}:NOTES.md"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertEqual(log, "hello, reformatted\n")
+
+
+class CancelAndLeaseTests(unittest.TestCase):
+    def test_already_cancelled_aborts_before_push(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            cancel = threading.Event()
+            cancel.set()
+
+            with self.assertRaises(PublishError) as ctx_err:
+                publish_implement(
+                    ctx,
+                    work,
+                    base_sha=base_sha,
+                    branch=branch,
+                    patch=patch_bytes,
+                    cancel=cancel,
+                    task={
+                        "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                        "base_branch": "main", "mode": "pr",
+                    },
+                    is_public=False,
+                    image_dir=None,
+                    codex_summary="",
+                    report_stage=lambda _s: None,
+                )
+            self.assertIn("cancelled", ctx_err.exception.reason)
+            self.assertIsNone(rev_parse_or_none(remote, branch))
+            self.assertEqual(ctx.github.created_pulls, [])  # type: ignore[attr-defined]
+
+    def test_stage_409_lease_lost_aborts_before_push_and_pr(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            ctx.api.queue_heartbeat_effects(LeaseLost("cancelled"))  # type: ignore[attr-defined]
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            cancel = threading.Event()
+
+            with self.assertRaises(PublishError) as ctx_err:
+                publish_implement(
+                    ctx,
+                    work,
+                    base_sha=base_sha,
+                    branch=branch,
+                    patch=patch_bytes,
+                    cancel=cancel,
+                    task={
+                        "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                        "base_branch": "main", "mode": "pr",
+                    },
+                    is_public=False,
+                    image_dir=None,
+                    codex_summary="",
+                    report_stage=lambda _s: None,
+                )
+            self.assertIn("lease lost", ctx_err.exception.reason)
+            self.assertTrue(cancel.is_set())
+            self.assertIsNone(rev_parse_or_none(remote, branch))
+            self.assertEqual(ctx.github.created_pulls, [])  # type: ignore[attr-defined]
+
+
+class BadModeAndRedactionTests(unittest.TestCase):
+    def test_symlink_mode_in_agent_svc_checkout_is_rejected_before_apply(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", "main")
+            work = _work()
+            branch = "codex/task-42-" + work.run_id
+            evil_patch = (
+                b"diff --git a/evil b/evil\n"
+                b"new file mode 120000\n"
+                b"index 0000000..1234567\n"
+                b"--- /dev/null\n"
+                b"+++ b/evil\n"
+                b"@@ -0,0 +1 @@\n"
+                b"+/etc/passwd\n"
+                b"\\ No newline at end of file\n"
+            )
+
+            with self.assertRaises(PublishError) as ctx_err:
+                publish_implement(
+                    ctx,
+                    work,
+                    base_sha=base_sha,
+                    branch=branch,
+                    patch=evil_patch,
+                    cancel=threading.Event(),
+                    task={
+                        "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
+                        "base_branch": "main", "mode": "pr",
+                    },
+                    is_public=False,
+                    image_dir=None,
+                    codex_summary="",
+                    report_stage=lambda _s: None,
+                )
+            self.assertIn("symlink", ctx_err.exception.reason)
+            self.assertFalse((root / "evil").exists())
+            # Never even reached the sandboxed preflight step.
+            self.assertEqual(ctx.codex.preflight_calls, [])  # type: ignore[attr-defined]
+
+    def test_git_failure_stderr_is_redacted_before_reaching_publish_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            secret = ctx.settings.github_agent_token
+
+            class _FakeResult:
+                returncode = 1
+                stdout = b""
+                stderr = f"remote: rejected, token {secret} is invalid".encode()
+
+            with patch("agent_svc.publish.subprocess.run", return_value=_FakeResult()):
+                from agent_svc.publish import _run_git
+
+                with self.assertRaises(PublishError) as ctx_err:
+                    _run_git(
+                        ["status"],
+                        cwd=root,
+                        env={},
+                        error="git failed",
+                        redactor=ctx.redactor,
+                    )
+            self.assertNotIn(secret, ctx_err.exception.reason)
+            self.assertIn("REDACTED", ctx_err.exception.reason)
 
 
 if __name__ == "__main__":

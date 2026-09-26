@@ -1,6 +1,17 @@
-"""Clean-checkout publication: apply an agent patch, run the trusted preflight,
-commit with the fixed identity/message/trailer, and push — for a fresh
-`implement` branch and for an existing `correction` branch alike.
+"""Clean-checkout publication: validate an agent patch, run the trusted
+preflight in the sandbox, apply the FINAL (post-preflight) patch, commit with
+the fixed identity/message/trailer, and push — for a fresh `implement` branch
+and for an existing `correction` branch alike.
+
+Security round 2 (blocker 1): agent-svc never runs ruff/black/compileall
+itself — those tools execute inside a directory whose content is entirely
+attacker-controlled (the agent's own patch), so running them as agent-svc
+would let a malicious patch read every credential agent-svc can reach.
+`_run_preflight` hands the patch to `codex.preflight`, which runs the trusted
+formatter/lint step as agent-codex in the sandbox and returns the resulting
+patch; agent-svc only ever applies that (like the original) to its own
+git-only checkout and runs the trusted `check_diff` (pure path/credential
+checks, no code execution) before and after.
 
 Every git process here runs hardened the same way the trusted GitHub Actions
 publisher does (see `agent-svc-design.md`): no system/global git config, no
@@ -12,22 +23,27 @@ never in argv, a git config file, or a log line.
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import repos
-from .api import Work
+from .api import LeaseLost, Work
+from .codex import CodexChildError
 from .context import ServiceContext
+from .log import Redactor
 
 _GIT_TIMEOUT_S = 120
 _COMMIT_NAME = "Business AI Codex"
 _COMMIT_EMAIL = "codex@users.noreply.github.com"
 _PUBLISH_DIR_MODE = 0o700
+_BAD_MODES = ("120000", "160000")
 
 # Per-repository preflight tool versions (see scripts/agent_preflight.py
 # `run`): the same repo can only ever need one pinned version of each tool,
@@ -86,8 +102,6 @@ def _git(
             "-c",
             "core.fsmonitor=false",
             "-c",
-            "diff.noTextconv=true",
-            "-c",
             "core.attributesFile=/dev/null",
             *args,
         ],
@@ -107,10 +121,13 @@ def _run_git(
     env: Mapping[str, str],
     input_bytes: bytes | None = None,
     error: str,
+    redactor: Redactor | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     result = _git(args, cwd=cwd, env=env, input_bytes=input_bytes)
     if result.returncode != 0:
         stderr = (result.stderr or b"").decode("utf-8", "replace").strip()
+        if redactor is not None:
+            stderr = redactor.redact(stderr)
         raise PublishError(f"{error}: {stderr[-2000:] or 'git command failed'}")
     return result
 
@@ -127,20 +144,43 @@ def _prepare_checkout(ctx: ServiceContext, run_id: str, mirror_path: Path) -> Pa
         cwd=publish_root,
         env=env,
         error="could not clone the mirror for publication",
+        redactor=ctx.redactor,
     )
     publish_dir.chmod(_PUBLISH_DIR_MODE)
     return publish_dir
 
 
-def _apply_patch(publish_dir: Path, patch: bytes, env: Mapping[str, str]) -> None:
+def _reject_bad_modes(publish_dir: Path, patch: bytes, env: Mapping[str, str]) -> None:
+    """Defense in depth, independent of the sandboxed child's own check: a
+    symlink or submodule entry applied directly in agent-svc's OWN checkout
+    would create a real filesystem symlink/gitlink owned by agent-svc, before
+    the trusted `check_diff` ever runs. `git apply --summary` parses the
+    patch (never touching the working tree) and lists every file mode it
+    would create/change; scanning that output for the two disallowed modes
+    catches this without agent-svc needing its own patch-format parser."""
+    result = _git(["apply", "--summary"], cwd=publish_dir, env=env, input_bytes=patch)
+    if result.returncode != 0:
+        # An unparseable/inapplicable patch is reported by the real `apply
+        # --index` call right after this; nothing to reject here yet.
+        return
+    summary = result.stdout.decode("utf-8", "replace")
+    if any(mode in summary for mode in _BAD_MODES):
+        raise PublishError("unsupported change (symlink or submodule)")
+
+
+def _apply_patch(
+    publish_dir: Path, patch: bytes, env: Mapping[str, str], *, redactor: Redactor | None
+) -> None:
     if not patch.strip():
         raise PublishError("agent produced no file changes")
+    _reject_bad_modes(publish_dir, patch, env)
     _run_git(
         ["apply", "--index"],
         cwd=publish_dir,
         env=env,
         input_bytes=patch,
         error="patch did not apply cleanly",
+        redactor=redactor,
     )
 
 
@@ -157,16 +197,44 @@ def _check_diff(
         raise PublishError(str(exc)) from exc
 
 
-def _preflight(ctx: ServiceContext, repo: str, publish_dir: Path) -> str:
-    tools = _tools_for_repo(ctx, repo)
+def _run_preflight(
+    ctx: ServiceContext, work: Work, *, patch: bytes, base_sha: str
+) -> tuple[str, bytes]:
+    """Hand the patch to the sandboxed `preflight` subcommand (runs the
+    trusted formatter/lint step as agent-codex) and return
+    `(preflight_result_text, final_patch)`. Never runs ruff/black/compileall
+    in this process — see the module docstring."""
+    repo = work.repo_full_name
+    mirror_path = ctx.mirrors.mirror_path(repo)
+    request = {
+        "run_id": work.run_id,
+        "repo": repo,
+        "mirror": str(mirror_path),
+        "base_sha": base_sha,
+        "patch_b64": base64.b64encode(patch).decode("ascii"),
+        "tools": _tools_for_repo(ctx, repo),
+    }
     try:
-        return str(ctx.trusted.agent_preflight.run(repo, publish_dir, tools=tools))
-    except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
-        reason = ctx.trusted.agent_preflight.failure_reason(exc)
-        raise PublishError(reason) from exc
+        result = ctx.codex.preflight(request)
+    except CodexChildError as exc:
+        reason = exc.body.get("preflight_failure") if exc.body else None
+        raise PublishError(str(reason) if reason else exc.reason) from exc
+    patch_b64 = result.get("patch_b64") or ""
+    try:
+        final_patch = base64.b64decode(patch_b64, validate=True) if patch_b64 else b""
+    except (ValueError, TypeError) as exc:
+        raise PublishError(f"invalid patch encoding from preflight: {exc}") from exc
+    return str(result.get("preflight_result", "")), final_patch
 
 
-def _commit(publish_dir: Path, env: Mapping[str, str], *, message: str, trailer: str) -> str:
+def _commit(
+    publish_dir: Path,
+    env: Mapping[str, str],
+    *,
+    message: str,
+    trailer: str,
+    redactor: Redactor | None,
+) -> str:
     _run_git(
         [
             "-c",
@@ -182,12 +250,14 @@ def _commit(publish_dir: Path, env: Mapping[str, str], *, message: str, trailer:
         cwd=publish_dir,
         env=env,
         error="commit failed",
+        redactor=redactor,
     )
     result = _run_git(
         ["rev-parse", "HEAD"],
         cwd=publish_dir,
         env=env,
         error="could not read the new commit sha",
+        redactor=redactor,
     )
     return result.stdout.decode("utf-8").strip()
 
@@ -202,7 +272,27 @@ def _push(
         cwd=publish_dir,
         env=push_env,
         error="push failed",
+        redactor=ctx.redactor,
     )
+
+
+def _check_not_cancelled(ctx: ServiceContext, work: Work, cancel: threading.Event) -> None:
+    """A synchronous lease check right before an irreversible step (push,
+    PR creation). If the lease was lost since the last background
+    heartbeat, or `cancel` is already set, abort before doing anything that
+    cannot be undone. Setting `cancel` here means the caller's own
+    callback/action-result helper -- which always checks `cancel` first --
+    sends nothing: the Task Manager API already owns the outcome.
+    """
+    if cancel.is_set():
+        raise PublishError("run was cancelled before publication", phase="publish")
+    try:
+        ctx.api.heartbeat(work.run_id, work.lease_id)
+    except LeaseLost as exc:
+        cancel.set()
+        raise PublishError(
+            f"lease lost before publication: {exc.detail}", phase="publish"
+        ) from exc
 
 
 def _pr_body(
@@ -243,16 +333,21 @@ def publish_implement(
     is_public: bool,
     image_dir: Path | None,
     codex_summary: str,
+    cancel: threading.Event,
     report_stage: Callable[[str], None],
 ) -> PublishResult:
     repo = work.repo_full_name
     mirror_path = ctx.mirrors.mirror_path(repo)
-    publish_dir = _prepare_checkout(ctx, work.run_id, mirror_path)
     checker = (
         ctx.trusted.public_agent_task.check_diff
         if is_public
         else ctx.trusted.agent_task.check_diff
     )
+
+    # 1) Cheap, pure validation of the ORIGINAL patch in agent-svc's own
+    #    checkout -- refuses blocked paths/credentials before the sandboxed
+    #    preflight step ever runs.
+    publish_dir = _prepare_checkout(ctx, work.run_id, mirror_path)
     try:
         env = _git_env()
         _run_git(
@@ -260,12 +355,30 @@ def publish_implement(
             cwd=publish_dir,
             env=env,
             error="could not create the publish branch",
+            redactor=ctx.redactor,
         )
-        _apply_patch(publish_dir, patch, env)
+        _apply_patch(publish_dir, patch, env, redactor=ctx.redactor)
         _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir)
         report_stage("patch_validated")
+    finally:
+        shutil.rmtree(publish_dir, ignore_errors=True)
 
-        preflight_result = _preflight(ctx, repo, publish_dir)
+    # 2) Sandboxed preflight (ruff/black/compileall) as agent-codex.
+    preflight_result, final_patch = _run_preflight(ctx, work, patch=patch, base_sha=base_sha)
+
+    # 3) Apply the FINAL (post-preflight) patch to a fresh checkout and
+    #    validate again before anything irreversible happens.
+    publish_dir = _prepare_checkout(ctx, work.run_id, mirror_path)
+    try:
+        env = _git_env()
+        _run_git(
+            ["checkout", "-b", branch, base_sha],
+            cwd=publish_dir,
+            env=env,
+            error="could not create the publish branch",
+            redactor=ctx.redactor,
+        )
+        _apply_patch(publish_dir, final_patch, env, redactor=ctx.redactor)
         _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir)
         report_stage("preflight_passed")
 
@@ -274,14 +387,17 @@ def publish_implement(
             env,
             message=f"feat(agent): work on task {work.task_id}",
             trailer=f"Agent-Run-ID: {work.run_id}",
+            redactor=ctx.redactor,
         )
 
         if ctx.github.get_ref(repo, branch) is not None:
             raise PublishError("branch already exists")
 
+        _check_not_cancelled(ctx, work, cancel)
         _push(ctx, repo, publish_dir, branch, env)
         report_stage("branch_pushed")
 
+        _check_not_cancelled(ctx, work, cancel)
         body = _pr_body(
             work,
             task,
@@ -309,6 +425,7 @@ def publish_correction(
     *,
     expected_head_sha: str,
     patch: bytes,
+    cancel: threading.Event,
     report_stage: Callable[[str], None],
 ) -> PublishResult:
     repo = work.repo_full_name
@@ -319,7 +436,6 @@ def publish_correction(
         raise PublishError("PR branch moved before publication")
 
     mirror_path = ctx.mirrors.mirror_path(repo)
-    publish_dir = _prepare_checkout(ctx, work.run_id, mirror_path)
     # Corrections always use the plain (non-public) validator, exactly like
     # the legacy `agent_release.py publish-correction`: repository/branch
     # approval was already proven when the original task/PR was opened, so
@@ -333,6 +449,9 @@ def publish_correction(
         "base_branch": work.base_branch,
         "mode": "pr",
     }
+
+    # 1) Cheap, pure validation of the ORIGINAL patch.
+    publish_dir = _prepare_checkout(ctx, work.run_id, mirror_path)
     try:
         env = _git_env()
         _run_git(
@@ -340,12 +459,31 @@ def publish_correction(
             cwd=publish_dir,
             env=env,
             error="could not check out the PR head",
+            redactor=ctx.redactor,
         )
-        _apply_patch(publish_dir, patch, env)
+        _apply_patch(publish_dir, patch, env, redactor=ctx.redactor)
         _check_diff(checker, cwd=publish_dir, task=task, image_dir=None)
         report_stage("patch_validated")
+    finally:
+        shutil.rmtree(publish_dir, ignore_errors=True)
 
-        _preflight(ctx, repo, publish_dir)
+    # 2) Sandboxed preflight as agent-codex.
+    _preflight_result, final_patch = _run_preflight(
+        ctx, work, patch=patch, base_sha=expected_head_sha
+    )
+
+    # 3) Apply the FINAL (post-preflight) patch to a fresh checkout.
+    publish_dir = _prepare_checkout(ctx, work.run_id, mirror_path)
+    try:
+        env = _git_env()
+        _run_git(
+            ["checkout", "--detach", expected_head_sha],
+            cwd=publish_dir,
+            env=env,
+            error="could not check out the PR head",
+            redactor=ctx.redactor,
+        )
+        _apply_patch(publish_dir, final_patch, env, redactor=ctx.redactor)
         _check_diff(checker, cwd=publish_dir, task=task, image_dir=None)
         report_stage("preflight_passed")
 
@@ -354,6 +492,7 @@ def publish_correction(
             env,
             message=f"fix(agent): apply owner correction for task {work.task_id}",
             trailer=f"Agent-Run-ID: {work.run_id}",
+            redactor=ctx.redactor,
         )
         if new_head == expected_head_sha:
             raise PublishError("correction did not create a new commit")
@@ -361,6 +500,7 @@ def publish_correction(
         if ctx.github.get_ref(repo, branch) != expected_head_sha:
             raise PublishError("PR branch moved before publication")
 
+        _check_not_cancelled(ctx, work, cancel)
         _push(ctx, repo, publish_dir, branch, env)
         report_stage("correction_pushed")
 

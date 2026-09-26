@@ -84,10 +84,6 @@ def _exec_result(**overrides: object) -> CodexResult:
     return CodexResult(**base)  # type: ignore[arg-type]
 
 
-def _stub_preflight(ctx, text: str = "stub preflight ok") -> None:
-    ctx.trusted.agent_preflight.run = lambda repo, root, *, tools=None: text  # type: ignore[assignment]
-
-
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
@@ -100,7 +96,6 @@ class HandleCorrectionHappyPathTests(unittest.TestCase):
             base_sha = make_github_remote(remote)
             push_new_branch(remote, base_sha, BRANCH)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
 
             work = _work(expected_head_sha=base_sha)
@@ -216,7 +211,6 @@ class HandleCorrectionRefusalTests(unittest.TestCase):
             base_sha = make_github_remote(remote)
             push_new_branch(remote, base_sha, BRANCH)
             ctx = build_test_context(root, github_remote=remote)
-            _stub_preflight(ctx)
             ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
 
             work = _work(expected_head_sha=base_sha)

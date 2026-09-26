@@ -173,6 +173,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             is_public=is_public,
             image_dir=image_dir,
             codex_summary=result.final_message,
+            cancel=run.cancel,
             report_stage=lambda name: run.stage(name, base_sha=base_sha, branch=branch),
         )
     except PublishError as exc:
