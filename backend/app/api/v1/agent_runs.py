@@ -7,6 +7,7 @@ import re
 from datetime import UTC, datetime
 from math import ceil
 from typing import Literal, cast
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import httpx
@@ -25,6 +26,7 @@ from app.db.models import (
     AgentRun,
     AgentRunAction,
     Attachment,
+    Project,
     ProjectDiscussion,
     Task,
 )
@@ -48,6 +50,7 @@ from app.schemas.agent_run import (
     AgentQaDeployment,
     AgentQaDeploymentAuthorization,
     AgentQaDeploymentAuthorizationOut,
+    AgentQaDeploymentFailure,
     AgentReleaseRequest,
     AgentReviewFinding,
     AgentReviewOut,
@@ -74,6 +77,18 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
 _GITHUB = "https://api.github.com"
 _METRICS_PILOT_START = datetime(2026, 9, 24, 18, 0, tzinfo=UTC)
+_QA_DEPLOY_FAILURE_MESSAGES = {
+    "image_pull_failed": (
+        "QA deployment failed [image_pull_failed]: could not pull the approved image; "
+        "check package read access."
+    ),
+    "deploy_failed": (
+        "QA deployment failed [deploy_failed]: inspect the trusted QA deploy workflow."
+    ),
+    "readiness_failed": (
+        "QA deployment failed [readiness_failed]: the QA service did not pass readiness."
+    ),
+}
 
 
 def _review_out(run: AgentRun) -> AgentReviewOut:
@@ -116,10 +131,17 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
     )
     return AgentRunDetailOut(
         run_id=run.run_id,
+        repo_full_name=run.repo_full_name,
         status=run.status,
         summary=run.task.title,
         impact=run.review_summary or run.task.description or "Review pending",
         head_sha=run.head_sha,
+        merged_sha=run.merged_sha,
+        deployed_sha=run.deployed_sha,
+        github_run_url=run.github_run_url,
+        error=run.error,
+        qa_ready_url=run.qa_ready_url,
+        qa_ready_sha=run.qa_ready_sha,
         ci_evidence=AgentCiEvidenceOut(
             state=run.ci_status,
             verified_head_sha=run.ci_verified_sha,
@@ -717,6 +739,8 @@ async def pending_notifications(
                 url=run.ci_url,
             ),
             actions=_run_detail(run).actions,
+            qa_ready_url=run.qa_ready_url,
+            qa_ready_sha=run.qa_ready_sha,
             qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
             qa_deploy_dispatch_error=run.qa_deploy_dispatch_error,
         )
@@ -1157,7 +1181,10 @@ async def agent_run_detail(
     run_id: str, session: DbSession, owner: OwnerUser
 ) -> AgentRunDetailOut:
     run = await session.scalar(
-        select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -1398,6 +1425,7 @@ async def agent_action_result(
     x_agent_callback_token: str | None = Header(default=None),
 ) -> AgentRunOut:
     _image_callback_auth(x_agent_callback_token)
+    await _lock_qa_project_for_run(session, run_id)
     run = await session.scalar(
         select(AgentRun)
         .where(AgentRun.run_id == run_id)
@@ -1876,13 +1904,18 @@ async def agent_qa_run_deployed(
     session: DbSession,
     x_agent_qa_callback_token: str | None = Header(default=None),
 ) -> AgentRunOut:
-    """Accept deployment completion only for the explicitly enabled QA repo.
+    """Accept completion for the exact image authorized by the QA workflow.
 
     The QA workflow probes its private service, then reports through a token
     scoped to this one repository instead of receiving the production callback
-    credential used by every agent workflow.
+    credential used by every agent workflow. The whole-workflow concurrency
+    group serializes owner merge and deployment mutations. A newer merge may
+    arrive while an already authorized image is deploying, so completion stays
+    bound to that exact merge/readiness evidence; freshness checks apply when a
+    new deployment is authorized or retried.
     """
     _qa_deploy_auth(x_agent_qa_callback_token)
+    await _lock_qa_project_for_run(session, run_id)
     run = await session.scalar(
         select(AgentRun).where(AgentRun.run_id == run_id).options(selectinload(AgentRun.task))
     )
@@ -1909,6 +1942,8 @@ async def agent_qa_run_deployed(
     run.qa_ready_url = payload.ready_url
     run.qa_ready_sha = payload.ready_sha
     run.qa_ready_at = run.deployed_at
+    run.error = None
+    run.github_run_url = payload.github_run_url
     run.finished_at = datetime.now(UTC)
     run.notified_at = None
     agent_events.record(session, run, github_run_url=payload.github_run_url)
@@ -1927,6 +1962,155 @@ async def agent_qa_run_deployed(
     return AgentRunOut.model_validate(run)
 
 
+async def _has_newer_qa_owner_merge(session: DbSession, run: AgentRun) -> bool:
+    if (
+        not run.merged_sha
+        or not re.fullmatch(r"[0-9a-f]{40}", run.merged_sha)
+        or not run.base_branch
+    ):
+        return True
+    newer_merge_shas = (
+        await session.scalars(
+            select(AgentRun.merged_sha)
+            .join(AgentRunAction, AgentRunAction.agent_run_id == AgentRun.id)
+            .where(
+                AgentRun.repo_full_name == settings.agent_qa_repository,
+                AgentRun.id != run.id,
+                AgentRun.status.in_(["merged", "deployed"]),
+                AgentRun.merged_sha.is_not(None),
+                AgentRunAction.kind == "merge",
+                AgentRunAction.status == "completed",
+                AgentRunAction.result["merge_sha"].as_string() == AgentRun.merged_sha,
+                AgentRunAction.request_data["expected_head_sha"].as_string()
+                == AgentRunAction.result["head_sha"].as_string(),
+            )
+            .distinct()
+        )
+    ).all()
+    if not newer_merge_shas:
+        return False
+    if any(
+        not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_sha)
+        for merge_sha in newer_merge_shas
+    ):
+        return True
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"{_GITHUB}/repos/{settings.agent_qa_repository}/compare/"
+            f"{run.merged_sha}...{quote(run.base_branch, safe='')}",
+            headers=_headers(settings.agent_qa_repository),
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="QA merge ordering verification failed")
+    comparison = response.json()
+    compare_status = comparison.get("status")
+    if compare_status == "identical":
+        return False
+    if compare_status != "ahead":
+        return True
+    commits = comparison.get("commits")
+    total_commits = comparison.get("total_commits")
+    if (
+        not isinstance(commits, list)
+        or not isinstance(total_commits, int)
+        or total_commits < len(commits)
+        or total_commits > len(commits)
+    ):
+        return True
+    owner_merge_set = set(newer_merge_shas)
+    for commit in commits:
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return True
+        if sha in owner_merge_set:
+            return True
+    return False
+
+
+async def _lock_qa_project_for_run(session: DbSession, run_id: str) -> bool:
+    repository = await session.scalar(
+        select(AgentRun.repo_full_name).where(AgentRun.run_id == run_id)
+    )
+    if repository != settings.agent_qa_repository:
+        return False
+    project = await session.scalar(
+        select(Project).where(Project.key == "agent-qa").with_for_update()
+    )
+    if project is None:
+        raise HTTPException(status_code=409, detail="QA project is unavailable")
+    return True
+
+
+@router.post("/{run_id}/qa-deployment-failed", response_model=AgentRunOut)
+async def agent_qa_deployment_failed(
+    run_id: str,
+    payload: AgentQaDeploymentFailure,
+    session: DbSession,
+    x_agent_qa_callback_token: str | None = Header(default=None),
+) -> AgentRunOut:
+    """Record a bounded QA deploy failure without marking its task complete."""
+    _qa_deploy_auth(x_agent_qa_callback_token)
+    await _lock_qa_project_for_run(session, run_id)
+    run = await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.run_id == run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+    if run is None or run.repo_full_name != settings.agent_qa_repository:
+        raise HTTPException(status_code=404, detail="QA agent run not found")
+    if run.status == "deployed" and run.deployed_sha == payload.merge_sha:
+        return AgentRunOut.model_validate(run)
+    if (
+        run.status != "merged"
+        or run.merged_sha != payload.merge_sha
+        or run.head_sha != payload.expected_head_sha
+        or run.qa_deploy_dispatch_status != "dispatched"
+        or run.merged_at is None
+    ):
+        raise HTTPException(status_code=409, detail="QA failure does not match the merged run")
+    expected_url = f"https://github.com/{settings.agent_qa_repository}/actions/runs/"
+    suffix = payload.github_run_url.removeprefix(expected_url)
+    if not payload.github_run_url.startswith(expected_url) or not suffix.isdecimal():
+        raise HTTPException(status_code=400, detail="invalid QA deployment run URL")
+    action = await session.scalar(
+        select(AgentRunAction)
+        .where(
+            AgentRunAction.action_id == str(payload.action_id),
+            AgentRunAction.agent_run_id == run.id,
+        )
+        .with_for_update()
+    )
+    if (
+        action is None
+        or action.kind != "merge"
+        or action.status != "completed"
+        or action.request_data.get("expected_head_sha") != payload.expected_head_sha
+        or (action.result or {}).get("head_sha") != payload.expected_head_sha
+        or (action.result or {}).get("merge_sha") != payload.merge_sha
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="QA failure is not tied to the completed owner merge",
+        )
+    error = _QA_DEPLOY_FAILURE_MESSAGES[payload.failure_code]
+    if run.error == error and run.github_run_url == payload.github_run_url:
+        return AgentRunOut.model_validate(run)
+    run.error = error
+    run.github_run_url = payload.github_run_url
+    run.notified_at = None
+    agent_events.record(
+        session,
+        run,
+        status="qa_deploy_failed",
+        phase="qa_deploy",
+        error=error,
+        github_run_url=payload.github_run_url,
+    )
+    await session.commit()
+    return AgentRunOut.model_validate(run)
+
+
 @router.post("/{run_id}/qa-deploy-dispatch-result", response_model=AgentRunOut)
 async def agent_qa_deploy_dispatch_result(
     run_id: str,
@@ -1936,6 +2120,7 @@ async def agent_qa_deploy_dispatch_result(
 ) -> AgentRunOut:
     """Record whether the trusted central workflow queued QA deployment."""
     _image_callback_auth(x_agent_callback_token)
+    await _lock_qa_project_for_run(session, run_id)
     run = await session.scalar(
         select(AgentRun)
         .where(AgentRun.run_id == run_id)
@@ -1999,11 +2184,14 @@ async def authorize_qa_deployment(
 ) -> AgentQaDeploymentAuthorizationOut:
     """Authorize only the exact QA merge dispatched by an owner release action."""
     _qa_deploy_auth(x_agent_qa_callback_token)
-    run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
+    await _lock_qa_project_for_run(session, run_id)
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).with_for_update()
+    )
     if run is None or run.repo_full_name != settings.agent_qa_repository:
         raise HTTPException(status_code=404, detail="QA agent run not found")
     if (
-        run.status not in {"merged", "deployed"}
+        run.status != "merged"
         or run.merged_sha != payload.merge_sha
         or run.qa_deploy_dispatch_status != "dispatched"
     ):
@@ -2034,6 +2222,11 @@ async def authorize_qa_deployment(
         raise HTTPException(
             status_code=409,
             detail="QA PR head differs from the owner-approved head",
+        )
+    if await _has_newer_qa_owner_merge(session, run):
+        raise HTTPException(
+            status_code=409,
+            detail="QA deployment was superseded by a newer owner merge",
         )
     return AgentQaDeploymentAuthorizationOut(
         authorized=True,

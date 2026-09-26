@@ -77,6 +77,16 @@ class AgentQaDeployment(AgentDeployment):
     ready_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
+class AgentQaDeploymentFailure(BaseModel):
+    action_id: UUID
+    expected_head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    merge_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    github_run_url: str = Field(
+        pattern=r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$"
+    )
+    failure_code: Literal["image_pull_failed", "deploy_failed", "readiness_failed"]
+
+
 class AgentQaDeploymentAuthorization(BaseModel):
     action_id: UUID
     expected_head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -145,10 +155,17 @@ class AgentActionAvailability(BaseModel):
 
 class AgentRunDetailOut(BaseModel):
     run_id: str
+    repo_full_name: str
     status: str
     summary: str
     impact: str
     head_sha: str | None
+    merged_sha: str | None
+    deployed_sha: str | None
+    github_run_url: str | None
+    error: str | None
+    qa_ready_url: str | None
+    qa_ready_sha: str | None
     ci_evidence: AgentCiEvidenceOut
     review: AgentReviewOut
     actions: dict[str, AgentActionAvailability]
@@ -244,6 +261,8 @@ class AgentNotificationOut(BaseModel):
     review: AgentReviewOut | None = None
     ci_evidence: AgentCiEvidenceOut | None = None
     actions: dict[str, AgentActionAvailability] | None = None
+    qa_ready_url: str | None = None
+    qa_ready_sha: str | None = None
     qa_deploy_dispatch_status: str | None = None
     qa_deploy_dispatch_error: str | None = None
 
