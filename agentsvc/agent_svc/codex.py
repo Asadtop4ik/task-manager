@@ -58,7 +58,9 @@ class CodexChildError(RuntimeError):
     to carry `preflight_failure`, the trusted script's own failure text,
     alongside the generic `reason` every subcommand reports."""
 
-    def __init__(self, exit_code: int, reason: str, *, body: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, exit_code: int, reason: str, *, body: dict[str, Any] | None = None
+    ) -> None:
         super().__init__(reason)
         self.exit_code = exit_code
         self.reason = reason
@@ -240,7 +242,9 @@ class CodexRunner:
     def package(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("package", request, timeout_s)
 
-    def preflight(self, request: dict[str, Any], *, timeout_s: float = 180.0) -> dict[str, Any]:
+    def preflight(
+        self, request: dict[str, Any], *, timeout_s: float = 180.0
+    ) -> dict[str, Any]:
         return self._simple_call("preflight", request, timeout_s)
 
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:

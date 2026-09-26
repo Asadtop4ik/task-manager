@@ -379,7 +379,9 @@ def publish_implement(
             redactor=ctx.redactor,
         )
         _apply_patch(publish_dir, patch, env, redactor=ctx.redactor)
-        _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir, is_public=is_public)
+        _check_diff(
+            checker, cwd=publish_dir, task=task, image_dir=image_dir, is_public=is_public
+        )
         report_stage("patch_validated")
     finally:
         shutil.rmtree(publish_dir, ignore_errors=True)
@@ -400,7 +402,9 @@ def publish_implement(
             redactor=ctx.redactor,
         )
         _apply_patch(publish_dir, final_patch, env, redactor=ctx.redactor)
-        _check_diff(checker, cwd=publish_dir, task=task, image_dir=image_dir, is_public=is_public)
+        _check_diff(
+            checker, cwd=publish_dir, task=task, image_dir=image_dir, is_public=is_public
+        )
         report_stage("preflight_passed")
 
         head_sha = _commit(

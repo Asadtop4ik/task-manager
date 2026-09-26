@@ -23,7 +23,9 @@ class TrustedModulesTests(unittest.TestCase):
             self.assertTrue(hasattr(trusted.agent_pr_review, "build_review_prompt"))
             self.assertTrue(hasattr(trusted.agent_repos, "REPOSITORIES"))
 
-    def test_agent_pr_review_loads_for_real_with_everything_the_review_lane_needs(self) -> None:
+    def test_agent_pr_review_loads_for_real_with_everything_the_review_lane_needs(
+        self,
+    ) -> None:
         """`agent_svc.review.handle_review` calls `trusted.agent_pr_review.
         build_review_prompt`/`_current_pr`/`_parse_result`/`_review_decision`
         directly (see `review.py`). Without this accessor the review lane

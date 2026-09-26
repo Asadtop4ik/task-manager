@@ -566,7 +566,9 @@ def cmd_package(request: dict[str, Any]) -> int:
     print(
         json.dumps(
             {
-                "patch_b64": base64.b64encode(patch_bytes).decode("ascii") if patch_bytes else "",
+                "patch_b64": (
+                    base64.b64encode(patch_bytes).decode("ascii") if patch_bytes else ""
+                ),
                 "changed_paths": changed_paths,
                 "bytes": len(patch_bytes),
             }
@@ -710,7 +712,9 @@ def cmd_preflight(request: dict[str, Any]) -> int:
             # alongside a generic `reason` for anything reading only that.
             failure_text = preflight_module.failure_reason(exc)
             print(
-                json.dumps({"reason": "trusted preflight failed", "preflight_failure": failure_text}),
+                json.dumps(
+                    {"reason": "trusted preflight failed", "preflight_failure": failure_text}
+                ),
                 flush=True,
             )
             return 3
@@ -730,7 +734,9 @@ def cmd_preflight(request: dict[str, Any]) -> int:
             {
                 "ok": True,
                 "patch_b64": (
-                    base64.b64encode(patch_bytes_out).decode("ascii") if patch_bytes_out else ""
+                    base64.b64encode(patch_bytes_out).decode("ascii")
+                    if patch_bytes_out
+                    else ""
                 ),
                 "changed_paths": changed_paths,
                 "preflight_result": preflight_result,

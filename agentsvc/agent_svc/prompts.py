@@ -41,7 +41,7 @@ class RouteDecision:
 
 
 def is_complex(work: Work) -> bool:
-    """"complex" always routes to the complex model, and so does
+    """ "complex" always routes to the complex model, and so does
     attempt_index >= 2 -- a retry -- REGARDLESS of an explicit "simple"
     hint: a simple route already failed once, so it never gets a second
     identical try. Only a first attempt with an explicit "simple" hint (or

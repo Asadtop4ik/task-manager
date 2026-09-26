@@ -201,7 +201,9 @@ class RecoveryCleansUpLeftoversTests(unittest.TestCase):
                 def cleanup(self, request: dict) -> dict:
                     raise RuntimeError("sudo unavailable")
 
-            recover(journal, api, _logger(), codex=BoomCodex(), state_dir=tmp)  # must not raise
+            recover(
+                journal, api, _logger(), codex=BoomCodex(), state_dir=tmp
+            )  # must not raise
 
     def test_without_codex_or_state_dir_recovery_behaves_exactly_as_before(self) -> None:
         with TemporaryDirectory() as tmp:

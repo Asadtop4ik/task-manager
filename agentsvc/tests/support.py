@@ -344,7 +344,9 @@ class FakeCodexRunner:
             raise self.package_error
         return self._package_results.pop(0)
 
-    def preflight(self, request: dict[str, Any], *, timeout_s: float = 180.0) -> dict[str, Any]:
+    def preflight(
+        self, request: dict[str, Any], *, timeout_s: float = 180.0
+    ) -> dict[str, Any]:
         self.preflight_calls.append(request)
         if self._preflight_results:
             result = self._preflight_results.pop(0)

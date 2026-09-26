@@ -273,7 +273,9 @@ def _make_images_readable_by_agent_codex(image_dir: Path, paths: list[Path]) -> 
         path.chmod(0o640)
 
 
-def _pr_matches_this_run(pr: Mapping[str, Any], repo: str, branch: str, base_branch: str) -> bool:
+def _pr_matches_this_run(
+    pr: Mapping[str, Any], repo: str, branch: str, base_branch: str
+) -> bool:
     head = pr.get("head") or {}
     base = pr.get("base") or {}
     return (

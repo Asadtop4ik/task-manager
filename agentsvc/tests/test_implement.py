@@ -85,7 +85,7 @@ class _FakeImageResponse:
         self._body = body
         self._read = False
 
-    def __enter__(self) -> "_FakeImageResponse":
+    def __enter__(self) -> _FakeImageResponse:
         return self
 
     def __exit__(self, *_exc: object) -> bool:

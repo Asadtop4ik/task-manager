@@ -312,9 +312,7 @@ class PublishImplementTests(unittest.TestCase):
                 )
             self.assertIn("protected path", ctx_err.exception.reason)
             # The exact prefix `public_agent_task.py`'s own CLI wrapper uses.
-            self.assertTrue(
-                ctx_err.exception.reason.startswith("public agent task rejected:")
-            )
+            self.assertTrue(ctx_err.exception.reason.startswith("public agent task rejected:"))
             self.assertIsNone(rev_parse_or_none(remote, branch))
 
     def test_private_check_diff_failure_uses_the_legacy_agent_task_prefix(self) -> None:
@@ -327,8 +325,12 @@ class PublishImplementTests(unittest.TestCase):
             work = _work()
             branch = "codex/task-42-" + work.run_id
             task = {
-                "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                "base_branch": "main", "mode": "pr",
+                "task_id": 42,
+                "run_id": work.run_id,
+                "title": "t",
+                "description": "d",
+                "base_branch": "main",
+                "mode": "pr",
             }
             # A credential path check_diff refuses, WITHOUT going through
             # the empty-patch fast path in _apply_patch.
@@ -336,9 +338,17 @@ class PublishImplementTests(unittest.TestCase):
 
             with self.assertRaises(PublishError) as ctx_err:
                 publish_implement(
-                    ctx, work, base_sha=base_sha, branch=branch, patch=patch_bytes, task=task,
-                    is_public=False, image_dir=None, codex_summary="",
-                    cancel=threading.Event(), report_stage=lambda _s: None,
+                    ctx,
+                    work,
+                    base_sha=base_sha,
+                    branch=branch,
+                    patch=patch_bytes,
+                    task=task,
+                    is_public=False,
+                    image_dir=None,
+                    codex_summary="",
+                    cancel=threading.Event(),
+                    report_stage=lambda _s: None,
                 )
             self.assertTrue(ctx_err.exception.reason.startswith("agent task failed:"))
             self.assertIn("credential", ctx_err.exception.reason)
@@ -443,8 +453,12 @@ class PrBodySummaryWhitespaceTests(unittest.TestCase):
                 patch=patch_bytes,
                 cancel=threading.Event(),
                 task={
-                    "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                    "base_branch": "main", "mode": "pr",
+                    "task_id": 42,
+                    "run_id": work.run_id,
+                    "title": "t",
+                    "description": "d",
+                    "base_branch": "main",
+                    "mode": "pr",
                 },
                 is_public=False,
                 image_dir=None,
@@ -484,8 +498,12 @@ class PreflightWiringTests(unittest.TestCase):
                 patch=patch_bytes,
                 cancel=threading.Event(),
                 task={
-                    "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                    "base_branch": "main", "mode": "pr",
+                    "task_id": 42,
+                    "run_id": work.run_id,
+                    "title": "t",
+                    "description": "d",
+                    "base_branch": "main",
+                    "mode": "pr",
                 },
                 is_public=False,
                 image_dir=None,
@@ -514,7 +532,9 @@ class PreflightWiringTests(unittest.TestCase):
             work = _work()
             branch = "codex/task-42-" + work.run_id
             original_patch = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
-            reformatted_patch = make_patch(remote, base_sha, {"NOTES.md": "hello, reformatted\n"})
+            reformatted_patch = make_patch(
+                remote, base_sha, {"NOTES.md": "hello, reformatted\n"}
+            )
             ctx.codex.queue_preflight_result(  # type: ignore[attr-defined]
                 {
                     "ok": True,
@@ -532,8 +552,12 @@ class PreflightWiringTests(unittest.TestCase):
                 patch=original_patch,
                 cancel=threading.Event(),
                 task={
-                    "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                    "base_branch": "main", "mode": "pr",
+                    "task_id": 42,
+                    "run_id": work.run_id,
+                    "title": "t",
+                    "description": "d",
+                    "base_branch": "main",
+                    "mode": "pr",
                 },
                 is_public=False,
                 image_dir=None,
@@ -543,7 +567,9 @@ class PreflightWiringTests(unittest.TestCase):
 
             log = subprocess.run(
                 ["git", "-C", str(remote), "show", f"refs/heads/{branch}:NOTES.md"],
-                capture_output=True, text=True, check=True,
+                capture_output=True,
+                text=True,
+                check=True,
             ).stdout
             self.assertEqual(log, "hello, reformatted\n")
 
@@ -571,8 +597,12 @@ class CancelAndLeaseTests(unittest.TestCase):
                     patch=patch_bytes,
                     cancel=cancel,
                     task={
-                        "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                        "base_branch": "main", "mode": "pr",
+                        "task_id": 42,
+                        "run_id": work.run_id,
+                        "title": "t",
+                        "description": "d",
+                        "base_branch": "main",
+                        "mode": "pr",
                     },
                     is_public=False,
                     image_dir=None,
@@ -605,8 +635,12 @@ class CancelAndLeaseTests(unittest.TestCase):
                     patch=patch_bytes,
                     cancel=cancel,
                     task={
-                        "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                        "base_branch": "main", "mode": "pr",
+                        "task_id": 42,
+                        "run_id": work.run_id,
+                        "title": "t",
+                        "description": "d",
+                        "base_branch": "main",
+                        "mode": "pr",
                     },
                     is_public=False,
                     image_dir=None,
@@ -649,8 +683,12 @@ class BadModeAndRedactionTests(unittest.TestCase):
                     patch=evil_patch,
                     cancel=threading.Event(),
                     task={
-                        "task_id": 42, "run_id": work.run_id, "title": "t", "description": "d",
-                        "base_branch": "main", "mode": "pr",
+                        "task_id": 42,
+                        "run_id": work.run_id,
+                        "title": "t",
+                        "description": "d",
+                        "base_branch": "main",
+                        "mode": "pr",
                     },
                     is_public=False,
                     image_dir=None,

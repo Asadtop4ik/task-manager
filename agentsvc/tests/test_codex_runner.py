@@ -149,9 +149,7 @@ class SimpleCallTests(unittest.TestCase):
             runner.preflight({"run_id": "r1"})
         self.assertEqual(ctx.exception.reason, "trusted preflight failed")
         assert ctx.exception.body is not None
-        self.assertEqual(
-            ctx.exception.body["preflight_failure"], "Ruff tekshiruvi xato berdi"
-        )
+        self.assertEqual(ctx.exception.body["preflight_failure"], "Ruff tekshiruvi xato berdi")
 
     def test_child_error_body_is_none_without_a_parseable_json_body(self) -> None:
         def fake_runner(argv, **kwargs):

@@ -1760,7 +1760,9 @@ class PreflightIntegrationTests(ChildProcessTestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         body = json.loads(completed.stdout)
-        self.assertEqual(body["preflight_result"], "acme/pkg: fake preflight ok tools=['ruff']")
+        self.assertEqual(
+            body["preflight_result"], "acme/pkg: fake preflight ok tools=['ruff']"
+        )
 
     def test_trusted_preflight_failure_reports_reason_and_failure_text(self) -> None:
         run_id, mirror, sha, patch_b64 = self.prepared_patch(repo="acme/fails")

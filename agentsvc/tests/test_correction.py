@@ -173,7 +173,10 @@ class HandleCorrectionRefusalTests(unittest.TestCase):
             patch_bytes = make_patch(remote, base_sha, {"FIX.md": "fixed\n"})
             ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
             ctx.codex.queue_package_result(  # type: ignore[attr-defined]
-                {"patch_b64": base64.b64encode(patch_bytes).decode(), "changed_paths": ["FIX.md"]}
+                {
+                    "patch_b64": base64.b64encode(patch_bytes).decode(),
+                    "changed_paths": ["FIX.md"],
+                }
             )
             secret_token = ctx.settings.github_agent_token
 
