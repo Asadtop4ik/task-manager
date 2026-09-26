@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import (
     JSON,
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -27,6 +28,8 @@ class AgentRun(Base, TimestampMixin):
             "task_id", "task_revision", "attempt_index", name="uq_agent_run_task_attempt"
         ),
         Index("ix_agent_runs_status_created", "status", "created_at"),
+        CheckConstraint("executor IN ('github', 'local')", name="ck_agent_runs_executor"),
+        Index("ix_agent_runs_executor_status_lease", "executor", "status", "lease_until"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -77,6 +80,13 @@ class AgentRun(Base, TimestampMixin):
     review_findings: Mapped[list[dict[str, object]] | None] = mapped_column(JSON)
     merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    executor: Mapped[str] = mapped_column(
+        String(8), default="github", server_default="github", nullable=False
+    )
+    lease_id: Mapped[str | None] = mapped_column(String(36))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_kind: Mapped[str | None] = mapped_column(String(12))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     task: Mapped["Task"] = relationship()
 

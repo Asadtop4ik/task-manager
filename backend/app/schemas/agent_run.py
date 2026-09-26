@@ -47,6 +47,7 @@ class AgentRunOut(BaseModel):
     review_findings: list[dict[str, object]] | None
     merged_at: datetime | None
     deployed_at: datetime | None
+    executor: str
 
 
 class AgentRunCallback(BaseModel):
@@ -265,6 +266,7 @@ class AgentNotificationOut(BaseModel):
     qa_ready_sha: str | None = None
     qa_deploy_dispatch_status: str | None = None
     qa_deploy_dispatch_error: str | None = None
+    executor: str = "github"
 
 
 class AgentNoticeAck(BaseModel):
@@ -293,6 +295,64 @@ class AgentMetricsOut(BaseModel):
     input_tokens: int
     cached_input_tokens: int
     output_tokens: int
+
+
+class AgentLeaseRequest(BaseModel):
+    lane: Literal["code"] = "code"
+
+
+class AgentWorkOut(BaseModel):
+    run_id: str
+    kind: Literal["implement", "review", "correction"]
+    lease_id: str
+    lease_until: datetime
+    attempts: int
+    attempt_index: int
+    task_id: int
+    task_revision: str
+    repo_full_name: str
+    base_branch: str
+    mode: str
+    title: str
+    description: str
+    image_count: int
+    complexity: Literal["simple", "complex"] | None
+    relevant_files: list[str]
+    branch: str | None
+    pr_url: str | None
+    pr_number: int | None
+    head_sha: str | None
+    action_id: str | None
+    instruction: str | None
+    expected_head_sha: str | None
+
+
+class AgentLeaseHeartbeat(BaseModel):
+    lease_id: str
+
+
+class AgentLeaseHeartbeatOut(BaseModel):
+    lease_until: datetime
+
+
+AgentStage = Literal[
+    "leased",
+    "workspace_ready",
+    "codex_started",
+    "codex_finished",
+    "patch_validated",
+    "preflight_passed",
+    "branch_pushed",
+    "review_started",
+    "correction_pushed",
+    "retrying",
+]
+
+
+class AgentStageReport(BaseModel):
+    lease_id: str
+    stage: AgentStage
+    error: str | None = Field(default=None, max_length=1000)
 
 
 class AgentEventOut(BaseModel):

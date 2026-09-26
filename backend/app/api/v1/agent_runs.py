@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Literal, cast
 from urllib.parse import quote
@@ -42,6 +42,9 @@ from app.schemas.agent_run import (
     AgentDeployment,
     AgentEventOut,
     AgentImageOut,
+    AgentLeaseHeartbeat,
+    AgentLeaseHeartbeatOut,
+    AgentLeaseRequest,
     AgentMerge,
     AgentMetricsOut,
     AgentNoticeAck,
@@ -59,6 +62,8 @@ from app.schemas.agent_run import (
     AgentRunDetailOut,
     AgentRunOut,
     AgentRunStart,
+    AgentStageReport,
+    AgentWorkOut,
     ExternalAgentPending,
     MetricDuration,
 )
@@ -72,6 +77,11 @@ from app.services.agent_repos import (
     repository_for,
 )
 from app.services.telegram_media import IMAGE_MIMES, telegram_image
+
+_LEASE_MINUTES = 5
+_WATCHDOG_DISPATCHED_MINUTES = 30
+_WATCHDOG_LEASE_MINUTES = 15
+_AGENT_SVC_TIMEOUT_ERROR = "agent-svc javob bermadi"
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -292,6 +302,162 @@ def _duration_summary(values: list[float]) -> MetricDuration:
 def _worker_auth(token: str | None) -> None:
     if not token or not hmac.compare_digest(token, settings.service_token):
         raise HTTPException(status_code=401, detail="invalid worker token")
+
+
+def _agent_svc_auth(token: str | None) -> None:
+    if not settings.agent_svc_token:
+        raise HTTPException(status_code=404, detail="not found")
+    if not token or not hmac.compare_digest(token, settings.agent_svc_token):
+        raise HTTPException(status_code=401, detail="invalid agent-svc token")
+
+
+def _require_lease(run: AgentRun, lease_id: str | None) -> None:
+    if run.lease_id is None or lease_id != run.lease_id:
+        raise HTTPException(status_code=409, detail="lease_mismatch")
+
+
+def _clear_lease(run: AgentRun) -> None:
+    run.lease_id = None
+    run.lease_until = None
+    run.lease_kind = None
+    run.heartbeat_at = None
+
+
+def _use_local_executor(project_key: str, mode: str) -> bool:
+    return mode == "pr" and project_key in settings.agent_local_executor_projects
+
+
+def _review_needed(run: AgentRun) -> bool:
+    """True exactly when the GitHub flow would dispatch `agent_pr_review`.
+
+    Shared by the local-executor lease query and tests, so both agree on the
+    single definition of "review still needed for the current head".
+    """
+    return bool(
+        run.pr_url
+        and run.status in {"pr_opened", "pr_ready"}
+        and run.ci_status == "success"
+        and run.ci_verified_sha is not None
+        and run.ci_verified_sha == run.head_sha
+        and run.review_sha != run.head_sha
+    )
+
+
+def _mark_running(
+    session: DbSession,
+    run: AgentRun,
+    changed: bool,
+    *,
+    github_run_url: str | None = None,
+) -> None:
+    """Same effects as a callback reporting status=running: start the runner
+    clock, record the transition, and move the task into progress. Reused by
+    the local-executor lease endpoint's implement step."""
+    now = datetime.now(UTC)
+    if run.runner_started_at is None:
+        run.runner_started_at = now
+    if changed:
+        agent_events.record(session, run, github_run_url=github_run_url)
+    if can_transition(TaskStatus(run.task.status), TaskStatus.IN_PROGRESS):
+        old = run.task.status
+        run.task.status = TaskStatus.IN_PROGRESS
+        run.task.started_at = run.task.started_at or now
+        activity.record(
+            session,
+            task_id=run.task_id,
+            actor=None,
+            kind=ActivityKind.STATUS_CHANGED,
+            payload={
+                "from": old,
+                "to": TaskStatus.IN_PROGRESS.value,
+                "agent_run_id": run.run_id,
+            },
+        )
+
+
+def _pr_number(pr_url: str | None) -> int | None:
+    if not pr_url:
+        return None
+    tail = pr_url.rsplit("/", 1)[-1]
+    return int(tail) if tail.isdecimal() else None
+
+
+async def _intake_complexity(
+    session: DbSession, task_id: int
+) -> tuple[Literal["simple", "complex"] | None, list[str]]:
+    intake = await session.scalar(select(AgentIntake).where(AgentIntake.task_id == task_id))
+    if intake is None:
+        return None, []
+    brief = intake.brief or {}
+    complexity = brief.get("complexity")
+    if complexity not in {"simple", "complex"}:
+        complexity = None
+    relevant_files = brief.get("relevant_files")
+    if not isinstance(relevant_files, list) or not all(
+        isinstance(item, str) for item in relevant_files
+    ):
+        relevant_files = []
+    return cast(Literal["simple", "complex"] | None, complexity), relevant_files
+
+
+async def _image_count(session: DbSession, task_id: int) -> int:
+    rows = await session.scalars(
+        select(Attachment.mime).where(Attachment.task_id == task_id).limit(3)
+    )
+    return sum(1 for mime in rows if mime in IMAGE_MIMES)
+
+
+async def _issue_lease(
+    session: DbSession,
+    run: AgentRun,
+    kind: Literal["implement", "review", "correction"],
+    now: datetime,
+    *,
+    action: AgentRunAction | None = None,
+) -> AgentWorkOut:
+    run.lease_id = str(uuid4())
+    run.lease_until = now + timedelta(minutes=_LEASE_MINUTES)
+    run.lease_kind = kind
+    run.heartbeat_at = now
+    # No event recorded here: `_mark_running`/the correction dispatch mirror
+    # already record the GitHub-parity event for this pickup, and agent-svc
+    # reports its own "leased" moment through POST /stage.
+    complexity, relevant_files = await _intake_complexity(session, run.task_id)
+    image_count = await _image_count(session, run.task_id)
+    await session.commit()
+    return AgentWorkOut(
+        run_id=run.run_id,
+        kind=kind,
+        lease_id=run.lease_id,
+        lease_until=run.lease_until,
+        attempts=run.attempts,
+        attempt_index=run.attempt_index,
+        task_id=run.task_id,
+        task_revision=run.task_revision,
+        repo_full_name=run.repo_full_name,
+        base_branch=run.base_branch,
+        mode=run.mode,
+        title=run.task.title,
+        description=run.task.description or "",
+        image_count=image_count,
+        complexity=complexity,
+        relevant_files=relevant_files,
+        branch=_run_branch(run),
+        pr_url=run.pr_url,
+        pr_number=_pr_number(run.pr_url),
+        head_sha=run.head_sha,
+        action_id=action.action_id if action is not None else None,
+        instruction=(
+            cast(str | None, action.request_data.get("instruction"))
+            if action is not None
+            else None
+        ),
+        expected_head_sha=(
+            cast(str | None, action.request_data.get("expected_head_sha"))
+            if action is not None
+            else None
+        ),
+    )
 
 
 def _qa_deploy_auth(token: str | None) -> None:
@@ -643,11 +809,257 @@ async def _close_pr(run: AgentRun) -> None:
         raise HTTPException(status_code=409, detail="GitHub could not close this PR")
 
 
+@router.post("/lease", response_model=AgentWorkOut)
+async def lease_agent_work(
+    payload: AgentLeaseRequest,
+    session: DbSession,
+    x_agent_svc_token: str | None = Header(default=None),
+) -> AgentWorkOut | Response:
+    """Hand agent-svc one unit of local-executor work, in a fixed priority order.
+
+    Order: reclaim expired leases first (failing exhausted implement attempts),
+    then an independent review, then an owner correction, then a fresh
+    implement job. Each candidate set is row-locked with SKIP LOCKED so two
+    concurrent lease calls never hand out the same run.
+    """
+    _agent_svc_auth(x_agent_svc_token)
+    now = datetime.now(UTC)
+
+    expired = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                AgentRun.executor == "local",
+                AgentRun.lease_id.is_not(None),
+                AgentRun.lease_until < now,
+            )
+            .options(selectinload(AgentRun.task))
+            .order_by(AgentRun.id)
+            .limit(20)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    for stale in expired:
+        if stale.lease_kind == "implement" and stale.attempts >= 2:
+            stale.status = "failed"
+            stale.error = _AGENT_SVC_TIMEOUT_ERROR
+            stale.finished_at = now
+            stale.notified_at = None
+            _clear_lease(stale)
+            agent_events.record(session, stale, phase="lease", error=stale.error)
+            if can_transition(TaskStatus(stale.task.status), TaskStatus.BLOCKED):
+                old = stale.task.status
+                stale.task.status = TaskStatus.BLOCKED
+                activity.record(
+                    session,
+                    task_id=stale.task_id,
+                    actor=None,
+                    kind=ActivityKind.STATUS_CHANGED,
+                    payload={
+                        "from": old,
+                        "to": TaskStatus.BLOCKED.value,
+                        "agent_run_id": stale.run_id,
+                    },
+                )
+        else:
+            # Undo whatever the lease pickup changed so the right step below
+            # (review needs no undo; implement/correction do) can hand this
+            # run out again.
+            if stale.lease_kind == "implement" and stale.status == "running":
+                stale.status = "dispatched"
+            elif stale.lease_kind == "correction":
+                stale_action = await session.scalar(
+                    select(AgentRunAction)
+                    .where(
+                        AgentRunAction.agent_run_id == stale.id,
+                        AgentRunAction.kind == "correction",
+                        AgentRunAction.status == "in_progress",
+                    )
+                    .with_for_update()
+                )
+                if stale_action is not None:
+                    stale_action.status = "accepted"
+                if stale.status == "correction_running":
+                    stale.status = "pr_opened"
+                    _refresh_pr_ready(stale)
+            _clear_lease(stale)
+    if expired:
+        await session.flush()
+
+    review_candidates = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                AgentRun.executor == "local",
+                AgentRun.lease_id.is_(None),
+                AgentRun.status.in_(["pr_opened", "pr_ready"]),
+                AgentRun.ci_status == "success",
+                AgentRun.pr_url.is_not(None),
+            )
+            .options(selectinload(AgentRun.task))
+            .order_by(AgentRun.id)
+            .limit(20)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    review_run = next((run for run in review_candidates if _review_needed(run)), None)
+    if review_run is not None:
+        return await _issue_lease(session, review_run, "review", now)
+
+    correction_row = (
+        await session.execute(
+            select(AgentRun, AgentRunAction)
+            .join(AgentRunAction, AgentRunAction.agent_run_id == AgentRun.id)
+            .where(
+                AgentRun.executor == "local",
+                AgentRun.lease_id.is_(None),
+                AgentRunAction.kind == "correction",
+                AgentRunAction.status == "accepted",
+            )
+            .options(selectinload(AgentRun.task))
+            .order_by(AgentRunAction.agent_run_id)
+            .limit(1)
+            .with_for_update(of=[AgentRun, AgentRunAction], skip_locked=True)
+        )
+    ).first()
+    if correction_row is not None:
+        correction_run, correction_action = correction_row
+        correction_action.status = "in_progress"
+        correction_run.status = "correction_running"
+        correction_run.notified_at = None
+        agent_events.record(session, correction_run, phase="correction")
+        return await _issue_lease(
+            session, correction_run, "correction", now, action=correction_action
+        )
+
+    implement_run = await session.scalar(
+        select(AgentRun)
+        .where(
+            AgentRun.executor == "local",
+            AgentRun.status == "dispatched",
+            AgentRun.lease_id.is_(None),
+        )
+        .options(selectinload(AgentRun.task))
+        .order_by(AgentRun.id)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    if implement_run is not None:
+        implement_run.attempts += 1
+        changed = implement_run.status != "running"
+        implement_run.status = "running"
+        _mark_running(session, implement_run, changed)
+        return await _issue_lease(session, implement_run, "implement", now)
+
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.post("/{run_id}/heartbeat", response_model=AgentLeaseHeartbeatOut)
+async def agent_work_heartbeat(
+    run_id: str,
+    payload: AgentLeaseHeartbeat,
+    session: DbSession,
+    x_agent_svc_token: str | None = Header(default=None),
+) -> AgentLeaseHeartbeatOut:
+    _agent_svc_auth(x_agent_svc_token)
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).with_for_update()
+    )
+    if run is None or run.executor != "local":
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.status == "cancelled":
+        raise HTTPException(status_code=409, detail="cancelled")
+    now = datetime.now(UTC)
+    if run.lease_id != payload.lease_id:
+        raise HTTPException(status_code=409, detail="lease_mismatch")
+    if run.lease_until is None or run.lease_until < now:
+        raise HTTPException(status_code=409, detail="lease_expired")
+    run.lease_until = now + timedelta(minutes=_LEASE_MINUTES)
+    run.heartbeat_at = now
+    await session.commit()
+    return AgentLeaseHeartbeatOut(lease_until=run.lease_until)
+
+
+@router.post("/{run_id}/stage", status_code=204)
+async def agent_work_stage(
+    run_id: str,
+    payload: AgentStageReport,
+    session: DbSession,
+    x_agent_svc_token: str | None = Header(default=None),
+) -> None:
+    _agent_svc_auth(x_agent_svc_token)
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.run_id == run_id).with_for_update()
+    )
+    if run is None or run.executor != "local":
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.lease_id != payload.lease_id:
+        raise HTTPException(status_code=409, detail="lease_mismatch")
+    agent_events.record(session, run, status=payload.stage, phase="stage", error=payload.error)
+    await session.commit()
+
+
+async def _fail_stale_local_runs(session: DbSession) -> None:
+    """Watchdog for a dead or unreachable agent-svc.
+
+    Runs inside the notifications poll (every 10s) rather than only inside
+    `/lease`, because a fully stalled agent-svc never calls `/lease` again to
+    trigger that endpoint's own expired-lease cleanup.
+    """
+    now = datetime.now(UTC)
+    dispatched_cutoff = now - timedelta(minutes=_WATCHDOG_DISPATCHED_MINUTES)
+    lease_cutoff = now - timedelta(minutes=_WATCHDOG_LEASE_MINUTES)
+    stale_runs = (
+        await session.scalars(
+            select(AgentRun)
+            .where(
+                AgentRun.executor == "local",
+                or_(
+                    (AgentRun.status == "dispatched")
+                    & AgentRun.lease_id.is_(None)
+                    & (AgentRun.created_at < dispatched_cutoff),
+                    AgentRun.lease_id.is_not(None) & (AgentRun.lease_until < lease_cutoff),
+                ),
+            )
+            .options(selectinload(AgentRun.task))
+            .order_by(AgentRun.id)
+            .limit(20)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    if not stale_runs:
+        return
+    for run in stale_runs:
+        run.status = "failed"
+        run.error = _AGENT_SVC_TIMEOUT_ERROR
+        run.finished_at = now
+        run.notified_at = None
+        _clear_lease(run)
+        agent_events.record(session, run, phase="lease", error=run.error)
+        if can_transition(TaskStatus(run.task.status), TaskStatus.BLOCKED):
+            old = run.task.status
+            run.task.status = TaskStatus.BLOCKED
+            activity.record(
+                session,
+                task_id=run.task_id,
+                actor=None,
+                kind=ActivityKind.STATUS_CHANGED,
+                payload={
+                    "from": old,
+                    "to": TaskStatus.BLOCKED.value,
+                    "agent_run_id": run.run_id,
+                },
+            )
+    await session.commit()
+
+
 @router.get("/notifications", response_model=list[AgentNotificationOut])
 async def pending_notifications(
     session: DbSession, x_agent_worker_token: str | None = Header(default=None)
 ) -> list[AgentNotificationOut]:
     _worker_auth(x_agent_worker_token)
+    await _fail_stale_local_runs(session)
     runs = (
         await session.scalars(
             select(AgentRun)
@@ -739,6 +1151,7 @@ async def pending_notifications(
                 url=run.ci_url,
             ),
             actions=_run_detail(run).actions,
+            executor=run.executor,
             qa_ready_url=run.qa_ready_url,
             qa_ready_sha=run.qa_ready_sha,
             qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
@@ -1059,7 +1472,10 @@ async def agent_pr_ci_result(
         _refresh_pr_ready(run)
         run.notified_at = None
         agent_events.record(session, run, phase="ci", github_run_url=run.ci_url)
-        await _dispatch_external_review(run, pr_number)
+        if run.executor != "local":
+            # A local-executor review is picked up by the next `/lease` call
+            # (see `_review_needed`) instead of a repository_dispatch.
+            await _dispatch_external_review(run, pr_number)
         target_status = TaskStatus.REVIEW
     else:
         run.status = "pr_opened"
@@ -1099,6 +1515,7 @@ async def agent_pr_review_result(
     payload: AgentReviewResult,
     session: DbSession,
     x_agent_callback_token: str | None = Header(default=None),
+    x_agent_lease_id: str | None = Header(default=None),
 ) -> AgentRunOut:
     _image_callback_auth(x_agent_callback_token)
     run = await session.scalar(
@@ -1109,6 +1526,8 @@ async def agent_pr_review_result(
     )
     if run is None or run.status not in {"pr_opened", "pr_ready"} or not run.pr_url:
         raise HTTPException(status_code=409, detail="agent PR is not awaiting review")
+    if run.executor == "local":
+        _require_lease(run, x_agent_lease_id)
     if run.head_sha != payload.sha:
         raise HTTPException(status_code=409, detail="review does not match current PR head")
     pr_number = run.pr_url.rsplit("/", 1)[-1]
@@ -1159,6 +1578,8 @@ async def agent_pr_review_result(
             ),
             phase="review",
         )
+    if run.executor == "local":
+        _clear_lease(run)
     await session.commit()
     return AgentRunOut.model_validate(run)
 
@@ -1324,6 +1745,10 @@ async def _request_owner_action(
         action.result = None
     assert action is not None
     await session.commit()
+    if kind == "correction" and run.executor == "local":
+        # agent-svc picks this up itself via the next `/agent-runs/lease`
+        # call (lease step 3); no repository_dispatch for a local run.
+        return _action_response(action, run)
     payload: dict[str, object] = {
         "expected_head_sha": expected_head_sha,
         "task_id": run.task_id,
@@ -1423,6 +1848,7 @@ async def agent_action_result(
     payload: AgentActionResult,
     session: DbSession,
     x_agent_callback_token: str | None = Header(default=None),
+    x_agent_lease_id: str | None = Header(default=None),
 ) -> AgentRunOut:
     _image_callback_auth(x_agent_callback_token)
     await _lock_qa_project_for_run(session, run_id)
@@ -1450,6 +1876,12 @@ async def agent_action_result(
         raise HTTPException(status_code=409, detail="release action result changed")
     if action.status == "rejected":
         return AgentRunOut.model_validate(run)
+    # Merge actions keep the GitHub workflow for both executors; only a local
+    # correction is reported by agent-svc and needs its lease checked. Checked
+    # after the idempotent replays above so a retry of an already-finished
+    # result never 409s just because the lease was already cleared.
+    if run.executor == "local" and action.kind == "correction":
+        _require_lease(run, x_agent_lease_id)
     if payload.status == "rejected":
         action.status = (
             "retryable" if await _merge_rejection_is_retryable(run, action) else "rejected"
@@ -1458,6 +1890,8 @@ async def agent_action_result(
         if action.kind == "correction" and run.status == "correction_running":
             run.status = "pr_opened"
             _refresh_pr_ready(run)
+        if run.executor == "local" and action.kind == "correction":
+            _clear_lease(run)
         await session.commit()
         return AgentRunOut.model_validate(run)
 
@@ -1528,6 +1962,8 @@ async def agent_action_result(
     else:
         raise HTTPException(status_code=409, detail="unknown release action")
     action.status = "completed"
+    if run.executor == "local" and action.kind == "correction":
+        _clear_lease(run)
     await session.commit()
     return AgentRunOut.model_validate(run)
 
@@ -1715,6 +2151,14 @@ async def start_agent_run(
                 raise
             return AgentRunOut.model_validate(existing)
         await session.refresh(run)
+    if _use_local_executor(task.project.key, mode):
+        # agent-svc leases this run itself (see POST /agent-runs/lease); it
+        # never goes through repository_dispatch.
+        run.executor = "local"
+        run.status = "dispatched"
+        agent_events.record(session, run)
+        await session.commit()
+        return AgentRunOut.model_validate(run)
     if run.attempts >= 2:
         run.status = "failed"
         run.error = "GitHub dispatch retry limit reached"
@@ -1796,8 +2240,9 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
                     "agent_run_id": run_id,
                 },
             )
-    else:
+    elif run.executor != "local":
         await _cancel_github(run)
+    _clear_lease(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
     agent_events.record(session, run)
@@ -2243,6 +2688,7 @@ async def agent_run_callback(
     payload: AgentRunCallback,
     session: DbSession,
     x_agent_callback_token: str | None = Header(default=None),
+    x_agent_lease_id: str | None = Header(default=None),
 ) -> AgentRunOut:
     if (
         not settings.agent_callback_token
@@ -2285,8 +2731,12 @@ async def agent_run_callback(
         "cancelled",
         "failed",
     }:
+        # An idempotent replay of an already-finished status; never require a
+        # lease that a prior terminal callback already cleared.
         return AgentRunOut.model_validate(run)
 
+    if run.executor == "local":
+        _require_lease(run, x_agent_lease_id)
     if payload.status in {"validating", "publishing", "deploying"}:
         if not payload.head_sha:
             raise HTTPException(status_code=400, detail="fast branch SHA is required")
@@ -2327,8 +2777,6 @@ async def agent_run_callback(
         payload.status == "failed" and run.error != payload.error
     )
     run.status = payload.status
-    if payload.status == "running" and run.runner_started_at is None:
-        run.runner_started_at = datetime.now(UTC)
     if payload.status == "pr_opened" and run.pr_opened_at is None:
         run.pr_opened_at = datetime.now(UTC)
     if payload.github_run_url:
@@ -2338,7 +2786,9 @@ async def agent_run_callback(
             raise HTTPException(status_code=400, detail="invalid GitHub run URL")
         run.github_run_url = payload.github_run_url
     run.error = payload.error
-    if changed:
+    if payload.status == "running":
+        _mark_running(session, run, changed, github_run_url=payload.github_run_url)
+    elif changed:
         agent_events.record(
             session,
             run,
@@ -2356,6 +2806,10 @@ async def agent_run_callback(
             phase=payload.failure_phase if payload.status == "failed" else None,
             github_run_url=payload.github_run_url,
         )
+    if run.executor == "local" and payload.status in {"pr_opened", "failed"}:
+        # Implement lease done: a review is leased separately once CI is
+        # green, or the run is terminal and needs no further lease at all.
+        _clear_lease(run)
     if payload.input_tokens is not None:
         run.input_tokens = payload.input_tokens
     if payload.cached_input_tokens is not None:
@@ -2377,23 +2831,6 @@ async def agent_run_callback(
             payload={
                 "from": old,
                 "to": TaskStatus.BLOCKED.value,
-                "agent_run_id": run_id,
-            },
-        )
-    if payload.status == "running" and can_transition(
-        TaskStatus(run.task.status), TaskStatus.IN_PROGRESS
-    ):
-        old = run.task.status
-        run.task.status = TaskStatus.IN_PROGRESS
-        run.task.started_at = run.task.started_at or datetime.now(UTC)
-        activity.record(
-            session,
-            task_id=run.task_id,
-            actor=None,
-            kind=ActivityKind.STATUS_CHANGED,
-            payload={
-                "from": old,
-                "to": TaskStatus.IN_PROGRESS.value,
                 "agent_run_id": run_id,
             },
         )

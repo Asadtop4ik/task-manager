@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.agent_repos import QA_REPOSITORY, REPOSITORIES
+
 _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
 # Values that are fine locally and must never reach production. A bot token or JWT
@@ -95,6 +97,22 @@ class Settings(BaseSettings):
     ketoshop_diagnostics_enabled: bool = Field(
         default=False, alias="KETOSHOP_DIAGNOSTICS_ENABLED"
     )
+    # Local agent-svc executor: a systemd service that leases coding work instead
+    # of GitHub Actions running it. Empty project list keeps every project on the
+    # existing GitHub dispatch path, byte-for-byte.
+    agent_svc_token: str = Field(default="", alias="AGENT_SVC_TOKEN")
+    agent_local_executor_projects: frozenset[str] = Field(
+        default_factory=frozenset, alias="AGENT_LOCAL_EXECUTOR_PROJECTS"
+    )
+
+    @field_validator("agent_local_executor_projects", mode="before")
+    @classmethod
+    def _parse_local_executor_projects(cls, value: object) -> frozenset[str]:
+        if isinstance(value, str):
+            return frozenset(part.strip() for part in value.split(",") if part.strip())
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return frozenset(str(part).strip() for part in value if str(part).strip())
+        return frozenset()
 
     # --- Web ---
     public_url: str = Field(default="http://localhost:5173", alias="PUBLIC_URL")
@@ -163,6 +181,24 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "AGENT_QA_READY_URL must target the isolated loopback readiness route"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _local_executor_projects_are_valid(self) -> "Settings":
+        if not self.agent_local_executor_projects:
+            return self
+        if len(self.agent_svc_token) < 32:
+            raise ValueError(
+                "AGENT_SVC_TOKEN must be at least 32 characters when "
+                "AGENT_LOCAL_EXECUTOR_PROJECTS is set"
+            )
+        known_keys = {item.project_key for item in REPOSITORIES} | {QA_REPOSITORY.project_key}
+        unknown = self.agent_local_executor_projects - known_keys
+        if unknown:
+            raise ValueError(
+                "AGENT_LOCAL_EXECUTOR_PROJECTS has unknown project key(s): "
+                f"{', '.join(sorted(unknown))}"
+            )
         return self
 
     @property
