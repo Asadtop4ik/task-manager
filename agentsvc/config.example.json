@@ -1,0 +1,55 @@
+{
+  "api_base_url": "https://tasks.standart-eko.uz/api/v1",
+  "paths": {
+    "trusted_dir": "/opt/agent-svc/trusted",
+    "tools_dir": "/opt/agent-svc/tools",
+    "libexec_dir": "/opt/agent-svc/libexec",
+    "state_dir": "/var/lib/agent-svc",
+    "mirrors_dir": "/var/lib/agent-svc/mirrors",
+    "publish_dir": "/var/lib/agent-svc/publish",
+    "runs_dir": "/var/lib/agent-svc/runs",
+    "work_dir": "/srv/agent-svc/work",
+    "codex_home_code": "/home/codex-runner/.codex-code",
+    "codex_home_chat": "/home/codex-runner/.codex-chat",
+    "codex_child_sudo": ["sudo", "-n", "-u", "codex-runner", "/usr/bin/python3", "/opt/agent-svc/libexec/codex_child.py"],
+    "image_state_sudo": ["sudo", "-n", "-u", "root", "/usr/bin/python3", "/opt/agent-svc/libexec/image_state.py"]
+  },
+  "lanes": {
+    "code": {
+      "enabled": false,
+      "poll_interval_s": 5,
+      "error_backoff_start_s": 30,
+      "error_backoff_max_s": 600
+    },
+    "chat": {
+      "enabled": false,
+      "poll_interval_s": 5,
+      "error_backoff_start_s": 30,
+      "error_backoff_max_s": 600
+    },
+    "watch": {
+      "enabled": false,
+      "poll_interval_s": 15,
+      "error_backoff_start_s": 30,
+      "error_backoff_max_s": 600
+    }
+  },
+  "heartbeat_interval_s": 30,
+  "models": {
+    "chat": { "model": "gpt-6-luna", "effort": "medium", "sandbox": "workspace-write", "multi_agent": false },
+    "intake": { "model": "gpt-6-luna", "effort": "high", "sandbox": "read-only", "multi_agent": false },
+    "implement_simple": { "model": "gpt-6-luna", "effort": "high", "sandbox": "workspace-write", "multi_agent": false },
+    "implement_complex": { "model": "gpt-6-sol", "effort": "medium", "sandbox": "workspace-write", "multi_agent": true },
+    "correction_simple": { "model": "gpt-6-luna", "effort": "high", "sandbox": "workspace-write", "multi_agent": false },
+    "correction_complex": { "model": "gpt-6-sol", "effort": "medium", "sandbox": "workspace-write", "multi_agent": true },
+    "review": { "model": "gpt-6-sol", "effort": "medium", "sandbox": "read-only", "multi_agent": false }
+  },
+  "timeouts_s": {
+    "intake": 180,
+    "implement_simple": 1200,
+    "implement_complex": 2100,
+    "correction": 1200,
+    "review": 480,
+    "idle": 480
+  }
+}

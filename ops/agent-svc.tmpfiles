@@ -1,0 +1,7 @@
+# agent-svc runtime directories. /var/lib/agent-svc itself is created by the unit's
+# StateDirectory= (0750 agent-svc:agent-svc); the mirrors/ subdirectory under it is
+# created by agent-svc at startup (0750, group agentwork, setgid) so codex-runner's
+# read-only bare-mirror fetches land with the right group ownership from the first run.
+d /srv/agent-svc 0750 agent-svc agentwork -
+d /srv/agent-svc/work 2770 agent-svc agentwork 3d
+d /var/lib/agent-svc/publish 0700 agent-svc agent-svc 1d

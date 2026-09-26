@@ -1,0 +1,15 @@
+# agent-svc sudo rules: two exact, argv-pinned commands, nothing else.
+# Defaults env_reset (the system default, not overridden here) strips the calling
+# environment before exec, so agent-svc cannot inject secrets or PATH tricks into
+# either target command via the environment.
+Defaults:agent-svc !requiretty
+
+# Run the sandboxed Codex child as the unprivileged codex-runner account. Only these
+# four subcommands plus --version are allowed; codex_child.py itself validates every
+# argument it receives on stdin (run_id, lane, model, effort, sandbox, paths).
+agent-svc ALL=(codex-runner) NOPASSWD: /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py cleanup, /usr/bin/python3 /opt/agent-svc/libexec/codex_child.py --version
+
+# Read-only Docker state for the project catalog's containers. Runs as root because
+# codex-runner is not in the docker group; image_state.py only calls `docker inspect`
+# on catalog-listed container names and prints image/running/health JSON.
+agent-svc ALL=(root) NOPASSWD: /usr/bin/python3 /opt/agent-svc/libexec/image_state.py *
