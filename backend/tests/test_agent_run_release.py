@@ -348,6 +348,8 @@ async def test_qa_merge_workflow_rejection_retries_with_same_action_id_when_stil
         ci_status="success",
         review_status="clean",
     )
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
     run.repo_full_name = "Asadtop4ik/agent-qa"
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/3"
@@ -435,6 +437,8 @@ async def test_stale_qa_merge_rejection_stays_rejected_and_invalidates_evidence(
         ci_status="success",
         review_status="clean",
     )
+    project.key = "agent-qa"
+    project.repo_full_name = "Asadtop4ik/agent-qa"
     run.repo_full_name = "Asadtop4ik/agent-qa"
     run.base_branch = "main"
     run.pr_url = "https://github.com/Asadtop4ik/agent-qa/pull/3"
