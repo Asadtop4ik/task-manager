@@ -165,8 +165,103 @@ def _write_subagent_rollout(child_thread_id: str, *, root_thread_id: str, tokens
     )
 
 
+def _app_server_read(control_path: Path) -> dict[str, Any]:
+    """Re-read the control file on every call: a test can drop a fresh
+    scenario into the "wt" snapshot directory (this fake's own cwd, set by
+    `codex_child.py`'s `discussion` subcommand) at any point, since app-server
+    mode has no TMPDIR-based control channel the way `exec` mode does."""
+    if control_path.is_file():
+        try:
+            data = json.loads(control_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {}
+
+
+def _app_server_main() -> int:
+    """A minimal fake `codex app-server --stdio`: one JSON-RPC turn.
+
+    Speaks just enough of the real protocol for `libexec/codex_child.py
+    cmd_discussion`'s tests: `initialize`/`initialized`, `thread/start` or
+    `thread/resume`, `turn/start`, then either a normal
+    `item/completed`+`turn/completed` pair or one of a few scripted failure
+    scenarios (an incoming approval request, silence/hang, an error
+    response, or a turn with no final answer).
+    """
+    control_path = Path("fake_app_server_control.json")
+
+    def send(message: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return 0
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        control = _app_server_read(control_path)
+        scenario = control.get("scenario", "normal")
+        thread_id = control.get("thread_id", "thr_new")
+        final_message = control.get("final_message", "Javob tayyor.")
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            send({"id": request_id, "result": {}})
+        elif method == "initialized":
+            continue
+        elif method in ("thread/start", "thread/resume"):
+            if scenario == "open_error":
+                send({"id": request_id, "error": {"message": "cannot open thread"}})
+                continue
+            resumed = message.get("params", {}).get("threadId")
+            send({"id": request_id, "result": {"thread": {"id": resumed or thread_id}}})
+        elif method == "turn/start":
+            send({"id": request_id, "result": {"turn": {"id": "turn_1"}}})
+            if scenario == "approval_request":
+                send(
+                    {
+                        "id": 77,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {},
+                    }
+                )
+                continue
+            if scenario == "hang":
+                time.sleep(float(control.get("sleep_s", 60)))
+                continue
+            if scenario == "no_final_answer":
+                send({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+                continue
+            send(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": final_message,
+                        }
+                    },
+                }
+            )
+            send({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+        # Any other method (notifications this fake does not model) is
+        # silently ignored, like the real app-server would send many more
+        # notifications a minimal client never needs to react to.
+
+
 def main() -> int:
     argv = sys.argv[1:]
+    if argv and argv[0] == "app-server":
+        return _app_server_main()
     control = _load_control()
 
     def opt(key: str, env_name: str, default: str) -> str:

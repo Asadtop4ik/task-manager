@@ -77,6 +77,7 @@ DEFAULT_MODEL_MATRIX: dict[str, dict[str, Any]] = {
 # Seconds. "idle" is a single global idle-timeout applied to every exec call.
 DEFAULT_TIMEOUTS: dict[str, int] = {
     "intake": 180,
+    "chat": 150,
     "implement_simple": 1200,
     "implement_complex": 2100,
     "correction": 1200,

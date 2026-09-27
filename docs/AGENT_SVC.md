@@ -28,7 +28,7 @@ Task Manager API (tasks.standart-eko.uz/api/v1)
 agent-svc  — user agent-svc, /opt/agent-svc/current (release symlink), systemd xizmati
   - CodeLane / ChatLane / WatchLoop (har biri alohida thread, mustaqil xato-tiklanish)
   - GitHub API mijozi, bare git mirror'lar (/srv/agent-svc/mirrors)
-      | sudo -n -u agent-codex /usr/bin/python3 -I libexec/codex_child.py {prepare,exec,package,cleanup}
+      | sudo -n -u agent-codex /usr/bin/python3 -I libexec/codex_child.py {prepare,exec,package,preflight,cleanup,discussion}
       v
 agent-codex (faqat shu maqsad uchun, codex-runner EMAS; bubblewrap + AppArmor sandbox)
   - CODEX_HOME = .codex-code (kod lane) yoki .codex-chat (suhbat lane)
@@ -91,7 +91,15 @@ asboblar, kredensiallar, config, unit, sudoers, tmpfiles) joyiga tushgach, qayta
 ishga tushiradi. Keyin ketma-ket bajaradi:
 
 1. `agentwork` guruhini, `agent-svc` va `agent-codex` foydalanuvchilarini yaratadi
-   (mavjud bo'lmasa; guruh allaqachon mavjud bo'lsa ham xatosiz).
+   (mavjud bo'lmasa; guruh allaqachon mavjud bo'lsa ham xatosiz). Shu bosqichda
+   (agar server'da `codex-runner` guruhi mavjud bo'lsa) `agent-codex` shu guruhga
+   ham qo'shiladi — **faqat** `/suhbat` (chat lane) uchun Ketoshop diagnostika
+   socket'iga (`/run/task-manager-diagnostics/diagnostics.sock`, rejim 0660,
+   `ops/task-manager-diagnostics.service`ning `Group=codex-runner`i) o'qish/yozish
+   ruxsati bersin deb. Socket'ning o'z guruhi, rejimi yoki
+   `ops/diagnostic_host.py`ning discussion-id/lease-id bo'yicha qayta
+   avtorizatsiyasi (haqiqiy xavfsizlik chegarasi — shu joyda hech narsa
+   yumshatilmaydi) o'zgarmaydi; bu faqat POSIX guruh a'zoligi.
 2. Kodni **faqat `git archive $commit`dan** (ishchi katalogdan emas) staging orqali
    `/opt/agent-svc/releases/<commit>/`ga o'rnatadi (agar shu commit uchun release
    allaqachon to'liq mavjud bo'lsa, qayta qurmaydi va **hech qachon** joriy

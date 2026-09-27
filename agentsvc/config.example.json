@@ -62,6 +62,7 @@
   },
   "timeouts": {
     "intake": 180,
+    "chat": 150,
     "implement_simple": 1200,
     "implement_complex": 2100,
     "correction": 1200,

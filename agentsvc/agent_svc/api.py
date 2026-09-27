@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, NoReturn
@@ -24,6 +24,22 @@ _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 _KINDS = frozenset({"implement", "review", "correction"})
 _COMPLEXITIES = frozenset({"simple", "complex"})
 _MAX_RELEVANT_FILES = 12
+
+# Chat lane (intake / discussion) constants. These endpoints (`/agent-intakes`,
+# `/project-discussions`) are a separate contract from `/agent-runs`: a
+# different auth header (`X-Intake-Worker-Token`, never `X-Agent-Svc-Token`)
+# and a worker-chosen lease header name (`X-Intake-Lease-ID`), ported from
+# `ops/intake_worker.py` exactly.
+_INTAKE_MODES = frozenset({"pr", "fast"})
+_ALLOWED_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_THREAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")
+_MAX_INTAKE_IMAGES = 3
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# Ported verbatim from `ops/intake_worker.py poll_discussion_once`: diagnostics
+# may only be enabled for this one fixed repository/branch, regardless of what
+# `project_key` a lease response claims.
+_KETOSHOP_REPO = "muradjanov-dev/ketoshop"
+_KETOSHOP_BRANCH = "master"
 
 STAGES = frozenset(
     {
@@ -268,6 +284,193 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     )
 
 
+@dataclass(frozen=True)
+class IntakeImage:
+    mime: str
+    size: int | None
+
+
+@dataclass(frozen=True)
+class IntakeLease:
+    intake_id: int
+    revision: int
+    lease_id: str
+    text: str
+    answer_text: str | None
+    mode: Literal["pr", "fast"]
+    images: tuple[IntakeImage, ...]
+    repo_full_name: str
+    base_branch: str
+    analysis_rounds: int
+
+
+@dataclass(frozen=True)
+class DiscussionLease:
+    discussion_id: int
+    revision: int
+    lease_id: str
+    repo_full_name: str
+    base_branch: str
+    project_key: str
+    diagnostics_enabled: bool
+    thread_id: str | None
+    text: str
+    images: tuple[IntakeImage, ...]
+
+
+def _parse_chat_images(
+    raw: Any, *, fail: Callable[[str], NoReturn]
+) -> tuple[IntakeImage, ...]:
+    if not isinstance(raw, list) or len(raw) > _MAX_INTAKE_IMAGES:
+        fail("has invalid images")
+    images: list[IntakeImage] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            fail("has an invalid image")
+        mime = item.get("mime")
+        size = item.get("size")
+        if mime not in _ALLOWED_IMAGE_MIMES:
+            fail("has an unsupported image type")
+        if size is not None and (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 1
+            or size > _MAX_IMAGE_BYTES
+        ):
+            fail("has an invalid image size")
+        images.append(IntakeImage(mime=mime, size=size))
+    return tuple(images)
+
+
+def parse_intake_lease(payload: Any, catalog: Mapping[str, str]) -> IntakeLease:
+    """Validate one `IntakeWorkOut` lease response (agent-intakes contract).
+
+    Ports `ops/intake_worker.py`'s `_validate_lease`/`_lease_identity` checks
+    exactly, against the current `IntakeWorkOut` schema (no `file_id` field
+    is used by the fetch itself -- image downloads are index-based -- but its
+    presence/shape is still validated for defense in depth, as legacy did).
+    """
+    if not isinstance(payload, dict):
+        raise InvalidResponse("intake lease response is not an object")
+
+    def fail(message: str) -> NoReturn:
+        raise InvalidResponse(f"intake lease response {message}")
+
+    intake_id = payload.get("id")
+    if _bad_int(intake_id, minimum=1):
+        fail("has an invalid id")
+    assert isinstance(intake_id, int)
+    revision = payload.get("revision")
+    if _bad_int(revision, minimum=1):
+        fail("has an invalid revision")
+    assert isinstance(revision, int)
+    lease_id = _valid_lease_id(payload.get("lease_id"))
+    if lease_id is None:
+        fail("has an invalid lease_id")
+    text = payload.get("text")
+    if not isinstance(text, str):
+        fail("has an invalid text")
+    answer_text = payload.get("answer_text")
+    if answer_text is not None and not isinstance(answer_text, str):
+        fail("has an invalid answer_text")
+    mode = payload.get("mode")
+    if mode not in _INTAKE_MODES:
+        fail("has an invalid mode")
+    repo_full_name = payload.get("repo_full_name")
+    base_branch = payload.get("base_branch")
+    if not isinstance(repo_full_name, str) or catalog.get(repo_full_name) != base_branch:
+        fail("has a repository outside the approved catalog")
+    assert isinstance(base_branch, str)
+    analysis_rounds = payload.get("analysis_rounds")
+    if _bad_int(analysis_rounds, minimum=0):
+        fail("has an invalid analysis_rounds")
+    assert isinstance(analysis_rounds, int)
+    images = _parse_chat_images(payload.get("images"), fail=fail)
+    return IntakeLease(
+        intake_id=intake_id,
+        revision=revision,
+        lease_id=lease_id,
+        text=text,
+        answer_text=answer_text,
+        mode=mode,
+        images=images,
+        repo_full_name=repo_full_name,
+        base_branch=base_branch,
+        analysis_rounds=analysis_rounds,
+    )
+
+
+def parse_discussion_lease(payload: Any, catalog: Mapping[str, str]) -> DiscussionLease:
+    """Validate one `DiscussionWork` lease response (project-discussions contract).
+
+    Ports the inline validation in `ops/intake_worker.py`'s
+    `poll_discussion_once` exactly, including the hardcoded ketoshop-only
+    diagnostics restriction (never derived from `project_key` alone).
+    """
+    if not isinstance(payload, dict):
+        raise InvalidResponse("discussion lease response is not an object")
+
+    def fail(message: str) -> NoReturn:
+        raise InvalidResponse(f"discussion lease response {message}")
+
+    discussion_id = payload.get("id")
+    if _bad_int(discussion_id, minimum=1):
+        fail("has an invalid id")
+    assert isinstance(discussion_id, int)
+    revision = payload.get("revision")
+    if _bad_int(revision, minimum=0):
+        fail("has an invalid revision")
+    assert isinstance(revision, int)
+    lease_id = _valid_lease_id(payload.get("lease_id"))
+    if lease_id is None:
+        fail("has an invalid lease_id")
+    repo_full_name = payload.get("repo_full_name")
+    base_branch = payload.get("base_branch")
+    if not isinstance(repo_full_name, str) or catalog.get(repo_full_name) != base_branch:
+        fail("has a repository outside the approved catalog")
+    assert isinstance(base_branch, str)
+    project_key = payload.get("project_key")
+    if not isinstance(project_key, str):
+        fail("has an invalid project_key")
+    diagnostics_enabled = payload.get("diagnostics_enabled", False)
+    if not isinstance(diagnostics_enabled, bool):
+        fail("has an invalid diagnostics_enabled")
+    if diagnostics_enabled and (
+        project_key != "ketoshop"
+        or repo_full_name != _KETOSHOP_REPO
+        or base_branch != _KETOSHOP_BRANCH
+    ):
+        fail("has diagnostics enabled for an unapproved project")
+    thread_id = payload.get("thread_id")
+    if thread_id is not None and (
+        not isinstance(thread_id, str) or not _THREAD_ID_RE.fullmatch(thread_id)
+    ):
+        fail("has an invalid thread_id")
+    text = payload.get("text")
+    if not isinstance(text, str):
+        fail("has an invalid text")
+    images = _parse_chat_images(payload.get("images"), fail=fail)
+    return DiscussionLease(
+        discussion_id=discussion_id,
+        revision=revision,
+        lease_id=lease_id,
+        repo_full_name=repo_full_name,
+        base_branch=base_branch,
+        project_key=project_key,
+        diagnostics_enabled=diagnostics_enabled,
+        thread_id=thread_id,
+        text=text,
+        images=images,
+    )
+
+
+def _content_type(headers: Mapping[str, str]) -> str:
+    for key, value in headers.items():
+        if key.lower() == "content-type":
+            return value.split(";", 1)[0].strip().lower()
+    return ""
+
+
 def _detail(exc: HttpError) -> str:
     try:
         parsed = json.loads(exc.snippet)
@@ -307,10 +510,13 @@ class TaskManagerApi:
         if not svc_token.strip() or not callback_token.strip():
             raise ValueError("agent-svc API requires its service and callback tokens")
         self._base = base_url.rstrip("/") + "/agent-runs"
+        # Chat lane (intake / discussion): a separate contract, base path,
+        # and auth header from the code lane above -- see `agent-svc-
+        # contract.md` and `ops/intake_worker.py`.
+        self._intake_base = base_url.rstrip("/") + "/agent-intakes"
+        self._discussion_base = base_url.rstrip("/") + "/project-discussions"
         self._svc_token = svc_token
         self._callback_token = callback_token
-        # Reserved for a future intake-lease integration; not used by any
-        # method below yet.
         self._intake_token = intake_token
         self._http = http
         self._catalog = catalog
@@ -329,6 +535,27 @@ class TaskManagerApi:
             content_type="application/json" if body is not None else None,
         )
         return self._http.send(request)
+
+    def _intake_worker_call(
+        self,
+        method: str,
+        base: str,
+        path: str,
+        *,
+        lease_id: str | None = None,
+        body: Any = None,
+        max_bytes: int | None = None,
+    ) -> HttpResponse:
+        extra = (("X-Intake-Lease-ID", lease_id),) if lease_id is not None else ()
+        request = self._http.build_request(
+            method,
+            f"{base}{path}",
+            auth_header=("X-Intake-Worker-Token", self._intake_token),
+            extra_headers=extra,
+            body=_encode(body),
+            content_type="application/json" if body is not None else None,
+        )
+        return self._http.send(request, max_bytes=max_bytes)
 
     def _callback_call(
         self, method: str, path: str, *, lease_id: str | None = None, body: Any = None
@@ -451,6 +678,81 @@ class TaskManagerApi:
             body={"sha": sha, "github_run_url": github_run_url},
         )
         return None if response.status == 204 else self._http.json(response)
+
+    # -- Chat lane: task intake -------------------------------------------
+
+    def lease_intake(self) -> IntakeLease | None:
+        response = self._intake_worker_call("POST", self._intake_base, "/lease")
+        if response.status == 204:
+            return None
+        return parse_intake_lease(self._http.json(response), self._catalog)
+
+    def intake_image(self, intake_id: int, lease_id: str, index: int) -> tuple[bytes, str]:
+        lease_id = _require_lease_id(lease_id)
+        response = self._intake_worker_call(
+            "GET",
+            self._intake_base,
+            f"/{intake_id}/images/{index}",
+            lease_id=lease_id,
+            max_bytes=_MAX_IMAGE_BYTES,
+        )
+        return response.body, _content_type(response.headers)
+
+    def report_intake_result(
+        self, intake_id: int, *, revision: int, lease_id: str, result: Mapping[str, Any]
+    ) -> None:
+        lease_id = _require_lease_id(lease_id)
+        self._intake_worker_call(
+            "POST",
+            self._intake_base,
+            f"/{intake_id}/result",
+            body={"revision": revision, "lease_id": lease_id, **result},
+        )
+
+    # -- Chat lane: project discussion (/suhbat) --------------------------
+
+    def lease_discussion(self) -> DiscussionLease | None:
+        response = self._intake_worker_call("POST", self._discussion_base, "/lease")
+        if response.status == 204:
+            return None
+        return parse_discussion_lease(self._http.json(response), self._catalog)
+
+    def discussion_image(
+        self, discussion_id: int, lease_id: str, index: int
+    ) -> tuple[bytes, str]:
+        lease_id = _require_lease_id(lease_id)
+        response = self._intake_worker_call(
+            "GET",
+            self._discussion_base,
+            f"/{discussion_id}/images/{index}",
+            lease_id=lease_id,
+            max_bytes=_MAX_IMAGE_BYTES,
+        )
+        return response.body, _content_type(response.headers)
+
+    def report_discussion_result(
+        self,
+        discussion_id: int,
+        *,
+        revision: int,
+        lease_id: str,
+        thread_id: str | None,
+        response: str | None,
+        error: str | None,
+    ) -> None:
+        lease_id = _require_lease_id(lease_id)
+        self._intake_worker_call(
+            "POST",
+            self._discussion_base,
+            f"/{discussion_id}/result",
+            body={
+                "revision": revision,
+                "lease_id": lease_id,
+                "thread_id": thread_id,
+                "response": response,
+                "error": error,
+            },
+        )
 
 
 def _encode(body: Any) -> bytes | None:

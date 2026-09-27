@@ -20,8 +20,9 @@ Defaults:agent-svc !requiretty
 # ops/install_agent_svc.sh); the sudoers rule is pinned to these stable paths, never
 # to a release-specific one. There is no `--version` entry: agent_svc's self-check
 # verifies this rule is reachable with `sudo -n -l`, which does not require running
-# the target command at all.
-agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py preflight, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py cleanup
+# the target command at all. `discussion` (Phase 3, chat lane): one read-only
+# `/suhbat` app-server turn, same trust boundary as the other five.
+agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py preflight, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py cleanup, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py discussion
 
 # Read-only Docker state for the project catalog's containers. Runs as root because
 # neither agent-svc nor agent-codex is in the docker group; image_state.py only

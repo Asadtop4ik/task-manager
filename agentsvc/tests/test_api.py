@@ -8,10 +8,18 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from agent_svc.api import InvalidWork, LeaseLost, TaskManagerApi
+from agent_svc.api import (
+    IntakeImage,
+    InvalidResponse,
+    InvalidWork,
+    LeaseLost,
+    TaskManagerApi,
+    parse_discussion_lease,
+    parse_intake_lease,
+)
 from agent_svc.http import JsonHttp
 
-CATALOG = {"Asadtop4ik/task-manager": "main"}
+CATALOG = {"Asadtop4ik/task-manager": "main", "muradjanov-dev/ketoshop": "master"}
 BASE_URL = "https://tasks.example.test/api/v1"
 # The contract sets lease_id via uuid4(); every method now validates it as one.
 LEASE_ID = "22222222-2222-2222-2222-222222222222"
@@ -48,10 +56,12 @@ def _work_payload(**overrides: Any) -> dict[str, Any]:
 
 
 class FakeResponse:
-    def __init__(self, body: bytes = b"", *, status: int = 200) -> None:
+    def __init__(
+        self, body: bytes = b"", *, status: int = 200, mime: str | None = None
+    ) -> None:
         self.body = body
         self.status = status
-        self.headers: dict[str, str] = {}
+        self.headers: dict[str, str] = {"Content-Type": mime} if mime else {}
 
     def __enter__(self) -> FakeResponse:
         return self
@@ -270,6 +280,213 @@ class StatusAndMonitorTests(unittest.TestCase):
         api.deployed("run-1", sha="a" * 40, github_run_url="https://x")
         self.assertTrue(opener.requests[0].full_url.endswith("/run-1/merged"))
         self.assertTrue(opener.requests[1].full_url.endswith("/run-1/deployed"))
+
+
+def _intake_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": 34,
+        "revision": 3,
+        "lease_id": LEASE_ID,
+        "text": "Task",
+        "answer_text": None,
+        "mode": "pr",
+        "images": [],
+        "repo_full_name": "Asadtop4ik/task-manager",
+        "base_branch": "main",
+        "analysis_rounds": 0,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _discussion_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": 5,
+        "revision": 1,
+        "lease_id": LEASE_ID,
+        "repo_full_name": "Asadtop4ik/task-manager",
+        "base_branch": "main",
+        "project_key": "task-manager",
+        "diagnostics_enabled": False,
+        "thread_id": None,
+        "text": "Salom",
+        "images": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class IntakeLeaseParsingTests(unittest.TestCase):
+    def test_valid_payload_parses(self) -> None:
+        lease = parse_intake_lease(_intake_payload(), CATALOG)
+        self.assertEqual(lease.intake_id, 34)
+        self.assertEqual(lease.repo_full_name, "Asadtop4ik/task-manager")
+        self.assertEqual(lease.images, ())
+
+    def test_unapproved_repository_rejected(self) -> None:
+        with self.assertRaises(InvalidResponse):
+            parse_intake_lease(_intake_payload(repo_full_name="someone-else/repo"), CATALOG)
+
+    def test_unapproved_branch_for_an_approved_repository_rejected(self) -> None:
+        with self.assertRaises(InvalidResponse):
+            parse_intake_lease(
+                _intake_payload(repo_full_name="muradjanov-dev/ketoshop", base_branch="main"),
+                CATALOG,
+            )
+
+    def test_non_uuid_lease_id_rejected(self) -> None:
+        with self.assertRaises(InvalidResponse):
+            parse_intake_lease(_intake_payload(lease_id="not-a-uuid"), CATALOG)
+
+    def test_fast_mode_accepted(self) -> None:
+        lease = parse_intake_lease(_intake_payload(mode="fast"), CATALOG)
+        self.assertEqual(lease.mode, "fast")
+
+    def test_invalid_mode_rejected(self) -> None:
+        with self.assertRaises(InvalidResponse):
+            parse_intake_lease(_intake_payload(mode="fastest"), CATALOG)
+
+    def test_image_with_unsupported_mime_rejected(self) -> None:
+        images = [{"mime": "image/gif", "size": 1}]
+        with self.assertRaises(InvalidResponse):
+            parse_intake_lease(_intake_payload(images=images), CATALOG)
+
+    def test_more_than_three_images_rejected(self) -> None:
+        images = [{"mime": "image/png", "size": 1}] * 4
+        with self.assertRaises(InvalidResponse):
+            parse_intake_lease(_intake_payload(images=images), CATALOG)
+
+    def test_valid_image_metadata_parses(self) -> None:
+        images = [{"mime": "image/png", "size": 4}]
+        lease = parse_intake_lease(_intake_payload(images=images), CATALOG)
+        self.assertEqual(lease.images, (IntakeImage(mime="image/png", size=4),))
+
+
+class DiscussionLeaseParsingTests(unittest.TestCase):
+    def test_valid_payload_parses(self) -> None:
+        lease = parse_discussion_lease(_discussion_payload(), CATALOG)
+        self.assertEqual(lease.discussion_id, 5)
+        self.assertFalse(lease.diagnostics_enabled)
+
+    def test_diagnostics_only_allowed_for_ketoshop_project_key(self) -> None:
+        payload = _discussion_payload(
+            repo_full_name="muradjanov-dev/ketoshop",
+            base_branch="master",
+            project_key="task-manager",
+            diagnostics_enabled=True,
+        )
+        with self.assertRaises(InvalidResponse):
+            parse_discussion_lease(payload, CATALOG)
+
+    def test_diagnostics_only_allowed_for_the_ketoshop_repository(self) -> None:
+        payload = _discussion_payload(
+            repo_full_name="Asadtop4ik/task-manager",
+            base_branch="main",
+            project_key="ketoshop",
+            diagnostics_enabled=True,
+        )
+        with self.assertRaises(InvalidResponse):
+            parse_discussion_lease(payload, CATALOG)
+
+    def test_diagnostics_enabled_for_ketoshop_parses(self) -> None:
+        payload = _discussion_payload(
+            repo_full_name="muradjanov-dev/ketoshop",
+            base_branch="master",
+            project_key="ketoshop",
+            diagnostics_enabled=True,
+        )
+        lease = parse_discussion_lease(payload, CATALOG)
+        self.assertTrue(lease.diagnostics_enabled)
+
+    def test_invalid_thread_id_rejected(self) -> None:
+        with self.assertRaises(InvalidResponse):
+            parse_discussion_lease(_discussion_payload(thread_id="has spaces"), CATALOG)
+
+    def test_valid_thread_id_parses(self) -> None:
+        lease = parse_discussion_lease(_discussion_payload(thread_id="thr_abc-1"), CATALOG)
+        self.assertEqual(lease.thread_id, "thr_abc-1")
+
+
+class IntakeApiTests(unittest.TestCase):
+    def test_lease_intake_204_returns_none(self) -> None:
+        api, opener = _api([FakeResponse(b"", status=204)])
+        self.assertIsNone(api.lease_intake())
+        self.assertEqual(
+            opener.requests[0].get_header("X-intake-worker-token"), "intake-token"
+        )
+        self.assertTrue(opener.requests[0].full_url.endswith("/agent-intakes/lease"))
+
+    def test_lease_intake_parses_valid_payload(self) -> None:
+        api, _opener = _api([FakeResponse(json.dumps(_intake_payload()).encode(), status=200)])
+        lease = api.lease_intake()
+        assert lease is not None
+        self.assertEqual(lease.intake_id, 34)
+
+    def test_intake_image_sends_lease_header_and_returns_body_and_mime(self) -> None:
+        api, opener = _api([FakeResponse(b"png!", status=200, mime="image/png")])
+        body, mime = api.intake_image(34, LEASE_ID, 0)
+        self.assertEqual((body, mime), (b"png!", "image/png"))
+        request = opener.requests[0]
+        self.assertTrue(request.full_url.endswith("/agent-intakes/34/images/0"))
+        self.assertEqual(request.get_header("X-intake-lease-id"), LEASE_ID)
+        self.assertEqual(request.get_header("X-intake-worker-token"), "intake-token")
+
+    def test_report_intake_result_posts_revision_lease_id_and_result_fields(self) -> None:
+        api, opener = _api([FakeResponse(b"", status=200)])
+        api.report_intake_result(
+            34, revision=3, lease_id=LEASE_ID, result={"status": "failed", "error": "x"}
+        )
+        request = opener.requests[0]
+        self.assertTrue(request.full_url.endswith("/agent-intakes/34/result"))
+        sent = json.loads(request.data)
+        self.assertEqual(
+            sent, {"revision": 3, "lease_id": LEASE_ID, "status": "failed", "error": "x"}
+        )
+
+
+class DiscussionApiTests(unittest.TestCase):
+    def test_lease_discussion_204_returns_none(self) -> None:
+        api, opener = _api([FakeResponse(b"", status=204)])
+        self.assertIsNone(api.lease_discussion())
+        self.assertTrue(opener.requests[0].full_url.endswith("/project-discussions/lease"))
+
+    def test_lease_discussion_parses_valid_payload(self) -> None:
+        api, _opener = _api(
+            [FakeResponse(json.dumps(_discussion_payload()).encode(), status=200)]
+        )
+        lease = api.lease_discussion()
+        assert lease is not None
+        self.assertEqual(lease.discussion_id, 5)
+
+    def test_discussion_image_sends_lease_header(self) -> None:
+        api, opener = _api([FakeResponse(b"jpg!", status=200, mime="image/jpeg")])
+        body, mime = api.discussion_image(5, LEASE_ID, 1)
+        self.assertEqual((body, mime), (b"jpg!", "image/jpeg"))
+        request = opener.requests[0]
+        self.assertTrue(request.full_url.endswith("/project-discussions/5/images/1"))
+        self.assertEqual(request.get_header("X-intake-lease-id"), LEASE_ID)
+
+    def test_report_discussion_result_posts_expected_body(self) -> None:
+        api, opener = _api([FakeResponse(b"", status=200)])
+        api.report_discussion_result(
+            5,
+            revision=1,
+            lease_id=LEASE_ID,
+            thread_id="thr_1",
+            response="Javob",
+            error=None,
+        )
+        sent = json.loads(opener.requests[0].data)
+        self.assertEqual(
+            sent,
+            {
+                "revision": 1,
+                "lease_id": LEASE_ID,
+                "thread_id": "thr_1",
+                "response": "Javob",
+                "error": None,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -242,7 +242,12 @@ class CodexRunner:
         return self._parse_child_reply(subcommand, completed.returncode, completed.stdout)
 
     def _call_with_grace(
-        self, subcommand: str, request: dict[str, Any], timeout_s: float
+        self,
+        subcommand: str,
+        request: dict[str, Any],
+        timeout_s: float,
+        *,
+        cancel: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Like `_simple_call`, but on timeout SIGTERMs `sudo` (relayed to the
         agent-codex child it supervises) and waits `sigkill_grace_s` before
@@ -253,12 +258,30 @@ class CodexRunner:
         trusted tool subprocess) would otherwise be killed out from under
         its own cleanup rather than given a chance to exit on its own; the
         child's own internal deadline/subreaper (see `PREFLIGHT_DEADLINE_S`
-        in `codex_child.py`) is the backstop if it doesn't."""
+        in `codex_child.py`) is the backstop if it doesn't.
+
+        `cancel` (used by `run_discussion`, never by `preflight`): a
+        background watcher SIGTERMs `sudo` early if `cancel` fires before the
+        call would otherwise finish, so a service shutdown interrupts an
+        in-flight discussion turn instead of blocking for its full timeout.
+        Passing `None` (the default) reproduces the exact prior behavior."""
         argv = self._argv(subcommand)
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
         process = self._popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        stop_watch = threading.Event()
+        cancel_watcher: threading.Thread | None = None
+        if cancel is not None:
+
+            def _watch_cancel() -> None:
+                while not stop_watch.is_set():
+                    if cancel.wait(timeout=0.5):
+                        self._send_sigterm(process)
+                        return
+
+            cancel_watcher = threading.Thread(target=_watch_cancel, daemon=True)
+            cancel_watcher.start()
         try:
             stdout_bytes, _stderr_bytes = process.communicate(payload, timeout=timeout_s)
         except subprocess.TimeoutExpired as exc:
@@ -270,6 +293,10 @@ class CodexRunner:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.communicate(timeout=5)
             raise CodexChildError(-1, f"codex child {subcommand} timed out") from exc
+        finally:
+            stop_watch.set()
+            if cancel_watcher is not None:
+                cancel_watcher.join(timeout=1)
         return self._parse_child_reply(subcommand, process.returncode, stdout_bytes)
 
     def prepare(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
@@ -285,6 +312,28 @@ class CodexRunner:
 
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("cleanup", request, timeout_s)
+
+    def run_discussion(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout_s: float,
+        cancel: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """One `/suhbat` app-server turn (single JSON-in, JSON-out call).
+
+        Unlike `run_exec`, the child never streams intermediate JSONL: only
+        the final `{"thread_id", "response"}` frame reaches stdout (tool
+        noise goes to the child's own stderr instead), so this reuses the
+        single-request/single-reply `_call_with_grace` plumbing `preflight`
+        already relies on for its own SIGTERM-then-grace cancellation
+        discipline, rather than `run_exec`'s line-streaming protocol.
+        `timeout_s` here is the OUTER wall clock the parent waits before
+        SIGTERM-ing `sudo`; callers should pass a small margin over the
+        child's own internal deadline (`request["timeout_s"]`) so the
+        child's clean, reasoned timeout wins the race, not our SIGTERM.
+        """
+        return self._call_with_grace("discussion", request, timeout_s, cancel=cancel)
 
     def run_exec(
         self,

@@ -19,8 +19,10 @@ from .api import TaskManagerApi, Work
 from .config import ConfigError, Settings, build_settings, load_config, load_secrets
 from .context import ServiceContext, build_context, token_selector
 from .correction import handle_correction
+from .discussion import handle_discussion
 from .http import JsonHttp
 from .implement import handle_implement
+from .intake import handle_intake
 from .lanes import ChatLane, CodeLane, WatchLoop
 from .log import Redactor
 from .recovery import recover
@@ -167,6 +169,8 @@ def run(settings: Settings) -> int:
         logger=logger,
         poll_s=settings.poll_interval_s,
         enabled=settings.chat_lane_enabled,
+        handle_intake=lambda lease: handle_intake(ctx, lease),
+        handle_discussion=lambda lease: handle_discussion(ctx, lease),
     )
     watch_loop = WatchLoop(
         checks=build_watch_checks(ctx) if settings.watch_enabled else [],

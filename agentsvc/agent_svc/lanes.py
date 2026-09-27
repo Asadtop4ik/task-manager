@@ -12,8 +12,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from threading import Event
 
+from .api import DiscussionLease, IntakeLease, LeaseLost, TaskManagerApi, Work
 from .api import InvalidResponse as ApiInvalidResponse
-from .api import LeaseLost, TaskManagerApi, Work
 from .log import Logger
 
 _INITIAL_BACKOFF_S = 30.0
@@ -154,14 +154,34 @@ class CodeLane(LoopRunner):
 
 
 class ChatLane(LoopRunner):
-    """Phase-3 placeholder: disabled until chat leasing/dispatch is implemented."""
+    """Leases task-intake and `/suhbat` discussion work, one job per tick.
+
+    Intake is checked first, and a discussion lease is only attempted when
+    there was no intake work to do -- matching legacy `ops/intake_worker.py
+    run_forever`'s own `poll_once()` -> (idle) -> `poll_discussion_once()`
+    order exactly, including that a lease-fetch failure for intake skips the
+    discussion poll for that tick too (the legacy worker's single top-level
+    `except Exception` around one whole `poll_once()` call already had this
+    effect). Each leased job runs through `LoopRunner.isolate` under its own
+    record id (`intake-<id>` / `discussion-<id>`), so one bad intake or
+    discussion never blocks the other kind or a later job of the same kind.
+    """
 
     def __init__(
-        self, *, api: TaskManagerApi, logger: Logger, poll_s: float, enabled: bool = False
+        self,
+        *,
+        api: TaskManagerApi,
+        logger: Logger,
+        poll_s: float,
+        enabled: bool = False,
+        handle_intake: Callable[[IntakeLease], None] | None = None,
+        handle_discussion: Callable[[DiscussionLease], None] | None = None,
     ) -> None:
         super().__init__(logger=logger, poll_s=poll_s)
         self._api = api
         self._enabled = enabled
+        self._handle_intake = handle_intake
+        self._handle_discussion = handle_discussion
 
     @property
     def name(self) -> str:
@@ -170,8 +190,75 @@ class ChatLane(LoopRunner):
     def tick(self) -> None:
         if not self._enabled:
             return
-        # Phase 3: chat lane leasing/dispatch is not implemented yet.
-        return
+        if self._lease_and_run_intake():
+            return
+        self._lease_and_run_discussion()
+
+    def _lease_and_run_intake(self) -> bool:
+        """True if there was intake work (or a lease-fetch problem) this tick."""
+        try:
+            lease = self._api.lease_intake()
+        except Exception as exc:
+            self._logger.error(exc, event="intake_lease_failed", lane=self.name)
+            return True
+        if lease is None:
+            return False
+        record_id = f"intake-{lease.intake_id}"
+        if self.in_backoff(record_id):
+            self._logger.event(
+                "leased_record_in_backoff",
+                level="warning",
+                lane=self.name,
+                task_id=lease.intake_id,
+                stage="leased",
+                detail="this intake recently failed and is still cooling down",
+            )
+            return True
+        if self._handle_intake is None:
+            self._logger.event(
+                "stage_not_implemented",
+                level="error",
+                lane=self.name,
+                task_id=lease.intake_id,
+                stage="leased",
+                detail="no intake handler registered",
+            )
+            return True
+        handler = self._handle_intake
+        self.isolate(record_id, lambda: handler(lease))
+        return True
+
+    def _lease_and_run_discussion(self) -> None:
+        try:
+            lease = self._api.lease_discussion()
+        except Exception as exc:
+            self._logger.error(exc, event="discussion_lease_failed", lane=self.name)
+            return
+        if lease is None:
+            return
+        record_id = f"discussion-{lease.discussion_id}"
+        if self.in_backoff(record_id):
+            self._logger.event(
+                "leased_record_in_backoff",
+                level="warning",
+                lane=self.name,
+                task_id=lease.discussion_id,
+                stage="leased",
+                detail="this discussion recently failed and is still cooling down",
+            )
+            return
+        if self._handle_discussion is None:
+            self._logger.event(
+                "stage_not_implemented",
+                level="error",
+                lane=self.name,
+                task_id=lease.discussion_id,
+                stage="leased",
+                detail="no discussion handler registered",
+            )
+            return
+        handler = self._handle_discussion
+        self.isolate(record_id, lambda: handler(lease))
 
 
 class WatchLoop(LoopRunner):
