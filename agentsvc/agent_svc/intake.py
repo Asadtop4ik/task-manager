@@ -86,6 +86,12 @@ class IntakeError(ValueError):
 def handle_intake(ctx: ServiceContext, lease: IntakeLease) -> None:
     with ChatRun(ctx) as run:
         result = _analyze(ctx, lease, run)
+    if result is None:
+        # Cancelled (service shutdown): the Task Manager API already owns
+        # this lease's fate (it will expire and be re-leased on its own,
+        # same as legacy dying mid-analysis under a systemd restart) --
+        # posting here would race whatever picks it up next.
+        return
     _post_result(ctx, lease, result)
 
 
@@ -98,12 +104,14 @@ def _post_result(ctx: ServiceContext, lease: IntakeLease, result: dict[str, Any]
         ctx.logger.error(exc, event="intake_result_delivery_failed", task_id=lease.intake_id)
 
 
-def _analyze(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> dict[str, Any]:
+def _analyze(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> dict[str, Any] | None:
     try:
         image_paths = _download_images(ctx, lease, run)
         if run.cancel.is_set():
-            return {"status": "failed", "error": _GENERIC_FAILURE_MESSAGE}
-        base_sha = ctx.mirrors.fetch(lease.repo_full_name, lease.base_branch)
+            return None
+        base_sha = ctx.mirrors.fetch(
+            lease.repo_full_name, lease.base_branch, timeout=run.remaining_s()
+        )
         mirror_path = ctx.mirrors.mirror_path(lease.repo_full_name)
         ctx.codex.prepare(
             {
@@ -111,13 +119,14 @@ def _analyze(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> dict[str,
                 "repo": lease.repo_full_name,
                 "mirror": str(mirror_path),
                 "base_sha": base_sha,
-            }
+            },
+            timeout_s=min(60.0, run.remaining_s()),
         )
         if run.cancel.is_set():
-            return {"status": "failed", "error": _GENERIC_FAILURE_MESSAGE}
+            return None
 
         route = ctx.settings.model_matrix["intake"]
-        timeout_s = ctx.settings.timeouts["intake"]
+        timeout_s = min(ctx.settings.timeouts["intake"], run.remaining_s())
         codex_result = ctx.codex.run_exec(
             {
                 "run_id": run.run_id,
@@ -125,7 +134,10 @@ def _analyze(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> dict[str,
                 "cwd": "wt",
                 "model": route["model"],
                 "effort": route["effort"],
-                "sandbox": route["sandbox"],
+                # Never trust config.json for this: intake must NEVER run
+                # with write access, regardless of what an operator's
+                # model_matrix says.
+                "sandbox": "read-only",
                 "multi_agent": route["multi_agent"],
                 "prompt": _build_prompt(lease),
                 "images": [str(path) for path in image_paths],
@@ -138,11 +150,12 @@ def _analyze(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> dict[str,
             cancel=run.cancel,
         )
         if codex_result.cancelled:
-            return {"status": "failed", "error": _GENERIC_FAILURE_MESSAGE}
+            return None
         if codex_result.timed_out or codex_result.idle_killed:
             return {"status": "failed", "error": _TIMED_OUT_MESSAGE}
         if codex_result.exit_code != 0:
-            raise IntakeError(_GENERIC_FAILURE_MESSAGE)
+            # Matches legacy `_run_codex`'s own IntakeError text exactly.
+            raise IntakeError(f"Codex analysis process exited {codex_result.exit_code}")
 
         result = _validate_result(_parse_final_message(codex_result.final_message))
         if lease.analysis_rounds > 0 and result["status"] == "needs_answers":
@@ -151,6 +164,8 @@ def _analyze(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> dict[str,
     except IntakeError as exc:
         return {"status": "failed", "error": str(exc)}
     except Exception as exc:
+        if run.cancel.is_set():
+            return None
         ctx.logger.error(exc, event="intake_analysis_failed", task_id=lease.intake_id)
         return {"status": "failed", "error": _GENERIC_FAILURE_MESSAGE}
 
@@ -161,7 +176,9 @@ def _download_images(ctx: ServiceContext, lease: IntakeLease, run: ChatRun) -> l
     target = run.run_dir / "images"
     paths = []
     for index, image in enumerate(lease.images):
-        data, content_type = ctx.api.intake_image(lease.intake_id, lease.lease_id, index)
+        data, content_type = ctx.api.intake_image(
+            lease.intake_id, lease.lease_id, index, timeout=run.remaining_s()
+        )
         if content_type != image.mime:
             raise IntakeError("downloaded image MIME type does not match metadata")
         if not data or len(data) > MAX_IMAGE_BYTES:

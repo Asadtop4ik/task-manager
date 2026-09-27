@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
@@ -43,6 +44,12 @@ AUDIT_PATH = Path(
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_AUDIT_AGE = timedelta(hours=24)
 MAX_AUDIT_LINES = 500
+# Phase 3 (agent-svc chat lane): a dedicated group that owns ONLY this socket,
+# narrower than the old `codex-runner` group (the live GitHub Actions runner
+# identity, far broader than "may read this one socket"). `agent-codex`'s
+# sudoers rule for the `discussion` subcommand grants exactly this group, via
+# `sudo -g`, nothing else.
+SOCKET_GROUP = os.environ.get("TASK_MANAGER_DIAGNOSTICS_SOCKET_GROUP", "task-diag-client")
 MAX_CALLS_PER_REVISION = 10
 MAX_LOG_INPUT_BYTES = 4 * 1024 * 1024
 MAX_LOG_LINE_BYTES = 4 * 1024
@@ -685,6 +692,22 @@ def _handle_client(connection: socket.socket, host: DiagnosticHost) -> None:
         connection.sendall(encoded + b"\n")
 
 
+def _narrow_socket_group(socket_path: Path, group_name: str) -> None:
+    """Best-effort: chgrp the socket to `group_name` if that group exists on
+    this host; otherwise leave its group exactly as it is today (the
+    process's own primary/effective group, `codex-runner` per the systemd
+    unit's own `Group=`). This ordering means installing this code can never
+    itself break the still-live legacy consumer (`ops/discussion_appserver.py`,
+    running as `codex-runner`) regardless of whether the group-creation step
+    of the installer has run yet on this host.
+    """
+    try:
+        gid = grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        return
+    os.chown(socket_path, -1, gid)
+
+
 def serve(host: DiagnosticHost, socket_path: Path = SOCKET_PATH) -> None:
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     if socket_path.exists():
@@ -694,6 +717,7 @@ def serve(host: DiagnosticHost, socket_path: Path = SOCKET_PATH) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_path))
     socket_path.chmod(0o660)
+    _narrow_socket_group(socket_path, SOCKET_GROUP)
     server.listen(16)
     try:
         while True:

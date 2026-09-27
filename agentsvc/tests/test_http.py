@@ -143,6 +143,30 @@ class JsonHttpSendTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 0)
         self.assertEqual(len(opener.calls), 4)
 
+    def test_timeout_override_reaches_the_opener(self) -> None:
+        seen_timeouts: list[float | None] = []
+
+        class _RecordingOpener:
+            def __call__(self, request: object, timeout: float | None = None) -> FakeResponse:
+                seen_timeouts.append(timeout)
+                return FakeResponse(b"{}", status=200)
+
+        http = JsonHttp(opener=_RecordingOpener(), timeout=15.0)
+        http.send(JsonHttp.build_request("GET", "http://x/y"), timeout=2.5)
+        self.assertEqual(seen_timeouts, [2.5])
+
+    def test_no_timeout_override_keeps_the_instance_default(self) -> None:
+        seen_timeouts: list[float | None] = []
+
+        class _RecordingOpener:
+            def __call__(self, request: object, timeout: float | None = None) -> FakeResponse:
+                seen_timeouts.append(timeout)
+                return FakeResponse(b"{}", status=200)
+
+        http = JsonHttp(opener=_RecordingOpener(), timeout=15.0)
+        http.send(JsonHttp.build_request("GET", "http://x/y"))
+        self.assertEqual(seen_timeouts, [15.0])
+
 
 if __name__ == "__main__":
     unittest.main()

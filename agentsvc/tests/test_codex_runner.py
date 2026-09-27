@@ -312,6 +312,87 @@ class FakePopen:
         return _drain(self.stdout), _drain(self.stderr)
 
 
+class _RespondsToSigtermPopen(FakePopen):
+    """Simulates a process that exits promptly on SIGTERM (the common case
+    for `discussion`'s app-server child): plain `FakePopen.terminate()` only
+    sets a flag, never actually ending the process, which would leave a
+    cancel test unable to tell "SIGTERM sent" apart from "the full outer
+    timeout simply elapsed"."""
+
+    def terminate(self) -> None:
+        super().terminate()
+        self.finish(-15)
+
+
+class RunDiscussionCancelTests(unittest.TestCase):
+    def test_cancel_ends_the_call_well_before_the_full_timeout(self) -> None:
+        fake = _RespondsToSigtermPopen()
+        cancel = threading.Event()
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", popen=lambda *a, **k: fake)
+
+        def _cancel_soon() -> None:
+            time.sleep(0.05)
+            cancel.set()
+
+        threading.Thread(target=_cancel_soon, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises(CodexChildError) as ctx:
+            runner.run_discussion({"run_id": "r1"}, timeout_s=30, cancel=cancel)
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(fake.terminated, "the cancel watcher never SIGTERMed the child")
+        self.assertLess(elapsed, 5.0)  # far under the 30s outer timeout_s
+        self.assertEqual(ctx.exception.exit_code, -15)
+
+    def test_no_cancel_event_means_no_watcher_and_normal_success(self) -> None:
+        fake = FakePopen()
+        fake.stdout.push('{"ok": true, "thread_id": "t1", "response": "hi"}')
+        fake.finish(0)
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", popen=lambda *a, **k: fake)
+
+        result = runner.run_discussion({"run_id": "r1"}, timeout_s=5)
+
+        self.assertEqual(result, {"ok": True, "thread_id": "t1", "response": "hi"})
+        self.assertFalse(fake.terminated)
+
+    def test_run_discussion_uses_the_configured_sudo_group(self) -> None:
+        captured: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            captured.append(list(argv))
+            fake = FakePopen()
+            fake.stdout.push('{"ok": true, "thread_id": "t1", "response": "hi"}')
+            fake.finish(0)
+            return fake
+
+        runner = CodexRunner(
+            command_prefix=["/usr/bin/sudo", "-n", "-u", "agent-codex", "--"],
+            libexec_dir="/x",
+            popen=popen,
+            discussion_sudo_group="task-diag-client",
+        )
+        runner.run_discussion({"run_id": "r1"}, timeout_s=5)
+        argv = captured[0]
+        self.assertIn("-g", argv)
+        self.assertEqual(argv[argv.index("-g") + 1], "task-diag-client")
+        self.assertLess(argv.index("-g"), argv.index("--"))
+
+    def test_other_subcommands_never_get_the_sudo_group(self) -> None:
+        captured: list[list[str]] = []
+
+        def fake_runner(argv, **kwargs):
+            captured.append(list(argv))
+            return FakeCompletedProcess(0, b'{"ok": true, "head": "' + b"a" * 40 + b'"}')
+
+        runner = CodexRunner(
+            command_prefix=["/usr/bin/sudo", "-n", "-u", "agent-codex", "--"],
+            libexec_dir="/x",
+            runner=fake_runner,
+        )
+        runner.prepare({"run_id": "r1"})
+        self.assertNotIn("-g", captured[0])
+
+
 def make_frame(**overrides) -> dict:
     frame = {
         "type": "agent_svc.result",

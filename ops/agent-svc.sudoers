@@ -20,9 +20,17 @@ Defaults:agent-svc !requiretty
 # ops/install_agent_svc.sh); the sudoers rule is pinned to these stable paths, never
 # to a release-specific one. There is no `--version` entry: agent_svc's self-check
 # verifies this rule is reachable with `sudo -n -l`, which does not require running
-# the target command at all. `discussion` (Phase 3, chat lane): one read-only
-# `/suhbat` app-server turn, same trust boundary as the other five.
-agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py preflight, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py cleanup, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py discussion
+# the target command at all.
+agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py preflight, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py cleanup
+
+# `discussion` (Phase 3, chat lane): one read-only `/suhbat` app-server turn, same
+# agent-codex trust boundary as the five above, PLUS the `task-diag-client` group —
+# and ONLY that group, and ONLY for this one subcommand — so the app-server can
+# reach the owner-only Ketoshop diagnostics socket for the duration of this one
+# call. `agent-codex` is never a permanent member of `task-diag-client` (see
+# ops/install_agent_svc.sh); this is the sole place it is ever granted, matching
+# `CodexRunner.run_discussion`'s own `sudo -n -u agent-codex -g task-diag-client --`.
+agent-svc ALL=(agent-codex : task-diag-client) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py discussion
 
 # Read-only Docker state for the project catalog's containers. Runs as root because
 # neither agent-svc nor agent-codex is in the docker group; image_state.py only

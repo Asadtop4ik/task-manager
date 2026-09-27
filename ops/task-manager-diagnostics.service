@@ -13,7 +13,22 @@ EnvironmentFile=/etc/task-manager/diagnostics.env
 Environment=TASK_MANAGER_DIAGNOSTICS_SOCKET=/run/task-manager-diagnostics/diagnostics.sock
 Environment=TASK_MANAGER_DIAGNOSTICS_AUDIT_FILE=/var/log/task-manager-diagnostics/audit.jsonl
 RuntimeDirectory=task-manager-diagnostics
-RuntimeDirectoryMode=0770
+# Not 0770: the directory itself is owned by (User=, Group=) = (task-
+# diagnostics, codex-runner) -- unchanged, so this unit's own start-up never
+# gains a hard dependency on a group it does not create (see
+# `_narrow_socket_group` in diagnostic_host.py for why that ordering
+# independence matters). Group loses write (rwx -> r-x): codex-runner
+# members may still traverse into the directory to reach the socket, but can
+# no longer unlink or replace the socket file itself. `agent-codex`'s
+# sudo'd `discussion` child reaches the socket with an EFFECTIVE gid of the
+# separate `task-diag-client` group (never codex-runner, never a
+# supplementary group of the agent-codex account itself -- see
+# ops/agent-svc.sudoers), which this directory does not own; "other" is
+# given search-only access (+x, no +r: the directory cannot be listed) so
+# that path resolution alone -- connecting to a socket whose OWN mode/group
+# is the real gate -- still works for it without widening who can read this
+# directory's contents.
+RuntimeDirectoryMode=0751
 LogsDirectory=task-manager-diagnostics
 LogsDirectoryMode=0750
 UMask=0077

@@ -400,7 +400,9 @@ class FakeChatApi:
     def set_image(self, kind: str, index: int, data: bytes, mime: str) -> None:
         self._images[(kind, index)] = (data, mime)
 
-    def intake_image(self, intake_id: int, lease_id: str, index: int) -> tuple[bytes, str]:
+    def intake_image(
+        self, intake_id: int, lease_id: str, index: int, *, timeout: float | None = None
+    ) -> tuple[bytes, str]:
         return self._images[("intake", index)]
 
     def report_intake_result(
@@ -411,7 +413,12 @@ class FakeChatApi:
         )
 
     def discussion_image(
-        self, discussion_id: int, lease_id: str, index: int
+        self,
+        discussion_id: int,
+        lease_id: str,
+        index: int,
+        *,
+        timeout: float | None = None,
     ) -> tuple[bytes, str]:
         return self._images[("discussion", index)]
 

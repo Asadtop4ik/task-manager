@@ -16,6 +16,7 @@ import importlib.util
 import os
 import re
 import subprocess
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,6 +164,22 @@ class MirrorManager:
         )
         self._run = command_runner or subprocess.run
         self._redactor = redactor
+        # One lock per repo (not one global lock): the code lane (implement/
+        # correction/review) and the chat lane (intake/discussion) share
+        # this one `MirrorManager` and can each fetch a DIFFERENT repo's
+        # mirror concurrently, but two `git fetch`/`rev-parse` calls against
+        # the SAME bare mirror directory at once (one from each lane) would
+        # otherwise race on its refs/objects.
+        self._repo_locks: dict[str, threading.Lock] = {}
+        self._repo_locks_guard = threading.Lock()
+
+    def _lock_for(self, repo: str) -> threading.Lock:
+        with self._repo_locks_guard:
+            lock = self._repo_locks.get(repo)
+            if lock is None:
+                lock = threading.Lock()
+                self._repo_locks[repo] = lock
+            return lock
 
     def mirror_path(self, repo: str) -> Path:
         return self._mirrors_dir / _mirror_dir_name(repo)
@@ -197,19 +214,33 @@ class MirrorManager:
             return
         raise ValueError(f"refusing to fetch unapproved branch {branch!r} for {repo}")
 
-    def fetch(self, repo: str, branch: str) -> str:
+    def fetch(self, repo: str, branch: str, *, timeout: float | None = None) -> str:
+        """Fetch `branch` and return its exact commit sha.
+
+        `timeout` (seconds) overrides the default per-git-call timeout for
+        BOTH git calls this makes -- used by the chat lane to clamp a fetch
+        to whatever remains of its own job budget (`ChatRun.remaining_s()`);
+        omitted (the default), this reproduces the exact prior behavior.
+        Serialized per-repo (see `_lock_for`) so a concurrent fetch of the
+        SAME mirror from another lane waits instead of racing.
+        """
         self._validate_branch(repo, branch)
-        path = self.ensure(repo)
-        refspec = f"+refs/heads/{branch}:refs/heads/{branch}"
-        self._git(
-            ["fetch", "--prune", self._remote_url_for(repo), refspec],
-            cwd=path,
-            env=self._fetch_env(repo),
-        )
-        self._set_group_readable(path)
-        result = self._git(
-            ["rev-parse", f"refs/heads/{branch}"], cwd=path, env=self._base_env()
-        )
+        with self._lock_for(repo):
+            path = self.ensure(repo)
+            refspec = f"+refs/heads/{branch}:refs/heads/{branch}"
+            self._git(
+                ["fetch", "--prune", self._remote_url_for(repo), refspec],
+                cwd=path,
+                env=self._fetch_env(repo),
+                timeout=timeout,
+            )
+            self._set_group_readable(path)
+            result = self._git(
+                ["rev-parse", f"refs/heads/{branch}"],
+                cwd=path,
+                env=self._base_env(),
+                timeout=timeout,
+            )
         sha = (result.stdout or "").strip()
         if not _SHA_RE.fullmatch(sha):
             raise ValueError(f"mirror fetch for {repo} did not produce a valid commit sha")
@@ -228,7 +259,14 @@ class MirrorManager:
         # argv, never in a git config file, never in the remote URL.
         return git_auth_env(self._base_env(), self._token_for(repo))
 
-    def _git(self, args: list[str], *, cwd: Path | None, env: dict[str, str]) -> Any:
+    def _git(
+        self,
+        args: list[str],
+        *,
+        cwd: Path | None,
+        env: dict[str, str],
+        timeout: float | None = None,
+    ) -> Any:
         # Always capture: uncaptured stderr would otherwise inherit our fds
         # and reach journald unredacted, and a failure's error message would
         # be empty instead of carrying the (redacted) reason.
@@ -238,7 +276,7 @@ class MirrorManager:
             env=env,
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_S,
+            timeout=timeout if timeout is not None else _GIT_TIMEOUT_S,
             check=False,
         )
         if result.returncode != 0:

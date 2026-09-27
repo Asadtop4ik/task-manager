@@ -1689,11 +1689,13 @@ MAX_DISCUSSION_RESPONSE_CHARS = 4_000
 DISCUSSION_RPC_LINE_BYTES = 1024 * 1024
 
 # The diagnostics proxy path and socket stay exactly as today (owned by
-# `ops/task-manager-diagnostics.service`, unchanged by this move); only the
-# identity connecting to that socket changes, from `codex-runner` to
-# `agent-codex` (see `ops/install_agent_svc.sh` and `docs/AGENT_SVC.md` for
-# the matching group-membership change). Overridable in test mode, like
-# every other path constant above.
+# `ops/task-manager-diagnostics.service`, unchanged by this move). What
+# changes is only how THIS process reaches that socket: agent-codex is never
+# a member of the socket's owning group, and this subcommand's own sudoers
+# rule grants it that group (`-g`, via `agent_svc.codex.CodexRunner.
+# run_discussion`) for the duration of this one call only -- see
+# ops/agent-svc.sudoers and ops/install_agent_svc.sh. Overridable in test
+# mode, like every other path constant above.
 DIAGNOSTIC_PROXY = _env_str("DIAGNOSTIC_PROXY", "/opt/task-manager/ops/diagnostic_proxy.py")
 DIAGNOSTIC_SOCKET = _env_str(
     "DIAGNOSTIC_SOCKET", "/run/task-manager-diagnostics/diagnostics.sock"
@@ -1826,13 +1828,28 @@ def _app_server_argv(
     return command
 
 
-def _discussion_env(codex_home: Path) -> dict[str, str]:
+def _discussion_env(run_dir: Path, codex_home: Path) -> dict[str, str]:
     return {
         "HOME": HOME_DIR,
         "CODEX_HOME": str(codex_home),
         "PATH": PATH_VALUE,
+        # `prepare` already created this (alongside "wt"/"images"), which
+        # `_validate_discussion_request` requires anyway -- never a fresh
+        # mkdir here, so the app-server can never be handed a tmp dir it
+        # doesn't already own.
+        "TMPDIR": str(run_dir / "tmp"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+    }
+
+
+def _thread_start_params(params: DiscussionParams) -> dict[str, Any]:
+    return {
+        "model": params.model,
+        "cwd": str(params.cwd_path),
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "serviceName": "task_manager_discussion",
     }
 
 
@@ -1843,7 +1860,7 @@ def _run_app_server_turn(
         process = subprocess.Popen(
             _app_server_argv(params.diagnostics_discussion_id, params.diagnostics_lease_id),
             cwd=str(params.cwd_path),
-            env=_discussion_env(params.codex_home),
+            env=_discussion_env(params.run_dir, params.codex_home),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1886,6 +1903,11 @@ def _run_app_server_turn(
     stderr_reader.start()
 
     deadline = time.monotonic() + params.timeout_s
+    next_id = [0]
+
+    def new_id() -> int:
+        next_id[0] += 1
+        return next_id[0]
 
     def send(method: str, request_id: int | None, rpc_params: dict[str, Any]) -> None:
         value: dict[str, Any] = {"method": method, "params": rpc_params}
@@ -1912,24 +1934,73 @@ def _run_app_server_turn(
                 raise _DiscussionRefusal("Codex suhbat aloqasi uzildi")
             return message
 
-    def response(request_id: int) -> dict[str, Any]:
+    def await_reply(request_id: int) -> dict[str, Any]:
+        """The raw JSON-RPC reply for `request_id` -- which may itself carry
+        an "error" field; callers decide whether that is fatal. Only an
+        INCOMING request (an approval ask) always raises here: that is never
+        acceptable regardless of which call is outstanding."""
         while True:
             message = read()
             if "id" in message and "method" in message:
                 # Never grant tool or network approvals to an automated chat.
                 raise _DiscussionRefusal("Codex qo‘shimcha ruxsat so‘radi")
             if message.get("id") == request_id:
-                if "error" in message:
-                    raise _DiscussionRefusal("Codex suhbatni boshlay olmadi")
-                result = message.get("result")
-                if not isinstance(result, dict):
-                    raise _DiscussionRefusal("Codex noto‘g‘ri javob berdi")
-                return result
+                return message
 
+    def response(request_id: int) -> dict[str, Any]:
+        reply = await_reply(request_id)
+        if "error" in reply:
+            raise _DiscussionRefusal("Codex suhbatni boshlay olmadi")
+        result = reply.get("result")
+        if not isinstance(result, dict):
+            raise _DiscussionRefusal("Codex noto‘g‘ri javob berdi")
+        return result
+
+    def extract_thread_id(reply: dict[str, Any]) -> str | None:
+        if "error" in reply:
+            return None
+        result = reply.get("result")
+        if not isinstance(result, dict):
+            return None
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            return None
+        candidate = thread.get("id")
+        if not isinstance(candidate, str) or not DISCUSSION_THREAD_ID_RE.fullmatch(candidate):
+            return None
+        return candidate
+
+    def open_thread() -> str:
+        if params.thread_id:
+            resume_id = new_id()
+            send(
+                "thread/resume",
+                resume_id,
+                {"threadId": params.thread_id, "cwd": str(params.cwd_path)},
+            )
+            resumed = extract_thread_id(await_reply(resume_id))
+            if resumed is not None:
+                return resumed
+            # The legacy chat worker's thread ids live under a different
+            # CODEX_HOME (the old codex-runner ~/.codex, not this lane's own
+            # .codex-chat) -- resume can fail forever for any thread that
+            # predates the chat-lane cutover. Fall back to a brand new
+            # thread instead of failing the whole turn; the caller persists
+            # whatever id THIS call returns, so the next turn resumes the
+            # new one.
+        start_id = new_id()
+        send("thread/start", start_id, _thread_start_params(params))
+        started = extract_thread_id(await_reply(start_id))
+        if started is None:
+            raise _DiscussionRefusal("Codex suhbatni saqlay olmadi")
+        return started
+
+    refused: ChildRefusal | None = None
     try:
+        init_id = new_id()
         send(
             "initialize",
-            1,
+            init_id,
             {
                 "clientInfo": {
                     "name": "task_manager_discussion",
@@ -1938,35 +2009,16 @@ def _run_app_server_turn(
                 }
             },
         )
-        response(1)
+        response(init_id)
         send("initialized", None, {})
-        if params.thread_id:
-            send(
-                "thread/resume",
-                2,
-                {"threadId": params.thread_id, "cwd": str(params.cwd_path)},
-            )
-        else:
-            send(
-                "thread/start",
-                2,
-                {
-                    "model": params.model,
-                    "cwd": str(params.cwd_path),
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "serviceName": "task_manager_discussion",
-                },
-            )
-        opened = response(2).get("thread")
-        if not isinstance(opened, dict) or not isinstance(opened.get("id"), str):
-            raise _DiscussionRefusal("Codex suhbatni saqlay olmadi")
-        saved_thread_id = opened["id"]
+
+        saved_thread_id = open_thread()
         inputs: list[dict[str, str]] = [{"type": "text", "text": params.prompt}]
         inputs.extend({"type": "localImage", "path": str(image)} for image in params.images)
+        turn_id = new_id()
         send(
             "turn/start",
-            3,
+            turn_id,
             {
                 "threadId": saved_thread_id,
                 "input": inputs,
@@ -1978,7 +2030,7 @@ def _run_app_server_turn(
                 "summary": "concise",
             },
         )
-        response(3)
+        response(turn_id)
         answer = ""
         while True:
             message = read()
@@ -1996,12 +2048,26 @@ def _run_app_server_turn(
                 return saved_thread_id, answer.strip()[:MAX_DISCUSSION_RESPONSE_CHARS]
             elif "id" in message and "method" in message:
                 raise _DiscussionRefusal("Codex qo‘shimcha ruxsat so‘radi")
+    except ChildRefusal as exc:
+        # Only recorded here (not yet read); attached to the exception down
+        # in `finally`, AFTER `stderr_reader.join()` -- reading `stderr_tail`
+        # this early would race that thread still draining the app-server's
+        # pipe.
+        refused = exc
+        raise
     finally:
         kill_tree(process.pid)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=5)
         reader.join(timeout=2)
         stderr_reader.join(timeout=2)
+        if refused is not None:
+            # Carried only for the redacted `stderr_tail` in the emitted
+            # refusal frame (see `cmd_discussion`) -- never used to change
+            # what was raised or how. Safe to mutate here: `finally` always
+            # completes before this same exception object reaches the
+            # caller.
+            refused.stderr_tail = list(stderr_tail)[-MAX_STDERR_LINES:]  # type: ignore[attr-defined]
 
 
 def cmd_discussion(request: dict[str, Any]) -> int:
@@ -2027,7 +2093,15 @@ def cmd_discussion(request: dict[str, Any]) -> int:
     try:
         thread_id, answer = _run_app_server_turn(params, signaled)
     except ChildRefusal as exc:
-        _emit_error(str(exc))
+        # `stderr_tail` (see `_run_app_server_turn`'s own `except ChildRefusal`)
+        # is the app-server's raw, UNREDACTED stderr: it goes into this one
+        # JSON frame on OUR stdout, never printed anywhere by this process,
+        # and the parent (`agent_svc.discussion`) redacts it before logging.
+        stderr_tail = getattr(exc, "stderr_tail", None)
+        body: dict[str, Any] = {"reason": str(exc)}
+        if stderr_tail:
+            body["stderr_tail"] = stderr_tail
+        print(json.dumps(body, ensure_ascii=False), flush=True)
         return 3
     except OSError as exc:
         _emit_error(f"discussion failed: {exc}")

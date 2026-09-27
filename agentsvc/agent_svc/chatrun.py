@@ -21,12 +21,26 @@ from __future__ import annotations
 
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from types import TracebackType
 
 from . import repos
 from .context import ServiceContext
+
+# A hard ceiling on the whole job, independent of and tighter than the Task
+# Manager lease (5 minutes): every step (image download, mirror fetch,
+# `prepare`, the Codex call itself) clamps its own timeout to whatever is
+# left of this budget, so a slow step can never eat so much of the lease
+# that a later step has no time left to even try -- and the job always
+# finishes (one way or another) with margin before the lease itself would
+# expire and the backend re-leases it out from under us.
+JOB_DEADLINE_S = 270.0
+# Never hand a callee a zero or negative timeout (which some APIs treat as
+# "wait forever" and others reject outright); this is small enough that a
+# genuinely exhausted budget still fails fast.
+_MIN_STEP_TIMEOUT_S = 1.0
 
 
 class ChatRun:
@@ -36,7 +50,12 @@ class ChatRun:
         self._ctx = ctx
         self.run_id = str(uuid.uuid4())
         self.cancel = threading.Event()
+        self._deadline = time.monotonic() + JOB_DEADLINE_S
         self.run_dir: Path = repos.make_run_dir(ctx.settings.work_root, self.run_id)
+
+    def remaining_s(self) -> float:
+        """Seconds left in this job's own deadline, floored at `_MIN_STEP_TIMEOUT_S`."""
+        return max(self._deadline - time.monotonic(), _MIN_STEP_TIMEOUT_S)
 
     def __enter__(self) -> ChatRun:
         self._ctx.cancel_registry.register(self.cancel)

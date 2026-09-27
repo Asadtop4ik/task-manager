@@ -35,6 +35,10 @@ _ALLOWED_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _THREAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")
 _MAX_INTAKE_IMAGES = 3
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# Matches legacy `ops/intake_worker.py MAX_RESULT_BYTES` exactly: a lease
+# response is a small JSON object, never anything close to the 4 MiB
+# default `JsonHttp` allows for a generic response.
+_MAX_LEASE_RESPONSE_BYTES = 64 * 1024
 # Ported verbatim from `ops/intake_worker.py poll_discussion_once`: diagnostics
 # may only be enabled for this one fixed repository/branch, regardless of what
 # `project_key` a lease response claims.
@@ -67,6 +71,35 @@ class InvalidWork(InvalidResponse):
     def __init__(self, message: str, *, run_id: str | None = None) -> None:
         super().__init__(message)
         self.run_id = run_id
+
+
+class IntakeLeaseInvalid(InvalidResponse):
+    """An intake lease response's identity (id/revision/lease_id) parsed,
+    but the rest of its body failed validation.
+
+    Carrying the identity lets the caller (`ChatLane`) report a "failed"
+    result back to the API immediately -- clearing the lease right away --
+    instead of leaving the row leased and silent until the backend's own
+    stale-lease sweep frees it up again minutes later.
+    """
+
+    def __init__(self, message: str, *, intake_id: int, revision: int, lease_id: str) -> None:
+        super().__init__(message)
+        self.intake_id = intake_id
+        self.revision = revision
+        self.lease_id = lease_id
+
+
+class DiscussionLeaseInvalid(InvalidResponse):
+    """Same as `IntakeLeaseInvalid`, for the project-discussions contract."""
+
+    def __init__(
+        self, message: str, *, discussion_id: int, revision: int, lease_id: str
+    ) -> None:
+        super().__init__(message)
+        self.discussion_id = discussion_id
+        self.revision = revision
+        self.lease_id = lease_id
 
 
 class LeaseLost(Exception):
@@ -327,8 +360,15 @@ def _parse_chat_images(
     for item in raw:
         if not isinstance(item, dict):
             fail("has an invalid image")
+        # `file_id` is not used by the fetch itself (image downloads are
+        # index-based, see `intake_image`/`discussion_image`), but its
+        # presence/shape is still validated here for defense in depth,
+        # exactly like legacy `ops/intake_worker.py _validate_lease` did.
+        file_id = item.get("file_id")
         mime = item.get("mime")
         size = item.get("size")
+        if not isinstance(file_id, str) or not file_id.strip():
+            fail("has an invalid image file_id")
         if mime not in _ALLOWED_IMAGE_MIMES:
             fail("has an unsupported image type")
         if size is not None and (
@@ -349,24 +389,36 @@ def parse_intake_lease(payload: Any, catalog: Mapping[str, str]) -> IntakeLease:
     exactly, against the current `IntakeWorkOut` schema (no `file_id` field
     is used by the fetch itself -- image downloads are index-based -- but its
     presence/shape is still validated for defense in depth, as legacy did).
+
+    Identity (id/revision/lease_id) is validated FIRST, matching legacy's own
+    `_lease_identity`/`_validate_lease` split: once those three parse, every
+    later failure raises `IntakeLeaseInvalid` (carrying that identity)
+    instead of a bare `InvalidResponse`, so the caller can still report a
+    failure back to the API rather than just losing the lease silently.
     """
     if not isinstance(payload, dict):
         raise InvalidResponse("intake lease response is not an object")
 
-    def fail(message: str) -> NoReturn:
-        raise InvalidResponse(f"intake lease response {message}")
-
     intake_id = payload.get("id")
     if _bad_int(intake_id, minimum=1):
-        fail("has an invalid id")
+        raise InvalidResponse("intake lease response has an invalid id")
     assert isinstance(intake_id, int)
     revision = payload.get("revision")
     if _bad_int(revision, minimum=1):
-        fail("has an invalid revision")
+        raise InvalidResponse("intake lease response has an invalid revision")
     assert isinstance(revision, int)
     lease_id = _valid_lease_id(payload.get("lease_id"))
     if lease_id is None:
-        fail("has an invalid lease_id")
+        raise InvalidResponse("intake lease response has an invalid lease_id")
+
+    def fail(message: str) -> NoReturn:
+        raise IntakeLeaseInvalid(
+            f"intake lease response {message}",
+            intake_id=intake_id,
+            revision=revision,
+            lease_id=lease_id,
+        )
+
     text = payload.get("text")
     if not isinstance(text, str):
         fail("has an invalid text")
@@ -406,24 +458,35 @@ def parse_discussion_lease(payload: Any, catalog: Mapping[str, str]) -> Discussi
     Ports the inline validation in `ops/intake_worker.py`'s
     `poll_discussion_once` exactly, including the hardcoded ketoshop-only
     diagnostics restriction (never derived from `project_key` alone).
+
+    Identity (id/revision/lease_id) is validated FIRST: once those three
+    parse, every later failure raises `DiscussionLeaseInvalid` (carrying
+    that identity) instead of a bare `InvalidResponse` -- see
+    `parse_intake_lease` for why.
     """
     if not isinstance(payload, dict):
         raise InvalidResponse("discussion lease response is not an object")
 
-    def fail(message: str) -> NoReturn:
-        raise InvalidResponse(f"discussion lease response {message}")
-
     discussion_id = payload.get("id")
     if _bad_int(discussion_id, minimum=1):
-        fail("has an invalid id")
+        raise InvalidResponse("discussion lease response has an invalid id")
     assert isinstance(discussion_id, int)
     revision = payload.get("revision")
-    if _bad_int(revision, minimum=0):
-        fail("has an invalid revision")
+    if _bad_int(revision, minimum=1):
+        raise InvalidResponse("discussion lease response has an invalid revision")
     assert isinstance(revision, int)
     lease_id = _valid_lease_id(payload.get("lease_id"))
     if lease_id is None:
-        fail("has an invalid lease_id")
+        raise InvalidResponse("discussion lease response has an invalid lease_id")
+
+    def fail(message: str) -> NoReturn:
+        raise DiscussionLeaseInvalid(
+            f"discussion lease response {message}",
+            discussion_id=discussion_id,
+            revision=revision,
+            lease_id=lease_id,
+        )
+
     repo_full_name = payload.get("repo_full_name")
     base_branch = payload.get("base_branch")
     if not isinstance(repo_full_name, str) or catalog.get(repo_full_name) != base_branch:
@@ -545,6 +608,7 @@ class TaskManagerApi:
         lease_id: str | None = None,
         body: Any = None,
         max_bytes: int | None = None,
+        timeout: float | None = None,
     ) -> HttpResponse:
         extra = (("X-Intake-Lease-ID", lease_id),) if lease_id is not None else ()
         request = self._http.build_request(
@@ -555,7 +619,7 @@ class TaskManagerApi:
             body=_encode(body),
             content_type="application/json" if body is not None else None,
         )
-        return self._http.send(request, max_bytes=max_bytes)
+        return self._http.send(request, max_bytes=max_bytes, timeout=timeout)
 
     def _callback_call(
         self, method: str, path: str, *, lease_id: str | None = None, body: Any = None
@@ -682,12 +746,16 @@ class TaskManagerApi:
     # -- Chat lane: task intake -------------------------------------------
 
     def lease_intake(self) -> IntakeLease | None:
-        response = self._intake_worker_call("POST", self._intake_base, "/lease")
+        response = self._intake_worker_call(
+            "POST", self._intake_base, "/lease", max_bytes=_MAX_LEASE_RESPONSE_BYTES
+        )
         if response.status == 204:
             return None
         return parse_intake_lease(self._http.json(response), self._catalog)
 
-    def intake_image(self, intake_id: int, lease_id: str, index: int) -> tuple[bytes, str]:
+    def intake_image(
+        self, intake_id: int, lease_id: str, index: int, *, timeout: float | None = None
+    ) -> tuple[bytes, str]:
         lease_id = _require_lease_id(lease_id)
         response = self._intake_worker_call(
             "GET",
@@ -695,6 +763,7 @@ class TaskManagerApi:
             f"/{intake_id}/images/{index}",
             lease_id=lease_id,
             max_bytes=_MAX_IMAGE_BYTES,
+            timeout=timeout,
         )
         return response.body, _content_type(response.headers)
 
@@ -712,13 +781,20 @@ class TaskManagerApi:
     # -- Chat lane: project discussion (/suhbat) --------------------------
 
     def lease_discussion(self) -> DiscussionLease | None:
-        response = self._intake_worker_call("POST", self._discussion_base, "/lease")
+        response = self._intake_worker_call(
+            "POST", self._discussion_base, "/lease", max_bytes=_MAX_LEASE_RESPONSE_BYTES
+        )
         if response.status == 204:
             return None
         return parse_discussion_lease(self._http.json(response), self._catalog)
 
     def discussion_image(
-        self, discussion_id: int, lease_id: str, index: int
+        self,
+        discussion_id: int,
+        lease_id: str,
+        index: int,
+        *,
+        timeout: float | None = None,
     ) -> tuple[bytes, str]:
         lease_id = _require_lease_id(lease_id)
         response = self._intake_worker_call(
@@ -727,6 +803,7 @@ class TaskManagerApi:
             f"/{discussion_id}/images/{index}",
             lease_id=lease_id,
             max_bytes=_MAX_IMAGE_BYTES,
+            timeout=timeout,
         )
         return response.body, _content_type(response.headers)
 

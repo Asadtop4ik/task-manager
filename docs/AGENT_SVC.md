@@ -92,14 +92,28 @@ ishga tushiradi. Keyin ketma-ket bajaradi:
 
 1. `agentwork` guruhini, `agent-svc` va `agent-codex` foydalanuvchilarini yaratadi
    (mavjud bo'lmasa; guruh allaqachon mavjud bo'lsa ham xatosiz). Shu bosqichda
-   (agar server'da `codex-runner` guruhi mavjud bo'lsa) `agent-codex` shu guruhga
-   ham qo'shiladi — **faqat** `/suhbat` (chat lane) uchun Ketoshop diagnostika
-   socket'iga (`/run/task-manager-diagnostics/diagnostics.sock`, rejim 0660,
-   `ops/task-manager-diagnostics.service`ning `Group=codex-runner`i) o'qish/yozish
-   ruxsati bersin deb. Socket'ning o'z guruhi, rejimi yoki
+   `task-diag-client` degan **alohida** tizim guruhi ham yaratiladi (mavjud
+   bo'lmasa) va (agar `codex-runner` guruhi mavjud bo'lsa) `codex-runner` shu
+   guruhga qo'shiladi. Bu guruh **faqat** Ketoshop diagnostika socket'iga
+   (`/run/task-manager-diagnostics/diagnostics.sock`, rejim 0660) tegishli:
+   `ops/diagnostic_host.py` bind qilgandan keyin socket'ni shu guruhga
+   o'tkazadi (`chgrp`, faqat guruh mavjud bo'lsa — aks holda hech narsa
+   qilmaydi, shuning uchun o'rnatish tartibi eski `codex-runner` yo'lini hech
+   qachon buzmaydi). **`agent-codex` bu guruhning doimiy a'zosi emas** —
+   `codex-runner`dan farqli o'laroq (u umuman jonli GitHub Actions runner
+   hisobi, "bitta socket o'qishi mumkin"dan ancha kengroq huquq bilan);
+   `agent-codex` bu guruhni faqat `discussion` kichik buyrug'ini ishga
+   tushirgan bitta `sudo` chaqiruvi davomida oladi (`sudo -g task-diag-client`,
+   `ops/agent-svc.sudoers`dagi alohida qoida, boshqa besh kichik buyruqqa
+   taalluqli emas). Socket'ning o'zi, rejimi yoki
    `ops/diagnostic_host.py`ning discussion-id/lease-id bo'yicha qayta
    avtorizatsiyasi (haqiqiy xavfsizlik chegarasi — shu joyda hech narsa
-   yumshatilmaydi) o'zgarmaydi; bu faqat POSIX guruh a'zoligi.
+   yumshatilmaydi) o'zgarmaydi. **Eslatma:** `task-diag-client` guruhi
+   yaratilgandan so'ng `task-manager-diagnostics` xizmati kamida bir marta
+   qayta ishga tushirilishi kerak (`sudo systemctl restart
+   task-manager-diagnostics`), shundagina ishlab turgan socket yangi guruhga
+   o'tadi — bu qadam shu skriptning tashqarisida, chunki u agent-svc'ga
+   tegishli emas.
 2. Kodni **faqat `git archive $commit`dan** (ishchi katalogdan emas) staging orqali
    `/opt/agent-svc/releases/<commit>/`ga o'rnatadi (agar shu commit uchun release
    allaqachon to'liq mavjud bo'lsa, qayta qurmaydi va **hech qachon** joriy

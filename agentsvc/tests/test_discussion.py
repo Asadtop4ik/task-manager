@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 from agent_svc.api import DiscussionLease, IntakeImage
 from agent_svc.codex import CodexChildError
@@ -155,6 +156,58 @@ class HandleDiscussionTests(unittest.TestCase):
         self.assertEqual(len(images), 1)
         self.assertTrue(Path(images[0]).name.startswith("image-0."))
         self.assertEqual(codex.image_modes, [0o640])
+
+    def test_cancel_during_prepare_posts_no_result(self) -> None:
+        ctx_holder: list[Any] = [None]
+
+        class _CancelingCodexRunner(FakeCodexRunner):
+            def prepare(self, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+                ctx_holder[0].cancel_registry.cancel_all()
+                return super().prepare(request, **kwargs)
+
+        codex = _CancelingCodexRunner()
+        api = FakeChatApi()
+        ctx, _tmp = self._context(codex, api)
+        ctx_holder[0] = ctx
+
+        handle_discussion(ctx, _lease())
+
+        self.assertEqual(api.discussion_results, [])
+        self.assertEqual(codex.run_discussion_calls, [])
+
+    def test_cancel_flag_set_during_the_child_call_posts_no_result(self) -> None:
+        # `run_discussion` raising a `CodexChildError` cannot itself tell us
+        # whether that was a genuine failure or the cancel watcher's own
+        # early SIGTERM; `run.cancel` is checked right after catching it.
+        ctx_holder: list[Any] = [None]
+
+        class _CancelingCodexRunner(FakeCodexRunner):
+            def run_discussion(self, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+                ctx_holder[0].cancel_registry.cancel_all()
+                raise CodexChildError(-1, "codex child discussion timed out")
+
+        codex = _CancelingCodexRunner()
+        api = FakeChatApi()
+        ctx, _tmp = self._context(codex, api)
+        ctx_holder[0] = ctx
+
+        handle_discussion(ctx, _lease())
+
+        self.assertEqual(api.discussion_results, [])
+
+    def test_job_deadline_clamps_the_inner_timeout(self) -> None:
+        codex = FakeCodexRunner()
+        codex.queue_discussion_result({"ok": True, "thread_id": "thr_new", "response": "OK"})
+        api = FakeChatApi()
+        ctx, _tmp = self._context(codex, api)
+
+        with patch("agent_svc.chatrun.JOB_DEADLINE_S", 0.01):
+            handle_discussion(ctx, _lease())
+
+        request = codex.run_discussion_calls[0]
+        # Far below the configured "chat" default (150s): the almost-
+        # exhausted job budget won, floored at `_MIN_STEP_TIMEOUT_S`.
+        self.assertEqual(request["timeout_s"], 1.0)
 
 
 class BuildPromptTests(unittest.TestCase):

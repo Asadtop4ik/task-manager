@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 from agent_svc.api import IntakeImage, IntakeLease
 from agent_svc.codex import CodexResult
@@ -209,7 +210,10 @@ class HandleIntakeTests(unittest.TestCase):
 
         result = api.intake_results[0]
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error"], "Task analysis could not be completed.")
+        # Matches legacy `_run_codex`'s own IntakeError text exactly, not the
+        # generic fallback (that text is reserved for a genuinely unexpected
+        # exception, never a Codex process that just exited non-zero).
+        self.assertEqual(result["error"], "Codex analysis process exited 1")
 
     def test_images_are_downloaded_group_readable_and_passed_to_codex(self) -> None:
         with TemporaryDirectory() as tmp_str:
@@ -228,6 +232,74 @@ class HandleIntakeTests(unittest.TestCase):
         self.assertEqual(len(exec_request["images"]), 1)
         self.assertTrue(Path(exec_request["images"][0]).name.startswith("image-0."))
         self.assertEqual(codex.image_modes, [0o640])
+
+    def test_cancel_during_prepare_posts_no_result(self) -> None:
+        # A service shutdown mid-analysis: legacy died silently under a
+        # systemd restart too (the backend's own lease sweep recovers it),
+        # so posting here would race whatever picks the lease up next.
+        ctx_holder: list[Any] = [None]
+
+        class _CancelingCodexRunner(FakeCodexRunner):
+            def prepare(self, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+                ctx_holder[0].cancel_registry.cancel_all()
+                return super().prepare(request, **kwargs)
+
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            remote = tmp / "remote.git"
+            make_github_remote(remote)
+            codex = _CancelingCodexRunner()
+            api = FakeChatApi()
+            ctx = build_test_context(tmp, github_remote=remote, codex=codex, api=api)
+            ctx_holder[0] = ctx
+
+            handle_intake(ctx, _lease())
+
+        self.assertEqual(api.intake_results, [])
+        self.assertEqual(codex.run_exec_calls, [])  # never reached exec at all
+
+    def test_cancelled_exec_result_posts_no_result(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            remote = tmp / "remote.git"
+            make_github_remote(remote)
+            codex = FakeCodexRunner()
+            codex.queue_exec_result(
+                CodexResult(
+                    exit_code=0,
+                    timed_out=False,
+                    cancelled=True,
+                    idle_killed=False,
+                    final_message="",
+                    usage=None,
+                    stderr_tail=[],
+                    frame=None,
+                )
+            )
+            api = FakeChatApi()
+            ctx = build_test_context(tmp, github_remote=remote, codex=codex, api=api)
+
+            handle_intake(ctx, _lease())
+
+        self.assertEqual(api.intake_results, [])
+
+    def test_job_deadline_clamps_the_exec_timeout(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            remote = tmp / "remote.git"
+            make_github_remote(remote)
+            codex = FakeCodexRunner()
+            codex.queue_exec_result(_exec_ok(_ready_final_message()))
+            api = FakeChatApi()
+            ctx = build_test_context(tmp, github_remote=remote, codex=codex, api=api)
+
+            with patch("agent_svc.chatrun.JOB_DEADLINE_S", 0.01):
+                handle_intake(ctx, _lease())
+
+        exec_request = codex.run_exec_calls[0]
+        # Far below the configured "intake" default (180s): the almost-
+        # exhausted job budget won, floored at `_MIN_STEP_TIMEOUT_S`.
+        self.assertEqual(exec_request["timeout_s"], 1.0)
 
 
 class ValidateResultTests(unittest.TestCase):

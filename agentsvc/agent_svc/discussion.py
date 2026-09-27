@@ -41,7 +41,14 @@ class DiscussionError(ValueError):
 
 def handle_discussion(ctx: ServiceContext, lease: DiscussionLease) -> None:
     with ChatRun(ctx) as run:
-        thread_id, response, error = _answer(ctx, lease, run)
+        outcome = _answer(ctx, lease, run)
+    if outcome is None:
+        # Cancelled (service shutdown): the Task Manager API already owns
+        # this lease's fate (it will expire and be re-leased on its own,
+        # same as legacy dying mid-turn under a systemd restart) -- posting
+        # here would race whatever picks it up next.
+        return
+    thread_id, response, error = outcome
     _post_result(ctx, lease, thread_id=thread_id, response=response, error=error)
 
 
@@ -70,12 +77,14 @@ def _post_result(
 
 def _answer(
     ctx: ServiceContext, lease: DiscussionLease, run: ChatRun
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None] | None:
     try:
         image_paths = _download_images(ctx, lease, run)
         if run.cancel.is_set():
-            return None, None, GENERIC_ERROR
-        base_sha = ctx.mirrors.fetch(lease.repo_full_name, lease.base_branch)
+            return None
+        base_sha = ctx.mirrors.fetch(
+            lease.repo_full_name, lease.base_branch, timeout=run.remaining_s()
+        )
         mirror_path = ctx.mirrors.mirror_path(lease.repo_full_name)
         ctx.codex.prepare(
             {
@@ -83,13 +92,14 @@ def _answer(
                 "repo": lease.repo_full_name,
                 "mirror": str(mirror_path),
                 "base_sha": base_sha,
-            }
+            },
+            timeout_s=min(60.0, run.remaining_s()),
         )
         if run.cancel.is_set():
-            return None, None, GENERIC_ERROR
+            return None
 
         route = ctx.settings.model_matrix["chat"]
-        inner_timeout_s = ctx.settings.timeouts["chat"]
+        inner_timeout_s = min(ctx.settings.timeouts["chat"], run.remaining_s())
         request = {
             "run_id": run.run_id,
             "prompt": _build_prompt(lease),
@@ -108,9 +118,18 @@ def _answer(
             request, timeout_s=inner_timeout_s + _OUTER_TIMEOUT_MARGIN_S, cancel=run.cancel
         )
     except CodexChildError as exc:
-        ctx.logger.error(exc, event="discussion_child_failed", task_id=lease.discussion_id)
+        if run.cancel.is_set():
+            return None
+        ctx.logger.error(
+            exc,
+            event="discussion_child_failed",
+            task_id=lease.discussion_id,
+            stderr_tail=exc.body.get("stderr_tail") if exc.body else None,
+        )
         return None, None, GENERIC_ERROR
     except Exception as exc:
+        if run.cancel.is_set():
+            return None
         ctx.logger.error(exc, event="discussion_failed", task_id=lease.discussion_id)
         return None, None, GENERIC_ERROR
 
@@ -133,7 +152,7 @@ def _download_images(ctx: ServiceContext, lease: DiscussionLease, run: ChatRun) 
     paths: list[Path] = []
     for index, image in enumerate(lease.images):
         data, content_type = ctx.api.discussion_image(
-            lease.discussion_id, lease.lease_id, index
+            lease.discussion_id, lease.lease_id, index, timeout=run.remaining_s()
         )
         if content_type != image.mime:
             raise DiscussionError("downloaded image MIME type does not match metadata")

@@ -9,7 +9,9 @@ import urllib.request
 from typing import Any
 
 from agent_svc.api import (
+    DiscussionLeaseInvalid,
     IntakeImage,
+    IntakeLeaseInvalid,
     InvalidResponse,
     InvalidWork,
     LeaseLost,
@@ -324,40 +326,53 @@ class IntakeLeaseParsingTests(unittest.TestCase):
         self.assertEqual(lease.images, ())
 
     def test_unapproved_repository_rejected(self) -> None:
-        with self.assertRaises(InvalidResponse):
+        # A body-level failure (identity already parsed): the caller can
+        # still report a failure back using the carried identity.
+        with self.assertRaises(IntakeLeaseInvalid) as ctx:
             parse_intake_lease(_intake_payload(repo_full_name="someone-else/repo"), CATALOG)
+        self.assertEqual(ctx.exception.intake_id, 34)
+        self.assertEqual(ctx.exception.revision, 3)
+        self.assertEqual(ctx.exception.lease_id, LEASE_ID)
 
     def test_unapproved_branch_for_an_approved_repository_rejected(self) -> None:
-        with self.assertRaises(InvalidResponse):
+        with self.assertRaises(IntakeLeaseInvalid):
             parse_intake_lease(
                 _intake_payload(repo_full_name="muradjanov-dev/ketoshop", base_branch="main"),
                 CATALOG,
             )
 
     def test_non_uuid_lease_id_rejected(self) -> None:
-        with self.assertRaises(InvalidResponse):
+        # An IDENTITY-level failure: there is no valid lease_id to carry, so
+        # this must NOT be an `IntakeLeaseInvalid` (nothing to report against).
+        with self.assertRaises(InvalidResponse) as ctx:
             parse_intake_lease(_intake_payload(lease_id="not-a-uuid"), CATALOG)
+        self.assertNotIsInstance(ctx.exception, IntakeLeaseInvalid)
 
     def test_fast_mode_accepted(self) -> None:
         lease = parse_intake_lease(_intake_payload(mode="fast"), CATALOG)
         self.assertEqual(lease.mode, "fast")
 
     def test_invalid_mode_rejected(self) -> None:
-        with self.assertRaises(InvalidResponse):
+        with self.assertRaises(IntakeLeaseInvalid):
             parse_intake_lease(_intake_payload(mode="fastest"), CATALOG)
 
     def test_image_with_unsupported_mime_rejected(self) -> None:
-        images = [{"mime": "image/gif", "size": 1}]
-        with self.assertRaises(InvalidResponse):
+        images = [{"file_id": "f1", "mime": "image/gif", "size": 1}]
+        with self.assertRaises(IntakeLeaseInvalid):
             parse_intake_lease(_intake_payload(images=images), CATALOG)
 
     def test_more_than_three_images_rejected(self) -> None:
-        images = [{"mime": "image/png", "size": 1}] * 4
-        with self.assertRaises(InvalidResponse):
+        images = [{"file_id": "f1", "mime": "image/png", "size": 1}] * 4
+        with self.assertRaises(IntakeLeaseInvalid):
+            parse_intake_lease(_intake_payload(images=images), CATALOG)
+
+    def test_image_with_missing_file_id_rejected(self) -> None:
+        images = [{"mime": "image/png", "size": 4}]
+        with self.assertRaises(IntakeLeaseInvalid):
             parse_intake_lease(_intake_payload(images=images), CATALOG)
 
     def test_valid_image_metadata_parses(self) -> None:
-        images = [{"mime": "image/png", "size": 4}]
+        images = [{"file_id": "f1", "mime": "image/png", "size": 4}]
         lease = parse_intake_lease(_intake_payload(images=images), CATALOG)
         self.assertEqual(lease.images, (IntakeImage(mime="image/png", size=4),))
 
@@ -375,8 +390,10 @@ class DiscussionLeaseParsingTests(unittest.TestCase):
             project_key="task-manager",
             diagnostics_enabled=True,
         )
-        with self.assertRaises(InvalidResponse):
+        with self.assertRaises(DiscussionLeaseInvalid) as ctx:
             parse_discussion_lease(payload, CATALOG)
+        self.assertEqual(ctx.exception.discussion_id, 5)
+        self.assertEqual(ctx.exception.lease_id, LEASE_ID)
 
     def test_diagnostics_only_allowed_for_the_ketoshop_repository(self) -> None:
         payload = _discussion_payload(
@@ -385,8 +402,13 @@ class DiscussionLeaseParsingTests(unittest.TestCase):
             project_key="ketoshop",
             diagnostics_enabled=True,
         )
-        with self.assertRaises(InvalidResponse):
+        with self.assertRaises(DiscussionLeaseInvalid):
             parse_discussion_lease(payload, CATALOG)
+
+    def test_non_uuid_lease_id_is_an_identity_failure_not_carried(self) -> None:
+        with self.assertRaises(InvalidResponse) as ctx:
+            parse_discussion_lease(_discussion_payload(lease_id="not-a-uuid"), CATALOG)
+        self.assertNotIsInstance(ctx.exception, DiscussionLeaseInvalid)
 
     def test_diagnostics_enabled_for_ketoshop_parses(self) -> None:
         payload = _discussion_payload(

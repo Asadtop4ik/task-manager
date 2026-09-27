@@ -29,6 +29,11 @@ from typing import Any
 DEFAULT_SUDO_PREFIX = ["/usr/bin/sudo", "-n", "-u", "agent-codex", "--"]
 DEFAULT_PYTHON_BIN = "/usr/bin/python3"
 DEFAULT_LIBEXEC_DIR = "/opt/agent-svc/libexec"
+# Phase 3 (chat lane): the ONLY subcommand that gets this group, and only for
+# the duration of that one sudo'd call (`sudo -g`) -- never a permanent
+# supplementary group of the agent-codex account. See ops/agent-svc.sudoers
+# and ops/install_agent_svc.sh for the matching sudoers rule and group setup.
+DEFAULT_DISCUSSION_SUDO_GROUP = "task-diag-client"
 
 HARD_WALL_SAFETY_S = 60.0
 # A generous grace period: SIGKILL must never be the first signal we send
@@ -176,6 +181,7 @@ class CodexRunner:
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         hard_wall_safety_s: float = HARD_WALL_SAFETY_S,
         sigkill_grace_s: float = SIGKILL_GRACE_S,
+        discussion_sudo_group: str = DEFAULT_DISCUSSION_SUDO_GROUP,
     ) -> None:
         self._command_prefix = list(
             DEFAULT_SUDO_PREFIX if command_prefix is None else command_prefix
@@ -190,12 +196,28 @@ class CodexRunner:
         # these to keep the timeout/SIGKILL-grace suite fast.
         self._hard_wall_safety_s = hard_wall_safety_s
         self._sigkill_grace_s = sigkill_grace_s
+        self._discussion_sudo_group = discussion_sudo_group
 
-    def _argv(self, subcommand: str) -> list[str]:
+    def _argv(self, subcommand: str, *, group: str | None = None) -> list[str]:
         # `-I` (isolated mode): no PYTHONPATH/user site/.pth files, matching
-        # the exact command sudoers pins in production.
+        # the exact command sudoers pins in production. `group` (only ever
+        # passed for "discussion", see `run_discussion`) inserts `-g group`
+        # right before the `--` that ends sudo's own option list, matching
+        # the exact `sudo -n -u agent-codex -g task-diag-client --` shape the
+        # sudoers rule for that one subcommand grants -- never applied to any
+        # other subcommand's argv.
+        prefix = list(self._command_prefix)
+        if group is not None and "--" in prefix:
+            # Tests exercising `run_discussion` directly against a fake
+            # `Popen` often pass `command_prefix=[]` to skip sudo's argv
+            # shape entirely; there is no sudo option list to insert a `-g`
+            # into then, so this is a no-op rather than an error in that
+            # case -- production's `codex_child_prefix` always ends in
+            # `--`, so the real invocation always gets the group.
+            index = prefix.index("--")
+            prefix = [*prefix[:index], "-g", group, *prefix[index:]]
         return [
-            *self._command_prefix,
+            *prefix,
             self._python_bin,
             "-I",
             str(self._child_script),
@@ -248,6 +270,7 @@ class CodexRunner:
         timeout_s: float,
         *,
         cancel: threading.Event | None = None,
+        group: str | None = None,
     ) -> dict[str, Any]:
         """Like `_simple_call`, but on timeout SIGTERMs `sudo` (relayed to the
         agent-codex child it supervises) and waits `sigkill_grace_s` before
@@ -265,7 +288,7 @@ class CodexRunner:
         call would otherwise finish, so a service shutdown interrupts an
         in-flight discussion turn instead of blocking for its full timeout.
         Passing `None` (the default) reproduces the exact prior behavior."""
-        argv = self._argv(subcommand)
+        argv = self._argv(subcommand, group=group)
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
         process = self._popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -332,8 +355,16 @@ class CodexRunner:
         SIGTERM-ing `sudo`; callers should pass a small margin over the
         child's own internal deadline (`request["timeout_s"]`) so the
         child's clean, reasoned timeout wins the race, not our SIGTERM.
+        The sudo call is granted this runner's `discussion_sudo_group`
+        (`-g`) for the duration of this one call only -- see `_argv`.
         """
-        return self._call_with_grace("discussion", request, timeout_s, cancel=cancel)
+        return self._call_with_grace(
+            "discussion",
+            request,
+            timeout_s,
+            cancel=cancel,
+            group=self._discussion_sudo_group,
+        )
 
     def run_exec(
         self,

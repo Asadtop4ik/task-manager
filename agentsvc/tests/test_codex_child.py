@@ -2474,6 +2474,30 @@ class DiscussionIntegrationTests(ChildProcessTestCase):
         self.assertEqual(body["thread_id"], "thr_saved")
         self.assertEqual(body["response"], "Davomi shu.")
 
+    def test_thread_resume_failure_falls_back_to_a_new_thread(self) -> None:
+        # Legacy `/suhbat` thread ids live under a different CODEX_HOME (the
+        # old codex-runner ~/.codex, never this lane's own .codex-chat), so
+        # resuming one forever fails after the chat-lane cutover -- the
+        # child must fall back to a brand-new thread instead of failing the
+        # whole turn, and report the NEW id back (the backend persists it).
+        run_id = new_run_id()
+        wt = self._prepare_wt(run_id)
+        self._write_control(
+            wt,
+            {
+                "resume_fails": True,
+                "fallback_thread_id": "thr_fresh",
+                "final_message": "Yangi thread bilan javob.",
+            },
+        )
+        completed = self.run_child(
+            "discussion", base_discussion_request(run_id, thread_id="thr_legacy_stale")
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)
+        self.assertEqual(body["thread_id"], "thr_fresh")
+        self.assertEqual(body["response"], "Yangi thread bilan javob.")
+
     def test_approval_request_is_never_granted_and_reported_as_a_refusal(self) -> None:
         run_id = new_run_id()
         wt = self._prepare_wt(run_id)
@@ -2547,6 +2571,84 @@ class DiscussionIntegrationTests(ChildProcessTestCase):
             "discussion", base_discussion_request(run_id, prompt="x" * 10_001)
         )
         self.assertEqual(completed.returncode, 3)
+
+    def test_image_path_escaping_the_run_dir_is_refused_in_process(self) -> None:
+        run_id = new_run_id()
+        wt = self._prepare_wt(run_id)
+        with patch.object(codex_child, "WORK_ROOT", self.work_root):
+            escaped = str(self.work_root.parent / "outside.png")
+            with self.assertRaises(codex_child.ChildRefusal):
+                codex_child._validate_discussion_request(
+                    base_discussion_request(run_id, images=[escaped])
+                )
+        self.assertTrue(wt.is_dir())  # sanity: prepare really ran
+
+    def test_bad_thread_id_is_refused_in_process(self) -> None:
+        run_id = new_run_id()
+        self._prepare_wt(run_id)
+        with (
+            patch.object(codex_child, "WORK_ROOT", self.work_root),
+            self.assertRaises(codex_child.ChildRefusal),
+        ):
+            codex_child._validate_discussion_request(
+                base_discussion_request(run_id, thread_id="has a space")
+            )
+
+    def test_timeout_is_detected_by_the_childs_own_deadline_not_the_full_hang(self) -> None:
+        # The child enforces `timeout_s` itself (it does not rely solely on
+        # an external SIGTERM): a short budget against a hung app-server
+        # must fail well before the process's own (much longer) sleep ends.
+        run_id = new_run_id()
+        wt = self._prepare_wt(run_id)
+        self._write_control(wt, {"scenario": "hang", "sleep_s": 30})
+        started = time.monotonic()
+        completed = self.run_child(
+            "discussion", base_discussion_request(run_id, timeout_s=2), timeout=15
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("vaqtida kelmadi", json.loads(completed.stdout)["reason"])
+        self.assertLess(elapsed, 15)
+
+    def test_tmpdir_is_the_run_dirs_own_tmp_subdirectory(self) -> None:
+        run_id = new_run_id()
+        wt = self._prepare_wt(run_id)
+        self._write_control(wt, {"scenario": "report_tmpdir"})
+        completed = self.run_child("discussion", base_discussion_request(run_id))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)
+        # `_run_dir` resolves WORK_ROOT (symlinks and all, e.g. macOS's
+        # /var -> /private/var); compare against the same resolved path.
+        self.assertEqual(body["response"], str((self.work_root / run_id / "tmp").resolve()))
+
+    def test_refusal_frame_carries_the_redacted_stderr_tail(self) -> None:
+        run_id = new_run_id()
+        wt = self._prepare_wt(run_id)
+        self._write_control(
+            wt, {"scenario": "open_error", "stderr_text": "diagnostic detail line"}
+        )
+        completed = self.run_child("discussion", base_discussion_request(run_id))
+        self.assertEqual(completed.returncode, 3)
+        body = json.loads(completed.stdout)
+        self.assertIn("stderr_tail", body)
+        self.assertIn("diagnostic detail line", "\n".join(body["stderr_tail"]))
+
+    def test_diagnostics_config_matches_the_legacy_ops_module_exactly(self) -> None:
+        # ops/discussion_appserver.py is the still-live legacy path this
+        # subcommand replaces; its MCP wiring must not silently drift.
+        ops_dir = TESTS_DIR.parent.parent / "ops"
+        if str(ops_dir) not in sys.path:
+            sys.path.insert(0, str(ops_dir))
+        import discussion_appserver
+
+        legacy = discussion_appserver._app_server_command(83, "lease-x")
+        new = codex_child._app_server_argv(83, "lease-x")
+        # Only argv[0] (the codex binary path) legitimately differs between
+        # the two modules; everything after "app-server" must match exactly.
+        self.assertEqual(legacy[1:], new[1:])
+        legacy_plain = discussion_appserver._app_server_command(None, None)
+        new_plain = codex_child._app_server_argv(None, None)
+        self.assertEqual(legacy_plain[1:], new_plain[1:])
 
 
 if __name__ == "__main__":

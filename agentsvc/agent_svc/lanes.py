@@ -12,8 +12,17 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from threading import Event
 
-from .api import DiscussionLease, IntakeLease, LeaseLost, TaskManagerApi, Work
+from .api import (
+    DiscussionLease,
+    DiscussionLeaseInvalid,
+    IntakeLease,
+    IntakeLeaseInvalid,
+    LeaseLost,
+    TaskManagerApi,
+    Work,
+)
 from .api import InvalidResponse as ApiInvalidResponse
+from .discussion import GENERIC_ERROR
 from .log import Logger
 
 _INITIAL_BACKOFF_S = 30.0
@@ -198,6 +207,28 @@ class ChatLane(LoopRunner):
         """True if there was intake work (or a lease-fetch problem) this tick."""
         try:
             lease = self._api.lease_intake()
+        except IntakeLeaseInvalid as exc:
+            # The identity (id/revision/lease_id) parsed; only the rest of
+            # the body did not. Report the failure right now instead of
+            # leaving the row leased and silent for the full lease window.
+            self._logger.error(
+                exc, event="intake_lease_invalid", lane=self.name, task_id=exc.intake_id
+            )
+            try:
+                self._api.report_intake_result(
+                    exc.intake_id,
+                    revision=exc.revision,
+                    lease_id=exc.lease_id,
+                    result={"status": "failed", "error": str(exc)},
+                )
+            except Exception as report_exc:
+                self._logger.error(
+                    report_exc,
+                    event="intake_result_delivery_failed",
+                    lane=self.name,
+                    task_id=exc.intake_id,
+                )
+            return True
         except Exception as exc:
             self._logger.error(exc, event="intake_lease_failed", lane=self.name)
             return True
@@ -231,6 +262,30 @@ class ChatLane(LoopRunner):
     def _lease_and_run_discussion(self) -> None:
         try:
             lease = self._api.lease_discussion()
+        except DiscussionLeaseInvalid as exc:
+            self._logger.error(
+                exc,
+                event="discussion_lease_invalid",
+                lane=self.name,
+                task_id=exc.discussion_id,
+            )
+            try:
+                self._api.report_discussion_result(
+                    exc.discussion_id,
+                    revision=exc.revision,
+                    lease_id=exc.lease_id,
+                    thread_id=None,
+                    response=None,
+                    error=GENERIC_ERROR,
+                )
+            except Exception as report_exc:
+                self._logger.error(
+                    report_exc,
+                    event="discussion_result_delivery_failed",
+                    lane=self.name,
+                    task_id=exc.discussion_id,
+                )
+            return
         except Exception as exc:
             self._logger.error(exc, event="discussion_lease_failed", lane=self.name)
             return

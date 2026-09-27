@@ -211,6 +211,10 @@ def _app_server_main() -> int:
         scenario = control.get("scenario", "normal")
         thread_id = control.get("thread_id", "thr_new")
         final_message = control.get("final_message", "Javob tayyor.")
+        if scenario == "report_tmpdir":
+            # Proves `_discussion_env` actually sets TMPDIR to the run's own
+            # tmp/ subdirectory, by echoing it back as the turn's answer.
+            final_message = os.environ.get("TMPDIR", "")
         method = message.get("method")
         request_id = message.get("id")
         if method == "initialize":
@@ -219,10 +223,28 @@ def _app_server_main() -> int:
             continue
         elif method in ("thread/start", "thread/resume"):
             if scenario == "open_error":
+                stderr_text = control.get("stderr_text")
+                if stderr_text:
+                    sys.stderr.write(stderr_text + "\n")
+                    sys.stderr.flush()
                 send({"id": request_id, "error": {"message": "cannot open thread"}})
                 continue
+            if method == "thread/resume" and control.get("resume_fails"):
+                # Simulates a legacy thread id that no longer resolves under
+                # this lane's own CODEX_HOME (see codex_child.py's
+                # `open_thread` fallback): the client is expected to retry
+                # with a fresh `thread/start` after seeing this error.
+                send({"id": request_id, "error": {"message": "thread not found"}})
+                continue
             resumed = message.get("params", {}).get("threadId")
-            send({"id": request_id, "result": {"thread": {"id": resumed or thread_id}}})
+            reply_thread_id = resumed or thread_id
+            if method == "thread/start" and control.get("resume_fails"):
+                # This can only be the FALLBACK thread/start after a failed
+                # resume (a fresh start never carries "threadId" in its
+                # params) -- report a NEW, different thread id so a test can
+                # tell the fallback actually happened.
+                reply_thread_id = control.get("fallback_thread_id", thread_id)
+            send({"id": request_id, "result": {"thread": {"id": reply_thread_id}}})
         elif method == "turn/start":
             send({"id": request_id, "result": {"turn": {"id": "turn_1"}}})
             if scenario == "approval_request":

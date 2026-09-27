@@ -180,17 +180,23 @@ ensure_system_user agent-codex /home/agent-codex
 sudo usermod -aG agentwork agent-codex
 # Phase 3 (chat lane): the read-only Ketoshop diagnostics socket
 # (/run/task-manager-diagnostics/diagnostics.sock, mode 0660) is owned by
-# group `codex-runner` -- ops/task-manager-diagnostics.service's own
-# `Group=`, unchanged by this move so the OLD ops/discussion_appserver.py
-# path (still live until Phase 5) keeps working. Codex's app-server now
-# connects to that socket as `agent-codex`, never `codex-runner`, so
-# `agent-codex` needs read+write group access too. This ONLY grants POSIX
-# group membership on the socket file; it never changes the socket's own
-# mode, its service `Group=`, or diagnostic_host.py's own re-authorization
-# of the discussion-id/lease-id the proxy passes it -- that host-side check
-# is what actually gates what the connection may do, and stays as-is.
+# group `codex-runner` today -- ops/task-manager-diagnostics.service's own
+# `Group=`, deliberately left unchanged so the OLD ops/discussion_appserver.py
+# path (still live until Phase 5) keeps working with no ordering dependency
+# on anything this installer does. Codex's app-server now connects to that
+# socket as `agent-codex`, but `agent-codex` itself is deliberately NOT made
+# a member of `codex-runner` (that account is the live GitHub Actions
+# self-hosted runner identity -- far broader than "may read one socket").
+# Instead: a dedicated group, `task-diag-client`, owns ONLY this one socket
+# (diagnostic_host.py chgrp's it there after bind, best-effort, if the group
+# exists); `codex-runner` joins it too (so the legacy client keeps working
+# once diagnostic_host.py's chgrp takes effect); `agent-codex` is never a
+# permanent member of it at all -- its sudoers rule for the `discussion`
+# subcommand only (see ops/agent-svc.sudoers) grants that group for the
+# duration of that one sudo'd call (`sudo -g task-diag-client`), nothing else.
+getent group task-diag-client >/dev/null || sudo groupadd --system task-diag-client
 if getent group codex-runner >/dev/null; then
-  sudo usermod -aG codex-runner agent-codex
+  sudo usermod -aG task-diag-client codex-runner
 fi
 if sudo test -L /home/agent-codex; then
   echo "/home/agent-codex is a symlink; refusing" >&2
