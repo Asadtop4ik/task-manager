@@ -1570,6 +1570,15 @@ def cmd_exec(request: dict[str, Any]) -> int:
     env = _exec_env(params)
     stderr_tail: deque[str] = deque(maxlen=MAX_STDERR_LINES)
 
+    # Mark OURSELVES (codex_child.py's own process, not codex) as a reaper
+    # for our descendants BEFORE codex ever starts: a double-forked/setsid
+    # grandchild that outlives its immediate parent then re-parents to US
+    # (Linux only) instead of init, so `_reap_all_descendants` below can
+    # actually find and kill it regardless of how deeply -- or how soon
+    # after spawn -- it tried to detach itself. Setting this only after
+    # `Popen` would leave exactly that window open.
+    _prctl(PR_SET_CHILD_SUBREAPER, 1)
+
     try:
         process = subprocess.Popen(
             command,
@@ -1585,13 +1594,12 @@ def cmd_exec(request: dict[str, Any]) -> int:
         _emit_error(f"failed to start codex: {exc}")
         return 3
 
-    # Mark OURSELVES (codex_child.py's own process, not codex) as a reaper
-    # for our descendants: a double-forked/setsid grandchild that outlives
-    # its immediate parent then re-parents to US (Linux only) instead of
-    # init, so `_reap_all_descendants` below can actually find and kill it
-    # regardless of how deeply it tried to detach itself.
-    _prctl(PR_SET_CHILD_SUBREAPER, 1)
+    signaled = threading.Event()
 
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        signaled.set()
+
+    previous_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         assert process.stdin is not None and process.stderr is not None
         try:
@@ -1607,18 +1615,7 @@ def cmd_exec(request: dict[str, Any]) -> int:
         )
         stderr_thread.start()
 
-        signaled = threading.Event()
-
-        def _handle_sigterm(_signum: int, _frame: Any) -> None:
-            signaled.set()
-
-        previous_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
-        try:
-            outcome = _stream_and_wait(
-                process, params.timeout_s, params.idle_timeout_s, signaled
-            )
-        finally:
-            signal.signal(signal.SIGTERM, previous_handler)
+        outcome = _stream_and_wait(process, params.timeout_s, params.idle_timeout_s, signaled)
 
         try:
             process.wait(timeout=5)
@@ -1652,8 +1649,17 @@ def cmd_exec(request: dict[str, Any]) -> int:
     finally:
         # Every exit path -- normal EOF, timeout, idle, SIGTERM, or an
         # exception above -- reaches here before `cmd_exec` actually
-        # returns, so nothing sandboxed can survive us.
-        _reap_all_descendants()
+        # returns, so nothing sandboxed can survive us. SIGTERM stays
+        # HANDLED (never restored to the default "terminate immediately")
+        # until every descendant is confirmed gone: a second SIGTERM
+        # arriving mid-reap (e.g. a slow service shutdown) must not kill US
+        # before `_reap_all_descendants` finishes, which would leave
+        # sandboxed processes orphaned -- the exact leak this whole
+        # subreaper mechanism exists to avoid.
+        try:
+            _reap_all_descendants()
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
 
 
 # --------------------------------------------------------------------------

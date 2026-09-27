@@ -125,31 +125,56 @@ class SimpleCallTests(unittest.TestCase):
         self.assertEqual(runner.cleanup({"run_id": "r1"}), {"ok": True})
 
     def test_preflight_success(self) -> None:
-        def fake_runner(argv, **kwargs):
-            return FakeCompletedProcess(
-                0,
-                b'{"ok": true, "patch_b64": "", "changed_paths": [], '
-                b'"preflight_result": "ok"}',
-            )
+        # `preflight` now goes through `_call_with_grace` (Popen +
+        # `communicate`, for the graceful-timeout behavior below), not the
+        # `subprocess.run`-shaped `_simple_call` -- hence a `FakePopen`, not
+        # a `fake_runner`.
+        fake = FakePopen()
+        fake.stdout.push(
+            '{"ok": true, "patch_b64": "", "changed_paths": [], "preflight_result": "ok"}'
+        )
+        fake.finish(0)
 
-        runner = CodexRunner(command_prefix=[], libexec_dir="/x", runner=fake_runner)
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", popen=lambda *a, **k: fake)
         result = runner.preflight({"run_id": "r1"})
         self.assertEqual(result["preflight_result"], "ok")
 
     def test_preflight_failure_carries_the_trusted_failure_text_in_body(self) -> None:
-        def fake_runner(argv, **kwargs):
-            return FakeCompletedProcess(
-                3,
-                b'{"reason": "trusted preflight failed", '
-                b'"preflight_failure": "Ruff tekshiruvi xato berdi"}',
-            )
+        fake = FakePopen()
+        fake.stdout.push(
+            '{"reason": "trusted preflight failed", '
+            '"preflight_failure": "Ruff tekshiruvi xato berdi"}'
+        )
+        fake.finish(3)
 
-        runner = CodexRunner(command_prefix=[], libexec_dir="/x", runner=fake_runner)
+        runner = CodexRunner(command_prefix=[], libexec_dir="/x", popen=lambda *a, **k: fake)
         with self.assertRaises(CodexChildError) as ctx:
             runner.preflight({"run_id": "r1"})
         self.assertEqual(ctx.exception.reason, "trusted preflight failed")
         assert ctx.exception.body is not None
         self.assertEqual(ctx.exception.body["preflight_failure"], "Ruff tekshiruvi xato berdi")
+
+    def test_preflight_timeout_sigterms_then_waits_grace_before_sigkill(self) -> None:
+        # A hung/SIGTERM-ignoring child must see SIGTERM (relayed through
+        # `sudo`) and a full grace period BEFORE SIGKILL -- never SIGKILL
+        # first, matching `run_exec`'s own termination pattern (see
+        # `_call_with_grace`'s docstring).
+        fake = FakePopen()  # never `finish()`es on its own: simulates a hang
+
+        runner = CodexRunner(
+            command_prefix=[],
+            libexec_dir="/x",
+            popen=lambda *a, **k: fake,
+            sigkill_grace_s=0.05,
+        )
+        with self.assertRaises(CodexChildError) as ctx:
+            runner.preflight({"run_id": "r1"}, timeout_s=0.05)
+        self.assertEqual(ctx.exception.exit_code, -1)
+        self.assertIn("timed out", ctx.exception.reason)
+        self.assertTrue(fake.terminated, "SIGTERM was never sent on timeout")
+        self.assertTrue(
+            fake.killed, "a child still alive after the grace period must be killed"
+        )
 
     def test_child_error_body_is_none_without_a_parseable_json_body(self) -> None:
         def fake_runner(argv, **kwargs):
@@ -263,6 +288,28 @@ class FakePopen:
 
     def poll(self) -> int | None:
         return self.returncode
+
+    def communicate(
+        self, input: bytes | None = None, timeout: float | None = None
+    ) -> tuple[bytes, bytes]:
+        """Mimics `subprocess.Popen.communicate` closely enough for
+        `_call_with_grace`'s tests: write+close stdin, block for exit (like
+        `wait`), then drain the now-EOF'd fake stdout/stderr streams."""
+        if input is not None:
+            self.stdin.write(input)
+        self.stdin.close()
+        if self.returncode is None and not self._exited.wait(timeout=timeout):
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
+
+        def _drain(stream: _FakeStream) -> bytes:
+            data = b""
+            while True:
+                chunk = stream.readline()
+                if chunk == b"":
+                    return data
+                data += chunk
+
+        return _drain(self.stdout), _drain(self.stderr)
 
 
 def make_frame(**overrides) -> dict:
