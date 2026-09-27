@@ -202,6 +202,27 @@ class CodexRunner:
             subcommand,
         ]
 
+    def _parse_child_reply(
+        self, subcommand: str, returncode: int, stdout_bytes: bytes
+    ) -> dict[str, Any]:
+        stdout_text = stdout_bytes.decode("utf-8", "replace").strip()
+        try:
+            body: Any = json.loads(stdout_text) if stdout_text else None
+        except json.JSONDecodeError:
+            body = None
+        if returncode != 0:
+            reason = body.get("reason") if isinstance(body, dict) else None
+            raise CodexChildError(
+                returncode,
+                reason or f"codex child {subcommand} failed",
+                body=body if isinstance(body, dict) else None,
+            )
+        if not isinstance(body, dict):
+            raise CodexChildError(
+                returncode, f"codex child {subcommand} returned invalid JSON"
+            )
+        return body
+
     def _simple_call(
         self, subcommand: str, request: dict[str, Any], timeout_s: float
     ) -> dict[str, Any]:
@@ -218,23 +239,38 @@ class CodexRunner:
             )
         except subprocess.TimeoutExpired as exc:
             raise CodexChildError(-1, f"codex child {subcommand} timed out") from exc
-        stdout_text = completed.stdout.decode("utf-8", "replace").strip()
+        return self._parse_child_reply(subcommand, completed.returncode, completed.stdout)
+
+    def _call_with_grace(
+        self, subcommand: str, request: dict[str, Any], timeout_s: float
+    ) -> dict[str, Any]:
+        """Like `_simple_call`, but on timeout SIGTERMs `sudo` (relayed to the
+        agent-codex child it supervises) and waits `sigkill_grace_s` before
+        SIGKILL -- the same never-SIGKILL-first pattern `run_exec` uses --
+        instead of `subprocess.run(timeout=...)`'s immediate SIGKILL of
+        `sudo`. `sudo` dying by SIGKILL cannot relay anything (SIGKILL is
+        never caught), so the child (mid-preflight, possibly still running a
+        trusted tool subprocess) would otherwise be killed out from under
+        its own cleanup rather than given a chance to exit on its own; the
+        child's own internal deadline/subreaper (see `PREFLIGHT_DEADLINE_S`
+        in `codex_child.py`) is the backstop if it doesn't."""
+        argv = self._argv(subcommand)
+        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        process = self._popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         try:
-            body: Any = json.loads(stdout_text) if stdout_text else None
-        except json.JSONDecodeError:
-            body = None
-        if completed.returncode != 0:
-            reason = body.get("reason") if isinstance(body, dict) else None
-            raise CodexChildError(
-                completed.returncode,
-                reason or f"codex child {subcommand} failed",
-                body=body if isinstance(body, dict) else None,
-            )
-        if not isinstance(body, dict):
-            raise CodexChildError(
-                completed.returncode, f"codex child {subcommand} returned invalid JSON"
-            )
-        return body
+            stdout_bytes, _stderr_bytes = process.communicate(payload, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            self._send_sigterm(process)
+            try:
+                process.communicate(timeout=self._sigkill_grace_s)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.communicate(timeout=5)
+            raise CodexChildError(-1, f"codex child {subcommand} timed out") from exc
+        return self._parse_child_reply(subcommand, process.returncode, stdout_bytes)
 
     def prepare(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("prepare", request, timeout_s)
@@ -245,7 +281,7 @@ class CodexRunner:
     def preflight(
         self, request: dict[str, Any], *, timeout_s: float = 180.0
     ) -> dict[str, Any]:
-        return self._simple_call("preflight", request, timeout_s)
+        return self._call_with_grace("preflight", request, timeout_s)
 
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("cleanup", request, timeout_s)

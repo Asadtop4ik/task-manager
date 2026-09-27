@@ -71,6 +71,11 @@ class RedactorTests(unittest.TestCase):
         result = redactor.redact("AUTHORIZATION: Basic dW5rbm93bjpzZWNyZXQ=")
         self.assertNotIn("dW5rbm93bjpzZWNyZXQ=", result)
 
+    def test_never_masks_the_ordinary_english_word_basic(self) -> None:
+        redactor = Redactor([])
+        text = "This is a basic setup with a basic auth fallback for legacy clients."
+        self.assertEqual(redactor.redact(text), text)
+
 
 class LoggerTests(unittest.TestCase):
     def _logger(self, secrets: list[str]) -> tuple[Logger, io.StringIO]:

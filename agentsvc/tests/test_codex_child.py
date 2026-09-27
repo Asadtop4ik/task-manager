@@ -684,6 +684,24 @@ class ScanPatchForBadModesTests(unittest.TestCase):
         patch_text = "diff --git a/link b/link\nindex 1111111..2222222 120000\n"
         self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), "link")
 
+    def test_flags_symlink_with_a_quoted_header_path(self) -> None:
+        # git quotes the whole "a/..."/"b/..." token (C-style escapes) for
+        # paths needing it -- e.g. embedded spaces or non-ASCII bytes.
+        patch_text = (
+            'diff --git "a/evil link" "b/evil link"\n'
+            "new file mode 120000\n"
+            "index 0000000..1111111\n"
+        )
+        self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), "evil link")
+
+    def test_flags_symlink_with_a_quoted_header_path_containing_escapes(self) -> None:
+        patch_text = (
+            'diff --git "a/quote\\"link" "b/quote\\"link"\n'
+            "new file mode 120000\n"
+            "index 0000000..1111111\n"
+        )
+        self.assertEqual(codex_child._scan_patch_for_bad_modes(patch_text), 'quote\\"link')
+
 
 class DescendantPidTests(unittest.TestCase):
     def test_finds_all_descendants(self) -> None:
@@ -1404,6 +1422,84 @@ class ExecSignalIntegrationTests(ChildProcessTestCase):
             _pid_alive_for_test(grandchild_pid), "grandchild in a new session survived SIGTERM"
         )
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "PR_SET_CHILD_SUBREAPER is Linux-only"
+    )
+    def test_a_second_sigterm_during_reap_does_not_kill_us_before_it_finishes(self) -> None:
+        # The SIGTERM handler must stay installed through the WHOLE
+        # `_reap_all_descendants` call, not just through `_stream_and_wait`:
+        # restoring the default disposition too early means an external
+        # SIGTERM arriving mid-reap (a slow shutdown sending it twice, or
+        # any other repeat signal) kills codex_child.py itself before it
+        # finishes cleaning up its sandboxed descendants.
+        #
+        # "double_fork_immune" makes "codex" exit almost immediately (so
+        # `_stream_and_wait`/`kill_tree` are never even in the picture --
+        # they only ever touch the "codex" pid's own tree, and the orphan
+        # has already been re-parented away from it by then) while leaving
+        # behind a SIGTERM-ignoring orphan that only `_reap_all_descendants`
+        # (the catch-all net, walking codex_child.py's OWN descendants) can
+        # reach. That forces the full tree-kill grace period to elapse
+        # inside `_reap_all_descendants` -- a long, deterministic window,
+        # with no dependency on `kill_tree`'s own grace loop, in which
+        # codex_child.py is provably still mid-reap when we send SIGTERM.
+        run_id = new_run_id()
+        run_dir = self.make_run_dir(run_id)
+        tmp_dir = run_dir / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        marker = tmp_dir / "orphan.pid"
+        (tmp_dir / "fake_codex_control.json").write_text(
+            json.dumps(
+                {
+                    "scenario": "double_fork_immune",
+                    "sleep_s": 60,
+                    "thread_id": "df-immune-1",
+                    "grandchild_marker": str(marker),
+                }
+            ),
+            encoding="utf-8",
+        )
+        request = self.base_exec_request(run_id, timeout_s=60, idle_timeout_s=60)
+        process = self.run_child(
+            "exec",
+            request,
+            popen=True,
+            env_extra={"AGENT_CHILD_TEST_TREE_KILL_GRACE_S": "3"},
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.1)
+            self.assertTrue(marker.exists(), "fake codex never reported the orphan's pid")
+            orphan_pid = int(marker.read_text().strip())
+            self.assertTrue(_pid_alive_for_test(orphan_pid))
+            # "codex" (the fake binary) has already exited by now -- give
+            # `_reap_all_descendants` a moment to actually start its grace
+            # wait for the now-orphaned, SIGTERM-immune grandchild, then hit
+            # codex_child.py itself with SIGTERM twice while it is
+            # confirmed still inside that wait.
+            time.sleep(0.5)
+            self.assertTrue(_pid_alive_for_test(orphan_pid), "died before the reap window")
+            process.send_signal(codex_child.signal.SIGTERM)
+            time.sleep(1.5)  # well inside the 3s grace window
+            self.assertTrue(_pid_alive_for_test(orphan_pid), "reaped faster than expected")
+            process.send_signal(codex_child.signal.SIGTERM)
+            process.wait(timeout=15)
+            stdout = process.stdout.read() if process.stdout else ""
+            stderr = process.stderr.read() if process.stderr else ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+        self.assertEqual(process.returncode, 0, stderr)
+        frame = json.loads(stdout.strip().splitlines()[-1])
+        self.assertEqual(frame["type"], "agent_svc.result")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _pid_alive_for_test(orphan_pid):
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive_for_test(orphan_pid), "orphan outlived codex_child.py")
+
 
 def _pid_alive_for_test(pid: int) -> bool:
     try:
@@ -1668,10 +1764,35 @@ from pathlib import Path
 def run(repo, root, *, tools=None):
     import os
     import subprocess
+    import sys
 
     root = Path(root)
     if repo == "acme/fails":
         raise RuntimeError("simulated preflight failure")
+    if repo == "acme/hangs":
+        # A stuck tool subprocess (real ruff/black hanging), not a hang in
+        # this script's own Python code -- the watchdog kills DESCENDANT
+        # PROCESSES, so the "hang" this simulates has to be one.
+        subprocess.run(
+            [sys.executable, "-c", "import time; time.sleep(3600)"], check=True
+        )
+        return "unreachable"
+    if repo == "acme/noisy":
+        # Real ruff prints "All checks passed!" (and black/compileall have
+        # their own harmless-looking stdout chatter) with no stdout=PIPE of
+        # its own -- straight to whatever fd 1 currently is.
+        subprocess.run(
+            [sys.executable, "-c", "print('All checks passed!')"], check=True
+        )
+    if repo == "acme/envcheck":
+        return "|".join(
+            [
+                os.environ.get("HOME", ""),
+                os.environ.get("RUFF_NO_CACHE", ""),
+                os.environ.get("BLACK_CACHE_DIR", ""),
+                os.environ.get("XDG_CACHE_HOME", ""),
+            ]
+        )
     # Like the real preflight: stage what it changed (formatter fixes) ...
     (root / "PREFLIGHT_RAN.txt").write_text("ran\\n", encoding="utf-8")
     subprocess.run(["git", "add", "--", "PREFLIGHT_RAN.txt"], cwd=root, check=True)
@@ -1796,6 +1917,76 @@ class PreflightIntegrationTests(ChildProcessTestCase):
             body["preflight_failure"], "trusted failure: simulated preflight failure"
         )
         self.assertFalse((self.work_root / run_id / "pf").exists())
+
+    def test_noisy_tool_stdout_does_not_corrupt_the_json_result(self) -> None:
+        # Real ruff/black/compileall print straight to their inherited
+        # stdout with no capture of their own; without diverting fd 1 to
+        # fd 2 for the duration of the trusted `run()` call, this text
+        # would land in the middle of our single JSON output line.
+        run_id, mirror, sha, patch_b64 = self.prepared_patch(repo="acme/noisy")
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/noisy",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        body = json.loads(completed.stdout)  # would raise ValueError if corrupted
+        self.assertTrue(body["ok"])
+        self.assertNotIn("All checks passed!", completed.stdout.decode())
+        self.assertIn(b"All checks passed!", completed.stderr)
+
+    def test_gives_the_trusted_preflight_a_private_home_and_cache_environment(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch(repo="acme/envcheck")
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/envcheck",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+            },
+            env_extra=self.preflight_env(),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        home, ruff_no_cache, black_cache_dir, xdg_cache_home = json.loads(completed.stdout)[
+            "preflight_result"
+        ].split("|")
+        # `codex_child.py` resolves `WORK_ROOT` (symlinks and all); match
+        # that here rather than assuming the test's own unresolved path.
+        run_dir = (self.work_root / run_id).resolve()
+        self.assertTrue(home.startswith(str(run_dir)))
+        self.assertNotEqual(home, str(self.root))  # never the real HOME override either
+        self.assertEqual(ruff_no_cache, "true")
+        self.assertTrue(black_cache_dir.startswith(str(run_dir)))
+        self.assertTrue(xdg_cache_home.startswith(str(run_dir)))
+        # Cleaned up afterwards, just like `pf/`.
+        self.assertFalse((run_dir / "pf-home").exists())
+        self.assertFalse((run_dir / "pf-cache").exists())
+
+    def test_a_hung_tool_subprocess_is_killed_by_the_internal_deadline(self) -> None:
+        run_id, mirror, sha, patch_b64 = self.prepared_patch(repo="acme/hangs")
+        completed = self.run_child(
+            "preflight",
+            {
+                "run_id": run_id,
+                "repo": "acme/hangs",
+                "mirror": mirror,
+                "base_sha": sha,
+                "patch_b64": patch_b64,
+            },
+            env_extra=self.preflight_env(AGENT_CHILD_TEST_PREFLIGHT_DEADLINE_S="0.5"),
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 3)
+        body = json.loads(completed.stdout)
+        self.assertEqual(body["preflight_failure"], "trusted preflight timed out")
 
     def test_rejects_tool_path_outside_tools_dir(self) -> None:
         run_id, mirror, sha, patch_b64 = self.prepared_patch()

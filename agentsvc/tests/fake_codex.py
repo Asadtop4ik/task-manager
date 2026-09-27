@@ -12,9 +12,10 @@ this script by hand) matching `FAKE_CODEX_*` environment variables are used
 instead, purely as a convenience.
 
 Control fields (all optional, defaults noted):
-  scenario            "normal" | "idle" | "hang" | "fail" | "grandchild" |
-                       "double_fork" | "spoof_frame" | "huge_stdout"
-                       (default "normal")
+  scenario            "normal" | "idle" | "hang" | "sigterm_immune" |
+                       "fail" | "grandchild" | "double_fork" |
+                       "double_fork_immune" | "spoof_frame" |
+                       "huge_stdout" (default "normal")
   thread_id           this run's own (root) thread id, reported in
                        `thread.started` and as this rollout's own
                        `session_meta.payload.id`/`session_id` (default
@@ -203,6 +204,18 @@ def main() -> int:
         while True:
             time.sleep(1)
 
+    if scenario == "sigterm_immune":
+        # Ignores SIGTERM entirely, so `kill_tree`'s first (graceful) signal
+        # never kills it -- the full tree-kill grace period must elapse
+        # before SIGKILL. Used to give a test a reliable, non-racy window in
+        # which codex_child.py itself is still mid-reap.
+        import signal as _signal
+
+        _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)
+        _emit({"type": "thread.started", "thread_id": thread_id})
+        while True:
+            time.sleep(1)
+
     if scenario == "fail":
         _emit({"type": "thread.started", "thread_id": thread_id})
         sys.stderr.write("fake codex: simulated failure\n")
@@ -251,6 +264,36 @@ def main() -> int:
         os.close(devnull_fd)
         os.waitpid(pid, 0)  # reap our own immediate child, like a real daemonizer
         return 0  # "codex" itself now exits normally
+
+    if scenario == "double_fork_immune":
+        # Same daemonization as "double_fork", but the orphaned grandchild
+        # also ignores SIGTERM. `_reap_all_descendants` (the catch-all net,
+        # since the orphan re-parents to codex_child.py, not to "codex")
+        # must then wait its own full grace period before SIGKILL -- a
+        # long, deterministic window in which codex_child.py itself is
+        # provably still mid-reap, for testing that an external SIGTERM
+        # landing in that window does not kill it before cleanup finishes.
+        _emit({"type": "thread.started", "thread_id": thread_id})
+        devnull_fd = os.open(os.devnull, os.O_RDWR)
+        pid = os.fork()
+        if pid == 0:
+            import signal as _signal
+
+            os.setsid()
+            os.dup2(devnull_fd, 0)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+            grandchild_pid = os.fork()
+            if grandchild_pid == 0:
+                _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)
+                if grandchild_marker:
+                    Path(grandchild_marker).write_text(str(os.getpid()), encoding="utf-8")
+                time.sleep(sleep_s)
+                os._exit(0)
+            os._exit(0)  # orphans the grandchild
+        os.close(devnull_fd)
+        os.waitpid(pid, 0)
+        return 0
 
     if scenario == "spoof_frame":
         # A compromised/misbehaving codex tries to forge our own result
