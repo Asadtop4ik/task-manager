@@ -140,7 +140,9 @@ mv "$raw_dir/agentsvc/libexec" "$stage_dir/pkg/libexec"
 mv "$raw_dir/agentsvc/codex" "$stage_dir/pkg/codex"
 mv "$raw_dir/scripts/"*.py "$stage_dir/pkg/trusted/"
 mv "$raw_dir/backend/app/services/agent_repos.py" "$stage_dir/pkg/trusted/"
-tar -C "$stage_dir/pkg" -czf "$stage_dir/code.tar.gz" agent_svc libexec codex trusted
+# No macOS extended attributes in the archive (GNU tar on the server warns about them).
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage_dir/pkg" -czf "$stage_dir/code.tar.gz" \
+  agent_svc libexec codex trusted
 
 remote_dir=$(ssh -o BatchMode=yes netcup 'mktemp -d /tmp/agent-svc-install.XXXXXX')
 [[ "$remote_dir" =~ ^/tmp/agent-svc-install\.[A-Za-z0-9]+$ ]] || exit 1
@@ -285,6 +287,9 @@ else
   }
   echo "node24 installed: $installed"
 fi
+# `mktemp -d` staging dirs are 0700; the top-level dir must stay traversable so
+# agent-codex (and agent-svc) can run the pinned node. Enforced on every run.
+sudo chmod 0755 "$node_dir"
 
 codex_cli_dir=/opt/agent-svc/codex-cli
 codex_version=""
@@ -322,7 +327,10 @@ case "$codex_version" in
     # explicitly here (see ops/agent-svc-codex.lock for why).
     sudo rm -rf "$codex_cli_dir"
     sudo install -d -m 0755 -o root -g root "$codex_cli_dir"
-    sudo "$node_dir/bin/npm" install --global --prefix "$codex_cli_dir" \
+    # npm is a `#!/usr/bin/env node` script and sudo's secure_path has no node,
+    # so run it with the pinned node first on PATH.
+    sudo env PATH="$node_dir/bin:/usr/bin:/bin" "$node_dir/bin/npm" install \
+      --global --prefix "$codex_cli_dir" \
       --ignore-scripts --no-audit --no-fund \
       "$work/$CODEX_MAIN_TARBALL_NAME" \
       "${CODEX_LINUX_X64_ALIAS}@file:$work/$CODEX_LINUX_X64_TARBALL_NAME"
