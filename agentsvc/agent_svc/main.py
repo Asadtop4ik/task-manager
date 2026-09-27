@@ -16,11 +16,14 @@ from urllib.parse import urlsplit
 
 from . import repos
 from .api import TaskManagerApi, Work
+from .codex import DEFAULT_DISCUSSION_SUDO_GROUP
 from .config import ConfigError, Settings, build_settings, load_config, load_secrets
 from .context import ServiceContext, build_context, token_selector
 from .correction import handle_correction
+from .discussion import handle_discussion
 from .http import JsonHttp
 from .implement import handle_implement
+from .intake import handle_intake
 from .lanes import ChatLane, CodeLane, WatchLoop
 from .log import Redactor
 from .recovery import recover
@@ -93,12 +96,16 @@ def _sudo_rule_check(
     script_path: Path,
     *args: str,
     name: str,
+    group: str | None = None,
 ) -> tuple[bool, str, str]:
     """Check a sudoers rule with `sudo -n -l`, never executing `script_path`.
 
     `prefix` must have the shape `[sudo, -n, -u, USER, --, python, *flags]`
     (as `codex_child_prefix` does); anything else is reported as
-    unprobeable rather than guessed at.
+    unprobeable rather than guessed at. `group` (only for the `discussion`
+    subcommand's own rule) probes the exact `sudo -n -l -u USER -g GROUP`
+    shape that rule grants, never the plain `-u USER` form the other five
+    subcommands use.
     """
     if not script_path.is_file():
         return False, name, f"missing: {script_path}"
@@ -107,7 +114,10 @@ def _sudo_rule_check(
         return False, name, f"cannot probe sudo rule: unexpected prefix shape {prefix!r}"
     sudo_bin, user = prefix[0], prefix[3]
     python_argv = prefix[prefix.index("--") + 1 :]
-    argv = [sudo_bin, "-n", "-l", "-u", user, *python_argv, str(script_path), *args]
+    argv = [sudo_bin, "-n", "-l", "-u", user]
+    if group is not None:
+        argv += ["-g", group]
+    argv += [*python_argv, str(script_path), *args]
     try:
         result = runner(argv, capture_output=True, text=True, timeout=10, check=False)
     except Exception as exc:
@@ -167,6 +177,8 @@ def run(settings: Settings) -> int:
         logger=logger,
         poll_s=settings.poll_interval_s,
         enabled=settings.chat_lane_enabled,
+        handle_intake=lambda lease: handle_intake(ctx, lease),
+        handle_discussion=lambda lease: handle_discussion(ctx, lease),
     )
     watch_loop = WatchLoop(
         checks=build_watch_checks(ctx) if settings.watch_enabled else [],
@@ -313,6 +325,22 @@ def self_check(
             ok_flags,
             *_sudo_rule_check(
                 runner, settings.codex_child_prefix, child_path, "prepare", name="codex_child"
+            ),
+        )
+        # `discussion` has its OWN sudoers rule (a `-g task-diag-client`
+        # group grant the other five subcommands never get) — probed
+        # separately so a self-check can never mistake "prepare/exec/etc.
+        # work" for "discussion (with its group) also works".
+        _emit(
+            lines,
+            ok_flags,
+            *_sudo_rule_check(
+                runner,
+                settings.codex_child_prefix,
+                child_path,
+                "discussion",
+                name="codex_child_discussion",
+                group=DEFAULT_DISCUSSION_SUDO_GROUP,
             ),
         )
 

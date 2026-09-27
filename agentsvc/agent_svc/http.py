@@ -85,14 +85,20 @@ class JsonHttp:
         request: urllib.request.Request,
         *,
         max_bytes: int | None = None,
+        timeout: float | None = None,
     ) -> HttpResponse:
+        """`timeout` overrides this instance's own default for this one
+        call only (used by the chat lane to clamp a call to whatever
+        remains of its own job budget); omitted, this reproduces the exact
+        prior behavior."""
         cap = max_bytes if max_bytes is not None else self.max_json_bytes
+        call_timeout = timeout if timeout is not None else self._timeout
         idempotent_get = request.get_method() == "GET"
         attempts = (len(_RETRY_BACKOFF_S) + 1) if idempotent_get else 1
         last_error: HttpError | None = None
         for attempt in range(attempts):
             try:
-                return self._send_once(request, cap)
+                return self._send_once(request, cap, call_timeout)
             except HttpError as exc:
                 if not idempotent_get or exc.status < 500:
                     raise
@@ -104,9 +110,11 @@ class JsonHttp:
         assert last_error is not None
         raise last_error
 
-    def _send_once(self, request: urllib.request.Request, cap: int) -> HttpResponse:
+    def _send_once(
+        self, request: urllib.request.Request, cap: int, timeout: float
+    ) -> HttpResponse:
         try:
-            with self._opener(request, timeout=self._timeout) as response:
+            with self._opener(request, timeout=timeout) as response:
                 status = int(getattr(response, "status", getattr(response, "code", 200)))
                 raw = response.read(cap + 1)
                 headers = dict(getattr(response, "headers", {}) or {})

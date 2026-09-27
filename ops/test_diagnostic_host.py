@@ -1,4 +1,6 @@
+import grp
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,7 +11,62 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from diagnostic_host import AuditLog, DiagnosticHost
+import diagnostic_host
+from diagnostic_host import AuditLog, DiagnosticHost, _narrow_socket_group
+
+
+class SocketGroupTests(unittest.TestCase):
+    """Phase 3: the socket narrows to a dedicated group when it exists, and
+    is left exactly as today (the process's own group, `codex-runner` per
+    the unit's `Group=`) otherwise -- so a partial rollout can never break
+    the still-live legacy consumer."""
+
+    def test_chgrp_applied_when_the_group_exists(self) -> None:
+        with (
+            patch.object(
+                diagnostic_host.grp,
+                "getgrnam",
+                return_value=SimpleNamespace(gr_gid=4242),
+            ),
+            patch.object(diagnostic_host.os, "chown") as chown,
+        ):
+            _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")
+        chown.assert_called_once_with(Path("/tmp/x.sock"), -1, 4242)
+
+    def test_chgrp_permission_error_keeps_the_broker_running(self) -> None:
+        with (
+            patch.object(
+                diagnostic_host.grp,
+                "getgrnam",
+                return_value=SimpleNamespace(gr_gid=4242),
+            ),
+            patch.object(
+                diagnostic_host.os, "chown", side_effect=PermissionError("not a member")
+            ),
+        ):
+            _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")  # no raise
+
+    def test_real_chgrp_to_a_group_we_are_not_in_does_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "s"
+            target.write_text("", encoding="utf-8")
+            foreign = next(
+                (g for g in grp.getgrall() if g.gr_gid not in os.getgroups()), None
+            )
+            if foreign is None or os.geteuid() == 0:
+                self.skipTest("needs a non-root user and a group it is not in")
+            _narrow_socket_group(target, foreign.gr_name)
+            self.assertNotEqual(target.stat().st_gid, foreign.gr_gid)
+
+    def test_no_op_when_the_group_is_missing(self) -> None:
+        with (
+            patch.object(
+                diagnostic_host.grp, "getgrnam", side_effect=KeyError("no such group")
+            ),
+            patch.object(diagnostic_host.os, "chown") as chown,
+        ):
+            _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")
+        chown.assert_not_called()
 
 
 class DiagnosticHostTests(unittest.TestCase):

@@ -262,10 +262,16 @@ class SelfCheckTests(unittest.TestCase):
                 command_runner=runner,
                 stream=io.StringIO(),
             )
-            self.assertEqual(len(runner.calls), 2)
+            # codex_child (prepare), codex_child_discussion (-g task-diag-client), image_state.
+            self.assertEqual(len(runner.calls), 3)
             for call in runner.calls:
                 self.assertIn("-l", call)  # `sudo -n -l`: report the rule, never execute it
                 self.assertNotIn("--version", call)  # codex_child.py has no such subcommand
+            discussion_call = next(call for call in runner.calls if "discussion" in call)
+            self.assertIn("-g", discussion_call)
+            self.assertIn("task-diag-client", discussion_call)
+            prepare_call = next(call for call in runner.calls if "prepare" in call)
+            self.assertNotIn("-g", prepare_call)
 
     def test_image_state_probe_matches_the_pinned_sudoers_invocation(self) -> None:
         # ops/agent-svc.sudoers pins exactly `/usr/bin/python3 -I

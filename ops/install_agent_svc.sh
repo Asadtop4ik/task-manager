@@ -178,6 +178,31 @@ sudo usermod -aG agentwork agent-svc
 
 ensure_system_user agent-codex /home/agent-codex
 sudo usermod -aG agentwork agent-codex
+# Phase 3 (chat lane): the read-only Ketoshop diagnostics socket
+# (/run/task-manager-diagnostics/diagnostics.sock, mode 0660) is owned by
+# group `codex-runner` today -- ops/task-manager-diagnostics.service's own
+# `Group=`, deliberately left unchanged so the OLD ops/discussion_appserver.py
+# path (still live until Phase 5) keeps working with no ordering dependency
+# on anything this installer does. Codex's app-server now connects to that
+# socket as `agent-codex`, but `agent-codex` itself is deliberately NOT made
+# a member of `codex-runner` (that account is the live GitHub Actions
+# self-hosted runner identity -- far broader than "may read one socket").
+# Instead: a dedicated group, `task-diag-client`, owns ONLY this one socket
+# (diagnostic_host.py chgrp's it there after bind, best-effort, if the group
+# exists); `codex-runner` joins it too (so the legacy client keeps working
+# once diagnostic_host.py's chgrp takes effect); `agent-codex` is never a
+# permanent member of it at all -- its sudoers rule for the `discussion`
+# subcommand only (see ops/agent-svc.sudoers) grants that group for the
+# duration of that one sudo'd call (`sudo -g task-diag-client`), nothing else.
+getent group task-diag-client >/dev/null || sudo groupadd --system task-diag-client
+if getent group codex-runner >/dev/null; then
+  sudo usermod -aG task-diag-client codex-runner
+fi
+# The diagnostics broker must itself be in the group to chgrp its socket (no
+# CAP_CHOWN); takes effect when task-manager-diagnostics.service restarts.
+if id -u task-diagnostics >/dev/null 2>&1; then
+  sudo usermod -aG task-diag-client task-diagnostics
+fi
 if sudo test -L /home/agent-codex; then
   echo "/home/agent-codex is a symlink; refusing" >&2
   exit 1

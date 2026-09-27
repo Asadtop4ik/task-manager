@@ -299,9 +299,23 @@ class FakeCodexRunner:
         self._preflight_results: list[dict[str, Any] | Exception] = []
         self.prepare_error: Exception | None = None
         self.package_error: Exception | None = None
+        self.run_discussion_calls: list[dict[str, Any]] = []
+        self._discussion_results: list[dict[str, Any] | Exception] = []
 
     def queue_exec_result(self, result: CodexResult) -> None:
         self._exec_results.append(result)
+
+    def queue_discussion_result(self, result: dict[str, Any] | Exception) -> None:
+        self._discussion_results.append(result)
+
+    def run_discussion(
+        self, request: dict[str, Any], *, timeout_s: float, cancel: Any = None
+    ) -> dict[str, Any]:
+        self.run_discussion_calls.append(request)
+        result = self._discussion_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def queue_package_result(self, result: dict[str, Any]) -> None:
         self._package_results.append(result)
@@ -366,6 +380,68 @@ class FakeCodexRunner:
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         self.cleanup_calls.append(request)
         return {"ok": True}
+
+
+class FakeChatApi:
+    """Minimal `TaskManagerApi` stand-in for chat lane handler tests.
+
+    `handle_intake`/`handle_discussion` never lease their own work (the
+    `ChatLane` already did that and hands them an already-validated
+    `IntakeLease`/`DiscussionLease`), so this only needs the image-download
+    and result-report methods those two handlers actually call, plus call
+    recording for assertions.
+    """
+
+    def __init__(self) -> None:
+        self._images: dict[tuple[str, int], tuple[bytes, str]] = {}
+        self.intake_results: list[dict[str, Any]] = []
+        self.discussion_results: list[dict[str, Any]] = []
+
+    def set_image(self, kind: str, index: int, data: bytes, mime: str) -> None:
+        self._images[(kind, index)] = (data, mime)
+
+    def intake_image(
+        self, intake_id: int, lease_id: str, index: int, *, timeout: float | None = None
+    ) -> tuple[bytes, str]:
+        return self._images[("intake", index)]
+
+    def report_intake_result(
+        self, intake_id: int, *, revision: int, lease_id: str, result: dict[str, Any]
+    ) -> None:
+        self.intake_results.append(
+            {"intake_id": intake_id, "revision": revision, "lease_id": lease_id, **result}
+        )
+
+    def discussion_image(
+        self,
+        discussion_id: int,
+        lease_id: str,
+        index: int,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[bytes, str]:
+        return self._images[("discussion", index)]
+
+    def report_discussion_result(
+        self,
+        discussion_id: int,
+        *,
+        revision: int,
+        lease_id: str,
+        thread_id: str | None,
+        response: str | None,
+        error: str | None,
+    ) -> None:
+        self.discussion_results.append(
+            {
+                "discussion_id": discussion_id,
+                "revision": revision,
+                "lease_id": lease_id,
+                "thread_id": thread_id,
+                "response": response,
+                "error": error,
+            }
+        )
 
 
 _SECRETS = {

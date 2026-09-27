@@ -85,8 +85,16 @@ UMask=0027
 # leading "-" tolerates codex-runner's home not existing on some other host.
 # docker.sock is intentionally left reachable: the root-only image_state.py helper
 # (invoked via sudo) needs it, and neither agent-codex nor codex-runner is in the
-# docker group.
-InaccessiblePaths=-/home/codex-runner /srv/stack/env /etc/task-manager /home/deploy
+# docker group. Phase 3 additions: the legacy intake worker's own session temp
+# directory (/run/task-manager-intake, per-session task text/answers/images while
+# that service is still live) and the diagnostics audit log
+# (/var/log/task-manager-diagnostics, per-call metadata of every owner diagnostics
+# query) are hidden from every agent-codex child this unit spawns, same as
+# codex-runner's home above -- neither is something Codex's sandbox needs to see.
+# /run/task-manager-diagnostics (the socket's own directory) is deliberately NOT
+# listed here: the `discussion` subcommand's app-server must still reach the
+# socket inside it (see ops/agent-svc.sudoers's `-g task-diag-client`).
+InaccessiblePaths=-/home/codex-runner /srv/stack/env /etc/task-manager /home/deploy -/run/task-manager-intake -/var/log/task-manager-diagnostics
 
 [Install]
 WantedBy=multi-user.target

@@ -1669,6 +1669,458 @@ def cmd_exec(request: dict[str, Any]) -> int:
 
 
 # --------------------------------------------------------------------------
+# discussion: a single read-only `/suhbat` app-server turn (chat lane only).
+#
+# Ports `ops/discussion_appserver.py run_turn`'s JSON-RPC exchange and
+# ketoshop diagnostics MCP wiring exactly, but as a codex_child subcommand:
+# `agent_svc.codex.CodexRunner.run_discussion` speaks the same single
+# JSON-request/JSON-reply protocol as `prepare`/`package`/`preflight` (never
+# `exec`'s line-streamed JSONL) -- only the final `{"ok", "thread_id",
+# "response"}` frame reaches OUR stdout; every app-server JSON-RPC message
+# and its own stderr are consumed here and never forwarded. Runs with the
+# same descendant reaping/timeout discipline as `cmd_exec`: PDEATHSIG on the
+# spawned app-server, a child-subreaper on this process, `kill_tree` on
+# SIGTERM/timeout, and `_reap_all_descendants` on every exit path.
+# --------------------------------------------------------------------------
+
+DISCUSSION_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+MAX_DISCUSSION_PROMPT_CHARS = 10_000
+MAX_DISCUSSION_RESPONSE_CHARS = 4_000
+DISCUSSION_RPC_LINE_BYTES = 1024 * 1024
+
+# The diagnostics proxy path and socket stay exactly as today (owned by
+# `ops/task-manager-diagnostics.service`, unchanged by this move). What
+# changes is only how THIS process reaches that socket: agent-codex is never
+# a member of the socket's owning group, and this subcommand's own sudoers
+# rule grants it that group (`-g`, via `agent_svc.codex.CodexRunner.
+# run_discussion`) for the duration of this one call only -- see
+# ops/agent-svc.sudoers and ops/install_agent_svc.sh. Overridable in test
+# mode, like every other path constant above.
+DIAGNOSTIC_PROXY = _env_str("DIAGNOSTIC_PROXY", "/opt/task-manager/ops/diagnostic_proxy.py")
+DIAGNOSTIC_SOCKET = _env_str(
+    "DIAGNOSTIC_SOCKET", "/run/task-manager-diagnostics/diagnostics.sock"
+)
+
+
+class _DiscussionRefusal(ChildRefusal):
+    """A validated app-server protocol failure.
+
+    Carries the same Uzbek text `ops/discussion_appserver.py` raised, for
+    the redacted stderr/`reason` detail only -- `agent_svc.discussion`
+    always reports one fixed generic user-facing error to the backend
+    regardless of this exact reason (see that module's `GENERIC_ERROR`).
+    """
+
+
+@dataclass(frozen=True)
+class DiscussionParams:
+    run_dir: Path
+    cwd_path: Path
+    codex_home: Path
+    prompt: str
+    images: list[Path]
+    thread_id: str | None
+    model: str
+    effort: str
+    diagnostics_discussion_id: int | None
+    diagnostics_lease_id: str | None
+    timeout_s: float
+
+
+def _validate_discussion_request(request: dict[str, Any]) -> DiscussionParams:
+    run_id = _validate_run_id(request.get("run_id"))
+    run_dir = _run_dir(run_id)
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not (1 <= len(prompt) <= MAX_DISCUSSION_PROMPT_CHARS):
+        raise ChildRefusal("invalid prompt")
+    raw_images = request.get("images") or []
+    if not isinstance(raw_images, list) or len(raw_images) > MAX_IMAGES:
+        raise ChildRefusal("invalid images")
+    images_root = run_dir / "images"
+    images: list[Path] = []
+    for raw in raw_images:
+        if not isinstance(raw, str):
+            raise ChildRefusal("invalid image path")
+        images.append(_ensure_within(Path(raw), images_root))
+    thread_id = request.get("thread_id")
+    if thread_id is not None and (
+        not isinstance(thread_id, str) or not DISCUSSION_THREAD_ID_RE.fullmatch(thread_id)
+    ):
+        raise ChildRefusal("invalid thread_id")
+    model = request.get("model")
+    if model not in MODELS:
+        raise ChildRefusal("invalid model")
+    effort = request.get("effort")
+    if effort not in EFFORTS:
+        raise ChildRefusal("invalid effort")
+    diagnostics = request.get("diagnostics")
+    diagnostics_discussion_id: int | None = None
+    diagnostics_lease_id: str | None = None
+    if diagnostics is not None:
+        if not isinstance(diagnostics, dict):
+            raise ChildRefusal("invalid diagnostics")
+        discussion_id = diagnostics.get("discussion_id")
+        lease_id = diagnostics.get("lease_id")
+        if (
+            isinstance(discussion_id, bool)
+            or not isinstance(discussion_id, int)
+            or discussion_id < 1
+        ):
+            raise ChildRefusal("invalid diagnostics discussion_id")
+        if not isinstance(lease_id, str) or not lease_id or len(lease_id) > 100:
+            raise ChildRefusal("invalid diagnostics lease_id")
+        diagnostics_discussion_id = discussion_id
+        diagnostics_lease_id = lease_id
+    timeout_s = _positive_number(request.get("timeout_s"), maximum=MAX_TIMEOUT_S)
+    cwd_path = run_dir / "wt"
+    if not cwd_path.is_dir():
+        raise ChildRefusal("worktree is not prepared")
+    # Re-scan for blocked paths every call, like `exec` does for "wt": a
+    # discussion thread can be resumed across multiple turns against the
+    # SAME prepared snapshot.
+    _refuse_if_agent_config_present(cwd_path)
+    return DiscussionParams(
+        run_dir=run_dir,
+        cwd_path=cwd_path,
+        codex_home=Path(CODEX_HOMES["chat"]),
+        prompt=prompt,
+        images=images,
+        thread_id=thread_id,
+        model=model,
+        effort=effort,
+        diagnostics_discussion_id=diagnostics_discussion_id,
+        diagnostics_lease_id=diagnostics_lease_id,
+        timeout_s=timeout_s,
+    )
+
+
+def _app_server_argv(
+    diagnostics_discussion_id: int | None, diagnostics_lease_id: str | None
+) -> list[str]:
+    command = [CODEX_BINARY, "app-server", "--stdio"]
+    if diagnostics_discussion_id is not None:
+        if not diagnostics_lease_id:
+            # `_validate_discussion_request` already guarantees this pairing
+            # before ever calling this function; this is a second,
+            # defense-in-depth check against a future internal caller that
+            # skips that validation.
+            raise ChildRefusal("diagnostic lease capability is required")
+        proxy_args = json.dumps(
+            [
+                DIAGNOSTIC_PROXY,
+                "--discussion-id",
+                str(diagnostics_discussion_id),
+                "--lease-id",
+                diagnostics_lease_id,
+                "--socket",
+                DIAGNOSTIC_SOCKET,
+            ],
+            separators=(",", ":"),
+        )
+        command.extend(
+            [
+                "--config",
+                'mcp_servers.ketoshop_diagnostics.command="/usr/bin/python3"',
+                "--config",
+                f"mcp_servers.ketoshop_diagnostics.args={proxy_args}",
+            ]
+        )
+    return command
+
+
+def _discussion_env(run_dir: Path, codex_home: Path) -> dict[str, str]:
+    return {
+        "HOME": HOME_DIR,
+        "CODEX_HOME": str(codex_home),
+        "PATH": PATH_VALUE,
+        # `prepare` already created this (alongside "wt"/"images"), which
+        # `_validate_discussion_request` requires anyway -- never a fresh
+        # mkdir here, so the app-server can never be handed a tmp dir it
+        # doesn't already own.
+        "TMPDIR": str(run_dir / "tmp"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+def _thread_start_params(params: DiscussionParams) -> dict[str, Any]:
+    return {
+        "model": params.model,
+        "cwd": str(params.cwd_path),
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "serviceName": "task_manager_discussion",
+    }
+
+
+def _run_app_server_turn(
+    params: DiscussionParams, signaled: threading.Event
+) -> tuple[str, str]:
+    try:
+        process = subprocess.Popen(
+            _app_server_argv(params.diagnostics_discussion_id, params.diagnostics_lease_id),
+            cwd=str(params.cwd_path),
+            env=_discussion_env(params.run_dir, params.codex_home),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            preexec_fn=_preexec_pdeathsig,
+        )
+    except OSError as exc:
+        raise ChildRefusal(f"failed to start codex app-server: {exc}") from exc
+    assert (
+        process.stdin is not None and process.stdout is not None and process.stderr is not None
+    )
+    stdin, stdout = process.stdin, process.stdout
+
+    messages: queue.Queue[Any] = queue.Queue()
+    stderr_tail: deque[str] = deque(maxlen=MAX_STDERR_LINES)
+
+    def _pump_messages() -> None:
+        try:
+            while True:
+                raw_line = stdout.readline(DISCUSSION_RPC_LINE_BYTES)
+                if not raw_line:
+                    break
+                text = raw_line.decode("utf-8", "replace").strip()
+                if not text:
+                    continue
+                try:
+                    messages.put(json.loads(text))
+                except json.JSONDecodeError:
+                    continue
+        except (OSError, ValueError):
+            pass
+        finally:
+            messages.put(None)
+
+    reader = threading.Thread(target=_pump_messages, daemon=True)
+    stderr_reader = threading.Thread(
+        target=_pump_stderr, args=(process.stderr, stderr_tail), daemon=True
+    )
+    reader.start()
+    stderr_reader.start()
+
+    deadline = time.monotonic() + params.timeout_s
+    next_id = [0]
+
+    def new_id() -> int:
+        next_id[0] += 1
+        return next_id[0]
+
+    def send(method: str, request_id: int | None, rpc_params: dict[str, Any]) -> None:
+        value: dict[str, Any] = {"method": method, "params": rpc_params}
+        if request_id is not None:
+            value["id"] = request_id
+        try:
+            stdin.write((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
+            stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise _DiscussionRefusal(f"Codex suhbat aloqasi uzildi: {exc}") from exc
+
+    def read() -> dict[str, Any]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _DiscussionRefusal("Codex javobi vaqtida kelmadi")
+            if signaled.is_set():
+                raise _DiscussionRefusal("cancelled")
+            try:
+                message = messages.get(timeout=min(max(remaining, 0.05), 0.5))
+            except queue.Empty:
+                continue
+            if message is None or not isinstance(message, dict):
+                raise _DiscussionRefusal("Codex suhbat aloqasi uzildi")
+            return message
+
+    def await_reply(request_id: int) -> dict[str, Any]:
+        """The raw JSON-RPC reply for `request_id` -- which may itself carry
+        an "error" field; callers decide whether that is fatal. Only an
+        INCOMING request (an approval ask) always raises here: that is never
+        acceptable regardless of which call is outstanding."""
+        while True:
+            message = read()
+            if "id" in message and "method" in message:
+                # Never grant tool or network approvals to an automated chat.
+                raise _DiscussionRefusal("Codex qo‘shimcha ruxsat so‘radi")
+            if message.get("id") == request_id:
+                return message
+
+    def response(request_id: int) -> dict[str, Any]:
+        reply = await_reply(request_id)
+        if "error" in reply:
+            raise _DiscussionRefusal("Codex suhbatni boshlay olmadi")
+        result = reply.get("result")
+        if not isinstance(result, dict):
+            raise _DiscussionRefusal("Codex noto‘g‘ri javob berdi")
+        return result
+
+    def extract_thread_id(reply: dict[str, Any]) -> str | None:
+        if "error" in reply:
+            return None
+        result = reply.get("result")
+        if not isinstance(result, dict):
+            return None
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            return None
+        candidate = thread.get("id")
+        if not isinstance(candidate, str) or not DISCUSSION_THREAD_ID_RE.fullmatch(candidate):
+            return None
+        return candidate
+
+    def open_thread() -> str:
+        if params.thread_id:
+            resume_id = new_id()
+            send(
+                "thread/resume",
+                resume_id,
+                {"threadId": params.thread_id, "cwd": str(params.cwd_path)},
+            )
+            resumed = extract_thread_id(await_reply(resume_id))
+            if resumed is not None:
+                return resumed
+            # The legacy chat worker's thread ids live under a different
+            # CODEX_HOME (the old codex-runner ~/.codex, not this lane's own
+            # .codex-chat) -- resume can fail forever for any thread that
+            # predates the chat-lane cutover. Fall back to a brand new
+            # thread instead of failing the whole turn; the caller persists
+            # whatever id THIS call returns, so the next turn resumes the
+            # new one.
+        start_id = new_id()
+        send("thread/start", start_id, _thread_start_params(params))
+        started = extract_thread_id(await_reply(start_id))
+        if started is None:
+            raise _DiscussionRefusal("Codex suhbatni saqlay olmadi")
+        return started
+
+    refused: ChildRefusal | None = None
+    try:
+        init_id = new_id()
+        send(
+            "initialize",
+            init_id,
+            {
+                "clientInfo": {
+                    "name": "task_manager_discussion",
+                    "title": "Task Manager discussion",
+                    "version": "1.0.0",
+                }
+            },
+        )
+        response(init_id)
+        send("initialized", None, {})
+
+        saved_thread_id = open_thread()
+        inputs: list[dict[str, str]] = [{"type": "text", "text": params.prompt}]
+        inputs.extend({"type": "localImage", "path": str(image)} for image in params.images)
+        turn_id = new_id()
+        send(
+            "turn/start",
+            turn_id,
+            {
+                "threadId": saved_thread_id,
+                "input": inputs,
+                "cwd": str(params.cwd_path),
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly"},
+                "model": params.model,
+                "effort": params.effort,
+                "summary": "concise",
+            },
+        )
+        response(turn_id)
+        answer = ""
+        while True:
+            message = read()
+            if message.get("method") == "item/completed":
+                item = (message.get("params") or {}).get("item") or {}
+                if item.get("type") == "agentMessage" and item.get("phase") in (
+                    None,
+                    "final_answer",
+                ):
+                    answer = str(item.get("text") or "")
+            elif message.get("method") == "turn/completed":
+                turn = (message.get("params") or {}).get("turn") or {}
+                if turn.get("status") != "completed" or not answer.strip():
+                    raise _DiscussionRefusal("Codex suhbat javobini tugata olmadi")
+                return saved_thread_id, answer.strip()[:MAX_DISCUSSION_RESPONSE_CHARS]
+            elif "id" in message and "method" in message:
+                raise _DiscussionRefusal("Codex qo‘shimcha ruxsat so‘radi")
+    except ChildRefusal as exc:
+        # Only recorded here (not yet read); attached to the exception down
+        # in `finally`, AFTER `stderr_reader.join()` -- reading `stderr_tail`
+        # this early would race that thread still draining the app-server's
+        # pipe.
+        refused = exc
+        raise
+    finally:
+        kill_tree(process.pid)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+        reader.join(timeout=2)
+        stderr_reader.join(timeout=2)
+        if refused is not None:
+            # Carried only for the redacted `stderr_tail` in the emitted
+            # refusal frame (see `cmd_discussion`) -- never used to change
+            # what was raised or how. Safe to mutate here: `finally` always
+            # completes before this same exception object reaches the
+            # caller.
+            refused.stderr_tail = list(stderr_tail)[-MAX_STDERR_LINES:]  # type: ignore[attr-defined]
+
+
+def cmd_discussion(request: dict[str, Any]) -> int:
+    try:
+        params = _validate_discussion_request(request)
+    except ChildRefusal as exc:
+        _emit_error(str(exc))
+        return 3
+    except OSError as exc:
+        _emit_error(f"discussion setup failed: {exc}")
+        return 3
+
+    signaled = threading.Event()
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        signaled.set()
+
+    previous_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
+    # Mark ourselves as a reaper BEFORE the app-server ever starts, so a
+    # double-forked/setsid grandchild (a sandboxed tool call) is reachable by
+    # `_reap_all_descendants` regardless of how deep or how soon it detaches.
+    _prctl(PR_SET_CHILD_SUBREAPER, 1)
+    try:
+        thread_id, answer = _run_app_server_turn(params, signaled)
+    except ChildRefusal as exc:
+        # `stderr_tail` (see `_run_app_server_turn`'s own `except ChildRefusal`)
+        # is the app-server's raw, UNREDACTED stderr: it goes into this one
+        # JSON frame on OUR stdout, never printed anywhere by this process,
+        # and the parent (`agent_svc.discussion`) redacts it before logging.
+        stderr_tail = getattr(exc, "stderr_tail", None)
+        body: dict[str, Any] = {"reason": str(exc)}
+        if stderr_tail:
+            body["stderr_tail"] = stderr_tail
+        print(json.dumps(body, ensure_ascii=False), flush=True)
+        return 3
+    except OSError as exc:
+        _emit_error(f"discussion failed: {exc}")
+        return 3
+    finally:
+        try:
+            _reap_all_descendants()
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+    print(
+        json.dumps(
+            {"ok": True, "thread_id": thread_id, "response": answer}, ensure_ascii=False
+        ),
+        flush=True,
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------
 # dispatch
 # --------------------------------------------------------------------------
 
@@ -1678,12 +2130,15 @@ SUBCOMMANDS: dict[str, Callable[[dict[str, Any]], int]] = {
     "package": cmd_package,
     "preflight": cmd_preflight,
     "cleanup": cmd_cleanup,
+    "discussion": cmd_discussion,
 }
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2 or argv[1] not in SUBCOMMANDS:
-        _emit_error("usage: codex_child.py <prepare|exec|package|preflight|cleanup>")
+        _emit_error(
+            "usage: codex_child.py <prepare|exec|package|preflight|cleanup|discussion>"
+        )
         return 2
     cap = PREFLIGHT_MAX_REQUEST_BYTES if argv[1] == "preflight" else MAX_REQUEST_BYTES
     raw = sys.stdin.buffer.read(cap + 1)

@@ -7,7 +7,16 @@ from datetime import UTC, datetime
 from threading import Event
 from unittest.mock import patch
 
-from agent_svc.api import InvalidWork, LeaseLost, Work
+from agent_svc.api import (
+    DiscussionLease,
+    DiscussionLeaseInvalid,
+    IntakeLease,
+    IntakeLeaseInvalid,
+    InvalidWork,
+    LeaseLost,
+    Work,
+)
+from agent_svc.discussion import GENERIC_ERROR
 from agent_svc.lanes import ChatLane, CodeLane, LoopRunner, WatchLoop
 from agent_svc.log import Logger, Redactor
 
@@ -245,11 +254,218 @@ class CodeLaneTests(unittest.TestCase):
         self.assertEqual([w.run_id for w in calls], ["run-1"])
 
 
+def _intake_lease(intake_id: int = 1) -> IntakeLease:
+    return IntakeLease(
+        intake_id=intake_id,
+        revision=1,
+        lease_id="lease-1",
+        text="Task",
+        answer_text=None,
+        mode="pr",
+        images=(),
+        repo_full_name="Owner/repo",
+        base_branch="main",
+        analysis_rounds=0,
+    )
+
+
+def _discussion_lease(discussion_id: int = 1) -> DiscussionLease:
+    return DiscussionLease(
+        discussion_id=discussion_id,
+        revision=1,
+        lease_id="lease-1",
+        repo_full_name="Owner/repo",
+        base_branch="main",
+        project_key="repo",
+        diagnostics_enabled=False,
+        thread_id=None,
+        text="Salom",
+        images=(),
+    )
+
+
+class FakeChatApi:
+    def __init__(
+        self,
+        *,
+        intake_leases: list[object] | None = None,
+        discussion_leases: list[object] | None = None,
+    ) -> None:
+        self._intake_leases = list(intake_leases or [])
+        self._discussion_leases = list(discussion_leases or [])
+        self.intake_lease_calls = 0
+        self.discussion_lease_calls = 0
+        self.intake_results: list[dict] = []
+        self.discussion_results: list[dict] = []
+
+    def lease_intake(self) -> IntakeLease | None:
+        self.intake_lease_calls += 1
+        result = self._intake_leases.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def lease_discussion(self) -> DiscussionLease | None:
+        self.discussion_lease_calls += 1
+        result = self._discussion_leases.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def report_intake_result(self, intake_id, *, revision, lease_id, result) -> None:
+        self.intake_results.append(
+            {"intake_id": intake_id, "revision": revision, "lease_id": lease_id, **result}
+        )
+
+    def report_discussion_result(
+        self, discussion_id, *, revision, lease_id, thread_id, response, error
+    ) -> None:
+        self.discussion_results.append(
+            {
+                "discussion_id": discussion_id,
+                "revision": revision,
+                "lease_id": lease_id,
+                "thread_id": thread_id,
+                "response": response,
+                "error": error,
+            }
+        )
+
+
 class ChatLaneTests(unittest.TestCase):
     def test_disabled_by_default_and_never_calls_the_api(self) -> None:
-        api = FakeApi(leases=[])
+        api = FakeChatApi()
         lane = ChatLane(api=api, logger=_logger(), poll_s=0.0)
         lane.tick()  # would raise IndexError if it leased anything
+
+    def test_disabled_lane_ignores_handlers_too(self) -> None:
+        calls: list[object] = []
+        api = FakeChatApi()
+        lane = ChatLane(
+            api=api,
+            logger=_logger(),
+            poll_s=0.0,
+            enabled=False,
+            handle_intake=lambda lease: calls.append(lease),
+        )
+        lane.tick()
+        self.assertEqual(calls, [])
+
+    def test_no_work_of_either_kind_is_a_no_op(self) -> None:
+        api = FakeChatApi(intake_leases=[None], discussion_leases=[None])
+        lane = ChatLane(api=api, logger=_logger(), poll_s=0.0, enabled=True)
+        lane.tick()
+        self.assertEqual(api.intake_lease_calls, 1)
+        self.assertEqual(api.discussion_lease_calls, 1)
+
+    def test_intake_work_dispatches_to_its_handler_and_skips_discussion(self) -> None:
+        lease = _intake_lease()
+        received: list[IntakeLease] = []
+        api = FakeChatApi(intake_leases=[lease])
+        lane = ChatLane(
+            api=api,
+            logger=_logger(),
+            poll_s=0.0,
+            enabled=True,
+            handle_intake=lambda work: received.append(work),
+        )
+        lane.tick()
+        self.assertEqual(received, [lease])
+        self.assertEqual(api.discussion_lease_calls, 0)  # intake found -> no discussion poll
+
+    def test_discussion_is_only_polled_when_intake_is_idle(self) -> None:
+        lease = _discussion_lease()
+        received: list[DiscussionLease] = []
+        api = FakeChatApi(intake_leases=[None], discussion_leases=[lease])
+        lane = ChatLane(
+            api=api,
+            logger=_logger(),
+            poll_s=0.0,
+            enabled=True,
+            handle_discussion=lambda work: received.append(work),
+        )
+        lane.tick()
+        self.assertEqual(received, [lease])
+
+    def test_an_intake_lease_fetch_failure_skips_discussion_this_tick(self) -> None:
+        api = FakeChatApi(intake_leases=[RuntimeError("network blip")], discussion_leases=[])
+        lane = ChatLane(api=api, logger=_logger(), poll_s=0.0, enabled=True)
+        lane.tick()  # must not raise, and must not try discussion (empty queue would IndexError)
+        self.assertEqual(api.discussion_lease_calls, 0)
+
+    def test_one_failing_intake_handler_does_not_block_a_later_one(self) -> None:
+        api = FakeChatApi(intake_leases=[_intake_lease(1), _intake_lease(2)])
+
+        def boom(work: IntakeLease) -> None:
+            raise RuntimeError("handler exploded")
+
+        processed: list[int] = []
+        lane = ChatLane(
+            api=api,
+            logger=_logger(),
+            poll_s=0.0,
+            enabled=True,
+            handle_intake=lambda work: (
+                boom(work) if work.intake_id == 1 else processed.append(work.intake_id)
+            ),
+        )
+        lane.tick()
+        lane.tick()
+        self.assertEqual(processed, [2])
+
+    def test_no_handler_registered_is_logged_and_does_not_raise(self) -> None:
+        api = FakeChatApi(intake_leases=[_intake_lease()])
+        lane = ChatLane(api=api, logger=_logger(), poll_s=0.0, enabled=True)
+        lane.tick()  # no handle_intake configured -> must not raise
+
+    def test_intake_body_validation_failure_is_reported_immediately(self) -> None:
+        # Identity parsed, body invalid: a real handler never runs (there is
+        # no valid IntakeLease), but the failure must reach the backend
+        # right now instead of leaving the row leased and silent for the
+        # full lease window.
+        invalid = IntakeLeaseInvalid(
+            "intake lease response has a repository outside the approved catalog",
+            intake_id=99,
+            revision=4,
+            lease_id="lease-9",
+        )
+        api = FakeChatApi(intake_leases=[invalid])
+        received: list[IntakeLease] = []
+        lane = ChatLane(
+            api=api,
+            logger=_logger(),
+            poll_s=0.0,
+            enabled=True,
+            handle_intake=lambda work: received.append(work),
+        )
+        lane.tick()  # must not raise
+        self.assertEqual(received, [])  # no handler invocation for an invalid lease
+        self.assertEqual(len(api.intake_results), 1)
+        result = api.intake_results[0]
+        self.assertEqual(result["intake_id"], 99)
+        self.assertEqual(result["revision"], 4)
+        self.assertEqual(result["lease_id"], "lease-9")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("approved catalog", result["error"])
+
+    def test_discussion_body_validation_failure_is_reported_with_generic_error(self) -> None:
+        invalid = DiscussionLeaseInvalid(
+            "discussion lease response has diagnostics enabled for an unapproved project",
+            discussion_id=7,
+            revision=2,
+            lease_id="lease-7",
+        )
+        api = FakeChatApi(intake_leases=[None], discussion_leases=[invalid])
+        lane = ChatLane(api=api, logger=_logger(), poll_s=0.0, enabled=True)
+        lane.tick()  # must not raise
+        self.assertEqual(len(api.discussion_results), 1)
+        result = api.discussion_results[0]
+        self.assertEqual(result["discussion_id"], 7)
+        self.assertEqual(result["revision"], 2)
+        self.assertEqual(result["lease_id"], "lease-7")
+        self.assertIsNone(result["thread_id"])
+        self.assertIsNone(result["response"])
+        self.assertEqual(result["error"], GENERIC_ERROR)
 
 
 class WatchLoopTests(unittest.TestCase):

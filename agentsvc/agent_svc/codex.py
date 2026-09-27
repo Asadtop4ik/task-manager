@@ -29,6 +29,11 @@ from typing import Any
 DEFAULT_SUDO_PREFIX = ["/usr/bin/sudo", "-n", "-u", "agent-codex", "--"]
 DEFAULT_PYTHON_BIN = "/usr/bin/python3"
 DEFAULT_LIBEXEC_DIR = "/opt/agent-svc/libexec"
+# Phase 3 (chat lane): the ONLY subcommand that gets this group, and only for
+# the duration of that one sudo'd call (`sudo -g`) -- never a permanent
+# supplementary group of the agent-codex account. See ops/agent-svc.sudoers
+# and ops/install_agent_svc.sh for the matching sudoers rule and group setup.
+DEFAULT_DISCUSSION_SUDO_GROUP = "task-diag-client"
 
 HARD_WALL_SAFETY_S = 60.0
 # A generous grace period: SIGKILL must never be the first signal we send
@@ -176,6 +181,7 @@ class CodexRunner:
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         hard_wall_safety_s: float = HARD_WALL_SAFETY_S,
         sigkill_grace_s: float = SIGKILL_GRACE_S,
+        discussion_sudo_group: str = DEFAULT_DISCUSSION_SUDO_GROUP,
     ) -> None:
         self._command_prefix = list(
             DEFAULT_SUDO_PREFIX if command_prefix is None else command_prefix
@@ -190,12 +196,28 @@ class CodexRunner:
         # these to keep the timeout/SIGKILL-grace suite fast.
         self._hard_wall_safety_s = hard_wall_safety_s
         self._sigkill_grace_s = sigkill_grace_s
+        self._discussion_sudo_group = discussion_sudo_group
 
-    def _argv(self, subcommand: str) -> list[str]:
+    def _argv(self, subcommand: str, *, group: str | None = None) -> list[str]:
         # `-I` (isolated mode): no PYTHONPATH/user site/.pth files, matching
-        # the exact command sudoers pins in production.
+        # the exact command sudoers pins in production. `group` (only ever
+        # passed for "discussion", see `run_discussion`) inserts `-g group`
+        # right before the `--` that ends sudo's own option list, matching
+        # the exact `sudo -n -u agent-codex -g task-diag-client --` shape the
+        # sudoers rule for that one subcommand grants -- never applied to any
+        # other subcommand's argv.
+        prefix = list(self._command_prefix)
+        if group is not None and "--" in prefix:
+            # Tests exercising `run_discussion` directly against a fake
+            # `Popen` often pass `command_prefix=[]` to skip sudo's argv
+            # shape entirely; there is no sudo option list to insert a `-g`
+            # into then, so this is a no-op rather than an error in that
+            # case -- production's `codex_child_prefix` always ends in
+            # `--`, so the real invocation always gets the group.
+            index = prefix.index("--")
+            prefix = [*prefix[:index], "-g", group, *prefix[index:]]
         return [
-            *self._command_prefix,
+            *prefix,
             self._python_bin,
             "-I",
             str(self._child_script),
@@ -242,7 +264,13 @@ class CodexRunner:
         return self._parse_child_reply(subcommand, completed.returncode, completed.stdout)
 
     def _call_with_grace(
-        self, subcommand: str, request: dict[str, Any], timeout_s: float
+        self,
+        subcommand: str,
+        request: dict[str, Any],
+        timeout_s: float,
+        *,
+        cancel: threading.Event | None = None,
+        group: str | None = None,
     ) -> dict[str, Any]:
         """Like `_simple_call`, but on timeout SIGTERMs `sudo` (relayed to the
         agent-codex child it supervises) and waits `sigkill_grace_s` before
@@ -253,12 +281,30 @@ class CodexRunner:
         trusted tool subprocess) would otherwise be killed out from under
         its own cleanup rather than given a chance to exit on its own; the
         child's own internal deadline/subreaper (see `PREFLIGHT_DEADLINE_S`
-        in `codex_child.py`) is the backstop if it doesn't."""
-        argv = self._argv(subcommand)
+        in `codex_child.py`) is the backstop if it doesn't.
+
+        `cancel` (used by `run_discussion`, never by `preflight`): a
+        background watcher SIGTERMs `sudo` early if `cancel` fires before the
+        call would otherwise finish, so a service shutdown interrupts an
+        in-flight discussion turn instead of blocking for its full timeout.
+        Passing `None` (the default) reproduces the exact prior behavior."""
+        argv = self._argv(subcommand, group=group)
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
         process = self._popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        stop_watch = threading.Event()
+        cancel_watcher: threading.Thread | None = None
+        if cancel is not None:
+
+            def _watch_cancel() -> None:
+                while not stop_watch.is_set():
+                    if cancel.wait(timeout=0.5):
+                        self._send_sigterm(process)
+                        return
+
+            cancel_watcher = threading.Thread(target=_watch_cancel, daemon=True)
+            cancel_watcher.start()
         try:
             stdout_bytes, _stderr_bytes = process.communicate(payload, timeout=timeout_s)
         except subprocess.TimeoutExpired as exc:
@@ -270,6 +316,10 @@ class CodexRunner:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.communicate(timeout=5)
             raise CodexChildError(-1, f"codex child {subcommand} timed out") from exc
+        finally:
+            stop_watch.set()
+            if cancel_watcher is not None:
+                cancel_watcher.join(timeout=1)
         return self._parse_child_reply(subcommand, process.returncode, stdout_bytes)
 
     def prepare(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
@@ -285,6 +335,36 @@ class CodexRunner:
 
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("cleanup", request, timeout_s)
+
+    def run_discussion(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout_s: float,
+        cancel: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """One `/suhbat` app-server turn (single JSON-in, JSON-out call).
+
+        Unlike `run_exec`, the child never streams intermediate JSONL: only
+        the final `{"thread_id", "response"}` frame reaches stdout (tool
+        noise goes to the child's own stderr instead), so this reuses the
+        single-request/single-reply `_call_with_grace` plumbing `preflight`
+        already relies on for its own SIGTERM-then-grace cancellation
+        discipline, rather than `run_exec`'s line-streaming protocol.
+        `timeout_s` here is the OUTER wall clock the parent waits before
+        SIGTERM-ing `sudo`; callers should pass a small margin over the
+        child's own internal deadline (`request["timeout_s"]`) so the
+        child's clean, reasoned timeout wins the race, not our SIGTERM.
+        The sudo call is granted this runner's `discussion_sudo_group`
+        (`-g`) for the duration of this one call only -- see `_argv`.
+        """
+        return self._call_with_grace(
+            "discussion",
+            request,
+            timeout_s,
+            cancel=cancel,
+            group=self._discussion_sudo_group,
+        )
 
     def run_exec(
         self,

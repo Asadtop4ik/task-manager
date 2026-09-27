@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -198,6 +200,101 @@ class MirrorManagerRealGitTests(unittest.TestCase):
             )
             sha = manager.fetch("owner/repo", agent_branch)
             self.assertTrue(sha)
+
+    def test_fetch_timeout_override_reaches_both_git_calls(self) -> None:
+        # The chat lane clamps a fetch to whatever remains of its own job
+        # budget (`ChatRun.remaining_s()`); omitted, the default stays in
+        # effect (proven by the other tests in this class never passing one).
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            _init_source_repo(source)
+            recorded: list[float | None] = []
+
+            def spy_runner(args: list[str], **kwargs: Any) -> Any:
+                if len(args) >= 2 and args[0] == "git" and args[1] in ("fetch", "rev-parse"):
+                    recorded.append(kwargs.get("timeout"))
+                return subprocess.run(args, **kwargs)
+
+            manager = MirrorManager(
+                Path(tmp) / "mirrors",
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                remote_url_for=lambda repo: str(source),
+                command_runner=spy_runner,
+            )
+            manager.fetch("owner/repo", "main", timeout=7.5)
+            self.assertEqual(recorded, [7.5, 7.5])
+
+    def test_concurrent_fetches_of_the_same_repo_are_serialized(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            _init_source_repo(source)
+            mirrors_dir = Path(tmp) / "mirrors"
+            active = [0]
+            max_active = [0]
+            active_lock = threading.Lock()
+
+            def spying_run(args: list[str], **kwargs: Any) -> Any:
+                is_fetch = len(args) >= 2 and args[0] == "git" and args[1] == "fetch"
+                if is_fetch:
+                    with active_lock:
+                        active[0] += 1
+                        max_active[0] = max(max_active[0], active[0])
+                try:
+                    if is_fetch:
+                        time.sleep(0.15)
+                    return subprocess.run(args, **kwargs)
+                finally:
+                    if is_fetch:
+                        with active_lock:
+                            active[0] -= 1
+
+            manager = MirrorManager(
+                mirrors_dir,
+                lambda repo: "tok",
+                approved_branches=APPROVED,
+                remote_url_for=lambda repo: str(source),
+                command_runner=spying_run,
+            )
+            manager.ensure("owner/repo")
+            threads = [
+                threading.Thread(target=manager.fetch, args=("owner/repo", "main"))
+                for _ in range(3)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual(max_active[0], 1)
+
+    def test_different_repos_fetch_concurrently_without_waiting(self) -> None:
+        with TemporaryDirectory() as tmp:
+            sources = {}
+            for name in ("a", "b"):
+                source = Path(tmp) / f"source-{name}"
+                source.mkdir()
+                _init_source_repo(source)
+                sources[f"owner/{name}"] = source
+            mirrors_dir = Path(tmp) / "mirrors"
+            manager = MirrorManager(
+                mirrors_dir,
+                lambda repo: "tok",
+                approved_branches={"owner/a": "main", "owner/b": "main"},
+                remote_url_for=lambda repo: str(sources[repo]),
+            )
+            results: dict[str, str] = {}
+
+            def run(repo: str) -> None:
+                results[repo] = manager.fetch(repo, "main")
+
+            threads = [threading.Thread(target=run, args=(repo,)) for repo in sources]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual(set(results), set(sources))
 
 
 class _FakeResult:
