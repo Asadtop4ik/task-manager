@@ -844,6 +844,12 @@ def cmd_preflight(request: dict[str, Any]) -> int:
             # not survive this call regardless of how it ended.
             _reap_all_descendants()
 
+        # Fail closed: if the watchdog fired, a killed tool may still look
+        # like a success to `subprocess.run` (the watchdog can reap it first,
+        # which Popen reports as exit 0), so never trust `run()`'s result.
+        if timed_out.is_set():
+            failure_text = "trusted preflight timed out"
+
         if failure_text is not None:
             print(
                 json.dumps(
