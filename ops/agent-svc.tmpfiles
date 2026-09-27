@@ -1,0 +1,22 @@
+# agent-svc runtime directories. /var/lib/agent-svc itself is created by the unit's
+# StateDirectory= (0750 agent-svc:agent-svc); runs/ and publish/ under it are agent-svc's
+# own state, created by the application (publish/ additionally gets 1-day cleanup below).
+#
+# Mirrors and the work root live under /srv/agent-svc so agent-codex (via the sudo'd
+# codex_child.py) can read/clone them: agent-codex is a member of group agentwork, not
+# of agent-svc's own primary group. Neither parent line carries an age: mirrors are
+# never swept, and each run directory's own lifecycle is what should expire, not the
+# work root itself.
+d /srv/agent-svc 0750 agent-svc agentwork -
+d /srv/agent-svc/mirrors 2750 agent-svc agentwork -
+d /srv/agent-svc/work 2750 agent-svc agentwork -
+
+# Each /srv/agent-svc/work/<run_id> is created by agent-svc itself (explicit chmod 3770:
+# setgid so agent-codex's group-owned writes stay group agentwork, plus the sticky bit
+# so one run's files can't be renamed/deleted by another run in the same group) when a
+# run starts; this "e" line only ages out entries already below the work root
+# (never recreates or re-chmods the root, thanks to the "-" placeholders) so a run
+# directory left behind by a crash is swept after 3 days.
+e /srv/agent-svc/work - - - 3d
+
+d /var/lib/agent-svc/publish 0700 agent-svc agent-svc 1d

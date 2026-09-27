@@ -1,0 +1,14 @@
+# Pinned official Node.js build for agent-codex's Codex CLI.
+#
+# Downloaded fresh from nodejs.org by the installer and verified against this
+# SHA-256 before extraction — never copied from codex-runner's home, which is
+# writable by any GitHub Actions job that runs there (a compromised or merely
+# careless job could otherwise plant a binary that ends up running as root).
+#
+# Regenerate by picking the current v24.x (LTS "Krypton") release from
+# https://nodejs.org/dist/index.json, then copying its linux-x64 tar.xz line
+# from https://nodejs.org/dist/<version>/SHASUMS256.txt.
+NODE_VERSION=v24.21.0
+NODE_TARBALL_NAME=node-v24.21.0-linux-x64.tar.xz
+NODE_TARBALL_URL=https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz
+NODE_TARBALL_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6

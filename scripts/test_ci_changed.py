@@ -30,6 +30,16 @@ class ChangedJobsTests(unittest.TestCase):
             {"backend": False, "bot": False, "frontend": False},
         )
 
+    def test_agentsvc_only_changes_rely_on_agent_policy(self) -> None:
+        self.assertEqual(
+            selected_jobs(["agentsvc/agent_svc/main.py", "agentsvc/tests/test_main.py"]),
+            {"backend": False, "bot": False, "frontend": False},
+        )
+        self.assertEqual(
+            selected_jobs(["agentsvc/agent_svc/main.py", "backend/app/main.py"]),
+            {"backend": True, "bot": False, "frontend": False},
+        )
+
     def test_rename_out_of_backend_still_runs_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
