@@ -705,7 +705,15 @@ def _narrow_socket_group(socket_path: Path, group_name: str) -> None:
         gid = grp.getgrnam(group_name).gr_gid
     except KeyError:
         return
-    os.chown(socket_path, -1, gid)
+    try:
+        os.chown(socket_path, -1, gid)
+    except OSError as error:
+        # The service user must be a member of the group to chgrp (no
+        # CAP_CHOWN). Never let this take the broker down: keep today's group.
+        print(
+            f"diagnostics: socket stays in its current group ({type(error).__name__})",
+            flush=True,
+        )
 
 
 def serve(host: DiagnosticHost, socket_path: Path = SOCKET_PATH) -> None:

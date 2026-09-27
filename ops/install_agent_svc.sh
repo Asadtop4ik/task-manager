@@ -198,6 +198,11 @@ getent group task-diag-client >/dev/null || sudo groupadd --system task-diag-cli
 if getent group codex-runner >/dev/null; then
   sudo usermod -aG task-diag-client codex-runner
 fi
+# The diagnostics broker must itself be in the group to chgrp its socket (no
+# CAP_CHOWN); takes effect when task-manager-diagnostics.service restarts.
+if id -u task-diagnostics >/dev/null 2>&1; then
+  sudo usermod -aG task-diag-client task-diagnostics
+fi
 if sudo test -L /home/agent-codex; then
   echo "/home/agent-codex is a symlink; refusing" >&2
   exit 1

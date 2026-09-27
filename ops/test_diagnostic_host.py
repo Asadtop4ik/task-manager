@@ -1,4 +1,6 @@
+import grp
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,31 @@ class SocketGroupTests(unittest.TestCase):
         ):
             _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")
         chown.assert_called_once_with(Path("/tmp/x.sock"), -1, 4242)
+
+    def test_chgrp_permission_error_keeps_the_broker_running(self) -> None:
+        with (
+            patch.object(
+                diagnostic_host.grp,
+                "getgrnam",
+                return_value=SimpleNamespace(gr_gid=4242),
+            ),
+            patch.object(
+                diagnostic_host.os, "chown", side_effect=PermissionError("not a member")
+            ),
+        ):
+            _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")  # no raise
+
+    def test_real_chgrp_to_a_group_we_are_not_in_does_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "s"
+            target.write_text("", encoding="utf-8")
+            foreign = next(
+                (g for g in grp.getgrall() if g.gr_gid not in os.getgroups()), None
+            )
+            if foreign is None or os.geteuid() == 0:
+                self.skipTest("needs a non-root user and a group it is not in")
+            _narrow_socket_group(target, foreign.gr_name)
+            self.assertNotEqual(target.stat().st_gid, foreign.gr_gid)
 
     def test_no_op_when_the_group_is_missing(self) -> None:
         with (
