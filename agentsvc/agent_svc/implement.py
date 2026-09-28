@@ -573,4 +573,12 @@ def _post_callback(ctx: ServiceContext, work: Work, payload: Mapping[str, Any]) 
         stripped = {
             key: value for key, value in payload.items() if key not in _OPS_CALLBACK_KEYS
         }
+        if stripped.get("status") == "ops_pending":
+            # `ops_pending` is only valid with at least one stored proposal;
+            # without them the backend would reject it too and the run would
+            # never be told anything. Report the no-patch outcome as a failure.
+            stripped["status"] = "failed"
+            stripped["error"] = (
+                "Agent faqat ops so‘rovi qaytardi, lekin so‘rov qabul qilinmadi."
+            )
         ctx.api.callback(work.run_id, work.lease_id, stripped)

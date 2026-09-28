@@ -907,6 +907,31 @@ class OpsRequestsFlowTests(unittest.TestCase):
             self.assertNotIn("ops_requests", payload)
             self.assertNotIn("ops_note", payload)
 
+    def test_rejected_ops_pending_callback_is_resent_as_failed(self) -> None:
+        # Without its proposals an `ops_pending` callback is invalid too, so
+        # the stripped resend must report the no-patch run as failed.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="Config change needed.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+            ctx.api.queue_callback_effects(HttpError(422, "ops_requests: value error"))  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            self.assertEqual(len(ctx.api.callbacks), 1)  # type: ignore[attr-defined]
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertNotIn("ops_requests", payload)
+            self.assertNotIn("ops_note", payload)
+            self.assertIn("ops so‘rovi", payload["error"])
+
     def test_non_ops_callback_rejection_is_not_retried_here(self) -> None:
         # A 422 on a payload that never carried ops fields at all must be
         # left entirely to `run.deliver`'s own retry/backoff, unchanged.
