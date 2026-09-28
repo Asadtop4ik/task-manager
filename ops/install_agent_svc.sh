@@ -387,8 +387,8 @@ ensure_tool() {
     local raw actual
     raw=$(sudo "$venv_dir/bin/$pkg" --version 2>/dev/null || true)
     case "$pkg" in
-      ruff) actual=$(printf '%s' "$raw" | awk '{print $2}') ;;
-      black) actual=$(printf '%s' "$raw" | awk '{print $2}' | tr -d ',') ;;
+      ruff) actual=$(printf '%s\n' "$raw" | awk 'NR==1{print $2}') ;;
+      black) actual=$(printf '%s\n' "$raw" | awk 'NR==1{print $2}' | tr -d ',') ;;
       *) actual="" ;;
     esac
     if [ "$actual" = "$version" ]; then
@@ -461,7 +461,7 @@ set -euo pipefail
 remote_dir="$1"
 sudo install -d -m 0755 -o root -g root /etc/agent-svc
 sudo install -d -m 0700 -o root -g root /etc/agent-svc/credentials
-sudo python3 "$remote_dir/sync_agent_svc_credentials.py"
+sudo python3 -B "$remote_dir/sync_agent_svc_credentials.py"
 REMOTE_F
 
 echo "== g) config, unit, sudoers, tmpfiles =="
