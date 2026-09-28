@@ -15,14 +15,24 @@ StartLimitIntervalSec=0
 Type=oneshot
 WorkingDirectory=/opt/agent-svc
 ExecStart=/usr/bin/python3 -I /opt/agent-svc/libexec/env_apply.py apply
-TimeoutStartSec=600
-# `applied`/`already_applied` is exit 0 as usual; every other terminal
-# outcome the helper can report on its own classified stdout/result JSON
-# (bad_request=2, refused=3, precondition=4, failed_rolled_back=5,
-# failed_rollback_failed=6, busy=7 -- see env_apply.py's EXIT_CODES) is a
-# SUCCESSFUL run of the helper, not a unit failure: `systemctl start` (and
-# `sudo -n -l`'s own reachability check) must not treat these as crashes.
-SuccessExitStatus=2 3 4 5 6 7
+# Generous headroom over the worst realistic case: ~30s lock wait + two
+# ~210s compose attempts (forward + rollback) + a 20s restart-stability
+# window + a ~10s readiness probe, on each of the forward and rollback
+# legs, plus normal process/import overhead. env_apply.py does not (yet)
+# track its own internal wall-clock deadline against this budget -- see
+# docs/AGENT_SVC.md's ops-requests section for the follow-up.
+TimeoutStartSec=900
+# `applied`/`already_applied` is exit 0 as usual. Exit 3/4/5/6/7 (refused,
+# precondition, failed_rolled_back, failed_rollback_failed, busy -- see
+# env_apply.py's EXIT_CODES) are also SUCCESSFUL, fully classified runs of
+# the helper, not unit failures: `systemctl start` (and `sudo -n -l`'s own
+# reachability check) must not treat them as crashes. Exit 2 (bad_request)
+# is deliberately EXCLUDED: it means the request file agent-svc itself
+# just wrote could not even be parsed/trusted, which points at a bug or a
+# compromise on the agent-svc side worth surfacing as a real unit failure
+# (visible in `systemctl status`/journal), not silently treated the same
+# as an ordinary policy refusal.
+SuccessExitStatus=3 4 5 6 7
 UMask=0077
 
 # Runs as root (no User=/Group=): the ONLY thing in the whole ops-requests
@@ -48,6 +58,23 @@ NoNewPrivileges=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+# Not ProtectProc=invisible (agent-svc.service uses it): docker CLI/compose
+# read other processes' /proc entries as part of normal operation on some
+# code paths, and this has not been verified safe under it -- server rollout
+# must check this specifically (docs/AGENT_SVC.md rollout notes) before it
+# is ever added here.
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+# The docker CLI talks to the daemon over a socket (no special
+# capabilities needed for that part), but this process itself does the
+# env-file chown/fchmod dance in write_env_line -- CAP_CHOWN/CAP_FOWNER for
+# that, CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH because ProtectSystem=strict's
+# read-only bind mounts plus root's usual DAC-bypass still need root's
+# normal file-access capabilities preserved for the paths this unit DOES
+# read/write. No networking, ptrace, module, or raw-device capabilities.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 # AF_UNIX: docker.sock (`docker inspect`/`docker compose`, read-only bind
 # mounts still permit connect() to an existing socket -- same reasoning as
 # agent-svc.service's own docker.sock access via the sudo'd image_state.py).
@@ -56,6 +83,13 @@ ProtectControlGroups=yes
 # `http://127.0.0.1:<port>/...`). No AF_NETLINK: unlike agent-svc.service,
 # this unit never runs bubblewrap/Codex.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Belt-and-braces alongside RestrictAddressFamilies=: no outbound network
+# at all except loopback (the `ready_url` probe, and whatever localhost
+# port docker.sock's TCP form might use on a host configured that way --
+# the common /var/run/docker.sock unix-socket case needs no IP address at
+# all, matched by AF_UNIX above instead).
+IPAddressDeny=any
+IPAddressAllow=localhost
 # No registry credentials, no image pulls (`docker compose ... --pull
 # never`): DOCKER_CONFIG points at an always-empty, root-only directory so
 # a compromised env_apply.py cannot exfiltrate or plant registry auth.

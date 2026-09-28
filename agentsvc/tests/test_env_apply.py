@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -252,6 +253,12 @@ class EnvApplyTestCase(unittest.TestCase):
             probe=lambda _url, _timeout: True,
             logger_runner=lambda _line: None,
             agent_svc_uid=os.getuid(),
+            # The real default (root-only, `frozenset({0})`) would refuse
+            # every env file these tests write, since they run as a normal
+            # user: match this test process's own uid, the same way a
+            # non-root test process can only ever chown a file to itself.
+            env_owner_uids=frozenset({os.getuid()}),
+            now=time.time,
         )
         base.update(overrides)
         return ea.Deps(**base)  # type: ignore[arg-type]
@@ -495,12 +502,38 @@ class PreconditionTests(EnvApplyTestCase):
         self.assertEqual(result["message"], "duplicate_key_line")
 
     def test_case_variant_key_line_precondition(self) -> None:
+        # ONLY a case-variant line (no canonical form at all): the specific
+        # "case_variant_key_line" classification.
         self._write_request()
         self.seed_running_container()
-        self.write_env(["ADMIN_TG_IDS=[11111]\n", "admin_tg_ids=[1]\n"])
+        self.write_env(["admin_tg_ids=[1]\n"])
         result, exit_code, _ = self.run_apply()
         self.assertEqual(exit_code, 4)
         self.assertEqual(result["message"], "case_variant_key_line")
+
+    def test_case_variant_alongside_canonical_is_duplicate(self) -> None:
+        # A canonical line AND a spaced, lowercase second declaration of the
+        # same key (adversarial probe: a real dotenv/pydantic-settings
+        # parser would still read the second line as re-declaring the key,
+        # case-insensitively, regardless of the space around `=`) -- must
+        # be refused as ambiguous, not silently ignored.
+        self._write_request()
+        self.seed_running_container()
+        self.write_env(["ADMIN_TG_IDS=[11111]\n", "admin_tg_ids = [11111,55555]\n"])
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "duplicate_key_line")
+
+    def test_malformed_key_line_same_case_with_spacing(self) -> None:
+        # Exact case, no export, no leading whitespace -- but spacing
+        # around `=` (or a `:` separator) means it is STILL not the one
+        # canonical form, and coexists with nothing else here.
+        self._write_request()
+        self.seed_running_container()
+        self.write_env(["ADMIN_TG_IDS = [11111]\n"])
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "malformed_key_line")
 
     def test_export_key_line_precondition(self) -> None:
         self._write_request()
@@ -648,6 +681,7 @@ class AppliedHappyPathTests(EnvApplyTestCase):
                 "--force-recreate",
                 "--pull",
                 "never",
+                "--no-build",
                 "--wait",
                 "--wait-timeout",
                 "180",
@@ -811,11 +845,55 @@ class AppliedHappyPathTests(EnvApplyTestCase):
             )
 
         self.docker.compose_effect = [after_forward, after_rollback]
+        # The forward probe must fail (every one of its up-to-5 attempts);
+        # the rollback path also probes `ready_url` (P3-21) and that one
+        # must succeed, confirming the restored old value is truly live.
+        probe_calls = {"n": 0}
+
+        def probe(_url: str, _timeout: float) -> bool:
+            probe_calls["n"] += 1
+            return probe_calls["n"] > ea.READY_PROBE_ATTEMPTS
+
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            result, exit_code = ea.cmd_apply(self.deps(probe=lambda _u, _t: False))
+            result, exit_code = ea.cmd_apply(self.deps(probe=probe))
         self.assertEqual(exit_code, 5)
+        self.assertEqual(result["code"], "failed_rolled_back")
         self.assertEqual(result["message"], "ready_probe_failed")
+        self.assertIsNone(result["rollback_message"])
+        self.assertEqual(self.env_path().read_text(encoding="utf-8"), "ADMIN_TG_IDS=[11111]\n")
+
+    def test_ready_url_probe_also_runs_on_rollback_and_can_fail_it(self) -> None:
+        write_allowlist(
+            self.allowlist_path, allowlist_doc(ready_url="http://127.0.0.1:8080/ready")
+        )
+        request = make_request(op="list_add", value="33333")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+
+        def after_forward() -> None:
+            self.docker.containers["qurbot-web"] = container_state(
+                f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111,33333]",)
+            )
+
+        def after_rollback() -> None:
+            self.docker.containers["qurbot-web"] = container_state(
+                f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111]",)
+            )
+
+        self.docker.compose_effect = [after_forward, after_rollback]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            # Probe fails unconditionally: forward AND rollback both fail
+            # their readiness check -- rollback cannot be confirmed live.
+            result, exit_code = ea.cmd_apply(self.deps(probe=lambda _u, _t: False))
+        self.assertEqual(exit_code, 6)
+        self.assertEqual(result["code"], "failed_rollback_failed")
+        self.assertEqual(result["message"], "ready_probe_failed")
+        self.assertEqual(result["rollback_message"], "rollback_verify_failed")
+        # The env file write-back still happened even though we could not
+        # confirm the old version is actually serving traffic.
         self.assertEqual(self.env_path().read_text(encoding="utf-8"), "ADMIN_TG_IDS=[11111]\n")
 
 
@@ -940,7 +1018,13 @@ class SentinelSecretTests(EnvApplyTestCase):
 
 
 class RollbackCliTests(EnvApplyTestCase):
-    def _seed_backup(self, request_id: str, *, current_value: str = "[11111,33333]") -> None:
+    def _seed_backup(
+        self,
+        request_id: str,
+        *,
+        current_value: str = "[11111,33333]",
+        ready_url: str | None = None,
+    ) -> None:
         self.write_env([f"ADMIN_TG_IDS={current_value}\n"])
         ea.write_backup(
             self.state_dir / "backups",
@@ -953,14 +1037,17 @@ class RollbackCliTests(EnvApplyTestCase):
                 "project_key": "qurbot",
                 "stack": "qurbot",
                 "key": "ADMIN_TG_IDS",
+                "key_format": "json_int_list",
                 "quote_style": "none",
                 "old_raw": "[11111]",
                 "new_raw": "[11111,33333]",
                 "pinned_image_tag": SHA_A,
                 "services": ["qurbot-web"],
                 "containers": [["qurbot-web", QURBOT_REPO]],
+                "ready_url": ready_url,
                 "ts": "2026-01-01T00:00:00+00:00",
             },
+            original_content=b"ADMIN_TG_IDS=[11111]\n",
         )
 
     def test_happy_path_restores_old_value_and_recreates(self) -> None:
@@ -1068,6 +1155,672 @@ class TestModeGateTests(unittest.TestCase):
             patch.object(ea.os, "geteuid", return_value=501),
         ):
             self.assertTrue(ea._test_mode_enabled())
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the adversarial (Opus) review of de93128: P2-1..P2-10
+# (reproduced via /private/tmp/.../scratchpad/envapply/test_probe{,2,3}.py),
+# P3-11..P3-21, and the per-project rate limit.
+# ---------------------------------------------------------------------------
+
+
+class LoneCrLineEndingTests(EnvApplyTestCase):
+    """P2-1 (probe A/A2): a lone `\\r` (not part of `\\r\\n`) used to be
+    silently absorbed by `bytes.splitlines`, which treats a bare `\\r` as
+    its own line boundary -- rewriting the target line then glued it
+    directly onto whatever followed with no separator, and a subsequent
+    rollback destroyed that following line entirely (verified: a
+    `BOT_TOKEN=...` line). Must now be refused outright, file byte-for-byte
+    untouched, no compose call."""
+
+    def test_lone_cr_on_target_line_refused_and_file_untouched(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        original = b"FOO=1\nADMIN_TG_IDS=[11111]\rBOT_TOKEN=supersecret\nBAR=2\n"
+        self.env_path().write_bytes(original)
+        os.chmod(self.env_path(), 0o640)
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "env_bad_line_ending")
+        self.assertEqual(self.env_path().read_bytes(), original)
+        self.assertEqual(self.docker.compose_calls, [])
+
+    def test_lone_cr_anywhere_in_file_refused_even_off_the_target_line(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.env_path().write_bytes(b"ADMIN_TG_IDS=[11111]\nOTHER=abc\rdef\n")
+        os.chmod(self.env_path(), 0o640)
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "env_bad_line_ending")
+
+    def test_crlf_file_is_fine(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.env_path().write_bytes(b"FOO=1\r\nADMIN_TG_IDS=[11111]\r\n")
+        os.chmod(self.env_path(), 0o640)
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        self.docker.compose_effect = [
+            lambda: self.docker.containers.__setitem__(
+                "qurbot-web",
+                container_state(f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111,55555]",)),
+            )
+        ]
+        _result, exit_code, _stdout = self.run_apply()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            self.env_path().read_bytes(), b"FOO=1\r\nADMIN_TG_IDS=[11111,55555]\r\n"
+        )
+
+    def test_nul_byte_refused(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.env_path().write_bytes(b"ADMIN_TG_IDS=[11111]\n\x00FOO=1\n")
+        os.chmod(self.env_path(), 0o640)
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "env_nul_byte")
+
+
+class ExceptionAfterWriteTests(EnvApplyTestCase):
+    """P2-2 (probes B/B2/I): an unexpected exception (not a `HelperError`)
+    anywhere after the env file has been rewritten used to propagate
+    uncaught -- no rollback, no persisted result, env left in the NEW
+    state; separately, a `HelperError` raised while re-parsing during
+    `cmd_apply`'s OWN automatic rollback fell into the lock-acquisition
+    `busy` handler and was reported `restarted: False` with nothing
+    persisted. Every such path must now go through `_rollback_and_finish`
+    (or the outer handler's corrected persist logic) and end in exactly one
+    accurately classified, persisted result."""
+
+    def test_compose_runner_oserror_after_write_rolls_back_and_persists(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+
+        real_runner = self.docker.runner
+
+        def flaky_runner(argv: list[str], **kwargs: object):
+            if argv[1] == "compose":
+                raise FileNotFoundError("docker binary missing")
+            return real_runner(argv, **kwargs)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result, exit_code = ea.cmd_apply(self.deps(runner=flaky_runner))
+        self.assertEqual(exit_code, 6)
+        self.assertEqual(result["code"], "failed_rollback_failed")
+        self.assertTrue(result["env_restored"])
+        self.assertEqual(self.env_path().read_text(encoding="utf-8"), "ADMIN_TG_IDS=[11111]\n")
+        result_path = self.state_dir / "results" / f"{request['request_id']}.json"
+        self.assertTrue(result_path.exists())
+        self.assertTrue((self.log_dir / "audit.jsonl").exists())
+
+    def test_compose_log_dir_missing_never_crashes_or_loses_unrelated_data(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n", "BOT_TOKEN=s\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _result, exit_code = ea.cmd_apply(self.deps(log_dir=self.root / "missing-log-dir"))
+        # Whatever the outcome, it is a real classified result (never an
+        # uncaught exception), and the unrelated BOT_TOKEN line survives.
+        self.assertIn(exit_code, (0, 5, 6))
+        self.assertIn("BOT_TOKEN=s", self.env_path().read_text(encoding="utf-8"))
+
+    def test_rollback_reparse_failure_after_restart_is_accurately_persisted(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        # Container env is never updated by any compose_effect -> forward
+        # verify fails with env_line_mismatch, triggering rollback.
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+
+        def corrupt_during_restart() -> None:
+            with open(self.env_path(), "a", encoding="utf-8") as handle:
+                handle.write("ADMIN_TG_IDS=[1]\n")
+
+        self.docker.compose_effect = [corrupt_during_restart]
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 6)
+        self.assertEqual(result["code"], "failed_rollback_failed")
+        self.assertEqual(result["message"], "env_line_mismatch")
+        self.assertTrue(result["restarted"])
+        self.assertEqual(result["rollback_message"], "reparse_failed")
+        result_path = self.state_dir / "results" / f"{request['request_id']}.json"
+        self.assertTrue(result_path.exists())
+        self.assertTrue((self.log_dir / "audit.jsonl").exists())
+
+
+class IdempotencyCacheHashBoundTests(EnvApplyTestCase):
+    """P2-3 (probe C): the idempotency cache used to be keyed on
+    `request_id` alone and read BEFORE any validation -- a replayed or
+    forged request reusing a `request_id` with a different value and a
+    bogus hash returned the FIRST request's cached "applied" result
+    without even touching docker. Must now be hash-bound and validated
+    first."""
+
+    def test_replay_with_different_value_and_bogus_hash_is_refused_not_replayed(self) -> None:
+        rid = new_uuid()
+        request = make_request(op="list_add", value="55555", request_id=rid)
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        self.docker.compose_effect = [
+            lambda: self.docker.containers.__setitem__(
+                "qurbot-web",
+                container_state(f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111,55555]",)),
+            )
+        ]
+        first, _first_exit, _ = self.run_apply()
+        self.assertEqual(first["code"], "applied")
+
+        bogus = make_request(
+            op="list_add", value="66666", request_id=rid, request_hash="0" * 64
+        )
+        write_request(self.request_path, bogus)
+        self.docker.inspect_calls.clear()
+        second, second_exit, _ = self.run_apply()
+        self.assertEqual(second_exit, 3)
+        self.assertEqual(second["code"], "refused")
+        self.assertNotEqual(second["message"], "ok")
+        self.assertEqual(self.docker.inspect_calls, [])
+
+    def test_needs_operator_after_failed_rollback_failed_blocks_retry(self) -> None:
+        rid = new_uuid()
+        request = make_request(op="list_add", value="55555", request_id=rid)
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        self.docker.compose_returncode = 1  # both forward and rollback compose fail
+        first, first_exit, _ = self.run_apply()
+        self.assertEqual(first_exit, 6)
+        self.assertEqual(first["code"], "failed_rollback_failed")
+
+        self.docker.compose_returncode = 0
+        self.docker.inspect_calls.clear()
+        retry, retry_exit, _ = self.run_apply()
+        self.assertEqual(retry_exit, 3)
+        self.assertEqual(retry["code"], "refused")
+        self.assertEqual(retry["message"], "needs_operator")
+        # Blocked before any fresh docker access -- and the ORIGINAL
+        # failed_rollback_failed result must survive untouched.
+        self.assertEqual(self.docker.inspect_calls, [])
+        on_disk = json.loads(
+            (self.state_dir / "results" / f"{rid}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(on_disk["code"], "failed_rollback_failed")
+
+
+class RollbackCliResultIsolationTests(EnvApplyTestCase):
+    """P2-4 (probe E): `cmd_rollback` used to write straight into
+    `results/<request_id>.json` -- a later refused (or otherwise
+    unsuccessful) manual rollback attempt silently overwrote the ORIGINAL
+    apply's own recorded outcome. Must now write a separate
+    `<request_id>.rollback.json` and never touch the apply's own result."""
+
+    def test_rollback_cli_never_overwrites_the_apply_result_file(self) -> None:
+        rid = new_uuid()
+        request = make_request(op="list_add", value="55555", request_id=rid)
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        self.docker.compose_effect = [
+            lambda: self.docker.containers.__setitem__(
+                "qurbot-web",
+                container_state(f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111,55555]",)),
+            )
+        ]
+        apply_result, _apply_exit, _ = self.run_apply()
+        self.assertEqual(apply_result["code"], "applied")
+
+        # A hand edit races the later rollback attempt -> CLI refuses.
+        self.write_env(["ADMIN_TG_IDS=[11111,55555,99999]\n"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rollback_result, rollback_exit = ea.cmd_rollback(self.deps(), rid)
+        self.assertEqual(rollback_exit, 3)
+        self.assertEqual(rollback_result["message"], "line_changed")
+
+        results_dir = self.state_dir / "results"
+        apply_on_disk = json.loads((results_dir / f"{rid}.json").read_text(encoding="utf-8"))
+        self.assertEqual(apply_on_disk["code"], "applied")  # untouched
+        rollback_on_disk = json.loads(
+            (results_dir / f"{rid}.rollback.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(rollback_on_disk["code"], "refused")
+        self.assertEqual(rollback_on_disk["request_id"], rid)
+
+
+class FreshImageTagOnRestartTests(EnvApplyTestCase):
+    """P2-6/P2-7 (probe F): both `cmd_apply`'s own automatic rollback and
+    the standalone `rollback` CLI used to restart against the STALE tag
+    recorded in the backup at apply time, potentially downgrading a
+    container to an old image if a new deploy landed since. Must now
+    re-inspect the currently running tag fresh, inside the lock,
+    immediately before every compose invocation."""
+
+    def test_cmd_apply_rollback_uses_freshly_reinspected_tag_not_the_original(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(tag=SHA_A, env=("ADMIN_TG_IDS=[11111]",))
+
+        def deploy_lands_during_forward_attempt() -> None:
+            # Forward verify will fail (env never updated); a NEW deploy to
+            # SHA_B lands while the forward attempt is in flight.
+            self.docker.containers["qurbot-web"] = container_state(
+                f"{QURBOT_REPO}:{SHA_B}", env=("ADMIN_TG_IDS=[11111]",)
+            )
+
+        self.docker.compose_effect = [deploy_lands_during_forward_attempt, lambda: None]
+        result, exit_code, _ = self.run_apply()
+        self.assertIn(exit_code, (5, 6))
+        rollback_call = self.docker.compose_calls[-1]
+        self.assertEqual(rollback_call["env"]["IMAGE_TAG"], SHA_B)
+        self.assertEqual(result["image_tag"], SHA_B)
+
+    def test_rollback_cli_uses_freshly_reinspected_tag_not_the_backup(self) -> None:
+        rid = new_uuid()
+        request = make_request(op="list_add", value="55555", request_id=rid)
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(tag=SHA_A, env=("ADMIN_TG_IDS=[11111]",))
+        self.docker.compose_effect = [
+            lambda: self.docker.containers.__setitem__(
+                "qurbot-web",
+                container_state(f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111,55555]",)),
+            )
+        ]
+        self.run_apply()
+
+        # A new deploy landed since the apply.
+        self.docker.containers["qurbot-web"] = container_state(
+            f"{QURBOT_REPO}:{SHA_B}", env=("ADMIN_TG_IDS=[11111,55555]",)
+        )
+
+        def rollback_effect() -> None:
+            self.docker.containers["qurbot-web"] = container_state(
+                f"{QURBOT_REPO}:{SHA_B}", env=("ADMIN_TG_IDS=[11111]",)
+            )
+
+        self.docker.compose_effect = [rollback_effect]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result, exit_code = ea.cmd_rollback(self.deps(), rid)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(self.docker.compose_calls[-1]["env"]["IMAGE_TAG"], SHA_B)
+        self.assertEqual(result["image_tag"], SHA_B)
+
+
+class ConcurrentEditNeverClobberedTests(EnvApplyTestCase):
+    """P2-8 (probe G): automatic rollback used to unconditionally overwrite
+    the target line with the old value -- a concurrent hand edit racing the
+    (advisory-only) lock got silently destroyed. Must now compare the
+    current line to exactly what THIS request wrote before ever touching
+    it again."""
+
+    def test_concurrent_hand_edit_during_restart_is_preserved_not_overwritten(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(
+            env=("ADMIN_TG_IDS=[11111]",)
+        )  # never updated -> verify fails
+
+        def concurrent_edit() -> None:
+            # Bypasses OUR lock entirely (flock is advisory) while we still
+            # believe we hold it -- the safety property must come from
+            # comparing line content, not from the lock alone.
+            self.env_path().write_text("ADMIN_TG_IDS=[99999]\n", encoding="utf-8")
+
+        self.docker.compose_effect = [concurrent_edit]
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 6)
+        self.assertEqual(result["code"], "failed_rollback_failed")
+        self.assertEqual(result["rollback_message"], "line_changed")
+        self.assertFalse(result["env_restored"])
+        self.assertEqual(self.env_path().read_text(encoding="utf-8"), "ADMIN_TG_IDS=[99999]\n")
+
+
+class StabilityWindowDeathTests(EnvApplyTestCase):
+    """P2-9 (probe D): a container that exited during the post-restart
+    stability window (restart policy "no") used to pass verification
+    anyway, because only `RestartCount` was re-checked, not `Running`.
+    Must now be treated as a verify failure."""
+
+    def test_container_exits_during_stability_window_is_not_reported_applied(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+
+        def compose_effect() -> None:
+            self.docker.containers["qurbot-web"] = container_state(
+                f"{QURBOT_REPO}:{SHA_A}", env=("ADMIN_TG_IDS=[11111,55555]",)
+            )
+
+        def sleep_kills_container(_seconds: float) -> None:
+            self.docker.containers["qurbot-web"]["State"]["Running"] = False
+
+        self.docker.compose_effect = [compose_effect, lambda: None]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result, exit_code = ea.cmd_apply(self.deps(sleep=sleep_kills_container))
+        self.assertNotEqual(result["code"], "applied")
+        self.assertIn(exit_code, (5, 6))
+
+
+class RollbackCliAlreadyOldTests(EnvApplyTestCase):
+    """P2-5 (probe M): after a `failed_rollback_failed` apply (the env file
+    IS already restored to the old value, but the restart/verify of that
+    restore never succeeded), the standalone CLI used to unconditionally
+    require the current line to equal the FORWARD value and refuse
+    "line_changed" otherwise -- making recovery from exactly this state
+    impossible. Must now recognize "already old" and just recreate +
+    verify, without touching the file."""
+
+    def test_recreates_without_rewriting_when_line_already_equals_old_value(self) -> None:
+        rid = new_uuid()
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])  # already the OLD value
+        ea.write_backup(
+            self.state_dir / "backups",
+            "qurbot",
+            rid,
+            {
+                "v": 1,
+                "request_id": rid,
+                "run_id": new_uuid(),
+                "project_key": "qurbot",
+                "stack": "qurbot",
+                "key": "ADMIN_TG_IDS",
+                "key_format": "json_int_list",
+                "quote_style": "none",
+                "old_raw": "[11111]",
+                "new_raw": "[11111,55555]",
+                "pinned_image_tag": SHA_A,
+                "services": ["qurbot-web"],
+                "containers": [["qurbot-web", QURBOT_REPO]],
+                "ready_url": None,
+                "ts": "2026-01-01T00:00:00+00:00",
+            },
+            original_content=b"ADMIN_TG_IDS=[11111]\n",
+        )
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        env_path = self.env_path()
+        inode_before = os.stat(env_path).st_ino
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result, exit_code = ea.cmd_rollback(self.deps(), rid)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["code"], "applied")
+        self.assertEqual(len(self.docker.compose_calls), 1)
+        # No rewrite happened -- same inode, same content.
+        self.assertEqual(os.stat(env_path).st_ino, inode_before)
+        self.assertEqual(env_path.read_text(encoding="utf-8"), "ADMIN_TG_IDS=[11111]\n")
+
+
+class AmbiguousKeyLineDetectionTests(EnvApplyTestCase):
+    """P3-11 (probe J): the old detector only caught `export`/indented/
+    exact-case-insensitive-no-spacing duplicates -- a same-key line with
+    different case AND spacing around `=` (`admin_tg_ids = [...]`) slipped
+    through entirely undetected, even though a real dotenv/pydantic-
+    settings parser would still read it as redeclaring the key."""
+
+    def test_spaced_lowercase_duplicate_detected_as_ambiguous(self) -> None:
+        request = make_request(op="list_remove", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111,55555]\n", "admin_tg_ids = [11111,55555]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]", "admin_tg_ids=[11111,55555]"))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "duplicate_key_line")
+        self.assertEqual(self.docker.compose_calls, [])
+
+
+class StrictIntCheckTests(EnvApplyTestCase):
+    """P3-12 (probe K): a misconfigured (over-permissive) allowlist
+    `item_re` on a json/csv_int_list key used to reach an uncaught
+    `ValueError` from `int(value)` inside `agent_ops_policy.apply_op`."""
+
+    def test_permissive_allowlist_item_re_does_not_crash_on_non_digit_value(self) -> None:
+        doc = allowlist_doc()
+        doc["projects"]["qurbot"]["keys"]["ADMIN_TG_IDS"]["item_re"] = "[a-z0-9]{5,15}"
+        write_allowlist(self.allowlist_path, doc)
+        request = make_request(op="list_add", value="abcdef")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "bad_list_item_int")
+        self.assertEqual(self.docker.compose_calls, [])
+
+
+class RequestFileHardeningTests(EnvApplyTestCase):
+    """P3-13/14: request.json must never be group/world-writable, its
+    containing directory (`/run/agent-svc/ops`) must not be a symlink or
+    group/world-writable, and the lock file itself must be opened
+    O_NOFOLLOW (LockFileHardeningTests below)."""
+
+    def test_group_writable_request_file_refused(self) -> None:
+        write_request(self.request_path, make_request())
+        os.chmod(self.request_path, 0o660)
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["message"], "group_or_world_writable")
+
+    def test_world_writable_request_file_refused(self) -> None:
+        write_request(self.request_path, make_request())
+        os.chmod(self.request_path, 0o646)
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["message"], "group_or_world_writable")
+
+    def test_ops_dir_symlink_refused(self) -> None:
+        write_request(self.request_path, make_request())
+        link_dir = self.root / "ops-link"
+        os.symlink(self.run_dir, link_dir)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result, exit_code = ea.cmd_apply(self.deps(request_path=link_dir / "request.json"))
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["message"], "ops_dir_symlink")
+
+    def test_ops_dir_group_writable_refused(self) -> None:
+        write_request(self.request_path, make_request())
+        os.chmod(self.run_dir, 0o770)
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["message"], "ops_dir_writable")
+
+
+class LockFileHardeningTests(EnvApplyTestCase):
+    def test_symlinked_lock_file_refused(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        env_path = self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        lock_path = env_path.with_name(env_path.name + ".lock")
+        elsewhere = self.root / "elsewhere.lock"
+        elsewhere.touch()
+        os.symlink(elsewhere, lock_path)
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "lock_symlink")
+        # Persisted (unlike genuine lock contention/busy): a symlinked lock
+        # file is a real, actionable outcome for this request_id.
+        self.assertTrue(
+            (self.state_dir / "results" / f"{request['request_id']}.json").exists()
+        )
+
+
+class StackAndServiceConsistencyTests(EnvApplyTestCase):
+    """P3-19: defense in depth beyond `agent_ops_policy`'s own
+    HARD_DENIED_PROJECTS check (keyed on `project_key`) -- nothing in that
+    module ties `stack` itself to which `project_key` may use it, so an
+    allowlist entry filed under a real, non-denied project_key could still
+    set `stack`/`env_file` to task-manager's own. Also: every compose
+    `service` must correspond to a `container` this helper actually
+    verifies, or a service could be recreated with nobody checking what it
+    ended up running."""
+
+    def test_stack_named_task_manager_under_different_project_key_refused(self) -> None:
+        doc = allowlist_doc(stack="task-manager", env_file="/srv/stack/env/task-manager.env")
+        write_allowlist(self.allowlist_path, doc)
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(result["message"], "stack_denied")
+        self.assertEqual(self.docker.compose_calls, [])
+
+    def test_services_not_in_containers_refused_as_precondition(self) -> None:
+        doc = allowlist_doc()
+        doc["projects"]["qurbot"]["services"] = ["qurbot-web", "qurbot-worker"]
+        # `containers` only lists qurbot-web -- qurbot-worker has no
+        # container this helper would ever verify.
+        write_allowlist(self.allowlist_path, doc)
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "services_containers_mismatch")
+        self.assertEqual(self.docker.compose_calls, [])
+
+
+class SemanticListComparisonTests(EnvApplyTestCase):
+    """P3-20: `already_applied` used to compare the container's live env
+    value against `new_raw` byte-for-byte -- a pure JSON formatting
+    difference (`[1, 2]` vs `[1,2]`) that docker/compose happened to report
+    verbatim from the file caused a full, unnecessary write+restart."""
+
+    def test_formatting_only_difference_is_already_applied_no_restart(self) -> None:
+        request = make_request(op="list_add", value="22222")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111,22222]\n"])
+        # Container's live env shows the SAME value with different JSON
+        # formatting -- semantically identical, not byte-identical.
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111, 22222]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["code"], "already_applied")
+        self.assertEqual(self.docker.compose_calls, [])
+
+    def test_csv_formatting_only_difference_is_already_applied(self) -> None:
+        doc = allowlist_doc()
+        doc["projects"]["qurbot"]["keys"]["ADMIN_TG_IDS"]["format"] = "csv_int_list"
+        write_allowlist(self.allowlist_path, doc)
+        request = make_request(op="list_add", value="22222")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=11111,22222\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=11111, 22222",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["code"], "already_applied")
+        self.assertEqual(self.docker.compose_calls, [])
+
+
+class UnsupportedOldValueTests(EnvApplyTestCase):
+    """P3-20 (second half): an old value containing `$`, a ` #`-style
+    inline comment marker, or trailing whitespace is refused up front
+    rather than silently treated as the literal value text."""
+
+    def test_dollar_in_old_value_refused(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=$FOO\n"])
+        self.seed_running_container()
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "unsupported_old_value")
+
+    def test_inline_comment_style_old_value_refused(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111] # comment\n"])
+        self.seed_running_container()
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "unsupported_old_value")
+
+
+class EnvFileNlinkAndOwnerTests(EnvApplyTestCase):
+    """P3-21: a hard-linked env file (editable "atomically" through the
+    other link name, bypassing our own rename-based replace) and an env
+    file owned by an unexpected uid are both refused."""
+
+    def test_hardlinked_env_file_refused(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        env_path = self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        os.link(env_path, self.env_file_root / "extra-link.env")
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        result, exit_code, _ = self.run_apply()
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "env_hardlinked")
+
+    def test_env_file_wrong_owner_refused(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result, exit_code = ea.cmd_apply(
+                self.deps(env_owner_uids=frozenset({os.getuid() + 999999}))
+            )
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["message"], "env_wrong_owner")
+
+
+class RateLimitTests(EnvApplyTestCase):
+    """Per-project rolling-hour apply budget (state in
+    `/var/lib/agent-ops/ratelimit.json`, root-only)."""
+
+    def test_limits_to_max_per_hour_then_recovers_after_window(self) -> None:
+        clock = {"t": 1000.0}
+        for _ in range(ea.RATE_LIMIT_MAX_PER_HOUR):
+            self.assertTrue(
+                ea.check_and_record_rate_limit(self.state_dir, "qurbot", now=clock["t"])
+            )
+            clock["t"] += 1.0
+        self.assertFalse(
+            ea.check_and_record_rate_limit(self.state_dir, "qurbot", now=clock["t"])
+        )
+        # A different project has its own, independent budget.
+        self.assertTrue(
+            ea.check_and_record_rate_limit(self.state_dir, "other-project", now=clock["t"])
+        )
+        # After the rolling window elapses, the original project recovers.
+        clock["t"] += ea.RATE_LIMIT_WINDOW_S + 1
+        self.assertTrue(
+            ea.check_and_record_rate_limit(self.state_dir, "qurbot", now=clock["t"])
+        )
+
+    def test_corrupt_counter_file_fails_open(self) -> None:
+        (self.state_dir / "ratelimit.json").write_text("not json", encoding="utf-8")
+        self.assertTrue(ea.check_and_record_rate_limit(self.state_dir, "qurbot", now=1000.0))
+
+    def test_wired_into_cmd_apply_as_refused_rate_limited(self) -> None:
+        request = make_request(op="list_add", value="55555")
+        write_request(self.request_path, request)
+        self.write_env(["ADMIN_TG_IDS=[11111]\n"])
+        self.seed_running_container(env=("ADMIN_TG_IDS=[11111]",))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            # Budget already exhausted.
+            result, exit_code = ea.cmd_apply(self.deps(rate_limit_max_per_hour=0))
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(result["message"], "rate_limited")
+        self.assertEqual(self.docker.compose_calls, [])
 
 
 if __name__ == "__main__":

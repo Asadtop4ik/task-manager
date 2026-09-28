@@ -345,38 +345,64 @@ so'rov qayta tekshirilganda fayl yangidan o'qiladi.
 
 ### Qo'lda orqaga qaytarish (manual rollback)
 
-Avtomatik rollback muvaffaqiyatsiz bo'lsa (natija kodi `failed_rollback_failed`, 🚨 kartada
-belgilanadi), yoki operator boshqa sababga ko'ra bitta so'rovni qo'lda bekor qilmoqchi
+Avtomatik rollback ham muvaffaqiyatsiz bo'lsa (natija kodi `failed_rollback_failed`, 🚨
+kartada belgilanadi), yoki operator boshqa sababga ko'ra bitta so'rovni qo'lda tekshirmoqchi
 bo'lsa:
 
 ```sh
 sudo /usr/bin/python3 -I /opt/agent-svc/libexec/env_apply.py rollback --request-id <uuid>
 ```
 
-Bu FAQAT `/var/lib/agent-ops/backups/<loyiha>/<request_id>.json`dagi zaxiradan tiklaydi
-(bu yerdagi zaxira — butun tizimda haqiqiy qiymat ochiq saqlanadigan yagona joy, shuning
-uchun katalog 0700 root:root) va FAQAT env fayldagi joriy qator aynan shu so'rov yozgan
-qiymatga teng bo'lsa harakat qiladi (aks holda "qator o'zgargan" xatosi bilan rad etadi —
-shu oraliqda boshqa birov qiymatni allaqachon o'zgartirgan bo'lishi mumkin, buni ustidan
-bosib yubormaslik uchun). Bu buyruq `/etc/sudoers.d/60-agent-svc`da YO'Q — faqat operator
+Bu `/var/lib/agent-ops/backups/<loyiha>/<request_id>.json`dagi zaxiradan foydalanadi (har bir
+zaxira ham JSON metama'lumot, ham so'rovdan OLDINGI holatdagi env faylning **to'liq nusxasi**
+(`<request_id>.env.bak`) — agar bu modulning qator-almashtirish mantig'ida qandaydir xato
+bo'lsa ham, oxirgi chora sifatida shu nusxadan qo'lda tiklash mumkin; shu sabab katalog 0700
+root:root). Joriy env qator uch holatdan biriga to'g'ri kelishi kerak: **(a)** hali ham shu
+so'rov yozgan YANGI qiymat — odatiy holat, CLI eski qiymatni yozadi, keyin qayta yaratadi va
+tekshiradi; **(b)** avtomatik rollback ALLAQACHON eski qiymatni tiklagan (masalan
+`failed_rollback_failed` — env fayl to'g'ri, faqat konteyner qayta yaratilmagan yoki
+tekshiruv o'tmagan) — bu holda CLI faylni QAYTA YOZMAYDI, faqat joriy pin qilingan image
+tag bilan qayta yaratadi va tekshiradi; **(c)** boshqa (uchinchi) qiymat — demak oraliqda
+kimdir/nimadir qatorni allaqachon o'zgartirgan — CLI "qator o'zgargan" xatosi bilan rad
+etadi va HECH NARSANI yozmaydi. Image tag har doim **joriy** ishlab turgan konteynerlardan
+qulf ichida qayta o'qiladi — zaxiradagi eski tegdan HECH QACHON emas (aks holda keyingi bir
+deploy'dan keyingi rollback image'ni eskisiga "pasaytirib" qo'yishi mumkin edi). Bu buyruq
+natijasi asl so'rovning `results/<request_id>.json`ini HECH QACHON ustidan yozmaydi — alohida
+`results/<request_id>.rollback.json`ga yoziladi, shunda asl muvaffaqiyatli/muvaffaqiyatsiz
+natija doim ko'rinib turadi. Bu buyruq `/etc/sudoers.d/60-agent-svc`da YO'Q — faqat operator
 serverga bevosita kirib, qo'lda ishga tushiradi. Oxirgi chora sifatida — mos zaxira topilmasa
-yoki bu ham ishlamasa — env faylni qo'lda tahrirlang va
+yoki bu ham ishlamasa — yuqoridagi `.env.bak` nusxasini qo'lda joyiga nusxalang (yoki env
+faylni qo'lda tahrirlang) va
 `/srv/stack/scripts/deploy.sh <stack> <hozirgi-ishlab-turgan-sha>`ni ishga tushiring.
+
+**Bilinadigan cheklov:** `env_apply.py` hozircha o'zining ichki umumiy vaqt byudjetini
+kuzatmaydi (faqat `agent-ops-apply.service`ning `TimeoutStartSec=900`i tashqi chegara
+sifatida bor) — juda sekin `docker compose`/tarmoq holatida nazariy jihatdan shu tashqi
+limitga urilib, natija hech qachon yozilmasdan to'xtatilishi mumkin (kam ehtimol, lekin
+mumkin). Server aylanishida kuzatiladigan keyingi ish sifatida qoldirilgan.
 
 ### Audit va loglar
 
 - `/var/log/agent-ops/audit.jsonl` — har bir urinish uchun bitta JSON qator (vaqt,
   request_id, run_id, loyiha, kalit, amal, qiymatlarning FAQAT sha256 hash'lari, natija
-  kodi, qayta ishga tushirilganmi, image tag, davomiylik). Qiymatning o'zi bu yerga hech
-  qachon yozilmaydi.
+  kodi, qayta ishga tushirilganmi, `env_restored` (env fayl niyat qilingan holatga
+  qaytarilganmi), `rollback_message` (rollback urinishining o'z natijasi, alohida kichik
+  lug'at), image tag, davomiylik). Qiymatning o'zi bu yerga hech qachon yozilmaydi.
 - `journalctl -t agent-ops` — audit qatorining syslog orqali ko'chirmasi.
 - `/var/log/agent-ops/compose-<request_id>.log` (root-only, 0700 katalog ichida) — shu
   so'rov uchun `docker compose`ning to'liq chiqishi, diagnostika uchun; bu yerda ham
   env qiymatlari ko'rinmaydi — compose faqat `PATH`, `IMAGE_TAG`, `DOCKER_CONFIG`,
   `HOME`ni oladi, butun env faylni emas.
 - `/var/lib/agent-ops/results/<request_id>.json` (0640 root:agent-svc) — shu so'rovning
-  yakuniy natijasi (kod, xabar, qayta ishga tushirilganmi, image tag — hech qachon
-  qiymat); `agent-svc` buni o'qib API'ga qaytaradi.
+  yakuniy natijasi: `code`, `exit`, `message`, `rollback_message`, `rolled_back`,
+  `restarted`, `env_restored`, `image_tag`, `request_hash` — hech qachon qiymat;
+  `agent-svc` buni o'qib API'ga qaytaradi. Qo'lda `rollback` CLI ishga tushirilsa, natijasi
+  shu faylni EMAS, `<request_id>.rollback.json`ni yozadi (yuqoriga qarang).
+- **Tezlik chegarasi**: bitta loyiha uchun soatiga eng ko'pi bilan 5 ta muvaffaqiyatli
+  urinish (`/var/lib/agent-ops/ratelimit.json`, root-only, faqat hisoblagich — qiymat
+  saqlanmaydi); undan oshsa `refused`/`rate_limited` bilan rad etiladi. Bu buzilgan/xato
+  agent-svc'ning bitta loyihani qayta-qayta urinishiga qarshi qo'shimcha himoya, egasi
+  tasdiqlagan alohida so'rovlarga odatda hech qachon tegmaydi.
 
 **Muhim:** `/run/agent-svc/ops` katalogini `agent-svc.tmpfiles` YARATMAYDI — sababi
 `agent-svc.service`ning o'zi `RuntimeDirectory=agent-svc`dan foydalanadi, ya'ni
