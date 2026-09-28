@@ -99,6 +99,13 @@ def test_ops_lines_header_counts_all_rows_and_uses_position() -> None:
     assert lines[2].startswith("1. ADMIN_TG_IDS")
 
 
+def test_unknown_op_falls_back_to_an_escaped_label() -> None:
+    row = _ops_row(op="<b>x</b>")
+    text = "\n".join(agent_ops.ops_lines({"ops_requests": [row]}))
+    assert "<b>x</b>" not in text
+    assert "&lt;b&gt;x&lt;/b&gt;" in text
+
+
 def test_invalid_row_with_valid_key_shows_key_but_never_value() -> None:
     row = _ops_row(status="invalid", value="5339875840", policy_reason="allowlistda yo‘q")
     text = "\n".join(agent_ops.ops_lines({"ops_requests": [row]}))
@@ -150,7 +157,10 @@ def test_missing_ops_fields_never_crash() -> None:
 # --- legacy vs owner card: values only ever on the owner side --------------
 
 
-def test_legacy_card_shows_only_a_count_never_keys_or_values() -> None:
+def test_agent_result_card_never_shows_keys_or_values_or_the_count_itself() -> None:
+    # agent_result_card() is reused as the owner-card base for ops-only runs
+    # (see agent_ops._owner_card), so it must stay free of the count line —
+    # only the legacy/task-origin send path in notify_agent_runs appends it.
     notice = {
         "task_id": 1,
         "title": "Env tweak",
@@ -160,9 +170,33 @@ def test_legacy_card_shows_only_a_count_never_keys_or_values() -> None:
         "ops_requests": [_ops_row()],
     }
     card = worker.agent_result_card(notice)
-    assert "Ops: 1 ta so‘rov egasi tasdig‘ida" in card
+    assert "Ops:" not in card
     assert "ADMIN_TG_IDS" not in card
     assert "5339875840" not in card
+
+
+def test_ops_count_line_reads_the_field_and_falls_back_to_counting_proposed_rows() -> None:
+    rows = [
+        _ops_row(id=1, status="proposed"),
+        _ops_row(id=2, status="applied"),
+        _ops_row(id=3, status="proposed"),
+    ]
+    # Field present: trust it even if it disagrees with the rows.
+    assert (
+        agent_ops.ops_count_line({"ops_pending_count": 5, "ops_requests": rows})
+        == "Ops: 5 ta so‘rov egasi tasdig‘ida"
+    )
+    assert agent_ops.ops_count_line({"ops_pending_count": 0, "ops_requests": rows}) is None
+    # Field absent or None: fall back to counting `proposed` rows ourselves.
+    assert (
+        agent_ops.ops_count_line({"ops_requests": rows}) == "Ops: 2 ta so‘rov egasi tasdig‘ida"
+    )
+    assert (
+        agent_ops.ops_count_line({"ops_pending_count": None, "ops_requests": rows})
+        == "Ops: 2 ta so‘rov egasi tasdig‘ida"
+    )
+    assert agent_ops.ops_count_line({}) is None
+    assert agent_ops.ops_count_line({"ops_requests": [_ops_row(status="applied")]}) is None
 
 
 def test_ops_applied_and_ops_pending_legacy_status_lines() -> None:
@@ -457,10 +491,20 @@ async def test_worker_ops_only_run_gets_owner_card_with_ops_buttons(monkeypatch)
     await worker.notify_agent_runs({})
 
     calls = bot.send_message.await_args_list
+    legacy_text = calls[0].args[1]
     owner_text = calls[1].args[1]
     owner_markup = calls[1].kwargs["reply_markup"]
 
+    # The legacy/task-origin card: count only, never a key or value.
+    assert "Ops: 1 ta so‘rov egasi tasdig‘ida" in legacy_text
+    assert "ADMIN_TG_IDS" not in legacy_text
+    assert "5339875840" not in legacy_text
+
+    # The owner card (no head_sha, so agent_result_card is its base): full
+    # detail block, but no redundant count line — that line is legacy-only.
     assert "ADMIN_TG_IDS" in owner_text
+    assert "5339875840" in owner_text
+    assert "Ops: 1 ta so‘rov egasi tasdig‘ida" not in owner_text
     labels = _markup_labels(owner_markup)
     assert any("tasdiqlash" in label for label in labels)
     assert "Merge va deploy" not in labels

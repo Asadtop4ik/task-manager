@@ -82,11 +82,6 @@ def agent_result_card(notice: dict[str, object]) -> str:
         lines.append(f"Sabab: {_html_text(notice.get('error') or 'noma’lum', 1200)}")
         if notice.get("github_run_url"):
             lines.append(f"Jarayon: {_html_text(notice['github_run_url'], 300)}")
-    # The legacy/task-origin card is the one place ops details are NOT shown —
-    # only ever a count, and only ever here (owner cards get the full block).
-    count_line = ops_count_line(notice)
-    if count_line:
-        lines.append(count_line)
     return "\n".join(lines)
 
 
@@ -148,12 +143,21 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                 legacy_chat_id = notice.get("chat_id")
                 legacy_message_id = notice.get("telegram_message_id")
                 if legacy_chat_id:
+                    # The task-origin card (maybe a group chat) is the one
+                    # place ops details are NOT shown — only ever a count,
+                    # and only ever appended here. `agent_result_card` itself
+                    # stays free of it: the owner card also builds on that
+                    # function for ops-only runs and must not inherit it.
+                    legacy_text = agent_result_card(notice)
+                    legacy_count_line = ops_count_line(notice)
+                    if legacy_count_line:
+                        legacy_text = "\n".join([legacy_text, legacy_count_line])
                     try:
                         legacy_message_id = await _upsert_agent_message(
                             bot,
                             chat_id=legacy_chat_id,
                             message_id=legacy_message_id,
-                            text=agent_result_card(notice),
+                            text=legacy_text,
                             reply_markup=None,
                         )
                     except (TelegramAPIError, OSError) as error:
@@ -205,7 +209,7 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                     )
                     # Full key/op/value detail is owner-only: never on the
                     # legacy task-origin card built above (that one only ever
-                    # gets a count, via agent_result_card -> ops_count_line).
+                    # gets a count, appended there directly, not here).
                     ops_block = ops_lines(notice)
                     if ops_block:
                         owner_text = "\n".join([owner_text, *ops_block])

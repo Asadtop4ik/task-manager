@@ -125,7 +125,8 @@ def _row_lines(row: dict[str, Any]) -> list[str]:
         return lines
 
     key = _safe_key(row)
-    op_label = _OP_LABELS.get(str(row.get("op") or ""), str(row.get("op") or "amal"))
+    op_raw = str(row.get("op") or "")
+    op_label = _OP_LABELS.get(op_raw, _html_text(op_raw or "amal", 24))
     value = _html_text(row.get("value"), 80)
     services = row.get("restart_services")
     service_names = (
@@ -163,7 +164,16 @@ def ops_lines(notice: dict[str, Any]) -> list[str]:
 def ops_count_line(notice: dict[str, Any]) -> str | None:
     """The one line the legacy task-origin card is allowed to show — no keys, no values."""
     count = notice.get("ops_pending_count")
-    if not isinstance(count, int) or count <= 0:
+    if not isinstance(count, int):
+        # Older/partial API responses may omit the field; count `proposed`
+        # rows ourselves rather than silently showing nothing.
+        rows = notice.get("ops_requests")
+        count = (
+            sum(1 for row in rows if isinstance(row, dict) and row.get("status") == "proposed")
+            if isinstance(rows, list)
+            else 0
+        )
+    if count <= 0:
         return None
     return f"Ops: {count} ta so‘rov egasi tasdig‘ida"
 
