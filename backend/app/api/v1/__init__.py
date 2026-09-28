@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.agent_intakes import router as agent_intakes_router
+from app.api.v1.agent_ops import router as agent_ops_router
 from app.api.v1.agent_runs import router as agent_runs_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.project_discussions import router as project_discussions_router
@@ -15,6 +16,7 @@ router.include_router(users_router)
 router.include_router(projects_router)
 router.include_router(tasks_router)
 router.include_router(agent_runs_router)
+router.include_router(agent_ops_router)
 router.include_router(agent_intakes_router)
 router.include_router(project_discussions_router)
 router.include_router(team_router)
