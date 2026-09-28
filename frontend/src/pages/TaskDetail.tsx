@@ -224,6 +224,8 @@ export default function TaskDetail() {
                   ? run.ci_status === "failure" ? "PR ochildi · CI xato" : "PR ochildi · CI kutilmoqda"
                   : run.status === "pr_ready" ? "PR tayyor · CI yashil"
                   : run.status === "merged" ? "PR birlashtirildi · serverga chiqishi tekshirilmoqda"
+                  : run.status === "ops_pending" ? "Ops tasdig‘ida"
+                  : run.status === "ops_applied" ? "Ops qo‘llandi"
                   : run.status}
               </span>
               {run.pr_url && (
@@ -242,7 +244,7 @@ export default function TaskDetail() {
                 </a>
               )}
               {run.error && <p className="text-late">{run.error}</p>}
-              {["pending", "dispatching", "dispatched", "running", "validating", "pr_opened", "pr_ready"].includes(run.status) && (
+              {["pending", "dispatching", "dispatched", "running", "validating", "pr_opened", "pr_ready", "ops_pending"].includes(run.status) && (
                 <button
                   type="button"
                   disabled={cancelAgent.isPending}

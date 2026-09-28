@@ -166,6 +166,34 @@ class TaskApi:
             },
         )
 
+    async def agent_run_for_ops(self, ops_id: int) -> dict[str, Any]:
+        """The run detail owning one ops request — callback data has no room for run_id.
+
+        ASSUMPTION: relies on `GET /agent-ops/{ops_id}` (OwnerUser), returning the
+        same `AgentRunDetailOut` shape as `agent_run`. Not one of the 3 endpoints
+        the spec enumerates for the ops router; see the WP-B report for why the
+        64-byte callback cap makes some such lookup unavoidable.
+        """
+        return await self._request("GET", f"/agent-ops/{ops_id}")
+
+    async def decide_ops_request(
+        self,
+        ops_id: int,
+        *,
+        decision: str,
+        request_hash: str,
+        action_id: str,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/agent-ops/{ops_id}/decision",
+            json={
+                "decision": decision,
+                "request_hash": request_hash,
+                "action_id": action_id,
+            },
+        )
+
     # --- agent intake ---------------------------------------------------
 
     async def create_agent_intake(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -1,8 +1,23 @@
+import re
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Same format as `scripts/agent_ops_policy.py` (WP-D0) and agent-svc's own
+# `ops_requests.py` — the backend never imports either, but the shapes must
+# match exactly since all three independently re-validate the same JSON.
+#
+# Always `re.fullmatch(..., re.ASCII)` through a `@field_validator`, never a
+# pydantic `Field(pattern=...)`: pydantic-core's `pattern` constraint uses
+# search semantics under an anchor that, unlike Python's own `re.fullmatch`,
+# can still accept a trailing newline.
+OPS_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}", re.ASCII)
+# Printable ASCII allow-list: blocks whitespace (incl. newline), NUL, U+2028,
+# quotes, `$` (compose interpolation), `#`, `=`, `\`, and (with the separate
+# `://` check below) URLs.
+OPS_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:@/+-]{1,256}", re.ASCII)
 
 
 class AgentRunOut(BaseModel):
@@ -50,10 +65,74 @@ class AgentRunOut(BaseModel):
     executor: str
 
 
+class AgentOpsProposal(BaseModel):
+    """One entry of `AgentRunCallback.ops_requests` — already scored by
+    agent-svc's own trusted `validate()` against the root-owned allowlist.
+    The backend re-validates the key/value shape itself rather than trusting
+    that scoring; only `policy`/`policy_reason`/`restart_services` are taken
+    on faith from agent-svc (they never reach the applying root helper,
+    which recomputes everything from its own allowlist copy)."""
+
+    kind: Literal["env_set"]
+    key: str
+    op: Literal["replace", "list_add", "list_remove"]
+    value: str
+    reason: str = Field(max_length=300)
+    policy: Literal["allowed", "denied"]
+    policy_reason: str = Field(default="", max_length=200)
+    restart_services: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("key")
+    @classmethod
+    def _check_key(cls, value: str) -> str:
+        if not OPS_KEY_RE.fullmatch(value):
+            raise ValueError("key must match [A-Z][A-Z0-9_]{1,63}")
+        return value
+
+    @field_validator("value")
+    @classmethod
+    def _check_value(cls, value: str) -> str:
+        if not OPS_VALUE_RE.fullmatch(value) or "://" in value:
+            raise ValueError(
+                "value must match [A-Za-z0-9_.,:@/+-]{1,256} and contain no '://'"
+            )
+        return value
+
+
+class AgentOpsRequestOut(BaseModel):
+    """Owner-only view of one stored proposal — includes the value. Never
+    reused for a task-visible payload; `AgentRunOut` above has none of this
+    table's columns."""
+
+    id: int
+    request_uuid: UUID
+    run_id: str
+    position: int
+    project_key: str
+    kind: str
+    key: str
+    op: str
+    value: str
+    reason: str | None
+    restart_services: list[str] | None
+    request_hash: str
+    status: str
+    policy_reason: str | None
+    decided_by_user_id: int | None
+    decided_at: datetime | None
+    lease_id: str | None
+    lease_until: datetime | None
+    attempts: int
+    applied_at: datetime | None
+    result: dict[str, object] | None
+    created_at: datetime
+    updated_at: datetime
+
+
 class AgentRunCallback(BaseModel):
     run_id: str
     status: str = Field(
-        pattern=r"^(running|validating|publishing|deploying|pr_opened|failed)$"
+        pattern=r"^(running|validating|publishing|deploying|pr_opened|ops_pending|failed)$"
     )
     github_run_url: str | None = None
     pr_url: str | None = None
@@ -63,6 +142,8 @@ class AgentRunCallback(BaseModel):
     input_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
+    ops_requests: list[AgentOpsProposal] = Field(default_factory=list, max_length=3)
+    ops_note: str | None = Field(default=None, max_length=200)
 
 
 class AgentDeployment(BaseModel):
@@ -170,6 +251,7 @@ class AgentRunDetailOut(BaseModel):
     ci_evidence: AgentCiEvidenceOut
     review: AgentReviewOut
     actions: dict[str, AgentActionAvailability]
+    ops_requests: list[AgentOpsRequestOut] = Field(default_factory=list)
 
 
 class AgentActionOut(BaseModel):
@@ -267,6 +349,11 @@ class AgentNotificationOut(BaseModel):
     qa_deploy_dispatch_status: str | None = None
     qa_deploy_dispatch_error: str | None = None
     executor: str = "github"
+    # Owner card only — includes values. The legacy task-origin card (which
+    # may be a group chat) must use `ops_pending_count` instead.
+    ops_requests: list[AgentOpsRequestOut] = Field(default_factory=list)
+    ops_controls_available: bool = False
+    ops_pending_count: int = 0
 
 
 class AgentNoticeAck(BaseModel):
