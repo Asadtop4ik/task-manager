@@ -98,6 +98,11 @@ class AgentRun(Base, TimestampMixin):
         Integer, default=0, server_default="0", nullable=False
     )
     review_attempts_sha: Mapped[str | None] = mapped_column(String(40))
+    # Codex's own free text explaining ops requests it did *not* make (e.g.
+    # "SUPER_ADMIN_TG_IDS isn't set; ask the owner to add it first"), stripped
+    # of the trailer line by agent-svc before it ever reaches here. Display
+    # only, never parsed. See `app.schemas.agent_run.AgentRunCallback.ops_note`.
+    ops_note: Mapped[str | None] = mapped_column(Text)
 
     task: Mapped["Task"] = relationship()
 

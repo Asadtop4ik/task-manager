@@ -18,6 +18,17 @@ OPS_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}", re.ASCII)
 # quotes, `$` (compose interpolation), `#`, `=`, `\`, and (with the separate
 # `://` check below) URLs.
 OPS_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:@/+-]{1,256}", re.ASCII)
+# A docker-compose service name: lowercase ASCII, matching the allowlist's
+# own `services`/`containers` entries.
+_RESTART_SERVICE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,62}", re.ASCII)
+# C0/C1 controls (incl. NUL) plus the two Unicode line/paragraph separators —
+# none of these are in `OPS_VALUE_RE`'s allow-list, but `reason`/`policy_reason`
+# are free text, not fullmatch-validated, so they get a strip instead.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+
+
+def _clean_text(value: str, max_length: int) -> str:
+    return _CONTROL_CHARS_RE.sub("", value).strip()[:max_length]
 
 
 class AgentRunOut(BaseModel):
@@ -98,11 +109,30 @@ class AgentOpsProposal(BaseModel):
             )
         return value
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _clean_reason(cls, value: str) -> str:
+        return _clean_text(value, 300) if isinstance(value, str) else value
+
+    @field_validator("policy_reason", mode="before")
+    @classmethod
+    def _clean_policy_reason(cls, value: str) -> str:
+        return _clean_text(value, 200) if isinstance(value, str) else value
+
+    @field_validator("restart_services")
+    @classmethod
+    def _check_restart_services(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if not _RESTART_SERVICE_RE.fullmatch(item):
+                raise ValueError("restart_services items must match [a-z0-9][a-z0-9_.-]{0,62}")
+        return value
+
 
 class AgentOpsRequestOut(BaseModel):
-    """Owner-only view of one stored proposal — includes the value. Never
-    reused for a task-visible payload; `AgentRunOut` above has none of this
-    table's columns."""
+    """Owner-only view of one stored proposal — includes the value, but never
+    the ops-apply lease (`lease_id`/`lease_until` are svc-only, see
+    `AgentOpsWorkOut`). Never reused for a task-visible payload; `AgentRunOut`
+    above has none of this table's columns."""
 
     id: int
     request_uuid: UUID
@@ -120,8 +150,6 @@ class AgentOpsRequestOut(BaseModel):
     policy_reason: str | None
     decided_by_user_id: int | None
     decided_at: datetime | None
-    lease_id: str | None
-    lease_until: datetime | None
     attempts: int
     applied_at: datetime | None
     result: dict[str, object] | None

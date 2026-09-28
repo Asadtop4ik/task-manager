@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import ColumnElement, func, or_, select
+from sqlalchemy import ColumnElement, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -1473,7 +1473,15 @@ async def pending_notifications(
                 qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
                 qa_deploy_dispatch_error=run.qa_deploy_dispatch_error,
                 ops_requests=agent_ops.ops_out(ops_rows, run.run_id, include_values=True),
-                ops_controls_available=any(row.status == "proposed" for row in ops_rows),
+                # Never advertise decision buttons once the run itself can no
+                # longer accept a decision (see `decide_ops_request`'s own
+                # `run.status in {"cancelled", "failed"}` check) — a
+                # `proposed` row can still exist there for a moment until the
+                # cancel cascade / watchdog TTL sweep catches up to it.
+                ops_controls_available=(
+                    run.status not in {"cancelled", "failed"}
+                    and any(row.status == "proposed" for row in ops_rows)
+                ),
                 ops_pending_count=sum(1 for row in ops_rows if row.status == "proposed"),
             )
         )
@@ -2632,14 +2640,21 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
             )
     elif run.executor != "local":
         await _cancel_github(run)
-    ops_rows = await session.scalars(
-        select(AgentOpsRequest).where(
+    # A bulk UPDATE guarded by `status IN (...)` in its own WHERE clause,
+    # never a SELECT-then-Python-loop-then-write: the run is already locked
+    # above, but the ops row is not, so `POST /agent-ops/lease` (which locks
+    # both atomically, see `app.services.agent_ops`) could concurrently flip
+    # one to `applying` in between. Re-checking status atomically inside the
+    # UPDATE itself means that row is simply left untouched rather than
+    # clobbered back to `cancelled` under an in-flight apply.
+    await session.execute(
+        update(AgentOpsRequest)
+        .where(
             AgentOpsRequest.agent_run_id == run.id,
             AgentOpsRequest.status.in_(("proposed", "approved")),
         )
+        .values(status="cancelled")
     )
-    for ops_row in ops_rows:
-        ops_row.status = "cancelled"
     _clear_lease(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
@@ -3130,6 +3145,7 @@ async def agent_run_callback(
         "cancelled",
         "failed",
         "ops_pending",
+        "ops_applied",
     }:
         # An idempotent replay of an already-finished status; never require a
         # lease that a prior terminal callback already cleared, and never
@@ -3198,11 +3214,20 @@ async def agent_run_callback(
     ):
         # Only inside this live-lease implement transition, and only once —
         # the idempotent-replay early return above means a run never reaches
-        # here a second time in this same status.
+        # here a second time in this same status. A `failed` implement has
+        # nothing left to apply, so any otherwise-eligible proposal is
+        # stored `cancelled` rather than `proposed` — no dead approve button
+        # on a run that already ended.
         project_key = run.task.project.key if run.task.project else ""
         await agent_ops.store_proposals(
-            session, run, payload.ops_requests, project_key=project_key
+            session,
+            run,
+            payload.ops_requests,
+            project_key=project_key,
+            run_failed=payload.status == "failed",
         )
+    if run.executor == "local" and payload.ops_note is not None:
+        run.ops_note = payload.ops_note
 
     changed = run.status != payload.status or (
         payload.status == "failed" and run.error != payload.error

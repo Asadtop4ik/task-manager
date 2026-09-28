@@ -5,6 +5,21 @@ callback, and the watchdog's TTL sweep) and `app.api.v1.agent_ops` (leasing,
 deciding and settling one request). Never imports `scripts/` — the backend
 independently recomputes `request_hash` and re-checks the secret-name
 denylist rather than trusting agent-svc's own copy of either.
+
+Locking discipline, load-bearing for correctness: every path that mutates an
+`AgentOpsRequest` row locks its parent `AgentRun` row FIRST — the same order
+`cancel_agent_run` uses. Two ops rows on the same run can otherwise each be
+decided/settled by a different concurrent request without either transaction
+seeing the other's write (classic write skew under READ COMMITTED with only
+the child row locked): reject B and report A applied can each compute "the
+run still has open rows" from their own snapshot and neither ever settles
+it. Locking the run serializes every mutation against that run, so the
+second transaction always sees the first's already-committed result. A bulk
+sweep (`reclaim_stale`, `lease`'s own reclaim) locks both tables in one
+`SELECT ... FOR UPDATE OF ... SKIP LOCKED` statement instead of two
+sequential lock statements — `SKIP LOCKED` never blocks (a partially-locked
+candidate row is skipped as a whole), so it can never be the blocked half of
+a deadlock regardless of which table the query plan locks first.
 """
 
 import hashlib
@@ -14,7 +29,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -39,6 +54,7 @@ SECRET_KEY_RE = re.compile(
 # see `reclaim_stale`.
 _TTL_HOURS = 72
 _SETTLE_ERROR = "Ops so‘rovlari qo‘llanmadi"
+_LEASE_EXPIRED_MESSAGE = "apply lease expired"
 
 
 def request_hash(
@@ -75,12 +91,32 @@ def has_eligible_proposal(proposals: Sequence[AgentOpsProposal]) -> bool:
     )
 
 
+async def lock_run_for_ops_id(session: AsyncSession, ops_id: int) -> AgentRun | None:
+    """Resolve one `AgentOpsRequest.id` to its parent run and take the run's
+    `FOR UPDATE` lock *before* the ops row itself — see the module docstring.
+    `agent_run_id` is immutable once a row is inserted, so this initial
+    unlocked lookup is safe; the caller still separately (re)loads and locks
+    the ops row afterward."""
+    agent_run_id = await session.scalar(
+        select(AgentOpsRequest.agent_run_id).where(AgentOpsRequest.id == ops_id)
+    )
+    if agent_run_id is None:
+        return None
+    return await session.scalar(
+        select(AgentRun)
+        .where(AgentRun.id == agent_run_id)
+        .options(selectinload(AgentRun.task))
+        .with_for_update()
+    )
+
+
 async def store_proposals(
     session: AsyncSession,
     run: AgentRun,
     proposals: Sequence[AgentOpsProposal],
     *,
     project_key: str,
+    run_failed: bool = False,
 ) -> list[AgentOpsRequest]:
     """Insert up to 3 rows for one local-executor callback.
 
@@ -88,16 +124,31 @@ async def store_proposals(
     transition for a run that already left it), so there is no existing-row
     check here — the unique `(agent_run_id, position)` constraint is the
     backstop against a bug ever double-inserting.
+
+    `run_failed=True` (the callback's status is `failed`, not `pr_opened`/
+    `ops_pending`) stores every otherwise-`proposed` row as `cancelled`
+    instead, with `policy_reason="run_failed"`: an implement failure has
+    nothing left to apply, so an owner card with a live approve button for
+    it would be a dead end.
     """
     rows: list[AgentOpsRequest] = []
     for position, proposal in enumerate(proposals[:3], start=1):
         denylisted = _is_denylisted(proposal)
         invalid = denylisted or proposal.policy == "denied"
-        policy_reason = (
-            "denylisted key"
-            if denylisted
-            else (proposal.policy_reason or ("denied" if invalid else None))
-        )
+        if denylisted:
+            policy_reason: str | None = "denylisted key"
+        elif invalid:
+            policy_reason = proposal.policy_reason or "denied"
+        elif run_failed:
+            policy_reason = "run_failed"
+        else:
+            policy_reason = proposal.policy_reason or None
+        if invalid:
+            status = "invalid"
+        elif run_failed:
+            status = "cancelled"
+        else:
+            status = "proposed"
         row = AgentOpsRequest(
             request_uuid=str(uuid4()),
             agent_run_id=run.id,
@@ -117,7 +168,7 @@ async def store_proposals(
                 op=proposal.op,
                 value=proposal.value,
             ),
-            status="invalid" if invalid else "proposed",
+            status=status,
             policy_reason=policy_reason,
         )
         session.add(row)
@@ -167,7 +218,9 @@ def ops_out(
     """`rows` -> the owner-facing shape. `include_values=False` is for any
     future consumer that must see request metadata without the value itself;
     every backend endpoint today is owner-only and passes `True` (the
-    task-visible `AgentRunOut` carries none of this table's columns at all)."""
+    task-visible `AgentRunOut` carries none of this table's columns at all).
+    Never carries the ops-apply lease (`lease_id`/`lease_until`) — that is
+    svc-only, see `AgentOpsWorkOut`."""
     return [
         AgentOpsRequestOut(
             id=row.id,
@@ -186,8 +239,6 @@ def ops_out(
             policy_reason=row.policy_reason,
             decided_by_user_id=row.decided_by_user_id,
             decided_at=row.decided_at,
-            lease_id=row.lease_id,
-            lease_until=row.lease_until,
             attempts=row.attempts,
             applied_at=row.applied_at,
             result=row.result,
@@ -205,7 +256,8 @@ async def settle_run(session: AsyncSession, run: AgentRun) -> None:
     `run.status` — it is already `deployed` (and its task already DONE, see
     `agent_run_deployed`) by the time any of them can even be leased.
 
-    Requires `run.task` to already be loaded on `run`.
+    Precondition: `run` is already locked `FOR UPDATE` by the caller (see the
+    module docstring) and `run.task` is already loaded.
     """
     if run.status != "ops_pending":
         return
@@ -262,20 +314,35 @@ async def settle_run(session: AsyncSession, run: AgentRun) -> None:
             )
 
 
-async def reclaim_stale(session: AsyncSession, now: datetime) -> None:
-    """Watchdog sweep, called from the same poll as
-    `agent_runs._fail_stale_local_runs`: an `applying` lease the applying
-    root helper never reported back on, and a `proposed`/`approved` request
-    nobody ever acted on, cannot wait forever.
+async def reclaim_expired_applying(
+    session: AsyncSession, now: datetime, *, limit: int = 20
+) -> dict[int, AgentRun]:
+    """`applying` rows whose lease the applying root helper never reported
+    back on: below the 3-attempt cap, released back to `approved` for another
+    lease; at the cap, failed outright. Locks each row's run in the same
+    statement (`of=[AgentOpsRequest, AgentRun]`, `SKIP LOCKED`) so this can
+    never deadlock against, or race, `POST /agent-ops/{ops_id}/result` or
+    `/decision` (which lock the run first) or `cancel_agent_run` (which never
+    touches an `applying` row at all — see `cancel_agent_run`).
+
+    Called both from the watchdog sweep (`reclaim_stale`) and eagerly from
+    `POST /agent-ops/lease`, inside its own advisory lock, before picking a
+    fresh candidate — an agent-svc that crashed mid-apply should not have to
+    wait for the next watchdog tick before its own next lease call can make
+    progress again.
+
+    Returns the touched runs (for the caller to `settle_run` afterward);
+    does not commit.
     """
     stale_applying = (
         await session.scalars(
             select(AgentOpsRequest)
+            .join(AgentRun, AgentRun.id == AgentOpsRequest.agent_run_id)
             .where(AgentOpsRequest.status == "applying", AgentOpsRequest.lease_until < now)
             .options(selectinload(AgentOpsRequest.agent_run).selectinload(AgentRun.task))
-            .order_by(AgentOpsRequest.id)
-            .limit(20)
-            .with_for_update(skip_locked=True)
+            .order_by(AgentRun.id, AgentOpsRequest.id)
+            .limit(limit)
+            .with_for_update(of=[AgentOpsRequest, AgentRun], skip_locked=True)
         )
     ).all()
     touched_runs: dict[int, AgentRun] = {}
@@ -285,39 +352,82 @@ async def reclaim_stale(session: AsyncSession, now: datetime) -> None:
         if row.attempts >= 3:
             row.status = "failed"
             row.result = {
-                "code": "lease_expired",
+                "code": "timeout",
                 "exit": None,
                 "rolled_back": None,
                 "restarted": None,
                 "image_tag": None,
-                "message": "apply lease expired",
+                "message": _LEASE_EXPIRED_MESSAGE,
             }
+            row.agent_run.notified_at = None
             agent_events.record(
                 session, row.agent_run, status="ops_failed", phase="ops", error="lease_expired"
             )
         else:
             row.status = "approved"
         touched_runs[row.agent_run_id] = row.agent_run
+    return touched_runs
+
+
+async def reclaim_stale(session: AsyncSession, now: datetime) -> None:
+    """Watchdog sweep, called from the same poll as
+    `agent_runs._fail_stale_local_runs`: an `applying` lease the applying
+    root helper never reported back on, and a `proposed`/`approved` request
+    nobody ever acted on, cannot wait forever. Also self-heals any
+    `ops_pending` run left with no open row at all — belt and suspenders
+    alongside the run-locking discipline that should prevent that from ever
+    happening in the first place (see the module docstring).
+    """
+    touched_runs = await reclaim_expired_applying(session, now)
 
     cutoff = now - timedelta(hours=_TTL_HOURS)
     ttl_rows = (
         await session.scalars(
             select(AgentOpsRequest)
+            .join(AgentRun, AgentRun.id == AgentOpsRequest.agent_run_id)
             .where(
-                AgentOpsRequest.status.in_(("proposed", "approved")),
-                AgentOpsRequest.created_at < cutoff,
+                or_(
+                    and_(
+                        AgentOpsRequest.status == "proposed",
+                        AgentOpsRequest.created_at < cutoff,
+                    ),
+                    and_(
+                        AgentOpsRequest.status == "approved",
+                        AgentOpsRequest.decided_at < cutoff,
+                    ),
+                )
             )
             .options(selectinload(AgentOpsRequest.agent_run).selectinload(AgentRun.task))
-            .order_by(AgentOpsRequest.id)
+            .order_by(AgentRun.id, AgentOpsRequest.id)
             .limit(20)
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=[AgentOpsRequest, AgentRun], skip_locked=True)
         )
     ).all()
     for row in ttl_rows:
         row.status = "cancelled"
+        row.agent_run.notified_at = None
         touched_runs[row.agent_run_id] = row.agent_run
 
     if touched_runs:
         await session.flush()
-        for run in touched_runs.values():
-            await settle_run(session, run)
+
+    # Self-heal: an `ops_pending` run with no proposed/approved/applying row
+    # left should always have already settled as a side effect of whichever
+    # transaction closed out its last open row. Sweep for any that somehow
+    # didn't (a bug, or a run-locking gap this review missed) so a run can
+    # never wait forever.
+    stuck_runs = (
+        await session.scalars(
+            select(AgentRun)
+            .where(AgentRun.status == "ops_pending")
+            .options(selectinload(AgentRun.task))
+            .order_by(AgentRun.id)
+            .limit(50)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    for run in stuck_runs:
+        touched_runs[run.id] = run
+
+    for run in touched_runs.values():
+        await settle_run(session, run)

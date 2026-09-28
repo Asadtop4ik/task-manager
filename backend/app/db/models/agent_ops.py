@@ -43,6 +43,7 @@ class AgentOpsRequest(Base, TimestampMixin):
             "'applied', 'failed', 'cancelled')",
             name="ck_agent_ops_requests_status",
         ),
+        CheckConstraint("position BETWEEN 1 AND 3", name="ck_agent_ops_requests_position"),
         Index("ix_agent_ops_requests_status_lease", "status", "lease_until"),
     )
 
