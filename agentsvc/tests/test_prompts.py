@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 import unittest
 from datetime import UTC, datetime
 
@@ -11,6 +12,7 @@ from agent_svc.config import (
     load_config,
 )
 from agent_svc.prompts import (
+    OPS_TRAILER_EXAMPLE,
     ORCHESTRATOR_RULES,
     compose_correction_prompt,
     compose_implement_prompt,
@@ -18,6 +20,18 @@ from agent_svc.prompts import (
     route_correction,
     route_implement,
 )
+
+
+def _fake_ops_project(**keys: tuple[tuple[str, ...], str]) -> object:
+    """A minimal stand-in for one `agent_ops_policy.ProjectPolicy`: only
+    `.keys` (mapping name -> an object with `.ops`/`.description`) is ever
+    read by `prompts.py`, which has no import on the real trusted module.
+    Each kwarg value is `(ops_tuple, description)`."""
+    policies = {
+        name: types.SimpleNamespace(ops=ops, description=description)
+        for name, (ops, description) in keys.items()
+    }
+    return types.SimpleNamespace(keys=policies)
 
 
 def _settings():
@@ -143,6 +157,48 @@ class ComposeImplementPromptTests(unittest.TestCase):
         self.assertNotIn(ORCHESTRATOR_RULES, simple_prompt)
         self.assertIn(ORCHESTRATOR_RULES, complex_prompt)
         self.assertIn("luna_worker", complex_prompt)
+
+
+class ComposeImplementPromptOpsRulesTests(unittest.TestCase):
+    def test_ops_trailer_example_matches_the_parser_marker_prefix(self) -> None:
+        from agent_svc.ops_requests import MARKER_PREFIX
+
+        self.assertTrue(OPS_TRAILER_EXAMPLE.startswith(MARKER_PREFIX))
+
+    def test_no_ops_rules_when_project_has_no_allowlist_entry(self) -> None:
+        prompt = compose_implement_prompt(
+            "BASE", _work(), complex_route=False, ops_project=None
+        )
+        self.assertNotIn("AGENT_OPS_REQUESTS", prompt)
+        self.assertNotIn("Ops requests:", prompt)
+
+    def test_ops_rules_present_and_never_include_values(self) -> None:
+        ops_project = _fake_ops_project(
+            ADMIN_TG_IDS=(("list_add", "list_remove"), "Telegram admin IDs"),
+            SUPER_ADMIN_TG_IDS=(("list_add",), "Telegram super-admin IDs"),
+        )
+        prompt = compose_implement_prompt(
+            "BASE", _work(), complex_route=False, ops_project=ops_project
+        )
+        self.assertIn("Ops requests:", prompt)
+        self.assertIn("ADMIN_TG_IDS", prompt)
+        self.assertIn("Telegram admin IDs", prompt)
+        self.assertIn("SUPER_ADMIN_TG_IDS", prompt)
+        self.assertIn("list_add/list_remove", prompt)
+        self.assertIn(OPS_TRAILER_EXAMPLE, prompt)
+        self.assertIn("at most 3", prompt)
+        # No key name looks anything like a real Telegram id / secret value:
+        # only names, ops, and descriptions were ever handed to this prompt.
+        self.assertNotIn("5339875840", prompt)
+        self.assertNotIn("917456291", prompt)
+
+    def test_ops_rules_combine_with_orchestrator_rules_on_complex_route(self) -> None:
+        ops_project = _fake_ops_project(FOO=(("replace",), "a flag"))
+        prompt = compose_implement_prompt(
+            "BASE", _work(), complex_route=True, ops_project=ops_project
+        )
+        self.assertIn(ORCHESTRATOR_RULES, prompt)
+        self.assertIn("Ops requests:", prompt)
 
 
 class ComposeCorrectionPromptTests(unittest.TestCase):

@@ -26,8 +26,10 @@ from .implement import handle_implement
 from .intake import handle_intake
 from .lanes import ChatLane, CodeLane, WatchLoop
 from .log import Redactor
+from .ops import OPS_APPLY_COMMAND, OpsLane
 from .recovery import recover
 from .review import handle_review
+from .trusted import TrustedModules
 from .watch import build_watch_checks
 
 _JOIN_TIMEOUT_S = 10.0
@@ -128,6 +130,24 @@ def _sudo_rule_check(
     return False, name, detail[:200]
 
 
+def _ops_apply_sudo_check(runner: Callable[..., Any]) -> tuple[bool, str, str]:
+    """`sudo -n -l` probe for the ops-lane apply rule, never actually
+    starting `agent-ops-apply.service`. `OPS_APPLY_COMMAND` is the exact
+    argv `agent_svc.ops.OpsLane` runs (`sudo -n systemctl start
+    agent-ops-apply.service`); `sudo -n -l <cmd...>` (its tail, after the
+    `sudo -n` prefix both share) reports whether the sudoers rule would
+    allow that invocation, without running it."""
+    argv = ["/usr/bin/sudo", "-n", "-l", *OPS_APPLY_COMMAND[2:]]
+    try:
+        result = runner(argv, capture_output=True, text=True, timeout=10, check=False)
+    except Exception as exc:
+        return False, "ops_apply_systemctl", f"{type(exc).__name__}: {exc}"
+    if result.returncode == 0:
+        return True, "ops_apply_systemctl", "sudo rule allows this invocation"
+    detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+    return False, "ops_apply_systemctl", detail[:200]
+
+
 def _first_catalog_container_name(catalog: repos.Catalog | None) -> str | None:
     """The first container name across the loaded catalog, if any repo has one."""
     if catalog is None:
@@ -197,6 +217,28 @@ def run(settings: Settings) -> int:
             target=watch_loop.run_forever, args=(stop,), name="watch-loop", daemon=True
         ),
     ]
+    # Its own thread, started only when the ops lane is enabled -- unlike
+    # the three lanes above (always started, gated internally by their own
+    # `enabled` flag): applying an env change runs a root oneshot unit, a
+    # capability most deployments never turn on, so there is no reason to
+    # even spin up the thread when it can never do anything.
+    if settings.ops_lane_enabled:
+        ops_lane = OpsLane(
+            api=ctx.api,
+            policy_module=ctx.trusted.agent_ops_policy,
+            allowlist_path=settings.ops_allowlist_path,
+            catalog_repos=ctx.catalog.repos,
+            request_dir=settings.ops_request_dir,
+            results_dir=settings.ops_results_dir,
+            logger=logger,
+            poll_s=settings.poll_interval_s,
+            enabled=True,
+        )
+        threads.append(
+            threading.Thread(
+                target=ops_lane.run_forever, args=(stop,), name="ops-lane", daemon=True
+            )
+        )
     for thread in threads:
         thread.start()
 
@@ -398,6 +440,29 @@ def self_check(
         else:
             found = sorted(item.name for item in tools_dir.iterdir())
             _emit(lines, ok_flags, True, "tools", ", ".join(found) if found else "none found")
+
+        if settings.ops_lane_enabled:
+            _emit(lines, ok_flags, *_ops_apply_sudo_check(runner))
+            try:
+                allowlist = TrustedModules(
+                    settings.trusted_dir
+                ).agent_ops_policy.load_allowlist(
+                    settings.ops_allowlist_path,
+                    catalog.repos if catalog is not None else (),
+                    require_root_owned=True,
+                )
+                _emit(
+                    lines,
+                    ok_flags,
+                    True,
+                    "ops_allowlist",
+                    f"{len(allowlist.projects)} project(s) loaded",
+                )
+            except Exception as exc:
+                _emit(lines, ok_flags, False, "ops_allowlist", f"{type(exc).__name__}: {exc}")
+        else:
+            _emit(lines, ok_flags, True, "ops_apply_systemctl", "skipped (ops lane disabled)")
+            _emit(lines, ok_flags, True, "ops_allowlist", "skipped (ops lane disabled)")
 
     for line in lines:
         print(line, file=out)

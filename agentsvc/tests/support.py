@@ -36,6 +36,7 @@ TRUSTED_SOURCE_FILES: tuple[Path, ...] = (
     REPO_ROOT / "scripts" / "agent_release.py",
     REPO_ROOT / "scripts" / "agent_images.py",
     REPO_ROOT / "scripts" / "agent_pr_review.py",
+    REPO_ROOT / "scripts" / "agent_ops_policy.py",
     REPO_ROOT / "backend" / "app" / "services" / "agent_repos.py",
 )
 

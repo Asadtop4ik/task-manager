@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from .api import Work
 from .config import Settings
@@ -84,7 +85,60 @@ def _relevant_files_note(relevant_files: Sequence[str]) -> str:
     return f"Start from these files:\n{listing}\n"
 
 
-def compose_implement_prompt(base_prompt: str, work: Work, *, complex_route: bool) -> str:
+# The exact trailer line format `agent_svc.ops_requests.split_trailer` looks
+# for (agent-svc-notes/ops-requests-spec.md section 2). Kept here as a
+# literal (not imported) so this prompt text can never silently drift from
+# what the parser actually expects even if the two modules are touched
+# independently -- a test asserts they match.
+OPS_TRAILER_EXAMPLE = (
+    'AGENT_OPS_REQUESTS: [{"kind":"env_set","key":"KEY_NAME","op":"list_add",'
+    '"value":"...","reason":"..."}]'
+)
+
+
+def _ops_rules_note(ops_project: Any) -> str:
+    """`ops_project` is one `agent_ops_policy.ProjectPolicy` (duck-typed here
+    -- this module has no import on the trusted policy module, exactly like
+    `ops_requests.py`): only key NAMES, allowed ops, and descriptions ever
+    reach this text, never a current or example value."""
+    lines = [
+        f"- {key_name} ({'/'.join(policy.ops)}): {policy.description}"
+        for key_name, policy in sorted(ops_project.keys.items())
+    ]
+    keys_block = "\n".join(lines)
+    return (
+        "Ops requests: you may ask the owner to change a small number of "
+        "non-secret operational settings for this project instead of (or in "
+        "addition to) a code change. You cannot see the current value of any "
+        "of these keys and must never guess or invent one. Only these keys "
+        "may be requested, using only the listed operation(s):\n"
+        f"{keys_block}\n"
+        "To request a change, end your final message with exactly one line, "
+        "the LAST line of the message, in this exact format (a JSON array "
+        "of at most 3 objects, each with exactly the keys kind, key, op, "
+        'value, reason; kind is always "env_set"):\n'
+        f"{OPS_TRAILER_EXAMPLE}\n"
+        "Rules: at most 3 requests per run; the owner must approve each one "
+        "individually before anything changes; never request a secret "
+        "value, a URL, or a key not listed above; never include this line "
+        "unless you are making a genuine, specific request.\n"
+    )
+
+
+def compose_implement_prompt(
+    base_prompt: str,
+    work: Work,
+    *,
+    complex_route: bool,
+    ops_project: Any | None = None,
+) -> str:
+    """`ops_project` is the allowlist entry for this project (or `None` when
+    there isn't one, or the allowlist itself failed to load for this run) --
+    ops rules are appended only when it is present, matching
+    `ops-requests-spec.md` section 2: an unlisted project gets no ops
+    instructions at all, so Codex has nothing to base a request on and (per
+    the base prompt / trusted task text) explains that in its own summary
+    instead."""
     parts = [base_prompt]
     note = _relevant_files_note(work.relevant_files)
     if note:
@@ -92,6 +146,8 @@ def compose_implement_prompt(base_prompt: str, work: Work, *, complex_route: boo
     parts.append(EFFICIENCY_RULES)
     if complex_route:
         parts.append(ORCHESTRATOR_RULES)
+    if ops_project is not None:
+        parts.append(_ops_rules_note(ops_project))
     return "\n".join(parts)
 
 
