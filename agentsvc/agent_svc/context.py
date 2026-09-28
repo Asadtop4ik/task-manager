@@ -94,6 +94,11 @@ def _build_codex_runner(settings: Settings) -> CodexRunner:
     `CodexRunner()`'s own hardcoded defaults.
     """
     prefix = list(settings.codex_child_prefix)
+    # The configured prefix ends in the interpreter's own `-I` (sudoers pins
+    # `/usr/bin/python3 -I …`), but `CodexRunner._argv` always appends `-I`
+    # itself; keep only one, or sudo refuses `python3 -I -I …` as not allowed.
+    if prefix and prefix[-1] == "-I":
+        prefix = prefix[:-1]
     kwargs: dict[str, Any] = {"libexec_dir": settings.libexec_dir}
     if prefix:
         kwargs["command_prefix"] = prefix[:-1]

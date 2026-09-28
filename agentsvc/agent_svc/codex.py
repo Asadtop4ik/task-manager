@@ -225,7 +225,11 @@ class CodexRunner:
         ]
 
     def _parse_child_reply(
-        self, subcommand: str, returncode: int, stdout_bytes: bytes
+        self,
+        subcommand: str,
+        returncode: int,
+        stdout_bytes: bytes,
+        stderr_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         stdout_text = stdout_bytes.decode("utf-8", "replace").strip()
         try:
@@ -234,9 +238,15 @@ class CodexRunner:
             body = None
         if returncode != 0:
             reason = body.get("reason") if isinstance(body, dict) else None
+            if not reason:
+                # No JSON refusal (e.g. sudo itself refused): keep the last
+                # stderr line so the failure is diagnosable from the run error.
+                lines = (stderr_bytes or b"").decode("utf-8", "replace").strip().splitlines()
+                tail = lines[-1][:200] if lines else ""
+                reason = f"codex child {subcommand} failed" + (f": {tail}" if tail else "")
             raise CodexChildError(
                 returncode,
-                reason or f"codex child {subcommand} failed",
+                reason,
                 body=body if isinstance(body, dict) else None,
             )
         if not isinstance(body, dict):
@@ -261,7 +271,9 @@ class CodexRunner:
             )
         except subprocess.TimeoutExpired as exc:
             raise CodexChildError(-1, f"codex child {subcommand} timed out") from exc
-        return self._parse_child_reply(subcommand, completed.returncode, completed.stdout)
+        return self._parse_child_reply(
+            subcommand, completed.returncode, completed.stdout, completed.stderr
+        )
 
     def _call_with_grace(
         self,
@@ -306,7 +318,7 @@ class CodexRunner:
             cancel_watcher = threading.Thread(target=_watch_cancel, daemon=True)
             cancel_watcher.start()
         try:
-            stdout_bytes, _stderr_bytes = process.communicate(payload, timeout=timeout_s)
+            stdout_bytes, stderr_bytes = process.communicate(payload, timeout=timeout_s)
         except subprocess.TimeoutExpired as exc:
             self._send_sigterm(process)
             try:
@@ -320,7 +332,9 @@ class CodexRunner:
             stop_watch.set()
             if cancel_watcher is not None:
                 cancel_watcher.join(timeout=1)
-        return self._parse_child_reply(subcommand, process.returncode, stdout_bytes)
+        return self._parse_child_reply(
+            subcommand, process.returncode, stdout_bytes, stderr_bytes
+        )
 
     def prepare(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("prepare", request, timeout_s)
