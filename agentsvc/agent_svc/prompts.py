@@ -121,7 +121,9 @@ def _ops_rules_note(ops_project: Any) -> str:
         "Rules: at most 3 requests per run; the owner must approve each one "
         "individually before anything changes; never request a secret "
         "value, a URL, or a key not listed above; never include this line "
-        "unless you are making a genuine, specific request.\n"
+        "unless you are making a genuine, specific request; never repeat a "
+        "requested value anywhere else in your message, only inside this "
+        "one line.\n"
     )
 
 

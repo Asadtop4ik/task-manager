@@ -17,6 +17,7 @@ from typing import Any
 
 from .api import Work
 from .context import ServiceContext
+from .http import HttpError
 from .ops_requests import build_ops_note, split_trailer
 from .ops_requests import validate as validate_ops_requests
 from .prompts import compose_implement_prompt, route_implement
@@ -24,6 +25,10 @@ from .publish import PublishError, _check_not_cancelled, publish_implement
 from .runctx import RunScaffold
 
 _NO_CHANGES_MESSAGE = "agent produced no file changes"
+_OPS_UNAVAILABLE_NOTE = "ops_unavailable"
+_OPS_CALLBACK_KEYS = ("ops_requests", "ops_note")
+_OPS_VALUE_PLACEHOLDER = "[ops qiymati]"
+_MIN_REDACTED_VALUE_LEN = 4
 
 
 def handle_implement(ctx: ServiceContext, work: Work, cancel: threading.Event) -> None:
@@ -143,6 +148,39 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
     # a public PR or a Telegram message. This one call covers all of them.
     summary, raw_ops, trailer_note = split_trailer(result.final_message or "")
 
+    # Ops block: policy access, validation, and note-building all in one
+    # place, all defended together. `ctx.trusted.agent_ops_policy` is a
+    # SECOND access to the trusted loader in this run (the first, inside
+    # `_load_ops_allowlist` above, is already defended the same way) -- an
+    # older installer without `scripts/agent_ops_policy.py` yet deployed
+    # would otherwise raise `FileNotFoundError` here, AFTER Codex already
+    # ran, crashing the whole run with no callback ever sent at all. Ops
+    # requests are a secondary feature: any failure here must degrade to
+    # "no proposals" instead of losing the run's own real outcome.
+    try:
+        policy_module = ctx.trusted.agent_ops_policy
+        proposals, drop_note = validate_ops_requests(
+            raw_ops,
+            project_key=ops_project_key,
+            repo_full_name=work.repo_full_name,
+            allowlist=allowlist,
+            policy_module=policy_module,
+        )
+        ops_note = build_ops_note(
+            trailer_note=trailer_note, drop_note=drop_note, policy_module=policy_module
+        )
+    except Exception as exc:
+        ctx.logger.error(exc, event="ops_validation_failed", run_id=work.run_id)
+        proposals = []
+        ops_note = _OPS_UNAVAILABLE_NOTE
+
+    # Defense in depth against Codex repeating a requested value in its own
+    # prose, outside the trailer line `split_trailer` already removed (the
+    # prompt also tells it not to) -- applied to every piece of Codex's own
+    # text used below, including the early failure-reason branch just past
+    # this point.
+    summary = _redact_ops_values(summary, proposals)
+
     if result.timed_out or result.idle_killed or result.exit_code != 0:
         reason = ctx.trusted.agent_task.failure_reason(
             failure_phase="implement",
@@ -154,6 +192,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         if result.error_message and not result.final_message:
             # e.g. a usage limit or model error reported by Codex itself.
             reason = f"{reason} (Codex: {result.error_message[:300]})"
+        reason = _redact_ops_values(reason, proposals)
         _fail(ctx, work, run, "implement", reason, usage=result.usage)
         return
 
@@ -169,15 +208,6 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             usage=result.usage,
         )
         return
-
-    proposals = validate_ops_requests(
-        raw_ops,
-        project_key=ops_project_key,
-        repo_full_name=work.repo_full_name,
-        allowlist=allowlist,
-        policy_module=ctx.trusted.agent_ops_policy,
-    )
-    ops_note = build_ops_note(trailer_note, ctx.trusted.agent_ops_policy)
 
     patch_b64 = package.get("patch_b64") or ""
     if not patch_b64:
@@ -333,6 +363,29 @@ def _load_ops_allowlist(ctx: ServiceContext, run_id: str) -> Any:
         return None
 
 
+def _redact_ops_values(text: str, proposals: list[dict[str, Any]]) -> str:
+    """Defense in depth: Codex might repeat a requested value in its own
+    prose -- outside the trailer line itself, which `split_trailer` already
+    removes -- e.g. "I'm asking the owner to add 5339875840 as an admin".
+    Replace every occurrence of a proposal's `value` (allowed or denied)
+    with a fixed placeholder before this text ever reaches a PR body or a
+    Telegram message. Only values at least `_MIN_REDACTED_VALUE_LEN`
+    characters long are redacted, so a short, generic value (a single
+    digit, "on"/"off", ...) never mangles ordinary prose that happens to
+    contain the same short substring by coincidence.
+    """
+    if not text or not proposals:
+        return text
+    values: set[str] = set()
+    for proposal in proposals:
+        value = proposal.get("value")
+        if isinstance(value, str) and len(value) >= _MIN_REDACTED_VALUE_LEN:
+            values.add(value)
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, _OPS_VALUE_PLACEHOLDER)
+    return text
+
+
 def _download_images(
     ctx: ServiceContext, work: Work, run: RunScaffold
 ) -> tuple[Path | None, list[Path]]:
@@ -473,11 +526,14 @@ def _fail(
         "failure_phase": phase,
     }
     payload.update(_usage_fields(usage))
-    # Only attached when this failure actually has ops requests to report
-    # (the "no patch, none allowed" flow); every other `_fail` call site is
+    # Attached whenever there is anything ops-related to report at all --
+    # not just a non-empty proposal list, but also a note-only outcome (a
+    # trailer was present but turned out ambiguous/invalid/all-dropped: see
+    # `_run_implement`'s ops block and `ops_requests.build_ops_note`).
+    # Every other `_fail` call site (no trailer, nothing dropped) is
     # unaffected and keeps sending exactly the payload it always has.
-    if ops_requests:
-        payload["ops_requests"] = ops_requests
+    if ops_requests or ops_note:
+        payload["ops_requests"] = ops_requests or []
         payload["ops_note"] = ops_note
     _callback(ctx, work, run, payload)
 
@@ -487,4 +543,34 @@ def _callback(
 ) -> None:
     if run.cancel.is_set():
         return
-    run.deliver(lambda: ctx.api.callback(work.run_id, work.lease_id, payload))
+    run.deliver(lambda: _post_callback(ctx, work, payload))
+
+
+def _post_callback(ctx: ServiceContext, work: Work, payload: Mapping[str, Any]) -> None:
+    """One callback delivery attempt, with one extra layer `run.deliver`
+    itself does not have: if the payload carries ops fields and the backend
+    rejects it with a 400/422 (a malformed `ops_requests`/`ops_note` --
+    which, thanks to the checks in `ops_requests.py`, should never happen,
+    but a defense this cheap is worth having anyway), resend ONCE without
+    those two fields rather than losing the run's own real outcome
+    (`pr_opened`/`ops_pending`/`failed`) over a secondary feature. The
+    rejection is logged by status code only -- never the response body,
+    which could otherwise echo back attacker-influenced field values
+    (`kind`/`op`) into the log.
+    """
+    try:
+        ctx.api.callback(work.run_id, work.lease_id, dict(payload))
+    except HttpError as exc:
+        carries_ops = any(key in payload for key in _OPS_CALLBACK_KEYS)
+        if not carries_ops or exc.status not in (400, 422):
+            raise
+        ctx.logger.event(
+            "ops_callback_rejected_retrying_without_ops",
+            level="warning",
+            run_id=work.run_id,
+            status=exc.status,
+        )
+        stripped = {
+            key: value for key, value in payload.items() if key not in _OPS_CALLBACK_KEYS
+        }
+        ctx.api.callback(work.run_id, work.lease_id, stripped)

@@ -441,12 +441,22 @@ def self_check(
             found = sorted(item.name for item in tools_dir.iterdir())
             _emit(lines, ok_flags, True, "tools", ", ".join(found) if found else "none found")
 
+        # Unconditional, regardless of `ops_lane_enabled`: the trusted
+        # `agent_ops_policy` module (`scripts/agent_ops_policy.py`) is a
+        # deployment prerequisite an installer might simply not have laid
+        # down yet, worth surfacing before the lane is ever turned on, not
+        # only after.
+        ops_trusted = TrustedModules(settings.trusted_dir)
+        try:
+            _ = ops_trusted.agent_ops_policy
+            _emit(lines, ok_flags, True, "agent_ops_policy", "trusted module loads")
+        except Exception as exc:
+            _emit(lines, ok_flags, False, "agent_ops_policy", f"{type(exc).__name__}: {exc}")
+
         if settings.ops_lane_enabled:
             _emit(lines, ok_flags, *_ops_apply_sudo_check(runner))
             try:
-                allowlist = TrustedModules(
-                    settings.trusted_dir
-                ).agent_ops_policy.load_allowlist(
+                allowlist = ops_trusted.agent_ops_policy.load_allowlist(
                     settings.ops_allowlist_path,
                     catalog.repos if catalog is not None else (),
                     require_root_owned=True,

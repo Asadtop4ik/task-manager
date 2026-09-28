@@ -58,6 +58,9 @@ _OPS_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}", re.ASCII)
 _OPS_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:@/+-]{1,256}", re.ASCII)
 _OPS_HASH_RE = re.compile(r"[0-9a-f]{64}")
 _OPS_KINDS = frozenset({"env_set"})
+# An ops lease/result response is a tiny JSON object -- smaller even than
+# the chat lane's own `_MAX_LEASE_RESPONSE_BYTES` cap.
+_MAX_OPS_RESPONSE_BYTES = 8 * 1024
 _OPS_OPS = frozenset({"replace", "list_add", "list_remove"})
 _MAX_OPS_VALUE_LEN = 256
 
@@ -335,11 +338,19 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
 
 class InvalidOpsWork(InvalidResponse):
     """An `/agent-ops/lease` response failed validation. `ops_id` is set
-    when it was parseable."""
+    when it was parseable; `lease_id` is set too once IT specifically has
+    also been validated -- carrying both lets the caller (`OpsLane.tick`)
+    still report `failed`/`bad_request` for a partially-malformed lease and
+    free the backend's exclusive "at most one applying globally" slot,
+    instead of leaving it held until the lease's own 15-minute window
+    expires on its own."""
 
-    def __init__(self, message: str, *, ops_id: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, ops_id: int | None = None, lease_id: str | None = None
+    ) -> None:
         super().__init__(message)
         self.ops_id = ops_id
+        self.lease_id = lease_id
 
 
 @dataclass(frozen=True)
@@ -386,24 +397,30 @@ def parse_ops_work(payload: Any, catalog: Mapping[str, str]) -> OpsWork:
     lease_id = _valid_lease_id(payload.get("lease_id"))
     if lease_id is None:
         fail("ops lease response has an invalid lease_id")
+
+    # From here on `lease_id` is known-valid: carry it in every subsequent
+    # failure too (see `InvalidOpsWork`'s own docstring for why).
+    def fail_with_lease(message: str) -> NoReturn:
+        raise InvalidOpsWork(message, ops_id=ops_id, lease_id=lease_id)
+
     lease_until = _parse_iso(payload.get("lease_until"))
     if lease_until is None:
-        fail("ops lease response has an invalid lease_until")
+        fail_with_lease("ops lease response has an invalid lease_until")
     project_key = payload.get("project_key")
     if not isinstance(project_key, str) or not _OPS_PROJECT_KEY_RE.fullmatch(project_key):
-        fail("ops lease response has an invalid project_key")
+        fail_with_lease("ops lease response has an invalid project_key")
     repo_full_name = payload.get("repo_full_name")
     if not isinstance(repo_full_name, str) or repo_full_name not in catalog:
-        fail("ops lease response repository is not in the approved catalog")
+        fail_with_lease("ops lease response repository is not in the approved catalog")
     kind = payload.get("kind")
     if kind not in _OPS_KINDS:
-        fail("ops lease response has an invalid kind")
+        fail_with_lease("ops lease response has an invalid kind")
     key = payload.get("key")
     if not isinstance(key, str) or not _OPS_KEY_RE.fullmatch(key):
-        fail("ops lease response has an invalid key")
+        fail_with_lease("ops lease response has an invalid key")
     op = payload.get("op")
     if op not in _OPS_OPS:
-        fail("ops lease response has an invalid op")
+        fail_with_lease("ops lease response has an invalid op")
     value = payload.get("value")
     if (
         not isinstance(value, str)
@@ -412,18 +429,18 @@ def parse_ops_work(payload: Any, catalog: Mapping[str, str]) -> OpsWork:
         or not _OPS_VALUE_RE.fullmatch(value)
         or "://" in value
     ):
-        fail("ops lease response has an invalid value")
+        fail_with_lease("ops lease response has an invalid value")
     request_hash = payload.get("request_hash")
     if not isinstance(request_hash, str) or not _OPS_HASH_RE.fullmatch(request_hash):
-        fail("ops lease response has an invalid request_hash")
+        fail_with_lease("ops lease response has an invalid request_hash")
     deployed_sha = payload.get("deployed_sha")
     if deployed_sha is not None and (
         not isinstance(deployed_sha, str) or not _SHA_RE.fullmatch(deployed_sha)
     ):
-        fail("ops lease response has an invalid deployed_sha")
+        fail_with_lease("ops lease response has an invalid deployed_sha")
     attempts = payload.get("attempts")
     if _bad_int(attempts, minimum=0):
-        fail("ops lease response has invalid attempts")
+        fail_with_lease("ops lease response has invalid attempts")
     assert isinstance(attempts, int)
 
     return OpsWork(
@@ -854,7 +871,7 @@ class TaskManagerApi:
             body=_encode(body),
             content_type="application/json" if body is not None else None,
         )
-        return self._http.send(request)
+        return self._http.send(request, max_bytes=_MAX_OPS_RESPONSE_BYTES)
 
     def lease_ops(self) -> OpsWork | None:
         response = self._ops_call("POST", "/lease")

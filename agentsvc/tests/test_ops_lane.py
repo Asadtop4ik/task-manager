@@ -9,9 +9,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from agent_svc.api import OpsWork
+from agent_svc.api import InvalidOpsWork, OpsWork
 from agent_svc.log import Logger, Redactor
-from agent_svc.ops import APPLY_TIMEOUT_S, OPS_APPLY_COMMAND, OpsLane
+from agent_svc.ops import (
+    APPLY_TIMEOUT_S,
+    OPS_APPLY_COMMAND,
+    OPS_IS_ACTIVE_COMMAND,
+    OpsLane,
+)
 from agent_svc.trusted import TrustedModules
 
 from .support import copy_trusted_dir
@@ -52,8 +57,8 @@ ALLOWLIST_DATA = {
 }
 
 
-def _logger() -> Logger:
-    return Logger(Redactor([]), stream=io.StringIO())
+def _logger(stream: io.StringIO | None = None) -> Logger:
+    return Logger(Redactor([]), stream=stream if stream is not None else io.StringIO())
 
 
 def _work(**overrides: Any) -> OpsWork:
@@ -78,9 +83,13 @@ def _work(**overrides: Any) -> OpsWork:
 
 
 class _FakeOpsApi:
-    def __init__(self, *, leases: list[Any] | None = None) -> None:
+    def __init__(
+        self, *, leases: list[Any] | None = None, result_effects: list[Any] | None = None
+    ) -> None:
         self._leases = list(leases or [])
+        self._result_effects = list(result_effects or [])
         self.results: list[dict[str, Any]] = []
+        self.result_calls = 0
 
     def lease_ops(self) -> OpsWork | None:
         assert self._leases, "lease_ops called with no queued lease in this test"
@@ -90,6 +99,11 @@ class _FakeOpsApi:
         return result
 
     def ops_result(self, ops_id: int, lease_id: str, payload: dict[str, Any]) -> None:
+        self.result_calls += 1
+        if self._result_effects:
+            effect = self._result_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
         self.results.append({"ops_id": ops_id, "lease_id": lease_id, **payload})
 
 
@@ -112,13 +126,36 @@ class _StubPolicyModule:
         return getattr(self._real, name)
 
 
+def _is_active_call(argv: list[str]) -> bool:
+    return argv[:2] == ["/usr/bin/systemctl", "is-active"]
+
+
 class _RecordingRunner:
-    def __init__(self, *, raise_timeout: bool = False) -> None:
+    """Routes by argv: an `is-active` probe always answers "inactive"
+    (returncode 3, systemd's usual code -- tests that don't care about the
+    pre-check are unaffected by its presence) unless `is_active_returncode`
+    says otherwise; anything else is the apply command itself."""
+
+    def __init__(
+        self,
+        *,
+        raise_timeout: bool = False,
+        is_active_returncode: int = 3,
+        raise_is_active: BaseException | None = None,
+    ) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
         self._raise_timeout = raise_timeout
+        self._is_active_returncode = is_active_returncode
+        self._raise_is_active = raise_is_active
 
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append((list(argv), kwargs))
+        if _is_active_call(argv):
+            if self._raise_is_active is not None:
+                raise self._raise_is_active
+            return subprocess.CompletedProcess(
+                argv, self._is_active_returncode, stdout="", stderr=""
+            )
         if self._raise_timeout:
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
@@ -140,8 +177,9 @@ class _ApplyingRunner(_RecordingRunner):
         request_id: str,
         result: dict[str, Any],
         result_request_id: str | None = None,
+        is_active_returncode: int = 3,
     ) -> None:
-        super().__init__()
+        super().__init__(is_active_returncode=is_active_returncode)
         self._results_dir = results_dir
         self._request_id = request_id
         self._result = result
@@ -150,11 +188,13 @@ class _ApplyingRunner(_RecordingRunner):
         )
 
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        response = super().__call__(argv, **kwargs)
+        if _is_active_call(argv):
+            return super().__call__(argv, **kwargs)
+        self.calls.append((list(argv), kwargs))
         self._results_dir.mkdir(parents=True, exist_ok=True)
         payload = {"request_id": self._result_request_id, **self._result}
         (self._results_dir / f"{self._request_id}.json").write_text(json.dumps(payload))
-        return response
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
 class OpsLaneTestCase(unittest.TestCase):
@@ -188,6 +228,7 @@ class OpsLaneTestCase(unittest.TestCase):
         allowlist: Any = "default",
         enabled: bool = True,
         require_root_owned_result: bool = False,
+        sleep: Any = None,
     ) -> OpsLane:
         return OpsLane(
             api=api,  # type: ignore[arg-type]
@@ -201,6 +242,7 @@ class OpsLaneTestCase(unittest.TestCase):
             enabled=enabled,
             command_runner=runner,
             require_root_owned_result=require_root_owned_result,
+            sleep=sleep if sleep is not None else (lambda _s: None),
         )
 
 
@@ -262,16 +304,32 @@ class RevalidationTests(OpsLaneTestCase):
         self.assertEqual(api.results[0]["status"], "failed")
         self.assertEqual(api.results[0]["code"], "refused")
 
-    def test_allowlist_load_failure_is_refused_and_never_crashes(self) -> None:
+    def test_allowlist_policy_error_is_refused_and_never_crashes(self) -> None:
         work = _work()
         api = _FakeOpsApi(leases=[work])
         runner = _RecordingRunner()
-        lane = self._lane(api=api, runner=runner, allowlist=RuntimeError("disk on fire"))
+        policy_error = self.real_policy.PolicyError("not_root_owned")
+        lane = self._lane(api=api, runner=runner, allowlist=policy_error)
         lane.tick()  # must not raise
 
         self.assertEqual(runner.calls, [])
         self.assertEqual(api.results[0]["status"], "failed")
         self.assertEqual(api.results[0]["code"], "refused")
+
+    def test_transient_allowlist_os_error_retries_instead_of_failing(self) -> None:
+        # An OSError the policy module's own `os.open` wrapper did not
+        # already turn into a `PolicyError` (e.g. `os.fstat`/`os.read`
+        # hitting EIO/ESTALE) is far more likely a transient filesystem
+        # hiccup than a genuine policy violation.
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _RecordingRunner()
+        lane = self._lane(api=api, runner=runner, allowlist=OSError("EIO"))
+        lane.tick()  # must not raise
+
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(api.results[0]["status"], "retry")
+        self.assertEqual(api.results[0]["code"], "no_result")
 
 
 class CrashRecoveryTests(OpsLaneTestCase):
@@ -292,6 +350,52 @@ class CrashRecoveryTests(OpsLaneTestCase):
         self.assertEqual(api.results[0]["code"], "applied")
 
 
+class IsActivePrecheckTests(OpsLaneTestCase):
+    def test_already_running_unit_reports_retry_busy_without_writing_request_file(
+        self,
+    ) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _RecordingRunner(is_active_returncode=0)  # 0 == active
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertEqual(len(runner.calls), 1)  # only the is-active probe
+        self.assertEqual(runner.calls[0][0], list(OPS_IS_ACTIVE_COMMAND))
+        self.assertFalse((self.request_dir / "request.json").exists())
+        self.assertEqual(api.results[0]["status"], "retry")
+        self.assertEqual(api.results[0]["code"], "busy")
+
+    def test_precheck_failure_reports_retry_no_result_without_writing_request_file(
+        self,
+    ) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _RecordingRunner(raise_is_active=OSError("systemctl not found"))
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertFalse((self.request_dir / "request.json").exists())
+        self.assertEqual(api.results[0]["status"], "retry")
+        self.assertEqual(api.results[0]["code"], "no_result")
+
+    def test_inactive_unit_proceeds_to_apply(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied"},
+            is_active_returncode=3,
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertEqual(len(runner.calls), 2)  # is-active, then apply
+        self.assertFalse((self.request_dir / "request.json").exists())  # unlinked after
+        self.assertEqual(api.results[0]["status"], "applied")
+
+
 class ApplyFlowTests(OpsLaneTestCase):
     def test_happy_path_writes_request_file_and_reports_applied(self) -> None:
         work = _work()
@@ -299,26 +403,20 @@ class ApplyFlowTests(OpsLaneTestCase):
         runner = _ApplyingRunner(
             results_dir=self.results_dir,
             request_id=REQUEST_UUID,
-            result={"code": "applied", "message": "done", "image_tag": "a" * 40},
+            result={"code": "applied", "message": "done", "image_tag": "ghcr.io/x/y:abc123"},
         )
         lane = self._lane(api=api, runner=runner)
         lane.tick()
 
-        self.assertEqual(len(runner.calls), 1)
-        argv, kwargs = runner.calls[0]
-        self.assertEqual(argv, list(OPS_APPLY_COMMAND))
-        self.assertEqual(kwargs["timeout"], APPLY_TIMEOUT_S)
+        self.assertEqual(len(runner.calls), 2)
+        apply_argv, apply_kwargs = runner.calls[1]
+        self.assertEqual(apply_argv, list(OPS_APPLY_COMMAND))
+        self.assertEqual(apply_kwargs["timeout"], APPLY_TIMEOUT_S)
+        self.assertEqual(APPLY_TIMEOUT_S, 960.0)
 
-        request_path = self.request_dir / "request.json"
-        self.assertTrue(request_path.is_file())
-        written = json.loads(request_path.read_text())
-        self.assertEqual(written["request_id"], REQUEST_UUID)
-        self.assertEqual(written["run_id"], RUN_ID)
-        self.assertEqual(written["project"], "qurbot")
-        self.assertEqual(written["key"], "ADMIN_TG_IDS")
-        self.assertEqual(written["op"], "list_add")
-        self.assertEqual(written["value"], "5339875840")
-        self.assertEqual(written["request_hash"], GOLDEN_HASH)
+        # request.json existed long enough to be written correctly, and is
+        # unlinked again once `systemctl start` genuinely returns.
+        self.assertFalse((self.request_dir / "request.json").exists())
 
         self.assertEqual(len(api.results), 1)
         result = api.results[0]
@@ -327,7 +425,37 @@ class ApplyFlowTests(OpsLaneTestCase):
         self.assertEqual(result["status"], "applied")
         self.assertEqual(result["code"], "applied")
         self.assertEqual(result["message"], "done")
-        self.assertEqual(result["image_tag"], "a" * 40)
+        self.assertEqual(result["image_tag"], "ghcr.io/x/y:abc123")
+
+    def test_request_file_content_is_correct(self) -> None:
+        # request.json is unlinked again by the time `tick()` returns, so
+        # its content is captured from INSIDE the runner call, at the exact
+        # moment a real `systemctl start` would be reading it.
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        captured: dict[str, Any] = {}
+        request_path = self.request_dir / "request.json"
+
+        class _CapturingRunner(_ApplyingRunner):
+            def __call__(self, argv, **kwargs):
+                if not _is_active_call(argv) and request_path.is_file():
+                    captured["content"] = json.loads(request_path.read_text())
+                return super().__call__(argv, **kwargs)
+
+        runner = _CapturingRunner(
+            results_dir=self.results_dir, request_id=REQUEST_UUID, result={"code": "applied"}
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        written = captured["content"]
+        self.assertEqual(written["request_id"], REQUEST_UUID)
+        self.assertEqual(written["run_id"], RUN_ID)
+        self.assertEqual(written["project"], "qurbot")
+        self.assertEqual(written["key"], "ADMIN_TG_IDS")
+        self.assertEqual(written["op"], "list_add")
+        self.assertEqual(written["value"], "5339875840")
+        self.assertEqual(written["request_hash"], GOLDEN_HASH)
 
     def test_already_applied_maps_to_applied_status(self) -> None:
         work = _work()
@@ -381,13 +509,19 @@ class ApplyFlowTests(OpsLaneTestCase):
         self.assertEqual(api.results[0]["code"], "busy")
 
     def test_missing_result_after_apply_retries_with_no_result_code(self) -> None:
+        # `systemctl` exits 0 (the default for `_RecordingRunner`) without
+        # the helper ever having written a result file -- e.g. it printed
+        # "Running in chroot, ignoring command" and exited 0 under
+        # `ProtectProc`. Exit code alone must never be trusted as success.
         work = _work()
         api = _FakeOpsApi(leases=[work])
-        runner = _RecordingRunner()  # never writes a result file
+        runner = _RecordingRunner()  # never writes a result file; exits 0
         lane = self._lane(api=api, runner=runner)
         lane.tick()
 
-        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(len(runner.calls), 2)
+        apply_argv, _kwargs = runner.calls[1]
+        self.assertEqual(apply_argv, list(OPS_APPLY_COMMAND))
         self.assertEqual(api.results[0]["status"], "retry")
         self.assertEqual(api.results[0]["code"], "no_result")
 
@@ -410,6 +544,78 @@ class ApplyFlowTests(OpsLaneTestCase):
         self.assertEqual(api.results[0]["code"], "bad_request")
         self.assertIn("request_id", api.results[0]["message"])
 
+    def test_wrong_request_hash_in_result_is_failed_bad_request(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "request_hash": "f" * 64},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertEqual(api.results[0]["status"], "failed")
+        self.assertEqual(api.results[0]["code"], "bad_request")
+        self.assertIn("hash", api.results[0]["message"])
+
+    def test_matching_request_hash_in_result_is_accepted(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "request_hash": GOLDEN_HASH},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertEqual(api.results[0]["status"], "applied")
+
+    def test_rollback_failed_uses_rollback_message_as_the_message_field(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={
+                "code": "failed_rollback_failed",
+                "message": "generic failure text",
+                "rollback_message": "env_write_failed",
+            },
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertEqual(api.results[0]["message"], "env_write_failed")
+
+    def test_malformed_rollback_message_is_ignored(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={
+                "code": "failed_rollback_failed",
+                "message": "generic failure text",
+                "rollback_message": "Not Valid Vocabulary!",
+            },
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertEqual(api.results[0]["message"], "generic failure text")
+
+    def test_non_string_code_reports_bad_request_without_crashing(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": ["not", "a", "string"]},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()  # must not raise (unhashable code)
+        self.assertEqual(api.results[0]["status"], "failed")
+        self.assertEqual(api.results[0]["code"], "bad_request")
+
     def test_malformed_existing_result_is_failed_bad_request(self) -> None:
         # The file exists (right path) but is not valid JSON -- must be
         # reported as failed/bad_request, never silently treated as "not
@@ -422,46 +628,201 @@ class ApplyFlowTests(OpsLaneTestCase):
         lane = self._lane(api=api, runner=runner)
         lane.tick()
 
-        self.assertEqual(runner.calls, [])  # never ran the apply unit
+        self.assertEqual(runner.calls, [])  # never ran the apply unit at all
         self.assertEqual(api.results[0]["status"], "failed")
         self.assertEqual(api.results[0]["code"], "bad_request")
 
-    def test_extra_result_fields_are_forwarded_when_present(self) -> None:
-        work = _work()
-        api = _FakeOpsApi(leases=[work])
-        runner = _ApplyingRunner(
-            results_dir=self.results_dir,
-            request_id=REQUEST_UUID,
-            result={
-                "code": "failed_rolled_back",
-                "exit": 5,
-                "restarted": True,
-                "rolled_back": True,
-                "image_tag": "c" * 40,
-                "message": "verify failed; rolled back",
-            },
-        )
-        lane = self._lane(api=api, runner=runner)
-        lane.tick()
-
-        result = api.results[0]
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["code"], "failed_rolled_back")
-        self.assertEqual(result["exit"], 5)
-        self.assertTrue(result["restarted"])
-        self.assertTrue(result["rolled_back"])
-        self.assertEqual(result["image_tag"], "c" * 40)
-        self.assertEqual(result["message"], "verify failed; rolled back")
-
-    def test_apply_timeout_reports_nothing_and_does_not_raise(self) -> None:
+    def test_apply_timeout_reports_nothing_and_never_unlinks_request_file(self) -> None:
         work = _work()
         api = _FakeOpsApi(leases=[work])
         runner = _RecordingRunner(raise_timeout=True)
         lane = self._lane(api=api, runner=runner)
         lane.tick()  # must not raise
 
-        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(len(runner.calls), 2)  # is-active, then the timing-out apply
         self.assertEqual(api.results, [])
+        # The helper may still be running (or still queued) past our own
+        # timeout and may still need to read request.json.
+        self.assertTrue((self.request_dir / "request.json").is_file())
+
+    def test_apply_command_exception_unlinks_request_file(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+
+        class _RaisingRunner(_RecordingRunner):
+            def __call__(self, argv, **kwargs):
+                if _is_active_call(argv):
+                    return super().__call__(argv, **kwargs)
+                self.calls.append((list(argv), kwargs))
+                raise FileNotFoundError("sudo binary missing")
+
+        runner = _RaisingRunner()
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()  # must not raise
+        self.assertFalse((self.request_dir / "request.json").exists())
+
+
+class ExtraFieldsClampingTests(OpsLaneTestCase):
+    def test_exit_out_of_range_is_sent_as_none(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "exit": 999},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertIsNone(api.results[0]["exit"])
+
+    def test_exit_negative_is_sent_as_none(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "exit": -9},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertIsNone(api.results[0]["exit"])
+
+    def test_exit_in_range_passes_through(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "exit": 0},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertEqual(api.results[0]["exit"], 0)
+
+    def test_exit_key_absent_is_omitted(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir, request_id=REQUEST_UUID, result={"code": "applied"}
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertNotIn("exit", api.results[0])
+
+    def test_image_tag_with_bad_characters_is_dropped(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "image_tag": "not a valid tag; rm -rf /"},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertNotIn("image_tag", api.results[0])
+
+    def test_image_tag_too_long_is_dropped(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "image_tag": "a" * 101},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+        self.assertNotIn("image_tag", api.results[0])
+
+    def test_env_restored_is_accepted_but_not_forwarded(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied", "env_restored": True},
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()  # must not raise / must not reject the result over it
+        self.assertEqual(api.results[0]["status"], "applied")
+        self.assertNotIn("env_restored", api.results[0])
+
+
+class ResultDeliveryRetryTests(OpsLaneTestCase):
+    def test_transient_delivery_failure_retries_and_eventually_succeeds(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(
+            leases=[work], result_effects=[RuntimeError("network blip"), RuntimeError("again")]
+        )
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir, request_id=REQUEST_UUID, result={"code": "applied"}
+        )
+        sleeps: list[float] = []
+        lane = self._lane(api=api, runner=runner, sleep=sleeps.append)
+        lane.tick()
+
+        self.assertEqual(api.result_calls, 3)  # 1 initial + 2 retries
+        self.assertEqual(len(api.results), 1)  # the 3rd attempt succeeded
+        self.assertEqual(sleeps, [1.0, 3.0])
+
+    def test_exhausting_all_retries_never_raises(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(
+            leases=[work],
+            result_effects=[RuntimeError("a"), RuntimeError("b"), RuntimeError("c")],
+        )
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir, request_id=REQUEST_UUID, result={"code": "applied"}
+        )
+        sleeps: list[float] = []
+        lane = self._lane(api=api, runner=runner, sleep=sleeps.append)
+        lane.tick()  # must not raise
+
+        self.assertEqual(api.result_calls, 3)
+        self.assertEqual(api.results, [])
+        self.assertEqual(sleeps, [1.0, 3.0])
+
+
+class InvalidLeaseTests(OpsLaneTestCase):
+    def test_invalid_lease_with_known_lease_id_reports_failed_bad_request(self) -> None:
+        api = _FakeOpsApi(
+            leases=[
+                InvalidOpsWork(
+                    "ops lease response has invalid attempts", ops_id=7, lease_id=LEASE_ID
+                )
+            ]
+        )
+        lane = self._lane(api=api, runner=_RecordingRunner())
+        lane.tick()  # must not raise
+        self.assertEqual(len(api.results), 1)
+        self.assertEqual(api.results[0]["ops_id"], 7)
+        self.assertEqual(api.results[0]["lease_id"], LEASE_ID)
+        self.assertEqual(api.results[0]["status"], "failed")
+        self.assertEqual(api.results[0]["code"], "bad_request")
+
+    def test_invalid_lease_without_a_known_lease_id_reports_nothing(self) -> None:
+        api = _FakeOpsApi(leases=[InvalidOpsWork("ops lease response has an invalid ops_id")])
+        lane = self._lane(api=api, runner=_RecordingRunner())
+        lane.tick()  # must not raise
+        self.assertEqual(api.results, [])
+
+
+class BackoffReportingTests(OpsLaneTestCase):
+    def test_in_backoff_work_is_reported_retry_busy_not_silently_held(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work, work])
+        runner = _RecordingRunner()
+        lane = self._lane(api=api, runner=runner)
+        # Seed backoff for this exact request_uuid, as a prior failed
+        # attempt would (mirrors `LoopRunnerTests`/`CodeLaneTests`'s own
+        # pattern for exercising `isolate`/`in_backoff` directly).
+        lane.isolate(REQUEST_UUID, lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        self.assertTrue(lane.in_backoff(REQUEST_UUID))
+
+        lane.tick()
+
+        self.assertEqual(runner.calls, [])  # never touched request/apply at all
+        self.assertEqual(api.results[0]["status"], "retry")
+        self.assertEqual(api.results[0]["code"], "busy")
 
 
 class ConstantsTests(unittest.TestCase):
@@ -475,6 +836,12 @@ class ConstantsTests(unittest.TestCase):
                 "start",
                 "agent-ops-apply.service",
             ),
+        )
+
+    def test_is_active_command_needs_no_sudo(self) -> None:
+        self.assertEqual(
+            OPS_IS_ACTIVE_COMMAND,
+            ("/usr/bin/systemctl", "is-active", "--quiet", "agent-ops-apply.service"),
         )
 
 

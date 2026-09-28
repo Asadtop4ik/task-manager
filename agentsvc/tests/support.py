@@ -183,6 +183,7 @@ class FakeApi:
         self.callbacks: list[dict[str, Any]] = []
         self.action_results: list[dict[str, Any]] = []
         self._heartbeat_effects: list[Any] = []
+        self._callback_effects: list[Any] = []
 
     def queue_heartbeat_effects(self, *effects: Any) -> None:
         self._heartbeat_effects.extend(effects)
@@ -201,7 +202,17 @@ class FakeApi:
     ) -> None:
         self.stages.append((run_id, lease_id, stage, error))
 
+    def queue_callback_effects(self, *effects: Any) -> None:
+        """Effects consumed in order by the NEXT `callback(...)` calls
+        (e.g. an `HttpError` to simulate a backend rejection) -- once
+        exhausted, `callback` records normally again."""
+        self._callback_effects.extend(effects)
+
     def callback(self, run_id: str, lease_id: str, payload: dict[str, Any]) -> None:
+        if self._callback_effects:
+            effect = self._callback_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
         self.callbacks.append(dict(payload))
 
     def action_result(self, run_id: str, lease_id: str, payload: dict[str, Any]) -> None:
