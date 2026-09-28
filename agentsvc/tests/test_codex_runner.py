@@ -44,9 +44,10 @@ from tests.test_codex_child import (  # noqa: E402
 
 
 class FakeCompletedProcess:
-    def __init__(self, returncode: int, stdout: bytes) -> None:
+    def __init__(self, returncode: int, stdout: bytes, stderr: bytes = b"") -> None:
         self.returncode = returncode
         self.stdout = stdout
+        self.stderr = stderr
 
 
 class SimpleCallTests(unittest.TestCase):
