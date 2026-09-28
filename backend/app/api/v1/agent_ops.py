@@ -4,6 +4,9 @@ owner-approved env change.
 Separate router from `agent_runs.py` (the spec keeps this file boundary so
 the two can be reviewed independently); the svc-token auth helper is shared
 by importing it from there rather than duplicating a security check.
+
+Locking discipline: see `app.services.agent_ops`'s module docstring. Every
+handler here that mutates an ops row locks its parent run first.
 """
 
 import zlib
@@ -55,6 +58,13 @@ def _require_live_ops_lease(row: AgentOpsRequest, lease_id: str | None) -> None:
         raise HTTPException(status_code=409, detail="lease_mismatch")
 
 
+def _lease_gate_met(run: AgentRun) -> bool:
+    return run.executor == "local" and (
+        (run.pr_url is not None and run.status == "deployed")
+        or (run.pr_url is None and run.status == "ops_pending")
+    )
+
+
 @router.post("/lease", response_model=AgentOpsWorkOut)
 async def lease_ops_work(
     session: DbSession,
@@ -72,6 +82,15 @@ async def lease_ops_work(
     _agent_svc_auth(x_agent_svc_token)
     await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _APPLY_LOCK_KEY})
     now = datetime.now(UTC)
+
+    # An agent-svc that crashed mid-apply should not have to wait for the
+    # next watchdog tick before its own next lease call can make progress —
+    # reclaim inside the same advisory lock, before picking anything.
+    reclaimed = await agent_ops.reclaim_expired_applying(session, now, limit=5)
+    for run in reclaimed.values():
+        await agent_ops.settle_run(session, run)
+    if reclaimed:
+        await session.flush()
 
     already_applying = await session.scalar(
         select(AgentOpsRequest.id).where(AgentOpsRequest.status == "applying").limit(1)
@@ -92,15 +111,25 @@ async def lease_ops_work(
             ),
         )
         .options(selectinload(AgentOpsRequest.agent_run))
-        .order_by(AgentOpsRequest.id)
+        .order_by(AgentRun.id, AgentOpsRequest.id)
         .limit(1)
-        .with_for_update(of=[AgentOpsRequest], skip_locked=True)
+        # Both tables locked in one statement, `SKIP LOCKED`: a run
+        # `cancel_agent_run` is concurrently locking is simply skipped this
+        # call (retried on the next poll), never blocked on or raced with.
+        .with_for_update(of=[AgentOpsRequest, AgentRun], skip_locked=True)
     )
     if row is None:
         await session.commit()
         return Response(status_code=204)
 
     run = row.agent_run
+    if not _lease_gate_met(run):
+        # Belt and suspenders: the WHERE clause above already guarantees
+        # this atomically, but re-checking in Python after the lock is
+        # cheap insurance against ever handing out a lease the gate does
+        # not actually support.
+        await session.commit()
+        return Response(status_code=204)
     row.status = "applying"
     row.lease_id = str(uuid4())
     row.lease_until = now + timedelta(minutes=15)
@@ -135,11 +164,11 @@ async def report_ops_result(
     """The applying root helper's outcome, relayed by agent-svc. Never the
     callback token — only the ops lease this same lane just took out."""
     _agent_svc_auth(x_agent_svc_token)
+    run = await agent_ops.lock_run_for_ops_id(session, ops_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="ops request not found")
     row = await session.scalar(
-        select(AgentOpsRequest)
-        .where(AgentOpsRequest.id == ops_id)
-        .options(selectinload(AgentOpsRequest.agent_run).selectinload(AgentRun.task))
-        .with_for_update()
+        select(AgentOpsRequest).where(AgentOpsRequest.id == ops_id).with_for_update()
     )
     if row is None:
         raise HTTPException(status_code=404, detail="ops request not found")
@@ -155,15 +184,17 @@ async def report_ops_result(
         "code": payload.code,
         "message": payload.message,
         "rolled_back": payload.rolled_back,
+        "restarted": payload.restarted,
+        "exit": payload.exit,
         "image_tag": payload.image_tag,
     }
-    run = row.agent_run
     row.lease_id = None
     row.lease_until = None
     if payload.status == "applied":
         row.status = "applied"
         row.result = result_payload
         row.applied_at = datetime.now(UTC)
+        run.notified_at = None
         agent_events.record(session, run, status="ops_applied", phase="ops")
     elif payload.status == "retry" and row.attempts < 3:
         row.status = "approved"
@@ -173,6 +204,7 @@ async def report_ops_result(
         # lease) — both end the request the same way.
         row.status = "failed"
         row.result = result_payload
+        run.notified_at = None
         agent_events.record(
             session, run, status="ops_failed", phase="ops", error=payload.message
         )
@@ -191,13 +223,16 @@ async def get_ops_request_run(
     callback data behind an ops decision button carries only `ops_id` and a
     hash prefix — never `run_id`, to stay inside the 64-byte payload limit —
     so the bot refreshes the card and builds `decide_ops_request`'s
-    `action_id` through this endpoint."""
+    `action_id` through this endpoint.
+
+    Read-only: never `FOR UPDATE` here. `_load_run_detail` can call out to
+    GitHub for an open PR's live head, and a lock must never be held across
+    that."""
     run = await session.scalar(
         select(AgentRun)
         .join(AgentOpsRequest, AgentOpsRequest.agent_run_id == AgentRun.id)
         .where(AgentOpsRequest.id == ops_id)
         .options(selectinload(AgentRun.task))
-        .with_for_update()
     )
     if run is None:
         raise HTTPException(status_code=404, detail="ops request not found")
@@ -211,22 +246,24 @@ async def decide_ops_request(
     session: DbSession,
     owner: OwnerUser,
 ) -> AgentOpsDecisionOut:
+    run = await agent_ops.lock_run_for_ops_id(session, ops_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="ops request not found")
     row = await session.scalar(
-        select(AgentOpsRequest)
-        .where(AgentOpsRequest.id == ops_id)
-        .options(selectinload(AgentOpsRequest.agent_run).selectinload(AgentRun.task))
-        .with_for_update()
+        select(AgentOpsRequest).where(AgentOpsRequest.id == ops_id).with_for_update()
     )
     if row is None:
         raise HTTPException(status_code=404, detail="ops request not found")
-    run = row.agent_run
     action_id = str(payload.action_id)
 
     if row.decision_action_id == action_id:
-        # Idempotent replay of the exact same owner tap. `status` can only
-        # have progressed from `approved` (never from `rejected`), so it is
-        # exact evidence of which decision this action_id was for.
-        was_approve = row.status in {"approved", "applying", "applied", "failed"}
+        # Idempotent replay of the exact same owner tap. `status` only ever
+        # moves away from `proposed` once, at decision time, to `rejected`
+        # (a dead end) or `approved` (which can then progress further, and
+        # can later be cancelled by an unrelated run cancellation) — so
+        # anything other than `rejected` is exact evidence this action_id
+        # was an approve.
+        was_approve = row.status != "rejected"
         if (payload.decision == "approve") == was_approve:
             # `updated_at` is server-computed (`onupdate=func.now()`); a
             # prior UPDATE in this same session can leave it expired, and a
@@ -254,6 +291,7 @@ async def decide_ops_request(
     if agent_ops.SECRET_KEY_RE.fullmatch(row.key):
         row.status = "invalid"
         row.policy_reason = "denylisted key"
+        await agent_ops.settle_run(session, run)
         await session.commit()
         raise HTTPException(status_code=409, detail="denylisted")
 

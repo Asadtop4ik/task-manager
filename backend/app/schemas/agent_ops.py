@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.agent_run import AgentOpsRequestOut, AgentRunDetailOut
 
@@ -62,9 +62,42 @@ class AgentOpsWorkOut(BaseModel):
     attempts: int
 
 
+# The applying root helper's fixed result vocabulary (see the spec's
+# `env_apply.py` exit/result codes) plus two agent-svc-lane-only codes for
+# when the helper never even reported back (`timeout`, `no_result`).
+_APPLIED_CODES = frozenset({"applied", "already_applied"})
+_RETRY_CODES = frozenset({"busy", "timeout", "no_result"})
+_FAILED_CODES = frozenset(
+    {"bad_request", "refused", "precondition", "failed_rolled_back", "failed_rollback_failed"}
+)
+OpsResultCode = Literal[
+    "applied",
+    "already_applied",
+    "bad_request",
+    "refused",
+    "precondition",
+    "failed_rolled_back",
+    "failed_rollback_failed",
+    "busy",
+    "timeout",
+    "no_result",
+]
+
+
 class AgentOpsResultIn(BaseModel):
     status: Literal["applied", "failed", "retry"]
-    code: str = Field(min_length=1, max_length=40)
+    code: OpsResultCode
     message: str | None = Field(default=None, max_length=300)
     rolled_back: bool | None = None
+    restarted: bool | None = None
+    exit: int | None = Field(default=None, ge=0, le=255)
     image_tag: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def _check_status_code_consistency(self) -> "AgentOpsResultIn":
+        expected = {"applied": _APPLIED_CODES, "retry": _RETRY_CODES, "failed": _FAILED_CODES}[
+            self.status
+        ]
+        if self.code not in expected:
+            raise ValueError(f"status {self.status!r} does not accept code {self.code!r}")
+        return self

@@ -16,6 +16,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.add_column("agent_runs", sa.Column("ops_note", sa.Text(), nullable=True))
     op.create_table(
         "agent_ops_requests",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -68,6 +69,7 @@ def upgrade() -> None:
             "'applied', 'failed', 'cancelled')",
             name="ck_agent_ops_requests_status",
         ),
+        sa.CheckConstraint("position BETWEEN 1 AND 3", name="ck_agent_ops_requests_position"),
     )
     op.create_index(
         "ix_agent_ops_requests_agent_run_id", "agent_ops_requests", ["agent_run_id"]
@@ -78,10 +80,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # `ops_pending` has no meaning to the pre-0019 code (no ops_requests rows
-    # for it to wait on any more); a run that reaches this migration in that
-    # state is stuck exactly like an implement lease that never came back.
-    op.execute("UPDATE agent_runs SET status = 'failed' WHERE status = 'ops_pending'")
+    # Neither `ops_pending` (still waiting) nor `ops_applied` (finished
+    # successfully) has any meaning to the pre-0019 code, and the table that
+    # explains either one is about to disappear. Both collapse to `failed`,
+    # exactly like an implement lease that never came back — the safer
+    # reading for a run downgrade will never automatically retry.
+    op.execute(
+        "UPDATE agent_runs SET status = 'failed' WHERE status IN ('ops_pending', 'ops_applied')"
+    )
     op.drop_index("ix_agent_ops_requests_status_lease", table_name="agent_ops_requests")
     op.drop_index("ix_agent_ops_requests_agent_run_id", table_name="agent_ops_requests")
     op.drop_table("agent_ops_requests")
+    op.drop_column("agent_runs", "ops_note")
