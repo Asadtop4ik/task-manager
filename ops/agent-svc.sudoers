@@ -37,3 +37,18 @@ agent-svc ALL=(agent-codex : task-diag-client) NOPASSWD: /usr/bin/python3 -I /op
 # calls `docker inspect` on catalog-listed container names and prints
 # image/running/health JSON. Also pinned with `-I` (see above).
 agent-svc ALL=(root) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/image_state.py *
+
+# agent "ops requests" (agent-svc-notes/ops-requests-spec.md): starts the static,
+# root oneshot unit agent-ops-apply.service, which applies ONE owner-approved
+# env-file change and restarts the affected stack. This argv carries no request
+# data at all — the whole request is a separate, root-owned file agent-svc wrote
+# first (/run/agent-svc/ops/request.json), which env_apply.py independently
+# re-validates against the root-owned allowlist before touching anything. A plain
+# `sudo` child cannot do this: it would inherit agent-svc.service's own mount
+# namespace, whose InaccessiblePaths= already hides /srv/stack/env (see
+# ops/agent-svc.service and ops/agent-ops-apply.service) — hence a dedicated unit,
+# started fresh by PID 1, instead of one more `sudo -u ... python3` rule like the
+# ones above. `systemctl start` on a oneshot unit is the whole grant; there is no
+# stop/restart/enable/disable rule here and none should ever be added — the
+# `rollback` subcommand is operator-only and deliberately NOT reachable via sudo.
+agent-svc ALL=(root) NOPASSWD: /usr/bin/systemctl start agent-ops-apply.service
