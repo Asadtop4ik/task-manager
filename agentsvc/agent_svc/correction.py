@@ -16,6 +16,7 @@ from typing import Any
 
 from .api import Work
 from .context import ServiceContext
+from .ops_requests import split_trailer
 from .prompts import compose_correction_prompt, route_correction
 from .publish import PublishError, publish_correction
 from .runctx import RunScaffold
@@ -126,7 +127,11 @@ def _run_correction(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         return
 
     if result.timed_out or result.idle_killed or result.exit_code != 0:
-        reason = (result.final_message or "").strip() or "Codex correction failed"
+        # Correction never acts on an ops-request trailer (v1); still strip
+        # it before this text reaches the owner via `action_result` -- an
+        # env value must never leak into a rejection message.
+        summary, _raw, _note = split_trailer(result.final_message or "")
+        reason = summary.strip() or "Codex correction failed"
         _reject(ctx, work, run, reason[:900])
         return
 

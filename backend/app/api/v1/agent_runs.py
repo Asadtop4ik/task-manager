@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import ColumnElement, func, or_, select
+from sqlalchemy import ColumnElement, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -23,6 +23,7 @@ from app.db.enums import ActivityKind, TaskStatus, can_transition
 from app.db.models import (
     AgentEvent,
     AgentIntake,
+    AgentOpsRequest,
     AgentRun,
     AgentRunAction,
     Attachment,
@@ -68,7 +69,7 @@ from app.schemas.agent_run import (
     ExternalAgentPending,
     MetricDuration,
 )
-from app.services import activity, agent_events
+from app.services import activity, agent_events, agent_ops
 from app.services.access import can_edit_task, can_see_task
 from app.services.agent_repos import (
     DISPATCH_REPOSITORY,
@@ -151,6 +152,8 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
     )
     return AgentRunDetailOut(
         run_id=run.run_id,
+        task_id=run.task_id,
+        title=run.task.title,
         repo_full_name=run.repo_full_name,
         status=run.status,
         summary=run.task.title,
@@ -174,7 +177,20 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
                 available=open_pr and run.status in {"pr_opened", "pr_ready"}
             ),
         },
+        ops_note=run.ops_note,
     )
+
+
+async def _run_detail_with_ops(session: DbSession, run: AgentRun) -> AgentRunDetailOut:
+    """`_run_detail` plus its owner-only `ops_requests` (with values) — a
+    separate async step because loading them is a query of its own, not
+    something already sitting on `run`. Shared by `GET /agent-runs/{run_id}`
+    and `POST /agent-ops/{ops_id}/decision`'s `run` field."""
+    detail = _run_detail(run)
+    if run.executor == "local":
+        rows = await agent_ops.list_for_run(session, run.id)
+        detail.ops_requests = agent_ops.ops_out(rows, run.run_id, include_values=True)
+    return detail
 
 
 def _can_merge(run: AgentRun) -> bool:
@@ -1267,6 +1283,12 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
     if stale_leases:
         await session.commit()
 
+    # An expired `applying` ops lease, and a `proposed`/`approved` ops
+    # request nobody ever acted on past its 72h TTL — independent of the
+    # local-executor implement/review/correction leases above.
+    await agent_ops.reclaim_stale(session, now)
+    await session.commit()
+
     dispatched_cutoff = now - timedelta(minutes=_WATCHDOG_DISPATCHED_MINUTES)
     unclaimed_dispatched = (
         await session.scalars(
@@ -1359,7 +1381,9 @@ async def pending_notifications(
                         & (AgentRun.ci_status == "success")
                         & (AgentRun.ci_verified_sha == AgentRun.head_sha)
                     ),
-                    AgentRun.status.in_(["merged", "failed", "deployed"]),
+                    AgentRun.status.in_(
+                        ["merged", "failed", "deployed", "ops_pending", "ops_applied"]
+                    ),
                     (
                         (AgentRun.status == "pr_opened")
                         & (AgentRun.review_status == "findings")
@@ -1402,52 +1426,70 @@ async def pending_notifications(
                 await session.commit()
                 continue
         verified_runs.append(run)
-    return [
-        AgentNotificationOut(
-            run_id=run.run_id,
-            task_id=run.task_id,
-            title=run.task.title,
-            repo_full_name=run.repo_full_name,
-            chat_id=run.task.source_chat_id
-            or (run.task.created_by.telegram_id if run.task.created_by else None),
-            status=run.status,
-            ci_status=run.ci_status,
-            ci_url=run.ci_url,
-            mode=run.mode,
-            pr_url=run.pr_url,
-            github_run_url=run.github_run_url,
-            head_sha=run.head_sha,
-            merged_sha=run.merged_sha,
-            deployed_sha=run.deployed_sha,
-            telegram_message_id=run.telegram_message_id,
-            error=run.error,
-            owner_chat_id=settings.owner_telegram_id or None,
-            owner_notice_chat_id=run.owner_notice_chat_id,
-            owner_notice_message_id=run.owner_notice_message_id,
-            owner_controls_available=bool(
-                settings.owner_telegram_id
-                and _owner_release_supported(run)
-                and run.pr_url
-                and run.head_sha
-                and run.status in {"pr_opened", "pr_ready"}
-            ),
-            summary=run.task.title,
-            impact=run.review_summary or run.task.description or "Review pending",
-            review=_review_out(run),
-            ci_evidence=AgentCiEvidenceOut(
-                state=run.ci_status,
-                verified_head_sha=run.ci_verified_sha,
-                url=run.ci_url,
-            ),
-            actions=_run_detail(run).actions,
-            executor=run.executor,
-            qa_ready_url=run.qa_ready_url,
-            qa_ready_sha=run.qa_ready_sha,
-            qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
-            qa_deploy_dispatch_error=run.qa_deploy_dispatch_error,
+    ops_by_run = await agent_ops.list_for_runs(
+        session, [run.id for run in verified_runs if run.executor == "local"]
+    )
+    notifications = []
+    for run in verified_runs:
+        ops_rows = ops_by_run.get(run.id, [])
+        notifications.append(
+            AgentNotificationOut(
+                run_id=run.run_id,
+                task_id=run.task_id,
+                title=run.task.title,
+                repo_full_name=run.repo_full_name,
+                chat_id=run.task.source_chat_id
+                or (run.task.created_by.telegram_id if run.task.created_by else None),
+                status=run.status,
+                ci_status=run.ci_status,
+                ci_url=run.ci_url,
+                mode=run.mode,
+                pr_url=run.pr_url,
+                github_run_url=run.github_run_url,
+                head_sha=run.head_sha,
+                merged_sha=run.merged_sha,
+                deployed_sha=run.deployed_sha,
+                telegram_message_id=run.telegram_message_id,
+                error=run.error,
+                owner_chat_id=settings.owner_telegram_id or None,
+                owner_notice_chat_id=run.owner_notice_chat_id,
+                owner_notice_message_id=run.owner_notice_message_id,
+                owner_controls_available=bool(
+                    settings.owner_telegram_id
+                    and _owner_release_supported(run)
+                    and run.pr_url
+                    and run.head_sha
+                    and run.status in {"pr_opened", "pr_ready"}
+                ),
+                summary=run.task.title,
+                impact=run.review_summary or run.task.description or "Review pending",
+                review=_review_out(run),
+                ci_evidence=AgentCiEvidenceOut(
+                    state=run.ci_status,
+                    verified_head_sha=run.ci_verified_sha,
+                    url=run.ci_url,
+                ),
+                actions=_run_detail(run).actions,
+                executor=run.executor,
+                qa_ready_url=run.qa_ready_url,
+                qa_ready_sha=run.qa_ready_sha,
+                qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
+                qa_deploy_dispatch_error=run.qa_deploy_dispatch_error,
+                ops_requests=agent_ops.ops_out(ops_rows, run.run_id, include_values=True),
+                # Never advertise decision buttons once the run itself can no
+                # longer accept a decision (see `decide_ops_request`'s own
+                # `run.status in {"cancelled", "failed"}` check) — a
+                # `proposed` row can still exist there for a moment until the
+                # cancel cascade / watchdog TTL sweep catches up to it.
+                ops_controls_available=(
+                    run.status not in {"cancelled", "failed"}
+                    and any(row.status == "proposed" for row in ops_rows)
+                ),
+                ops_pending_count=sum(1 for row in ops_rows if row.status == "proposed"),
+                ops_note=run.ops_note,
+            )
         )
-        for run in verified_runs
-    ]
+    return notifications
 
 
 @router.get("/metrics", response_model=AgentMetricsOut)
@@ -1589,7 +1631,15 @@ async def mark_notified(
     run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status not in {"pr_opened", "pr_ready", "merged", "failed", "deployed"}:
+    if run.status not in {
+        "pr_opened",
+        "pr_ready",
+        "merged",
+        "failed",
+        "deployed",
+        "ops_pending",
+        "ops_applied",
+    }:
         raise HTTPException(status_code=409, detail="run is not finished")
     if (
         run.status == "pr_opened"
@@ -1626,7 +1676,15 @@ async def mark_owner_notified(
     run = await session.scalar(select(AgentRun).where(AgentRun.run_id == run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    if run.status not in {"pr_opened", "pr_ready", "merged", "failed", "deployed"}:
+    if run.status not in {
+        "pr_opened",
+        "pr_ready",
+        "merged",
+        "failed",
+        "deployed",
+        "ops_pending",
+        "ops_applied",
+    }:
         raise HTTPException(status_code=409, detail="run is not notifiable")
     if payload.message_id is None:
         raise HTTPException(status_code=422, detail="owner message ID is required")
@@ -1904,6 +1962,35 @@ async def list_task_runs(
     return [AgentRunOut.model_validate(row) for row in runs]
 
 
+async def _load_run_detail(
+    session: DbSession, run: AgentRun, *, refresh_pr_head: bool = True
+) -> AgentRunDetailOut:
+    """The full `GET /agent-runs/{run_id}` body for an already-loaded,
+    already-locked run: refresh PR-live state if one is open, then the
+    detail plus its owner-only `ops_requests`.
+
+    `refresh_pr_head=False` skips the GitHub PR-head lookup (and the write it
+    can trigger via `_invalidate_review_and_ci`) entirely, for callers that
+    must stay strictly read-only — see `GET /agent-ops/{ops_id}`, which
+    resolves to the same run a different way and must never clobber a
+    concurrent CI/correction callback's write to the same row."""
+    if not refresh_pr_head:
+        return await _run_detail_with_ops(session, run)
+    is_open = False
+    if run.pr_url and run.status in {"pr_opened", "pr_ready", "correction_running"}:
+        current_head, is_open = await _current_pr_head(run)
+        if current_head != run.head_sha:
+            _invalidate_review_and_ci(run, current_head)
+            await session.commit()
+    detail = await _run_detail_with_ops(session, run)
+    if not is_open:
+        detail.actions = {
+            "merge": AgentActionAvailability(available=False),
+            "correction": AgentActionAvailability(available=False),
+        }
+    return detail
+
+
 @router.get("/{run_id}", response_model=AgentRunDetailOut)
 async def agent_run_detail(
     run_id: str, session: DbSession, owner: OwnerUser
@@ -1916,19 +2003,7 @@ async def agent_run_detail(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    is_open = False
-    if run.pr_url and run.status in {"pr_opened", "pr_ready", "correction_running"}:
-        current_head, is_open = await _current_pr_head(run)
-        if current_head != run.head_sha:
-            _invalidate_review_and_ci(run, current_head)
-            await session.commit()
-    detail = _run_detail(run)
-    if not is_open:
-        detail.actions = {
-            "merge": AgentActionAvailability(available=False),
-            "correction": AgentActionAvailability(available=False),
-        }
-    return detail
+    return await _load_run_detail(session, run)
 
 
 async def _request_owner_action(
@@ -2556,10 +2631,12 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         "validating",
         "pr_opened",
         "pr_ready",
+        "ops_pending",
     }:
         raise HTTPException(status_code=409, detail="agent run is already finished")
-    if run.status in {"pr_opened", "pr_ready"}:
-        await _close_pr(run)
+    if run.status in {"pr_opened", "pr_ready", "ops_pending"}:
+        if run.status in {"pr_opened", "pr_ready"}:
+            await _close_pr(run)
         if can_transition(TaskStatus(run.task.status), TaskStatus.TODO):
             old = run.task.status
             run.task.status = TaskStatus.TODO
@@ -2576,6 +2653,21 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
             )
     elif run.executor != "local":
         await _cancel_github(run)
+    # A bulk UPDATE guarded by `status IN (...)` in its own WHERE clause,
+    # never a SELECT-then-Python-loop-then-write: the run is already locked
+    # above, but the ops row is not, so `POST /agent-ops/lease` (which locks
+    # both atomically, see `app.services.agent_ops`) could concurrently flip
+    # one to `applying` in between. Re-checking status atomically inside the
+    # UPDATE itself means that row is simply left untouched rather than
+    # clobbered back to `cancelled` under an in-flight apply.
+    await session.execute(
+        update(AgentOpsRequest)
+        .where(
+            AgentOpsRequest.agent_run_id == run.id,
+            AgentOpsRequest.status.in_(("proposed", "approved")),
+        )
+        .values(status="cancelled")
+    )
     _clear_lease(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
@@ -3065,13 +3157,33 @@ async def agent_run_callback(
         "deployed",
         "cancelled",
         "failed",
+        "ops_pending",
+        "ops_applied",
     }:
         # An idempotent replay of an already-finished status; never require a
-        # lease that a prior terminal callback already cleared.
+        # lease that a prior terminal callback already cleared, and never
+        # re-store proposals a first callback already inserted.
         return AgentRunOut.model_validate(run)
 
     if run.executor == "local":
         _require_live_lease(run, x_agent_lease_id, kind="implement")
+
+    # Ops proposals are trusted from the local executor only, inside its own
+    # live implement lease — a GitHub-executor run (whose callback token is
+    # also held by GitHub Actions) can never attach or claim them.
+    if payload.ops_requests and run.executor != "local":
+        raise HTTPException(status_code=409, detail="ops_requests require the local executor")
+    if payload.status == "ops_pending":
+        if run.executor != "local":
+            raise HTTPException(
+                status_code=409, detail="ops_pending requires the local executor"
+            )
+        if not agent_ops.has_eligible_proposal(payload.ops_requests):
+            raise HTTPException(
+                status_code=400,
+                detail="ops_pending requires at least one eligible ops request",
+            )
+
     if payload.status in {"validating", "publishing", "deploying"}:
         if not payload.head_sha:
             raise HTTPException(status_code=400, detail="fast branch SHA is required")
@@ -3108,6 +3220,28 @@ async def agent_run_callback(
         if recovering_preflight:
             run.notified_at = None  # Edit the earlier failed card, never send a second one.
 
+    if (
+        run.executor == "local"
+        and payload.ops_requests
+        and payload.status in {"pr_opened", "ops_pending", "failed"}
+    ):
+        # Only inside this live-lease implement transition, and only once —
+        # the idempotent-replay early return above means a run never reaches
+        # here a second time in this same status. A `failed` implement has
+        # nothing left to apply, so any otherwise-eligible proposal is
+        # stored `cancelled` rather than `proposed` — no dead approve button
+        # on a run that already ended.
+        project_key = run.task.project.key if run.task.project else ""
+        await agent_ops.store_proposals(
+            session,
+            run,
+            payload.ops_requests,
+            project_key=project_key,
+            run_failed=payload.status == "failed",
+        )
+    if run.executor == "local" and payload.ops_note is not None:
+        run.ops_note = payload.ops_note
+
     changed = run.status != payload.status or (
         payload.status == "failed" and run.error != payload.error
     )
@@ -3141,9 +3275,10 @@ async def agent_run_callback(
             phase=payload.failure_phase if payload.status == "failed" else None,
             github_run_url=payload.github_run_url,
         )
-    if run.executor == "local" and payload.status in {"pr_opened", "failed"}:
+    if run.executor == "local" and payload.status in {"pr_opened", "failed", "ops_pending"}:
         # Implement lease done: a review is leased separately once CI is
-        # green, or the run is terminal and needs no further lease at all.
+        # green, or the run is terminal (or waiting on an owner ops decision)
+        # and needs no further implement lease at all.
         _clear_lease(run)
     if payload.input_tokens is not None:
         run.input_tokens = payload.input_tokens
@@ -3151,7 +3286,7 @@ async def agent_run_callback(
         run.cached_input_tokens = payload.cached_input_tokens
     if payload.output_tokens is not None:
         run.output_tokens = payload.output_tokens
-    if payload.status in {"pr_opened", "failed"}:
+    if payload.status in {"pr_opened", "failed", "ops_pending"}:
         run.finished_at = datetime.now(UTC)
     if payload.status == "failed" and can_transition(
         TaskStatus(run.task.status), TaskStatus.BLOCKED

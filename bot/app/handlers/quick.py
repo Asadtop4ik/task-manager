@@ -291,6 +291,7 @@ async def stop_agent(message: Message) -> None:
                     "validating",
                     "pr_opened",
                     "pr_ready",
+                    "ops_pending",
                 }
             ),
             None,

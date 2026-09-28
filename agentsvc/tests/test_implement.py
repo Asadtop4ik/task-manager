@@ -8,10 +8,12 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
 
 from agent_svc.api import Work
 from agent_svc.codex import CodexChildError, CodexResult
+from agent_svc.http import HttpError
 from agent_svc.implement import handle_implement
 
 from .support import (
@@ -523,6 +525,468 @@ class BranchExistsRecoveryTests(unittest.TestCase):
             payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
             self.assertEqual(payload["status"], "failed")
             self.assertIn("branch already exists", payload["error"])
+
+
+QURBOT_ALLOWLIST_DATA = {
+    "version": 1,
+    "projects": {
+        "qurbot": {
+            "repo_full_name": "muradjanov-dev/qurbot",
+            "stack": "qurbot",
+            "env_file": "/srv/stack/env/qurbot.env",
+            "services": ["qurbot-web", "qurbot-worker"],
+            "containers": [
+                ["qurbot-web", "ghcr.io/muradjanov-dev/qurbot"],
+                ["qurbot-worker", "ghcr.io/muradjanov-dev/qurbot"],
+            ],
+            "ready_url": None,
+            "keys": {
+                "ADMIN_TG_IDS": {
+                    "format": "json_int_list",
+                    "ops": ["list_add", "list_remove"],
+                    "item_re": "[1-9][0-9]{4,14}",
+                    "max_items": 50,
+                    "protected_items": [917456291],
+                    "description": "Telegram admin IDs",
+                }
+            },
+        }
+    },
+}
+
+_OPS_MARKER = (
+    'AGENT_OPS_REQUESTS: [{"kind":"env_set","key":"ADMIN_TG_IDS","op":"list_add",'
+    '"value":"5339875840","reason":"owner asked to add a new admin"}]'
+)
+_OPS_MARKER_DENIED = (
+    'AGENT_OPS_REQUESTS: [{"kind":"env_set","key":"FEATURE_TOGGLE","op":"replace",'
+    '"value":"x","reason":"owner asked"}]'
+)
+
+
+def _qurbot_work(**overrides: object) -> Work:
+    base: dict[str, object] = dict(
+        repo_full_name="muradjanov-dev/qurbot", base_branch="master", task_revision="a" * 64
+    )
+    base.update(overrides)
+    return _work(**base)
+
+
+def _install_qurbot_allowlist(ctx):
+    """Patch `implement._load_ops_allowlist` to return a real `Allowlist`
+    parsed from `QURBOT_ALLOWLIST_DATA` against the real trusted catalog --
+    `load_allowlist` itself always requires a root-owned file (per the
+    spec), which no test process can satisfy, so tests substitute this
+    private loader instead of writing a real file on disk."""
+    allowlist = ctx.trusted.agent_ops_policy.parse_allowlist(
+        QURBOT_ALLOWLIST_DATA, ctx.trusted.agent_repos.REPOSITORIES
+    )
+    return patch("agent_svc.implement._load_ops_allowlist", return_value=allowlist)
+
+
+class OpsRequestsFlowTests(unittest.TestCase):
+    def test_pr_body_never_contains_the_ops_marker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="Added the requested notes file.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "pr_opened")
+            body = ctx.github.created_pulls[0]["body"]  # type: ignore[attr-defined]
+            self.assertNotIn("AGENT_OPS_REQUESTS", body)
+            self.assertNotIn("5339875840", body)
+            self.assertIn("Added the requested notes file.", body)
+
+    def test_patch_with_allowed_ops_reports_pr_opened_with_ops_requests(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="Added the notes file.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "pr_opened")
+            self.assertEqual(len(payload["ops_requests"]), 1)
+            proposal = payload["ops_requests"][0]
+            self.assertEqual(proposal["key"], "ADMIN_TG_IDS")
+            self.assertEqual(proposal["policy"], "allowed")
+            self.assertEqual(proposal["restart_services"], ["qurbot-web", "qurbot-worker"])
+
+    def test_no_patch_with_allowed_ops_reports_ops_pending(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="No code change needed.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            self.assertEqual(len(ctx.api.callbacks), 1)  # type: ignore[attr-defined]
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "ops_pending")
+            self.assertEqual(len(payload["ops_requests"]), 1)
+            self.assertEqual(payload["ops_requests"][0]["policy"], "allowed")
+            self.assertEqual(ctx.github.created_pulls, [])  # type: ignore[attr-defined]
+
+    def test_no_patch_with_denied_ops_only_reports_failed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="No code change needed.\n" + _OPS_MARKER_DENIED)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn("agent produced no file changes", payload["error"])
+            self.assertEqual(len(payload["ops_requests"]), 1)
+            self.assertEqual(payload["ops_requests"][0]["policy"], "denied")
+            self.assertEqual(payload["ops_requests"][0]["policy_reason"], "not_allowlisted")
+
+    def test_ops_lane_disabled_means_no_prompt_rules_denied_ops_disabled_no_ops_pending(
+        self,
+    ) -> None:
+        # P3-5: `settings.ops_lane_enabled=False` must behave like there is
+        # no allowlist at all -- even when an allowlist entry exists and
+        # would otherwise allow the request (`_install_qurbot_allowlist`
+        # below) -- with its own `policy_reason` so this is distinguishable
+        # from a missing/invalid allowlist file, and it must never leave a
+        # run in `ops_pending` (nothing will ever lease/apply it).
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(
+                root, github_remote=remote, config_overrides={"ops_lane_enabled": False}
+            )
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="No code change needed.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            prompt = ctx.codex.run_exec_calls[0]["prompt"]  # type: ignore[attr-defined]
+            self.assertNotIn("Ops requests:", prompt)
+            self.assertNotIn("AGENT_OPS_REQUESTS", prompt)
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertNotEqual(payload["status"], "ops_pending")
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(len(payload["ops_requests"]), 1)
+            self.assertEqual(payload["ops_requests"][0]["policy"], "denied")
+            self.assertEqual(payload["ops_requests"][0]["policy_reason"], "ops_disabled")
+
+    def test_missing_allowlist_means_no_prompt_rules_and_denied_no_allowlist(self) -> None:
+        # No `_install_qurbot_allowlist` patch here: the real `load_allowlist`
+        # runs against `settings.ops_allowlist_path`, which does not exist in
+        # the test environment -- exactly the "missing file" production case.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="No code change needed.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            handle_implement(ctx, work, threading.Event())
+
+            prompt = ctx.codex.run_exec_calls[0]["prompt"]  # type: ignore[attr-defined]
+            self.assertNotIn("Ops requests:", prompt)
+            self.assertNotIn("AGENT_OPS_REQUESTS", prompt)
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(len(payload["ops_requests"]), 1)
+            self.assertEqual(payload["ops_requests"][0]["policy"], "denied")
+            self.assertEqual(payload["ops_requests"][0]["policy_reason"], "no_allowlist")
+
+    def test_prompt_gets_ops_rules_only_for_an_allowlisted_project(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            prompt = ctx.codex.run_exec_calls[0]["prompt"]  # type: ignore[attr-defined]
+            self.assertIn("Ops requests:", prompt)
+            self.assertIn("ADMIN_TG_IDS", prompt)
+            self.assertIn("AGENT_OPS_REQUESTS:", prompt)
+            # Never a value, current or example.
+            self.assertNotIn("5339875840", prompt)
+            self.assertNotIn("917456291", prompt)
+
+    def test_ambiguous_trailer_sets_ops_note_even_with_zero_proposals(self) -> None:
+        # P3-12 regression: a trailer was present (two marker lines) but
+        # never trusted enough to parse -- the callback must still say so,
+        # even though there is nothing in `ops_requests` to show.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(
+                    final_message="No code change needed.\n" + _OPS_MARKER + "\n" + _OPS_MARKER
+                )
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["ops_requests"], [])
+            self.assertEqual(payload["ops_note"], "ambiguous")
+
+    def test_invalid_trailer_json_sets_ops_note_even_with_zero_proposals(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(
+                    final_message="No code change needed.\nAGENT_OPS_REQUESTS: {not json"
+                )
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["ops_requests"], [])
+            self.assertEqual(payload["ops_note"], "invalid_trailer")
+
+    def test_missing_agent_ops_policy_module_never_crashes_the_run(self) -> None:
+        # P1-2 regression: `ctx.trusted.agent_ops_policy` is accessed a
+        # SECOND time after Codex has already run (validate/build_ops_note);
+        # if that raises (e.g. an older installer without the trusted
+        # module deployed yet), the run's own real outcome must still be
+        # reported -- never lost to an uncaught exception.
+        class _RaisingOnAgentOpsPolicy:
+            def __init__(self, real_trusted: Any) -> None:
+                self._real = real_trusted
+
+            @property
+            def agent_ops_policy(self) -> Any:
+                raise FileNotFoundError("agent_ops_policy.py")
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real, name)
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="Added the notes file.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+            # The prompt-time allowlist load still succeeds normally
+            # (`_load_ops_allowlist` catches it too, but we want to isolate
+            # the POST-Codex access specifically): only swap `ctx.trusted`
+            # in AFTER the prompt has already been composed.
+            original_run_exec = ctx.codex.run_exec  # type: ignore[attr-defined]
+
+            def swap_trusted_then_run(request, **kwargs):
+                object.__setattr__(ctx, "trusted", _RaisingOnAgentOpsPolicy(ctx.trusted))
+                return original_run_exec(request, **kwargs)
+
+            ctx.codex.run_exec = swap_trusted_then_run  # type: ignore[method-assign,attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            self.assertEqual(len(ctx.api.callbacks), 1)  # type: ignore[attr-defined]
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "pr_opened")
+            self.assertEqual(payload["ops_requests"], [])
+            self.assertEqual(payload["ops_note"], "ops_unavailable")
+
+    def test_repeated_value_in_prose_is_redacted_from_the_pr_body(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(
+                    final_message=(
+                        "I added 5339875840 as a new admin per the request.\n" + _OPS_MARKER
+                    )
+                )
+            )
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            body = ctx.github.created_pulls[0]["body"]  # type: ignore[attr-defined]
+            self.assertNotIn("5339875840", body)
+            self.assertIn("[ops qiymati]", body)
+
+    def test_short_values_are_never_redacted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            marker = (
+                'AGENT_OPS_REQUESTS: [{"kind":"env_set","key":"ADMIN_TG_IDS","op":"list_add",'
+                '"value":"11111","reason":"x"}]'
+            )
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="The value 111 stays in this sentence.\n" + marker)
+            )
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            body = ctx.github.created_pulls[0]["body"]  # type: ignore[attr-defined]
+            self.assertIn("111", body)
+            self.assertNotIn("[ops qiymati]", body)
+
+    def test_ops_callback_rejected_with_422_is_resent_without_ops_fields(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            patch_bytes = make_patch(remote, base_sha, {"NOTES.md": "hello\n"})
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="Added the notes file.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["NOTES.md"]}
+            )
+            ctx.api.queue_callback_effects(HttpError(422, "ops_requests: value error"))  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            # The retried, stripped payload made it through.
+            self.assertEqual(len(ctx.api.callbacks), 1)  # type: ignore[attr-defined]
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "pr_opened")
+            self.assertNotIn("ops_requests", payload)
+            self.assertNotIn("ops_note", payload)
+
+    def test_rejected_ops_pending_callback_is_resent_as_failed(self) -> None:
+        # Without its proposals an `ops_pending` callback is invalid too, so
+        # the stripped resend must report the no-patch run as failed.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="Config change needed.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+            ctx.api.queue_callback_effects(HttpError(422, "ops_requests: value error"))  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            self.assertEqual(len(ctx.api.callbacks), 1)  # type: ignore[attr-defined]
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertNotIn("ops_requests", payload)
+            self.assertNotIn("ops_note", payload)
+            self.assertIn("ops so‘rovi", payload["error"])
+
+    def test_non_ops_callback_rejection_is_not_retried_here(self) -> None:
+        # A 422 on a payload that never carried ops fields at all must be
+        # left entirely to `run.deliver`'s own retry/backoff, unchanged.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(root, github_remote=remote)
+            work = _work()
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+            ctx.api.queue_callback_effects(HttpError(422, "unrelated error"))  # type: ignore[attr-defined]
+
+            handle_implement(ctx, work, threading.Event())
+
+            # `run.deliver` retried the exact same payload and it succeeded
+            # the second time (no ops fields involved at all).
+            self.assertEqual(len(ctx.api.callbacks), 1)  # type: ignore[attr-defined]
+            self.assertEqual(ctx.api.callbacks[0]["status"], "failed")  # type: ignore[attr-defined]
 
 
 class HeartbeatCancellationTests(unittest.TestCase):

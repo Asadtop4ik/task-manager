@@ -121,6 +121,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (`ops/agent_deploy_monitor.py`) stays the source of truth for CI/merge/
     # deploy checks until cutover explicitly enables this lane.
     "watch_enabled": False,
+    # Off by default (agent-svc-notes/ops-requests-spec.md section 5): the
+    # ops lane applies owner-approved env changes through a root oneshot
+    # unit and must be explicitly turned on per deployment.
+    "ops_lane_enabled": False,
+    "ops_allowlist_path": "/etc/agent-svc/ops-allowlist.json",
+    "ops_request_dir": "/run/agent-svc/ops",
+    "ops_results_dir": "/var/lib/agent-ops/results",
     "poll_interval_s": 5.0,
     "watch_poll_interval_s": 15.0,
     "sd_watchdog_interval_s": 20.0,
@@ -130,7 +137,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "preflight_tool_paths": DEFAULT_PREFLIGHT_TOOL_PATHS,
 }
 
-_BOOL_KEYS = ("code_lane_enabled", "chat_lane_enabled", "watch_enabled")
+_BOOL_KEYS = ("code_lane_enabled", "chat_lane_enabled", "watch_enabled", "ops_lane_enabled")
 _FLOAT_KEYS = ("poll_interval_s", "watch_poll_interval_s", "sd_watchdog_interval_s")
 _STR_KEYS = (
     "api_base_url",
@@ -142,7 +149,14 @@ _STR_KEYS = (
     "mirrors_dir",
     "codex_home_code",
     "codex_home_chat",
+    "ops_allowlist_path",
+    "ops_request_dir",
+    "ops_results_dir",
 )
+
+# `model_matrix`/`timeouts` entry shapes, for the deep-merge validation in
+# `_merge_model_matrix`/`_merge_timeouts` below.
+_MODEL_MATRIX_ENTRY_FIELDS = frozenset({"model", "effort", "multi_agent", "sandbox"})
 
 
 class ConfigError(ValueError):
@@ -168,6 +182,10 @@ class Settings:
     code_lane_enabled: bool
     chat_lane_enabled: bool
     watch_enabled: bool
+    ops_lane_enabled: bool
+    ops_allowlist_path: str
+    ops_request_dir: str
+    ops_results_dir: str
     poll_interval_s: float
     watch_poll_interval_s: float
     sd_watchdog_interval_s: float
@@ -185,6 +203,84 @@ class Settings:
     def secret_values(self) -> tuple[str, ...]:
         """Every loaded secret string, for building a `log.Redactor`."""
         return tuple(getattr(self, name) for name in SECRET_NAMES)
+
+
+def _merge_model_matrix(overrides: Any) -> dict[str, dict[str, Any]]:
+    """Deep-merge a user config's `model_matrix` onto `DEFAULT_MODEL_MATRIX`.
+
+    A config written before a lane existed (e.g. before the chat lane added
+    `model_matrix.chat`) must still load and get that lane's shipped
+    defaults for the keys it never mentioned -- previously `{**DEFAULT_CONFIG,
+    **raw}` replaced the *entire* `model_matrix` dict wholesale, so such a
+    config silently lost `model_matrix["chat"]`/`timeouts["chat"]` and every
+    `/suhbat` call crashed with `KeyError: 'chat'` the first time it read
+    `settings.model_matrix["chat"]`. Merging per-entry (and per-field within
+    an entry) means an override only ever *narrows* what the config
+    controls, never drops an entry the running code still expects to find.
+    """
+    if not isinstance(overrides, dict):
+        raise ConfigError("config key 'model_matrix' must be an object")
+    # Like the top-level config keys (`test_unknown_key_rejected`) and a
+    # per-entry field (just below): a `model_matrix` entry name the running
+    # code does not recognize is far more likely a typo or a config meant
+    # for a newer agent-svc than something to silently keep around unused --
+    # reject the whole file rather than accept dead configuration.
+    unknown_names = set(overrides) - set(DEFAULT_MODEL_MATRIX)
+    if unknown_names:
+        raise ConfigError(
+            "unknown model_matrix entry(ies): " + ", ".join(sorted(unknown_names))
+        )
+    merged: dict[str, dict[str, Any]] = {
+        name: dict(entry) for name, entry in DEFAULT_MODEL_MATRIX.items()
+    }
+    for name, override_entry in overrides.items():
+        if not isinstance(override_entry, dict):
+            raise ConfigError(f"config key 'model_matrix.{name}' must be an object")
+        unknown_fields = set(override_entry) - _MODEL_MATRIX_ENTRY_FIELDS
+        if unknown_fields:
+            raise ConfigError(
+                f"unknown model_matrix.{name} field(s): " + ", ".join(sorted(unknown_fields))
+            )
+        merged[name] = {**merged[name], **override_entry}
+    for name, entry in merged.items():
+        _validate_model_matrix_entry(name, entry)
+    return merged
+
+
+def _validate_model_matrix_entry(name: str, entry: dict[str, Any]) -> None:
+    missing = _MODEL_MATRIX_ENTRY_FIELDS - set(entry)
+    if missing:
+        raise ConfigError(
+            f"model_matrix.{name!r} is missing field(s): " + ", ".join(sorted(missing))
+        )
+    model = entry["model"]
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError(f"model_matrix.{name}.model must be a non-empty string")
+    effort = entry["effort"]
+    if not isinstance(effort, str) or not effort.strip():
+        raise ConfigError(f"model_matrix.{name}.effort must be a non-empty string")
+    multi_agent = entry["multi_agent"]
+    if not isinstance(multi_agent, bool):
+        raise ConfigError(f"model_matrix.{name}.multi_agent must be a boolean")
+    sandbox = entry["sandbox"]
+    if not isinstance(sandbox, str) or not sandbox.strip():
+        raise ConfigError(f"model_matrix.{name}.sandbox must be a non-empty string")
+
+
+def _merge_timeouts(overrides: Any) -> dict[str, int]:
+    """Deep-merge a user config's `timeouts` onto `DEFAULT_TIMEOUTS` -- the
+    same missing-key hazard `_merge_model_matrix` fixes, for the sibling dict
+    that crashed `/suhbat` with `KeyError: 'chat'` (see its docstring)."""
+    if not isinstance(overrides, dict):
+        raise ConfigError("config key 'timeouts' must be an object")
+    unknown = set(overrides) - set(DEFAULT_TIMEOUTS)
+    if unknown:
+        raise ConfigError("unknown timeouts field(s): " + ", ".join(sorted(unknown)))
+    merged = {**DEFAULT_TIMEOUTS, **overrides}
+    for name, value in merged.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError(f"timeouts.{name!r} must be a positive number")
+    return merged
 
 
 def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
@@ -233,10 +329,13 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
         or merged["idle_timeout_s"] <= 0
     ):
         raise ConfigError("config key 'idle_timeout_s' must be a positive integer")
-    if not isinstance(merged["model_matrix"], dict):
-        raise ConfigError("config key 'model_matrix' must be an object")
-    if not isinstance(merged["timeouts"], dict):
-        raise ConfigError("config key 'timeouts' must be an object")
+    # Deep-merge, not the wholesale `{**DEFAULT_CONFIG, **raw}` replacement
+    # above: see `_merge_model_matrix`'s docstring for the `KeyError: 'chat'`
+    # bug this fixes. `raw.get(...)` (not `merged[...]`, which already holds
+    # the same value) makes explicit that these two keys are recomputed from
+    # the user's own override, never from the shallow merge.
+    merged["model_matrix"] = _merge_model_matrix(raw.get("model_matrix", {}))
+    merged["timeouts"] = _merge_timeouts(raw.get("timeouts", {}))
     tool_paths = merged["preflight_tool_paths"]
     if not isinstance(tool_paths, dict) or not all(
         isinstance(key, str) and isinstance(value, str) and value.strip()
@@ -350,6 +449,10 @@ def build_settings(config: Mapping[str, Any], secrets: Mapping[str, str]) -> Set
         code_lane_enabled=config["code_lane_enabled"],
         chat_lane_enabled=config["chat_lane_enabled"],
         watch_enabled=config["watch_enabled"],
+        ops_lane_enabled=config["ops_lane_enabled"],
+        ops_allowlist_path=config["ops_allowlist_path"],
+        ops_request_dir=config["ops_request_dir"],
+        ops_results_dir=config["ops_results_dir"],
         poll_interval_s=config["poll_interval_s"],
         watch_poll_interval_s=config["watch_poll_interval_s"],
         sd_watchdog_interval_s=config["sd_watchdog_interval_s"],

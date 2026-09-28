@@ -12,12 +12,14 @@ from agent_svc.api import (
     DiscussionLeaseInvalid,
     IntakeImage,
     IntakeLeaseInvalid,
+    InvalidOpsWork,
     InvalidResponse,
     InvalidWork,
     LeaseLost,
     TaskManagerApi,
     parse_discussion_lease,
     parse_intake_lease,
+    parse_ops_work,
 )
 from agent_svc.http import JsonHttp
 
@@ -509,6 +511,134 @@ class DiscussionApiTests(unittest.TestCase):
                 "error": None,
             },
         )
+
+
+def _ops_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ops_id": 1,
+        "request_uuid": "44444444-4444-4444-4444-444444444444",
+        "run_id": "00000000-0000-4000-8000-000000000001",
+        "lease_id": LEASE_ID,
+        "lease_until": "2026-09-28T12:00:00+00:00",
+        "project_key": "qurbot",
+        "repo_full_name": "Asadtop4ik/task-manager",
+        "kind": "env_set",
+        "key": "ADMIN_TG_IDS",
+        "op": "list_add",
+        "value": "5339875840",
+        "request_hash": "a" * 64,
+        "deployed_sha": "b" * 40,
+        "attempts": 0,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class ParseOpsWorkTests(unittest.TestCase):
+    def test_valid_payload_parses(self) -> None:
+        work = parse_ops_work(_ops_payload(), CATALOG)
+        self.assertEqual(work.ops_id, 1)
+        self.assertEqual(work.project_key, "qurbot")
+        self.assertEqual(work.key, "ADMIN_TG_IDS")
+        self.assertEqual(work.op, "list_add")
+        self.assertEqual(work.value, "5339875840")
+        self.assertEqual(work.deployed_sha, "b" * 40)
+
+    def test_null_deployed_sha_is_accepted(self) -> None:
+        work = parse_ops_work(_ops_payload(deployed_sha=None), CATALOG)
+        self.assertIsNone(work.deployed_sha)
+
+    def test_not_an_object_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work([], CATALOG)
+
+    def test_bad_ops_id_rejected_before_ops_id_is_known(self) -> None:
+        with self.assertRaises(InvalidOpsWork) as ctx:
+            parse_ops_work(_ops_payload(ops_id="not-an-int"), CATALOG)
+        self.assertIsNone(ctx.exception.ops_id)
+
+    def test_bad_request_uuid_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork) as ctx:
+            parse_ops_work(_ops_payload(request_uuid="not-a-uuid"), CATALOG)
+        self.assertEqual(ctx.exception.ops_id, 1)
+
+    def test_unapproved_repository_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(repo_full_name="someone-else/repo"), CATALOG)
+
+    def test_kind_other_than_env_set_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(kind="db_migrate"), CATALOG)
+
+    def test_bad_key_charset_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(key="lowercase_key"), CATALOG)
+
+    def test_bad_op_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(op="delete"), CATALOG)
+
+    def test_value_with_newline_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(value="123\nDATABASE_URL=x"), CATALOG)
+
+    def test_value_with_scheme_separator_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(value="http://evil.example"), CATALOG)
+
+    def test_bad_request_hash_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(request_hash="not-hex"), CATALOG)
+
+    def test_bad_deployed_sha_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(deployed_sha="not-a-sha"), CATALOG)
+
+    def test_negative_attempts_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(attempts=-1), CATALOG)
+
+    def test_non_uuid_lease_id_rejected(self) -> None:
+        with self.assertRaises(InvalidOpsWork):
+            parse_ops_work(_ops_payload(lease_id="not-a-uuid"), CATALOG)
+
+
+class OpsApiTests(unittest.TestCase):
+    def test_lease_ops_204_returns_none(self) -> None:
+        api, opener = _api([FakeResponse(b"", status=204)])
+        self.assertIsNone(api.lease_ops())
+        request = opener.requests[0]
+        self.assertTrue(request.full_url.endswith("/agent-ops/lease"))
+        self.assertEqual(request.get_header("X-agent-svc-token"), "svc-token")
+
+    def test_lease_ops_parses_valid_payload(self) -> None:
+        api, _opener = _api([FakeResponse(json.dumps(_ops_payload()).encode(), status=200)])
+        work = api.lease_ops()
+        assert work is not None
+        self.assertEqual(work.ops_id, 1)
+        self.assertEqual(work.key, "ADMIN_TG_IDS")
+
+    def test_ops_result_uses_svc_token_and_lease_header(self) -> None:
+        api, opener = _api([FakeResponse(b"", status=204)])
+        result = api.ops_result(1, LEASE_ID, {"status": "applied", "code": "applied"})
+        self.assertIsNone(result)
+        request = opener.requests[0]
+        self.assertTrue(request.full_url.endswith("/agent-ops/1/result"))
+        self.assertEqual(request.get_header("X-agent-svc-token"), "svc-token")
+        self.assertEqual(request.get_header("X-agent-lease-id"), LEASE_ID)
+        self.assertEqual(json.loads(request.data), {"status": "applied", "code": "applied"})
+
+    def test_ops_result_rejects_a_non_uuid_lease_id_before_any_request(self) -> None:
+        api, opener = _api([])
+        with self.assertRaises(ValueError):
+            api.ops_result(1, "not-a-uuid", {"status": "applied"})
+        self.assertEqual(opener.requests, [])
+
+    def test_ops_result_409_raises_lease_lost(self) -> None:
+        api, _opener = _api([_http_error(409, {"detail": "lease_expired"})])
+        with self.assertRaises(LeaseLost) as ctx:
+            api.ops_result(1, LEASE_ID, {"status": "retry"})
+        self.assertEqual(ctx.exception.detail, "lease_expired")
 
 
 if __name__ == "__main__":

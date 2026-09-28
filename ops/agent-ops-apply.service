@@ -1,0 +1,103 @@
+[Unit]
+Description=Task Manager agent-ops root env-apply helper (agent-ops-apply)
+# Started ONLY on demand: agent-svc's `sudo -n systemctl start
+# agent-ops-apply.service` (ops/agent-svc.sudoers, the single fixed-argv
+# rule -- no request data ever reaches this process through sudo/systemctl
+# itself). Deliberately no [Install] section: this unit is never `enable`d
+# and never starts on boot. Rollback is NOT "start this unit by hand" -- it
+# is a direct, separate command: `sudo /usr/bin/python3 -I
+# /opt/agent-svc/libexec/env_apply.py rollback --request-id <uuid>` (see
+# docs/AGENT_SVC.md). Starting THIS unit by hand (e.g. to debug) still
+# requires agent-svc.service to be running: ReadOnlyPaths=/run/agent-svc
+# below needs that directory to exist, and only agent-svc.service's own
+# RuntimeDirectory= creates/removes it. One-time install steps, users,
+# paths and rollback: docs/AGENT_SVC.md. Installed by
+# ops/install_agent_svc.sh; do not hand-edit on the server.
+
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/agent-svc
+ExecStart=/usr/bin/python3 -I /opt/agent-svc/libexec/env_apply.py apply
+# Generous headroom over the worst realistic case: ~30s lock wait + two
+# ~210s compose attempts (forward + rollback) + a 20s restart-stability
+# window + a ~10s readiness probe, on each of the forward and rollback
+# legs, plus normal process/import overhead. env_apply.py does not (yet)
+# track its own internal wall-clock deadline against this budget -- see
+# docs/AGENT_SVC.md's ops-requests section for the follow-up.
+TimeoutStartSec=900
+# `applied`/`already_applied` is exit 0 as usual. Exit 3/4/5/6/7 (refused,
+# precondition, failed_rolled_back, failed_rollback_failed, busy -- see
+# env_apply.py's EXIT_CODES) are also SUCCESSFUL, fully classified runs of
+# the helper, not unit failures: `systemctl start` (and `sudo -n -l`'s own
+# reachability check) must not treat them as crashes. Exit 2 (bad_request)
+# is deliberately EXCLUDED: it means the request file agent-svc itself
+# just wrote could not even be parsed/trusted, which points at a bug or a
+# compromise on the agent-svc side worth surfacing as a real unit failure
+# (visible in `systemctl status`/journal), not silently treated the same
+# as an ordinary policy refusal.
+SuccessExitStatus=3 4 5 6 7
+UMask=0077
+
+# Runs as root (no User=/Group=): the ONLY thing in the whole ops-requests
+# feature ever allowed to read or write a production /srv/stack/env/*.env
+# file, restart a production stack, or read the root-owned allowlist. A
+# plain `sudo` helper run as a child of agent-svc.service cannot do this:
+# sudo children inherit the CALLER's mount namespace
+# (agent-svc-notes/ops-requests-spec.md section 0 finding 1), and
+# agent-svc.service's own InaccessiblePaths= already hides
+# /srv/stack/env from it and everything spawned under it. This unit is its
+# own, freshly started process in its own cgroup/mount namespace (PID 1
+# starts it directly), NOT a child of agent-svc.service -- so
+# `systemctl stop agent-svc` (or a crash of it) never interrupts an apply
+# already in flight here, and agent-svc's own hardening/InaccessiblePaths=
+# has no bearing on what THIS unit can reach.
+ProtectSystem=strict
+ReadWritePaths=/srv/stack/env /var/lib/agent-ops /var/log/agent-ops
+ReadOnlyPaths=/run/agent-svc
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# Not ProtectProc=invisible (agent-svc.service uses it): docker CLI/compose
+# read other processes' /proc entries as part of normal operation on some
+# code paths, and this has not been verified safe under it -- server rollout
+# must check this specifically (docs/AGENT_SVC.md rollout notes) before it
+# is ever added here.
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+# The docker CLI talks to the daemon over a socket (no special
+# capabilities needed for that part), but this process itself does the
+# env-file chown/fchmod dance in write_env_line -- CAP_CHOWN/CAP_FOWNER for
+# that, CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH because ProtectSystem=strict's
+# read-only bind mounts plus root's usual DAC-bypass still need root's
+# normal file-access capabilities preserved for the paths this unit DOES
+# read/write. No networking, ptrace, module, or raw-device capabilities.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+# AF_UNIX: docker.sock (`docker inspect`/`docker compose`, read-only bind
+# mounts still permit connect() to an existing socket -- same reasoning as
+# agent-svc.service's own docker.sock access via the sudo'd image_state.py).
+# AF_INET/AF_INET6: the optional per-project `ready_url` readiness probe
+# over loopback only (agent_ops_policy.py's own `_READY_URL_RE` pins it to
+# `http://127.0.0.1:<port>/...`). No AF_NETLINK: unlike agent-svc.service,
+# this unit never runs bubblewrap/Codex.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Belt-and-braces alongside RestrictAddressFamilies=: no outbound network
+# at all except loopback (the `ready_url` probe, and whatever localhost
+# port docker.sock's TCP form might use on a host configured that way --
+# the common /var/run/docker.sock unix-socket case needs no IP address at
+# all, matched by AF_UNIX above instead).
+IPAddressDeny=any
+IPAddressAllow=localhost
+# No registry credentials, no image pulls (`docker compose ... --pull
+# never`): DOCKER_CONFIG points at an always-empty, root-only directory so
+# a compromised env_apply.py cannot exfiltrate or plant registry auth.
+Environment=DOCKER_CONFIG=/var/lib/agent-ops/docker-config HOME=/var/lib/agent-ops
+CPUQuota=50%
+MemoryMax=512M

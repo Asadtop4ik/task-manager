@@ -68,6 +68,26 @@ class ProductionArgvTests(unittest.TestCase):
         self.assertIn(" ".join(argv[7:]), _allowed_commands())
 
 
+class OpsApplySudoersRuleTests(unittest.TestCase):
+    def test_ops_apply_systemctl_rule_in_sudoers(self) -> None:
+        """`agent_svc.ops.OPS_APPLY_COMMAND` (WP-C) is the argv `OpsLane`
+        runs to trigger the root oneshot apply unit; the matching sudoers
+        line itself is WP-D's responsibility (`ops/agent-svc.sudoers`,
+        `agentsvc/libexec/env_apply.py`, `ops/agent-ops-apply.service`), not
+        in scope for this branch. This assertion is expected to FAIL until
+        WP-D lands that line -- it is intentionally left red here (per the
+        WP-C task boundary) as a cross-branch integration check, not a
+        regression in this branch's own code. Every other test in this file
+        must stay green.
+        """
+        text = SUDOERS.read_text(encoding="utf-8")
+        self.assertIn(
+            "agent-svc ALL=(root) NOPASSWD: "
+            "/usr/bin/systemctl start agent-ops-apply.service",
+            text,
+        )
+
+
 class ChildFailureReasonTests(unittest.TestCase):
     def test_sudo_refusal_reason_reaches_the_error(self) -> None:
         from agent_svc.codex import CodexChildError, CodexRunner

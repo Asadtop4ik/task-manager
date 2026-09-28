@@ -13,6 +13,13 @@ from arq.connections import RedisSettings
 from app.cards import build_card
 from app.config import settings
 from app.handlers.agent_intake import notification_message
+from app.handlers.agent_ops import (
+    combine_keyboards,
+    compose_owner_text,
+    ops_count_line,
+    ops_keyboard,
+    ops_lines,
+)
 from app.handlers.agent_release import release_card, release_keyboard
 from app.handlers.project_discussion import discussion_keyboard
 from app.loader import create_bot
@@ -35,13 +42,19 @@ def _html_text(value: object, limit: int) -> str:
 
 
 def agent_result_card(notice: dict[str, object]) -> str:
-    """A concise, factual status card. PR-ready requires exact-head CI success."""
-    task_id = notice["task_id"]
+    """A concise, factual status card. PR-ready requires exact-head CI success.
+
+    `notice` is either the notification-worker's `AgentNotificationOut` shape
+    (always has `task_id`/`title`) or, for an ops-only run, the backend's
+    `AgentRunDetailOut` (via `agent_ops._owner_card`) — fall back rather than
+    KeyError if either ever omits a field.
+    """
+    task_id = notice.get("task_id")
     project = str(notice.get("repo_full_name") or "").split("/")[-1]
-    title = notice.get("title") or "Vazifa"
-    status = notice["status"]
+    title = notice.get("title") or notice.get("summary") or "Vazifa"
+    status = notice.get("status")
     lines = [
-        f"🤖 #{task_id} · {_html_text(project, 120)}",
+        f"🤖 #{task_id if task_id is not None else '?'} · {_html_text(project, 120)}",
         f"Vazifa: {_html_text(title, 500)}",
     ]
     if status == "pr_ready":
@@ -70,6 +83,12 @@ def agent_result_card(notice: dict[str, object]) -> str:
         if sha:
             lines.append(f"Commit: {sha[:12]}")
         lines.append(f"Deploy: {_html_text(notice.get('github_run_url') or '—', 300)}")
+    elif status == "ops_pending":
+        lines.append(
+            "Holat: ⏳ Kod o‘zgarishi kerak emas; muhit sozlamalari egasi tasdig‘ini kutmoqda."
+        )
+    elif status == "ops_applied":
+        lines.append("Holat: ✅ Muhit sozlamalari qo‘llandi.")
     else:
         lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
         lines.append(f"Sabab: {_html_text(notice.get('error') or 'noma’lum', 1200)}")
@@ -136,12 +155,21 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                 legacy_chat_id = notice.get("chat_id")
                 legacy_message_id = notice.get("telegram_message_id")
                 if legacy_chat_id:
+                    # The task-origin card (maybe a group chat) is the one
+                    # place ops details are NOT shown — only ever a count,
+                    # and only ever appended here. `agent_result_card` itself
+                    # stays free of it: the owner card also builds on that
+                    # function for ops-only runs and must not inherit it.
+                    legacy_text = agent_result_card(notice)
+                    legacy_count_line = ops_count_line(notice)
+                    if legacy_count_line:
+                        legacy_text = "\n".join([legacy_text, legacy_count_line])
                     try:
                         legacy_message_id = await _upsert_agent_message(
                             bot,
                             chat_id=legacy_chat_id,
                             message_id=legacy_message_id,
-                            text=agent_result_card(notice),
+                            text=legacy_text,
                             reply_markup=None,
                         )
                     except (TelegramAPIError, OSError) as error:
@@ -191,6 +219,13 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                         if len(owner_head_sha) == 40
                         else agent_result_card(notice)
                     )
+                    # Full key/op/value detail is owner-only: never on the
+                    # legacy task-origin card built above (that one only ever
+                    # gets a count, appended there directly, not here).
+                    # `compose_owner_text` truncates only the release/status
+                    # portion, never the ops block, to stay under Telegram's
+                    # message-length cap.
+                    owner_text = compose_owner_text(owner_text, ops_lines(notice))
                     owner_markup = None
                     if len(owner_head_sha) == 40:
                         actions = notice.get("actions") or {}
@@ -199,6 +234,13 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                         owner_markup = release_keyboard(
                             str(run_id), owner_head_sha, actions=actions
                         )
+                        if notice.get("ops_controls_available"):
+                            owner_markup = combine_keyboards(
+                                owner_markup,
+                                ops_keyboard(notice.get("ops_requests")),
+                            )
+                    elif notice.get("ops_controls_available"):
+                        owner_markup = ops_keyboard(notice.get("ops_requests"))
                     # An ID is reusable only alongside the same owner chat ID.
                     reusable_id = (
                         owner_message_id if owner_notice_chat_id == owner_chat_id else None

@@ -77,6 +77,7 @@ required_paths=(
   scripts/agent_pr_review.py
   scripts/agent_release.py
   scripts/agent_images.py
+  scripts/agent_ops_policy.py
   backend/app/services/agent_repos.py
   ops/agent-svc.service
   ops/agent-svc.sudoers
@@ -86,6 +87,8 @@ required_paths=(
   ops/agent-svc-codex.lock
   ops/env_file_lock.py
   ops/sync_agent_svc_credentials.py
+  ops/agent-ops-apply.service
+  ops/ops-allowlist.example.json
 )
 for path in "${required_paths[@]}"; do
   test -e "$path" || {
@@ -131,15 +134,24 @@ git archive "$commit" -- \
   agentsvc/agent_svc agentsvc/libexec agentsvc/codex \
   scripts/agent_task.py scripts/public_agent_task.py scripts/agent_preflight.py \
   scripts/agent_pr_review.py scripts/agent_release.py scripts/agent_images.py \
+  scripts/agent_ops_policy.py \
   backend/app/services/agent_repos.py \
+  ops/env_file_lock.py \
   | tar -x -C "$raw_dir"
 
 mkdir -p "$stage_dir/pkg/trusted"
 mv "$raw_dir/agentsvc/agent_svc" "$stage_dir/pkg/agent_svc"
+# agentsvc/libexec already carries env_apply.py (agent-ops root helper, WP-D) --
+# no separate archive entry needed, it rides along with the whole directory.
 mv "$raw_dir/agentsvc/libexec" "$stage_dir/pkg/libexec"
 mv "$raw_dir/agentsvc/codex" "$stage_dir/pkg/codex"
 mv "$raw_dir/scripts/"*.py "$stage_dir/pkg/trusted/"
 mv "$raw_dir/backend/app/services/agent_repos.py" "$stage_dir/pkg/trusted/"
+# env_apply.py loads this by path from trusted/ too (non-blocking lock retry
+# reimplemented on top of its sibling-lock-file convention -- see env_apply.py's
+# module docstring); ops/sync_agent_svc_credentials.py keeps using its own
+# separately-scp'd copy below, unrelated to this trusted/ one.
+mv "$raw_dir/ops/env_file_lock.py" "$stage_dir/pkg/trusted/"
 # No macOS extended attributes in the archive (GNU tar on the server warns about them).
 COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage_dir/pkg" -czf "$stage_dir/code.tar.gz" \
   agent_svc libexec codex trusted
@@ -151,6 +163,7 @@ scp -q -o BatchMode=yes "$stage_dir/code.tar.gz" \
   ops/agent-svc.service ops/agent-svc.sudoers ops/agent-svc.tmpfiles \
   ops/agent-svc-tools.lock ops/agent-svc-node.lock ops/agent-svc-codex.lock \
   ops/env_file_lock.py ops/sync_agent_svc_credentials.py \
+  ops/agent-ops-apply.service ops/ops-allowlist.example.json \
   agentsvc/config.example.json \
   "netcup:$remote_dir/"
 
@@ -507,6 +520,39 @@ sudo visudo -c
 sudo install -o root -g root -m 0644 \
   "$remote_dir/agent-svc.tmpfiles" /etc/tmpfiles.d/agent-svc.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/agent-svc.conf
+
+# agent-ops-apply.service (agent "ops requests", WP-D): same staged-verify-then-
+# install shape as agent-svc.service above. Deliberately never `enable`d or
+# `start`ed here (and it has no [Install] section to enable) -- it only ever
+# runs on demand, via ops/agent-svc.sudoers' `systemctl start` rule or an
+# operator's manual rollback invocation.
+verify_dir=$(sudo mktemp -d /tmp/agent-svc-unit-verify.XXXXXX)
+sudo install -o root -g root -m 0644 \
+  "$remote_dir/agent-ops-apply.service" "$verify_dir/agent-ops-apply.service"
+sudo systemd-analyze verify "$verify_dir/agent-ops-apply.service"
+sudo rm -rf "$verify_dir"
+
+staged_ops_unit=/etc/systemd/system/.agent-ops-apply.service.tmp
+sudo install -o root -g root -m 0644 "$remote_dir/agent-ops-apply.service" "$staged_ops_unit"
+sudo mv -T "$staged_ops_unit" /etc/systemd/system/agent-ops-apply.service
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/agent-ops-apply.service
+
+# Root-owned allowlist of NON-secret env keys agent-ops-apply.service is ever
+# allowed to touch (agent_ops_policy.py's `load_allowlist`/`parse_allowlist`
+# independently re-check ownership/permissions/shape regardless of this
+# install step). Left alone if already present, exactly like config.json above
+# -- an operator's hand-edited allowlist (adding a project) must never be
+# clobbered by a later re-install. The shipped example has an empty
+# "projects" map, i.e. the feature is off until an operator adds an entry.
+sudo install -d -m 0755 -o root -g root /etc/agent-svc
+if [ -f /etc/agent-svc/ops-allowlist.json ]; then
+  echo "/etc/agent-svc/ops-allowlist.json already exists; left unchanged"
+else
+  sudo install -o root -g root -m 0644 \
+    "$remote_dir/ops-allowlist.example.json" /etc/agent-svc/ops-allowlist.json
+  echo "Installed default (empty) /etc/agent-svc/ops-allowlist.json"
+fi
 
 echo "config, unit, sudoers and tmpfiles installed"
 REMOTE_G

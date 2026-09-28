@@ -45,6 +45,25 @@ _MAX_LEASE_RESPONSE_BYTES = 64 * 1024
 _KETOSHOP_REPO = "muradjanov-dev/ketoshop"
 _KETOSHOP_BRANCH = "master"
 
+# Ops lane (agent-svc-notes/ops-requests-spec.md section 5/6, WP-C): a
+# separate contract again, `/agent-ops` (not `/agent-runs`), always the
+# X-Agent-Svc-Token (agent-svc's own lease/result, never the callback token
+# GitHub Actions holds). These regexes intentionally mirror
+# `scripts/agent_ops_policy.py`'s `KEY_RE`/`VALUE_RE` rather than importing
+# them: `api.py` validates an untrusted network response at the transport
+# boundary, before any of that trusted policy code (loaded later, by file
+# path, from `trusted_dir`) is even in play.
+_OPS_PROJECT_KEY_RE = re.compile(r"[a-z0-9-]{1,40}", re.ASCII)
+_OPS_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}", re.ASCII)
+_OPS_VALUE_RE = re.compile(r"[A-Za-z0-9_.,:@/+-]{1,256}", re.ASCII)
+_OPS_HASH_RE = re.compile(r"[0-9a-f]{64}")
+_OPS_KINDS = frozenset({"env_set"})
+# An ops lease/result response is a tiny JSON object -- smaller even than
+# the chat lane's own `_MAX_LEASE_RESPONSE_BYTES` cap.
+_MAX_OPS_RESPONSE_BYTES = 8 * 1024
+_OPS_OPS = frozenset({"replace", "list_add", "list_remove"})
+_MAX_OPS_VALUE_LEN = 256
+
 STAGES = frozenset(
     {
         "leased",
@@ -317,6 +336,131 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     )
 
 
+class InvalidOpsWork(InvalidResponse):
+    """An `/agent-ops/lease` response failed validation. `ops_id` is set
+    when it was parseable; `lease_id` is set too once IT specifically has
+    also been validated -- carrying both lets the caller (`OpsLane.tick`)
+    still report `failed`/`bad_request` for a partially-malformed lease and
+    free the backend's exclusive "at most one applying globally" slot,
+    instead of leaving it held until the lease's own 15-minute window
+    expires on its own."""
+
+    def __init__(
+        self, message: str, *, ops_id: int | None = None, lease_id: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.ops_id = ops_id
+        self.lease_id = lease_id
+
+
+@dataclass(frozen=True)
+class OpsWork:
+    ops_id: int
+    request_uuid: str
+    run_id: str
+    lease_id: str
+    lease_until: datetime
+    project_key: str
+    repo_full_name: str
+    kind: Literal["env_set"]
+    key: str
+    op: Literal["replace", "list_add", "list_remove"]
+    value: str
+    request_hash: str
+    deployed_sha: str | None
+    attempts: int
+
+
+def parse_ops_work(payload: Any, catalog: Mapping[str, str]) -> OpsWork:
+    """Validate one `AgentOpsWorkOut` lease response (`/agent-ops/lease`)."""
+    if not isinstance(payload, dict):
+        raise InvalidOpsWork("ops lease response is not an object")
+
+    ops_id = payload.get("ops_id")
+    if _bad_int(ops_id, minimum=1):
+        raise InvalidOpsWork("ops lease response has an invalid ops_id")
+    assert isinstance(ops_id, int)
+
+    def fail(message: str) -> NoReturn:
+        raise InvalidOpsWork(message, ops_id=ops_id)
+
+    request_uuid_raw = payload.get("request_uuid")
+    try:
+        request_uuid = str(UUID(str(request_uuid_raw)))
+    except (ValueError, AttributeError, TypeError):
+        fail("ops lease response has an invalid request_uuid")
+    run_id_raw = payload.get("run_id")
+    try:
+        run_id = str(UUID(str(run_id_raw)))
+    except (ValueError, AttributeError, TypeError):
+        fail("ops lease response has an invalid run_id")
+    lease_id = _valid_lease_id(payload.get("lease_id"))
+    if lease_id is None:
+        fail("ops lease response has an invalid lease_id")
+
+    # From here on `lease_id` is known-valid: carry it in every subsequent
+    # failure too (see `InvalidOpsWork`'s own docstring for why).
+    def fail_with_lease(message: str) -> NoReturn:
+        raise InvalidOpsWork(message, ops_id=ops_id, lease_id=lease_id)
+
+    lease_until = _parse_iso(payload.get("lease_until"))
+    if lease_until is None:
+        fail_with_lease("ops lease response has an invalid lease_until")
+    project_key = payload.get("project_key")
+    if not isinstance(project_key, str) or not _OPS_PROJECT_KEY_RE.fullmatch(project_key):
+        fail_with_lease("ops lease response has an invalid project_key")
+    repo_full_name = payload.get("repo_full_name")
+    if not isinstance(repo_full_name, str) or repo_full_name not in catalog:
+        fail_with_lease("ops lease response repository is not in the approved catalog")
+    kind = payload.get("kind")
+    if kind not in _OPS_KINDS:
+        fail_with_lease("ops lease response has an invalid kind")
+    key = payload.get("key")
+    if not isinstance(key, str) or not _OPS_KEY_RE.fullmatch(key):
+        fail_with_lease("ops lease response has an invalid key")
+    op = payload.get("op")
+    if op not in _OPS_OPS:
+        fail_with_lease("ops lease response has an invalid op")
+    value = payload.get("value")
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_OPS_VALUE_LEN
+        or not _OPS_VALUE_RE.fullmatch(value)
+        or "://" in value
+    ):
+        fail_with_lease("ops lease response has an invalid value")
+    request_hash = payload.get("request_hash")
+    if not isinstance(request_hash, str) or not _OPS_HASH_RE.fullmatch(request_hash):
+        fail_with_lease("ops lease response has an invalid request_hash")
+    deployed_sha = payload.get("deployed_sha")
+    if deployed_sha is not None and (
+        not isinstance(deployed_sha, str) or not _SHA_RE.fullmatch(deployed_sha)
+    ):
+        fail_with_lease("ops lease response has an invalid deployed_sha")
+    attempts = payload.get("attempts")
+    if _bad_int(attempts, minimum=0):
+        fail_with_lease("ops lease response has invalid attempts")
+    assert isinstance(attempts, int)
+
+    return OpsWork(
+        ops_id=ops_id,
+        request_uuid=request_uuid,
+        run_id=run_id,
+        lease_id=lease_id,
+        lease_until=lease_until,
+        project_key=project_key,
+        repo_full_name=repo_full_name,
+        kind=kind,
+        key=key,
+        op=op,
+        value=value,
+        request_hash=request_hash,
+        deployed_sha=deployed_sha,
+        attempts=attempts,
+    )
+
+
 @dataclass(frozen=True)
 class IntakeImage:
     mime: str
@@ -578,6 +722,10 @@ class TaskManagerApi:
         # contract.md` and `ops/intake_worker.py`.
         self._intake_base = base_url.rstrip("/") + "/agent-intakes"
         self._discussion_base = base_url.rstrip("/") + "/project-discussions"
+        # Ops lane: yet another separate contract/base path (backend router
+        # `backend/app/api/v1/agent_ops.py`, prefix `/agent-ops`), always the
+        # service token -- never the callback token GitHub Actions holds.
+        self._ops_base = base_url.rstrip("/") + "/agent-ops"
         self._svc_token = svc_token
         self._callback_token = callback_token
         self._intake_token = intake_token
@@ -704,6 +852,38 @@ class TaskManagerApi:
         try:
             response = self._callback_call(
                 "POST", f"/{run_id}/action-result", lease_id=lease_id, body=dict(payload)
+            )
+        except HttpError as exc:
+            _reraise_lease_conflict(exc)
+        return None if response.status == 204 else self._http.json(response)
+
+    # -- Ops lane: owner-approved env-change requests ----------------------
+
+    def _ops_call(
+        self, method: str, path: str, *, lease_id: str | None = None, body: Any = None
+    ) -> HttpResponse:
+        extra = (("X-Agent-Lease-ID", lease_id),) if lease_id is not None else ()
+        request = self._http.build_request(
+            method,
+            f"{self._ops_base}{path}",
+            auth_header=("X-Agent-Svc-Token", self._svc_token),
+            extra_headers=extra,
+            body=_encode(body),
+            content_type="application/json" if body is not None else None,
+        )
+        return self._http.send(request, max_bytes=_MAX_OPS_RESPONSE_BYTES)
+
+    def lease_ops(self) -> OpsWork | None:
+        response = self._ops_call("POST", "/lease")
+        if response.status == 204:
+            return None
+        return parse_ops_work(self._http.json(response), self._catalog)
+
+    def ops_result(self, ops_id: int, lease_id: str, payload: Mapping[str, Any]) -> Any:
+        lease_id = _require_lease_id(lease_id)
+        try:
+            response = self._ops_call(
+                "POST", f"/{ops_id}/result", lease_id=lease_id, body=dict(payload)
             )
         except HttpError as exc:
             _reraise_lease_conflict(exc)

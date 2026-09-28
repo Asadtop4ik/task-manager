@@ -240,6 +240,36 @@ class HandleCorrectionRefusalTests(unittest.TestCase):
             self.assertEqual(result["status"], "rejected")
             self.assertIn("could not apply", result["message"])
 
+    def test_ops_trailer_is_stripped_from_the_rejection_message(self) -> None:
+        # Correction never acts on an ops-request trailer (v1) -- it must
+        # still never let one reach the owner via `action_result`.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            push_new_branch(remote, base_sha, BRANCH)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
+            work = _work(expected_head_sha=base_sha)
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(
+                    exit_code=1,
+                    final_message=(
+                        "I could not apply the fix.\n"
+                        'AGENT_OPS_REQUESTS: [{"kind":"env_set","key":"ADMIN_TG_IDS",'
+                        '"op":"list_add","value":"5339875840","reason":"x"}]'
+                    ),
+                )
+            )
+
+            handle_correction(ctx, work, threading.Event())
+
+            result = ctx.api.action_results[0]  # type: ignore[attr-defined]
+            self.assertEqual(result["status"], "rejected")
+            self.assertIn("could not apply", result["message"])
+            self.assertNotIn("AGENT_OPS_REQUESTS", result["message"])
+            self.assertNotIn("5339875840", result["message"])
+
     def test_push_race_is_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -15,7 +15,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ TRUSTED_SOURCE_FILES: tuple[Path, ...] = (
     REPO_ROOT / "scripts" / "agent_release.py",
     REPO_ROOT / "scripts" / "agent_images.py",
     REPO_ROOT / "scripts" / "agent_pr_review.py",
+    REPO_ROOT / "scripts" / "agent_ops_policy.py",
     REPO_ROOT / "backend" / "app" / "services" / "agent_repos.py",
 )
 
@@ -182,6 +183,7 @@ class FakeApi:
         self.callbacks: list[dict[str, Any]] = []
         self.action_results: list[dict[str, Any]] = []
         self._heartbeat_effects: list[Any] = []
+        self._callback_effects: list[Any] = []
 
     def queue_heartbeat_effects(self, *effects: Any) -> None:
         self._heartbeat_effects.extend(effects)
@@ -200,7 +202,17 @@ class FakeApi:
     ) -> None:
         self.stages.append((run_id, lease_id, stage, error))
 
+    def queue_callback_effects(self, *effects: Any) -> None:
+        """Effects consumed in order by the NEXT `callback(...)` calls
+        (e.g. an `HttpError` to simulate a backend rejection) -- once
+        exhausted, `callback` records normally again."""
+        self._callback_effects.extend(effects)
+
     def callback(self, run_id: str, lease_id: str, payload: dict[str, Any]) -> None:
+        if self._callback_effects:
+            effect = self._callback_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
         self.callbacks.append(dict(payload))
 
     def action_result(self, run_id: str, lease_id: str, payload: dict[str, Any]) -> None:
@@ -461,10 +473,14 @@ def build_test_context(
     codex: FakeCodexRunner | None = None,
     api: FakeApi | None = None,
     github: FakeGitHub | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
 ) -> ServiceContext:
     """A `ServiceContext` wired from real trusted scripts and a real mirror,
     with `FakeApi`/`FakeGitHub`/`FakeCodexRunner` standing in for the network,
-    GitHub, and the sandboxed Codex child."""
+    GitHub, and the sandboxed Codex child. `ops_lane_enabled` defaults to
+    `True` here (unlike the real `_DEFAULTS`) since most tests exercise ops
+    proposals as an enabled feature; pass `config_overrides={"ops_lane_enabled":
+    False}` for the disabled-lane case (P3-5)."""
     trusted_dir = copy_trusted_dir(tmp / "trusted")
     state_dir = tmp / "state"
     work_root = tmp / "work"
@@ -479,6 +495,8 @@ def build_test_context(
         "work_root": str(work_root),
         "mirrors_dir": str(mirrors_dir),
         "runs_dir": str(state_dir / "runs"),
+        "ops_lane_enabled": True,
+        **(config_overrides or {}),
     }
     settings = build_settings(config, _SECRETS)
     catalog = repos.load_catalog(trusted_dir)
