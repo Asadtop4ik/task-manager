@@ -255,6 +255,163 @@ sudo systemd-run --quiet --wait --pipe --collect \
 `--collect` transient unit'ni tugagach avtomatik tozalaydi; `--wait --pipe`
 natijani to'g'ridan-to'g'ri terminalga oqizadi.
 
+## Agent "ops so'rovlari" (ops requests)
+
+Codex hech qachon production `.env`/maxfiy fayllarga bevosita kira olmaydi va yoza olmaydi.
+Buning o'rniga Codex faqat oldindan ro'yxatga olingan, MAXFIY BO'LMAGAN env kalitlarini
+o'zgartirishni "so'rashi" mumkin (masalan, Telegram admin ID qo'shish); egasi (owner)
+Telegramda har bir so'rovni alohida ko'rib chiqadi va tasdiqlaydi; faqat shundan keyin
+root darajasidagi alohida bitta martalik xizmat o'zgarishni qo'llaydi va tegishli stack'ni
+qayta ishga tushiradi. To'liq loyihaviy hujjat: `agent-svc-notes/ops-requests-spec.md`.
+
+### Qanday ishlaydi (qisqa oqim)
+
+1. Codex final xabarining oxirgi qatorida `AGENT_OPS_REQUESTS: [...]` trailer orqali eng
+   ko'pi bilan 3 ta so'rov taklif qiladi (`kind=env_set`, `key`, `op`
+   — `replace`/`list_add`/`list_remove`, `value`, `reason`). Bu qator ochiq PR matnidan va
+   Codex izohidan doim olib tashlanadi — qiymat hech qachon jamoat ko'radigan joyga
+   chiqmaydi.
+2. Backend har bir so'rovni pastdagi root-owned allowlist asosida tekshiradi va Telegramda
+   egasi kartasiga alohida qator sifatida chiqaradi; egasi har birini ikki bosqichda
+   (tanlash → tasdiqlash) ✅/❌ qiladi.
+3. Tasdiqlangan so'rov (kod o'zgarishi bo'lsa — production'ga aynan shu commit deploy
+   qilingani va sog'lom ekani tasdiqlangandan keyin) `agent-svc`ning alohida "ops lane"
+   oqimi orqali `/run/agent-svc/ops/request.json` faylini (0640, egasi `agent-svc`) yozadi
+   va `sudo -n systemctl start agent-ops-apply.service`ni chaqiradi.
+4. `agent-ops-apply.service` — ROOT sifatida ishlaydigan alohida bitta martalik
+   (`Type=oneshot`) xizmat (`ops/agent-ops-apply.service`), `agent-svc.service`ning bir
+   qismi EMAS — o'zining alohida mount namespace'ida, PID 1 tomonidan har safar yangidan
+   ishga tushiriladi (shuning uchun `agent-svc.service`ning `InaccessiblePaths=`i yoki
+   uni to'xtatish bu xizmatga ta'sir qilmaydi). U `agentsvc/libexec/env_apply.py apply`ni
+   bajaradi: so'rovni **mustaqil ravishda** root-owned allowlist bo'yicha qayta tekshiradi
+   (agent-svc'ga hech qachon ishonmaydi — u ham buzilgan bo'lishi mumkin), tegishli
+   konteynerlarni `docker inspect` qiladi (hammasi ishlab turishi va bitta xil image
+   SHA'siga ega bo'lishi shart), env faylni qulflab (`flock`, 30 soniya urinib ko'radi)
+   bitta qatorni o'zgartiradi, `docker compose -f stacks/<stack>.yml up -d --no-deps
+   --force-recreate --pull never --wait` bilan qayta ishga tushiradi va natijani
+   tekshiradi (running/healthy yoki qayta ishga tushishlar soni barqaror, image SHA,
+   `Config.Env`dagi aniq qiymat, ixtiyoriy `ready_url`). Xato bo'lsa — avtomatik orqaga
+   qaytaradi (eski qiymatni tiklaydi, konteynerni qayta yaratadi, eski qiymat ishlab
+   turganini tasdiqlaydi).
+5. Natija (hech qachon qiymatning o'zi emas — faqat kod, xabar va sha256 hash'lar)
+   `/var/lib/agent-ops/results/<request_id>.json`ga yoziladi va Telegram kartasida
+   ko'rinadi.
+
+### Loyihani allowlist'ga qo'shish
+
+`/etc/agent-svc/ops-allowlist.json` (root:root 0644) — `agent-svc` bu faylni FAQAT o'qiydi,
+hech qachon yozmaydi; ham backend, ham `agent-ops-apply.service` uni root-owned, group/
+world-writable bo'lmagan, simlink bo'lmagan holda alohida-alohida tekshiradi. Standart
+o'rnatish (`install_agent_svc.sh`) `ops/ops-allowlist.example.json`ni FAQAT bu fayl mavjud
+bo'lmasa nusxalaydi (`{"version":1,"projects":{}}` — funksiya butunlay o'chirilgan holat).
+Yangi loyiha qo'shish uchun shu faylni **qo'lda**, serverda, root sifatida tahrirlang, masalan:
+
+```json
+{"version": 1, "projects": {"qurbot": {
+  "repo_full_name": "muradjanov-dev/qurbot", "stack": "qurbot",
+  "env_file": "/srv/stack/env/qurbot.env",
+  "services": ["qurbot-web", "qurbot-worker"],
+  "containers": [["qurbot-web","ghcr.io/muradjanov-dev/qurbot"],
+                 ["qurbot-worker","ghcr.io/muradjanov-dev/qurbot"]],
+  "ready_url": null,
+  "keys": {"ADMIN_TG_IDS": {"format":"json_int_list","ops":["list_add","list_remove"],
+    "item_re":"[1-9][0-9]{4,14}","max_items":50,"protected_items":[917456291],
+    "description":"Telegram admin IDs"}}}}}
+```
+
+Tekshiruv qoidalari (`scripts/agent_ops_policy.py`, ikkala tomon — backend va
+`env_apply.py` — bir xil moduldan foydalanadi): `task-manager` va `agent-qa` loyihalari
+kod ichida qattiq taqiqlangan (`task-manager.env`da agent-svc/GitHub tokenlari bor;
+task-api'ni qayta ishga tushirish shu lane o'zi hisobot beradigan API'ni uzadi);
+`env_file` doim `/srv/stack/env/<stack>.env` shakliga mos bo'lishi shart; `containers`
+faqat `backend/app/services/agent_repos.py`dagi shu loyiha uchun ro'yxatga olingan
+image'lardan bo'lishi kerak; kalit nomlari maxfiy ko'rinadigan so'zlarni (`SECRET`,
+`TOKEN`, `PASSW`, `KEY`, `URL`, `HOST`, `DATABASE` va h.k.) o'z ichiga olishi mumkin
+emas. Faylni o'zgartirgandan keyin xizmatni qayta ishga tushirish shart emas — har bir
+so'rov qayta tekshirilganda fayl yangidan o'qiladi.
+
+### O'chirish tugmalari (kill switches)
+
+- **Butunlay o'chirish**: `/etc/agent-svc/config.json`da `ops_lane_enabled: false`
+  (standart o'rnatishda shunday) — `sudo systemctl restart agent-svc`.
+- **Bitta loyihani o'chirish**: uni `/etc/agent-svc/ops-allowlist.json`dan olib
+  tashlang — fayl har safar so'rov kelganda qayta o'qiladi, xizmatni qayta yuklash
+  shart emas.
+- **Hammasini o'chirish, faylni o'chirmasdan**: allowlist'ni
+  `{"version":1,"projects":{}}` holatiga qaytaring.
+- **sudo qoidasini olib tashlash** (oxirgi chora): `/etc/sudoers.d/60-agent-svc`dan
+  `agent-ops-apply.service` qatorini olib tashlang (yoki `ops/agent-svc.sudoers`dan olib
+  tashlab qayta o'rnating) — shunda `agent-svc` bu xizmatni umuman ishga tushira olmaydi.
+
+### Qo'lda orqaga qaytarish (manual rollback)
+
+Avtomatik rollback ham muvaffaqiyatsiz bo'lsa (natija kodi `failed_rollback_failed`, 🚨
+kartada belgilanadi), yoki operator boshqa sababga ko'ra bitta so'rovni qo'lda tekshirmoqchi
+bo'lsa:
+
+```sh
+sudo /usr/bin/python3 -I /opt/agent-svc/libexec/env_apply.py rollback --request-id <uuid>
+```
+
+Bu `/var/lib/agent-ops/backups/<loyiha>/<request_id>.json`dagi zaxiradan foydalanadi (har bir
+zaxira ham JSON metama'lumot, ham so'rovdan OLDINGI holatdagi env faylning **to'liq nusxasi**
+(`<request_id>.env.bak`) — agar bu modulning qator-almashtirish mantig'ida qandaydir xato
+bo'lsa ham, oxirgi chora sifatida shu nusxadan qo'lda tiklash mumkin; shu sabab katalog 0700
+root:root). Joriy env qator uch holatdan biriga to'g'ri kelishi kerak: **(a)** hali ham shu
+so'rov yozgan YANGI qiymat — odatiy holat, CLI eski qiymatni yozadi, keyin qayta yaratadi va
+tekshiradi; **(b)** avtomatik rollback ALLAQACHON eski qiymatni tiklagan (masalan
+`failed_rollback_failed` — env fayl to'g'ri, faqat konteyner qayta yaratilmagan yoki
+tekshiruv o'tmagan) — bu holda CLI faylni QAYTA YOZMAYDI, faqat joriy pin qilingan image
+tag bilan qayta yaratadi va tekshiradi; **(c)** boshqa (uchinchi) qiymat — demak oraliqda
+kimdir/nimadir qatorni allaqachon o'zgartirgan — CLI "qator o'zgargan" xatosi bilan rad
+etadi va HECH NARSANI yozmaydi. Image tag har doim **joriy** ishlab turgan konteynerlardan
+qulf ichida qayta o'qiladi — zaxiradagi eski tegdan HECH QACHON emas (aks holda keyingi bir
+deploy'dan keyingi rollback image'ni eskisiga "pasaytirib" qo'yishi mumkin edi). Bu buyruq
+natijasi asl so'rovning `results/<request_id>.json`ini HECH QACHON ustidan yozmaydi — alohida
+`results/<request_id>.rollback.json`ga yoziladi, shunda asl muvaffaqiyatli/muvaffaqiyatsiz
+natija doim ko'rinib turadi. Bu buyruq `/etc/sudoers.d/60-agent-svc`da YO'Q — faqat operator
+serverga bevosita kirib, qo'lda ishga tushiradi. Oxirgi chora sifatida — mos zaxira topilmasa
+yoki bu ham ishlamasa — yuqoridagi `.env.bak` nusxasini qo'lda joyiga nusxalang (yoki env
+faylni qo'lda tahrirlang) va
+`/srv/stack/scripts/deploy.sh <stack> <hozirgi-ishlab-turgan-sha>`ni ishga tushiring.
+
+**Bilinadigan cheklov:** `env_apply.py` hozircha o'zining ichki umumiy vaqt byudjetini
+kuzatmaydi (faqat `agent-ops-apply.service`ning `TimeoutStartSec=900`i tashqi chegara
+sifatida bor) — juda sekin `docker compose`/tarmoq holatida nazariy jihatdan shu tashqi
+limitga urilib, natija hech qachon yozilmasdan to'xtatilishi mumkin (kam ehtimol, lekin
+mumkin). Server aylanishida kuzatiladigan keyingi ish sifatida qoldirilgan.
+
+### Audit va loglar
+
+- `/var/log/agent-ops/audit.jsonl` — har bir urinish uchun bitta JSON qator (vaqt,
+  request_id, run_id, loyiha, kalit, amal, qiymatlarning FAQAT sha256 hash'lari, natija
+  kodi, qayta ishga tushirilganmi, `env_restored` (env fayl niyat qilingan holatga
+  qaytarilganmi), `rollback_message` (rollback urinishining o'z natijasi, alohida kichik
+  lug'at), image tag, davomiylik). Qiymatning o'zi bu yerga hech qachon yozilmaydi.
+- `journalctl -t agent-ops` — audit qatorining syslog orqali ko'chirmasi.
+- `/var/log/agent-ops/compose-<request_id>.log` (root-only, 0700 katalog ichida) — shu
+  so'rov uchun `docker compose`ning to'liq chiqishi, diagnostika uchun; bu yerda ham
+  env qiymatlari ko'rinmaydi — compose faqat `PATH`, `IMAGE_TAG`, `DOCKER_CONFIG`,
+  `HOME`ni oladi, butun env faylni emas.
+- `/var/lib/agent-ops/results/<request_id>.json` (0640 root:agent-svc) — shu so'rovning
+  yakuniy natijasi: `code`, `exit`, `message`, `rollback_message`, `rolled_back`,
+  `restarted`, `env_restored`, `image_tag`, `request_hash` — hech qachon qiymat;
+  `agent-svc` buni o'qib API'ga qaytaradi. Qo'lda `rollback` CLI ishga tushirilsa, natijasi
+  shu faylni EMAS, `<request_id>.rollback.json`ni yozadi (yuqoriga qarang).
+- **Tezlik chegarasi**: bitta loyiha uchun soatiga eng ko'pi bilan 5 ta muvaffaqiyatli
+  urinish (`/var/lib/agent-ops/ratelimit.json`, root-only, faqat hisoblagich — qiymat
+  saqlanmaydi); undan oshsa `refused`/`rate_limited` bilan rad etiladi. Bu buzilgan/xato
+  agent-svc'ning bitta loyihani qayta-qayta urinishiga qarshi qo'shimcha himoya, egasi
+  tasdiqlagan alohida so'rovlarga odatda hech qachon tegmaydi.
+
+**Muhim:** `/run/agent-svc/ops` katalogini `agent-svc.tmpfiles` YARATMAYDI — sababi
+`agent-svc.service`ning o'zi `RuntimeDirectory=agent-svc`dan foydalanadi, ya'ni
+`/run/agent-svc`ning butun umrini systemd boshqaradi (har safar xizmat qayta ishga
+tushganda 0755 agent-svc:agent-svc holida yangidan yaratiladi, to'xtaganda esa butunlay
+o'chiriladi). Shu sababli `/run/agent-svc/ops`ni (0750 agent-svc:agent-svc) **agent-svc
+kodining o'zi** yaratishi kerak — bir marta ishga tushishda yoki `request.json`ni birinchi
+yozishdan oldin (batafsili: `ops/agent-svc.tmpfiles`dagi izoh).
+
 ## Bekor qilish (rollback)
 
 1. Muammoli loyihani `AGENT_LOCAL_EXECUTOR_PROJECTS`dan olib tashlang va

@@ -43,6 +43,11 @@ _FILES: dict[str, str] = {
     "agent_images": "agent_images.py",
     "agent_pr_review": "agent_pr_review.py",
     "agent_repos": "agent_repos.py",
+    # WP-D0/WP-C ops requests: the shared allowlist/hash/apply-op policy
+    # module (`scripts/agent_ops_policy.py`), loaded by file path exactly
+    # like every other trusted script -- see its own module docstring for
+    # why it has no import on anything else in this repository.
+    "agent_ops_policy": "agent_ops_policy.py",
 }
 
 
@@ -79,7 +84,23 @@ def _load(trusted_dir: Path, name: str) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load trusted module {name!r}: {resolved}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Register under its own qualified name BEFORE executing it, exactly
+    # like the normal import machinery does. A trusted module written with
+    # `from __future__ import annotations` (e.g. `agent_ops_policy.py`) has
+    # every annotation as a string; the stdlib `dataclasses` module resolves
+    # some of those (its `ClassVar`/`InitVar`/`KW_ONLY` check, `_is_type`)
+    # via `sys.modules[cls.__module__].__dict__` while the class body is
+    # still executing. Without this line that lookup finds nothing (`spec.
+    # name` was never in `sys.modules`) and raises a bare `AttributeError`
+    # on the first `@dataclass` field, unrelated to that field's real type.
+    with _lock:
+        sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        with _lock:
+            sys.modules.pop(spec.name, None)
+        raise
     with _lock:
         _module_cache[key] = module
     return module
@@ -118,3 +139,7 @@ class TrustedModules:
     @property
     def agent_repos(self) -> ModuleType:
         return _load(self._dir, "agent_repos")
+
+    @property
+    def agent_ops_policy(self) -> ModuleType:
+        return _load(self._dir, "agent_ops_policy")

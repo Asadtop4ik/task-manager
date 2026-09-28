@@ -20,3 +20,33 @@ d /srv/agent-svc/work 2750 agent-svc agentwork -
 e /srv/agent-svc/work - - - 3d
 
 d /var/lib/agent-svc/publish 0700 agent-svc agent-svc 1d
+
+# agent "ops requests" (agent-svc-notes/ops-requests-spec.md, WP-D): state for the
+# root oneshot unit ops/agent-ops-apply.service, which is its own separate process
+# tree (not a child of agent-svc.service -- see that unit file), so its directories
+# are root-owned, not agent-svc-owned, even though they live under a name that
+# pairs with /var/lib/agent-svc. `results/` is 0750 root:agent-svc so agent-svc can
+# READ (never write) the one result file it is waiting on; `backups/` and
+# `docker-config/` hold real, unredacted env values (the one place that is
+# unavoidable -- see env_apply.py's module docstring) and a docker CLI config
+# directory respectively, so both stay 0700 root:root, unreadable by agent-svc or
+# anything else. None of these are ever swept by age: every result/backup is a
+# permanent audit trail until an operator removes it by hand.
+d /var/lib/agent-ops 0750 root agent-svc -
+d /var/lib/agent-ops/results 0750 root agent-svc -
+d /var/lib/agent-ops/backups 0700 root root -
+d /var/lib/agent-ops/docker-config 0700 root root -
+d /var/log/agent-ops 0700 root root -
+
+# Deliberately NO line here for /run/agent-svc/ops (where agent-svc writes
+# request.json for env_apply.py to read): agent-svc.service declares
+# `RuntimeDirectory=agent-svc`, so systemd itself owns /run/agent-svc's entire
+# lifecycle -- created fresh (0755 agent-svc:agent-svc) on every start of
+# agent-svc.service and REMOVED on every stop, including any subdirectory that
+# was under it. A tmpfiles "d" line for /run/agent-svc/ops would only apply at
+# boot (or a manual `systemd-tmpfiles --create`), not on every agent-svc restart,
+# so it cannot be relied on to exist after a later `systemctl restart agent-svc`.
+# agent-svc's own code must create /run/agent-svc/ops itself (0750
+# agent-svc:agent-svc, e.g. via `os.makedirs(..., exist_ok=True)` followed by an
+# explicit `os.chmod` since the directory-creation mode is subject to umask) --
+# either once at startup or lazily right before it first writes request.json.

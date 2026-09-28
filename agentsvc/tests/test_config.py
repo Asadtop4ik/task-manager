@@ -6,6 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agent_svc.config import (
+    DEFAULT_MODEL_MATRIX,
+    DEFAULT_TIMEOUTS,
     OPTIONAL_SECRET_NAMES,
     REQUIRED_SECRET_NAMES,
     SECRET_NAMES,
@@ -121,6 +123,166 @@ class LoadConfigTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text("{not json")
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_ops_lane_defaults(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp) / "absent.json")
+            self.assertFalse(config["ops_lane_enabled"])
+            self.assertEqual(config["ops_allowlist_path"], "/etc/agent-svc/ops-allowlist.json")
+            self.assertEqual(config["ops_request_dir"], "/run/agent-svc/ops")
+            self.assertEqual(config["ops_results_dir"], "/var/lib/agent-ops/results")
+
+    def test_ops_lane_enabled_can_be_overridden(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"ops_lane_enabled": True}))
+            config = load_config(path)
+            self.assertTrue(config["ops_lane_enabled"])
+
+
+class ModelMatrixTimeoutsDeepMergeTests(unittest.TestCase):
+    """The production bug this fixes: a config written before a lane
+    existed (e.g. before the chat lane added `model_matrix.chat`/
+    `timeouts.chat`) used to lose that lane's entry ENTIRELY -- the old
+    loader did `{**DEFAULT_CONFIG, **raw}`, which replaces `model_matrix`/
+    `timeouts` wholesale rather than merging per key -- and every `/suhbat`
+    call crashed with `KeyError: 'chat'` the moment it read
+    `settings.model_matrix["chat"]`."""
+
+    def test_old_style_config_missing_a_whole_entry_still_gets_its_defaults(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            # Simulates a config saved before the chat lane existed: only
+            # the lanes that existed at the time are present.
+            path.write_text(
+                json.dumps(
+                    {
+                        "model_matrix": {
+                            "intake": {
+                                "model": "gpt-6-luna",
+                                "effort": "high",
+                                "multi_agent": False,
+                                "sandbox": "read-only",
+                            }
+                        },
+                        "timeouts": {"intake": 180},
+                    }
+                )
+            )
+            config = load_config(path)
+            self.assertEqual(config["model_matrix"]["chat"], DEFAULT_MODEL_MATRIX["chat"])
+            self.assertEqual(config["timeouts"]["chat"], DEFAULT_TIMEOUTS["chat"])
+            # Every other shipped lane/timeout is still there too.
+            for name in DEFAULT_MODEL_MATRIX:
+                self.assertIn(name, config["model_matrix"])
+            for name in DEFAULT_TIMEOUTS:
+                self.assertIn(name, config["timeouts"])
+
+    def test_partial_entry_override_merges_per_field(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"model_matrix": {"chat": {"effort": "high"}}}))
+            config = load_config(path)
+            self.assertEqual(config["model_matrix"]["chat"]["effort"], "high")
+            # Every other field of THIS entry still comes from the default.
+            self.assertEqual(
+                config["model_matrix"]["chat"]["model"], DEFAULT_MODEL_MATRIX["chat"]["model"]
+            )
+            self.assertEqual(
+                config["model_matrix"]["chat"]["sandbox"],
+                DEFAULT_MODEL_MATRIX["chat"]["sandbox"],
+            )
+
+    def test_timeouts_partial_override_keeps_the_rest(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"timeouts": {"review": 999}}))
+            config = load_config(path)
+            self.assertEqual(config["timeouts"]["review"], 999)
+            self.assertEqual(config["timeouts"]["chat"], DEFAULT_TIMEOUTS["chat"])
+
+    def test_bad_multi_agent_type_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {"model_matrix": {"chat": {"multi_agent": "definitely-not-a-bool"}}}
+                )
+            )
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_bad_model_type_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"model_matrix": {"chat": {"model": ""}}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_unknown_field_inside_a_model_matrix_entry_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"model_matrix": {"chat": {"bogus_field": 1}}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_unknown_timeouts_field_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"timeouts": {"not_a_real_lane": 10}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_non_positive_timeout_value_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"timeouts": {"chat": 0}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_new_model_matrix_entry_beyond_the_shipped_defaults_is_rejected(self) -> None:
+        # A future lane's name isn't guessable here; a config referencing
+        # one the current code does not know about must fail at startup
+        # (loudly), not be silently accepted and then ignored everywhere.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "model_matrix": {
+                            "future_lane": {
+                                "model": "x",
+                                "effort": "y",
+                                "multi_agent": False,
+                                "sandbox": "read-only",
+                            }
+                        }
+                    }
+                )
+            )
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_non_dict_model_matrix_entry_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"model_matrix": {"chat": "not-an-object"}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_non_dict_top_level_model_matrix_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"model_matrix": "nope"}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_non_dict_top_level_timeouts_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"timeouts": "nope"}))
             with self.assertRaises(ConfigError):
                 load_config(path)
 

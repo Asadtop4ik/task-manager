@@ -4,6 +4,7 @@ import email.message
 import io
 import json
 import os
+import shutil
 import socket
 import unittest
 import urllib.error
@@ -19,6 +20,20 @@ from .support import build_test_context, make_github_remote
 from .test_implement import _work as _implement_work
 
 TRUSTED_DIR = Path(__file__).resolve().parents[2] / "backend" / "app" / "services"
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+
+
+def _trusted_dir_with_ops_policy(tmp: Path) -> Path:
+    """A `trusted_dir` with both `agent_repos.py` (from the real
+    `backend/app/services`, same as `TRUSTED_DIR`) and
+    `agent_ops_policy.py` (from `scripts/`) -- most self-check tests need
+    both; the one that specifically wants the ops policy module MISSING
+    uses `TRUSTED_DIR` directly instead."""
+    directory = tmp / "trusted"
+    directory.mkdir(exist_ok=True)
+    shutil.copy2(TRUSTED_DIR / "agent_repos.py", directory / "agent_repos.py")
+    shutil.copy2(_SCRIPTS_DIR / "agent_ops_policy.py", directory / "agent_ops_policy.py")
+    return directory
 
 
 def _http_error(status: int, payload: dict | None = None) -> urllib.error.HTTPError:
@@ -157,18 +172,24 @@ class SelfCheckTests(unittest.TestCase):
         *,
         libexec_has_child: bool = False,
         libexec_has_image_state: bool = False,
+        trusted_dir: Path | None = None,
+        ops_lane_enabled: bool = False,
     ):
         _write_secrets(tmp)
         config = load_config(tmp / "absent-config.json")
+        resolved_trusted_dir = (
+            trusted_dir if trusted_dir is not None else _trusted_dir_with_ops_policy(tmp)
+        )
         config = {
             **config,
-            "trusted_dir": str(TRUSTED_DIR),
+            "trusted_dir": str(resolved_trusted_dir),
             "state_dir": str(tmp / "state"),
             "work_root": str(tmp / "work"),
             "mirrors_dir": str(tmp / "mirrors"),
             "runs_dir": str(tmp / "runs"),
             "libexec_dir": str(tmp / "libexec"),
             "tools_dir": str(tmp / "tools"),
+            "ops_lane_enabled": ops_lane_enabled,
         }
         (tmp / "state").mkdir(mode=0o750)
         (tmp / "work").mkdir(mode=0o750)
@@ -351,6 +372,122 @@ class SelfCheckTests(unittest.TestCase):
             )
             self.assertIn("FAIL codex_child", stream.getvalue())
             self.assertIn("FAIL image_state", stream.getvalue())
+            self.assertEqual(code, 1)
+
+    def test_ops_checks_report_skipped_when_lane_disabled(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp,
+                libexec_has_child=True,
+                libexec_has_image_state=True,
+                ops_lane_enabled=False,
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            stream = io.StringIO()
+            code = self_check(
+                settings, None, None, opener=opener, command_runner=runner, stream=stream
+            )
+            output = stream.getvalue()
+            self.assertIn("OK ops_apply_systemctl skipped (ops lane disabled)", output)
+            self.assertIn("OK ops_allowlist skipped (ops lane disabled)", output)
+            self.assertEqual(code, 0)
+            # Never even probed sudo for the ops-apply rule while disabled.
+            self.assertFalse(any("systemctl" in " ".join(call) for call in runner.calls))
+
+    def test_ops_checks_run_and_probe_the_exact_systemctl_argv_when_enabled(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp,
+                libexec_has_child=True,
+                libexec_has_image_state=True,
+                ops_lane_enabled=True,
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            stream = io.StringIO()
+            self_check(
+                settings, None, None, opener=opener, command_runner=runner, stream=stream
+            )
+
+            systemctl_calls = [call for call in runner.calls if "/usr/bin/systemctl" in call]
+            self.assertEqual(len(systemctl_calls), 1)
+            self.assertEqual(
+                systemctl_calls[0],
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "-l",
+                    "/usr/bin/systemctl",
+                    "start",
+                    "agent-ops-apply.service",
+                ],
+            )
+            # Never actually started the unit: only `-l` (list), never a
+            # real `systemctl start`.
+            self.assertNotIn(
+                ["/usr/bin/systemctl", "start", "agent-ops-apply.service"], runner.calls
+            )
+
+    def test_ops_allowlist_check_fails_gracefully_when_enabled_but_unreadable(self) -> None:
+        # `TRUSTED_DIR` (the real `backend/app/services` directory) has no
+        # `agent_ops_policy.py` -- proves both a missing trusted module AND
+        # (since the allowlist check depends on the same module) a missing/
+        # invalid ops allowlist setup are each reported as a normal FAIL
+        # line, never a crash, exactly like every other probe.
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp,
+                libexec_has_child=True,
+                libexec_has_image_state=True,
+                ops_lane_enabled=True,
+                trusted_dir=TRUSTED_DIR,
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            stream = io.StringIO()
+            code = self_check(
+                settings, None, None, opener=opener, command_runner=runner, stream=stream
+            )
+            output = stream.getvalue()
+            self.assertIn("FAIL agent_ops_policy", output)
+            self.assertIn("FAIL ops_allowlist", output)
+            self.assertEqual(code, 1)
+
+    def test_agent_ops_policy_module_check_runs_even_when_lane_disabled(self) -> None:
+        with TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            settings = self._settings(
+                tmp,
+                libexec_has_child=True,
+                libexec_has_image_state=True,
+                ops_lane_enabled=False,
+                trusted_dir=TRUSTED_DIR,
+            )
+            opener = FakeOpener(
+                [FakeResponse(b"", status=200), FakeResponse(b"[]", status=200)]
+            )
+            runner = _FakeCommandRunner(returncode=0)
+            stream = io.StringIO()
+            code = self_check(
+                settings, None, None, opener=opener, command_runner=runner, stream=stream
+            )
+            # The module load is checked regardless of whether the lane is
+            # enabled -- unlike `ops_apply_systemctl`/`ops_allowlist`, which
+            # only report "skipped" here.
+            self.assertIn("FAIL agent_ops_policy", stream.getvalue())
+            self.assertIn(
+                "OK ops_apply_systemctl skipped (ops lane disabled)", stream.getvalue()
+            )
             self.assertEqual(code, 1)
 
 

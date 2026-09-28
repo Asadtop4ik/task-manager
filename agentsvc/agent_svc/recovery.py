@@ -21,7 +21,16 @@ from .journal import Journal, JournalEntry
 from .log import Logger
 
 # Statuses after which no further agent-svc action on this run is expected.
-TERMINAL_STATUSES = frozenset({"merged", "deployed", "failed", "cancelled"})
+# `ops_applied` is a true terminal status (spec: "terminal success");
+# `ops_pending` is not terminal for the RUN as a whole (it is still waiting
+# on owner approval + the ops lane), but IS terminal from THIS journal
+# entry's own point of view: once the implement handler's `ops_pending`
+# callback lands, control over the run has passed entirely to the separate
+# ops-approval/OpsLane flow, so the code-lane journal entry has nothing
+# further to do and must not be resumed.
+TERMINAL_STATUSES = frozenset(
+    {"merged", "deployed", "failed", "cancelled", "ops_applied", "ops_pending"}
+)
 
 
 def recover(

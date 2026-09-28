@@ -17,11 +17,18 @@ from typing import Any
 
 from .api import Work
 from .context import ServiceContext
+from .http import HttpError
+from .ops_requests import build_ops_note, split_trailer
+from .ops_requests import validate as validate_ops_requests
 from .prompts import compose_implement_prompt, route_implement
 from .publish import PublishError, _check_not_cancelled, publish_implement
 from .runctx import RunScaffold
 
 _NO_CHANGES_MESSAGE = "agent produced no file changes"
+_OPS_UNAVAILABLE_NOTE = "ops_unavailable"
+_OPS_CALLBACK_KEYS = ("ops_requests", "ops_note")
+_OPS_VALUE_PLACEHOLDER = "[ops qiymati]"
+_MIN_REDACTED_VALUE_LEN = 4
 
 
 def handle_implement(ctx: ServiceContext, work: Work, cancel: threading.Event) -> None:
@@ -94,7 +101,21 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         if is_public
         else ctx.trusted.agent_task.build_prompt(task)
     )
-    prompt = compose_implement_prompt(base_prompt, work, complex_route=route.complex)
+    # Loaded fresh, once per run (never cached across runs -- an operator may
+    # edit the allowlist between two runs of the same project): used both to
+    # decide whether the prompt gets ops-request instructions, and later to
+    # validate whatever trailer Codex actually emitted. `None` means "missing
+    # or invalid file" -- treated as "no allowlist" throughout, never a crash.
+    ops_project_key = _ops_project_key(ctx, work)
+    allowlist = _load_ops_allowlist(ctx, work.run_id)
+    ops_project = (
+        allowlist.projects.get(ops_project_key)
+        if allowlist is not None and ops_project_key is not None
+        else None
+    )
+    prompt = compose_implement_prompt(
+        base_prompt, work, complex_route=route.complex, ops_project=ops_project
+    )
 
     run.stage("codex_started")
     result = ctx.codex.run_exec(
@@ -121,17 +142,57 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
     if run.cancel.is_set() or result.cancelled:
         return
 
+    # Every downstream use of Codex's own text -- a failure reason, the "no
+    # changes" note, or the eventual PR body -- must never carry the ops
+    # trailer line: an env value (however harmless-looking) must never reach
+    # a public PR or a Telegram message. This one call covers all of them.
+    summary, raw_ops, trailer_note = split_trailer(result.final_message or "")
+
+    # Ops block: policy access, validation, and note-building all in one
+    # place, all defended together. `ctx.trusted.agent_ops_policy` is a
+    # SECOND access to the trusted loader in this run (the first, inside
+    # `_load_ops_allowlist` above, is already defended the same way) -- an
+    # older installer without `scripts/agent_ops_policy.py` yet deployed
+    # would otherwise raise `FileNotFoundError` here, AFTER Codex already
+    # ran, crashing the whole run with no callback ever sent at all. Ops
+    # requests are a secondary feature: any failure here must degrade to
+    # "no proposals" instead of losing the run's own real outcome.
+    try:
+        policy_module = ctx.trusted.agent_ops_policy
+        proposals, drop_note = validate_ops_requests(
+            raw_ops,
+            project_key=ops_project_key,
+            repo_full_name=work.repo_full_name,
+            allowlist=allowlist,
+            policy_module=policy_module,
+        )
+        ops_note = build_ops_note(
+            trailer_note=trailer_note, drop_note=drop_note, policy_module=policy_module
+        )
+    except Exception as exc:
+        ctx.logger.error(exc, event="ops_validation_failed", run_id=work.run_id)
+        proposals = []
+        ops_note = _OPS_UNAVAILABLE_NOTE
+
+    # Defense in depth against Codex repeating a requested value in its own
+    # prose, outside the trailer line `split_trailer` already removed (the
+    # prompt also tells it not to) -- applied to every piece of Codex's own
+    # text used below, including the early failure-reason branch just past
+    # this point.
+    summary = _redact_ops_values(summary, proposals)
+
     if result.timed_out or result.idle_killed or result.exit_code != 0:
         reason = ctx.trusted.agent_task.failure_reason(
             failure_phase="implement",
             codex_step_outcome="failure",
-            load_result_text=lambda: result.final_message or None,
+            load_result_text=lambda: summary or None,
             load_policy_error_text=lambda: None,
             load_fast_error_text=lambda: None,
         )
         if result.error_message and not result.final_message:
             # e.g. a usage limit or model error reported by Codex itself.
             reason = f"{reason} (Codex: {result.error_message[:300]})"
+        reason = _redact_ops_values(reason, proposals)
         _fail(ctx, work, run, "implement", reason, usage=result.usage)
         return
 
@@ -150,11 +211,34 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
 
     patch_b64 = package.get("patch_b64") or ""
     if not patch_b64:
+        if any(proposal["policy"] == "allowed" for proposal in proposals):
+            _callback(
+                ctx,
+                work,
+                run,
+                {
+                    "run_id": work.run_id,
+                    "status": "ops_pending",
+                    "ops_requests": proposals,
+                    "ops_note": ops_note,
+                    **_usage_fields(result.usage),
+                },
+            )
+            return
         reason = _NO_CHANGES_MESSAGE
-        summary = " ".join((result.final_message or "").split())
-        if summary:
-            reason += "\nCodex izohi (tasdiqlanmagan): " + summary[:650]
-        _fail(ctx, work, run, "implement", reason[:900], usage=result.usage)
+        flat_summary = " ".join(summary.split())
+        if flat_summary:
+            reason += "\nCodex izohi (tasdiqlanmagan): " + flat_summary[:650]
+        _fail(
+            ctx,
+            work,
+            run,
+            "implement",
+            reason[:900],
+            usage=result.usage,
+            ops_requests=proposals,
+            ops_note=ops_note,
+        )
         return
 
     try:
@@ -175,7 +259,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             task=task,
             is_public=is_public,
             image_dir=image_dir,
-            codex_summary=result.final_message,
+            codex_summary=summary,
             cancel=run.cancel,
             report_stage=lambda name: run.stage(name, base_sha=base_sha, branch=branch),
         )
@@ -203,6 +287,8 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             "status": "pr_opened",
             "pr_url": publish_result.pr_url,
             "head_sha": publish_result.head_sha,
+            "ops_requests": proposals,
+            "ops_note": ops_note,
             **_usage_fields(result.usage),
         },
     )
@@ -242,6 +328,62 @@ def is_public_repo(ctx: ServiceContext, repo_full_name: str) -> bool:
     """
     info = ctx.catalog.get(repo_full_name)
     return info is not None and (not info.private or info.qa_only)
+
+
+def _ops_project_key(ctx: ServiceContext, work: Work) -> str | None:
+    """The allowlist project key for `work.repo_full_name`, or `None` if
+    (implausibly, since `parse_work` already proved this repo is in the
+    approved catalog) it has none. The allowlist itself keys projects by
+    this same `project_key`, never by `repo_full_name` directly."""
+    info = ctx.catalog.get(work.repo_full_name)
+    return info.project_key if info is not None else None
+
+
+def _load_ops_allowlist(ctx: ServiceContext, run_id: str) -> Any:
+    """Load the ops-requests allowlist fresh for this one run (never cached
+    across runs -- an operator may edit it between two runs). Missing or
+    invalid -> `None`: every caller treats that exactly like "no allowlist
+    entry for this project" (no ops rules in the prompt, every proposal
+    denied with `policy_reason="no_allowlist"`); this must never crash an
+    implement run over a secondary feature. Logged once, here, on failure.
+
+    A separate, private function (rather than inlining `ctx.trusted.
+    agent_ops_policy.load_allowlist(...)` at each call site) so tests can
+    substitute a canned `Allowlist` with `unittest.mock.patch.object` instead
+    of needing a real root-owned file on disk (`require_root_owned=True` is
+    always passed in production, per the spec, and would refuse any file a
+    non-root test process could create).
+    """
+    try:
+        return ctx.trusted.agent_ops_policy.load_allowlist(
+            ctx.settings.ops_allowlist_path, ctx.catalog.repos, require_root_owned=True
+        )
+    except Exception as exc:
+        ctx.logger.error(exc, event="ops_allowlist_load_failed", run_id=run_id)
+        return None
+
+
+def _redact_ops_values(text: str, proposals: list[dict[str, Any]]) -> str:
+    """Defense in depth: Codex might repeat a requested value in its own
+    prose -- outside the trailer line itself, which `split_trailer` already
+    removes -- e.g. "I'm asking the owner to add 5339875840 as an admin".
+    Replace every occurrence of a proposal's `value` (allowed or denied)
+    with a fixed placeholder before this text ever reaches a PR body or a
+    Telegram message. Only values at least `_MIN_REDACTED_VALUE_LEN`
+    characters long are redacted, so a short, generic value (a single
+    digit, "on"/"off", ...) never mangles ordinary prose that happens to
+    contain the same short substring by coincidence.
+    """
+    if not text or not proposals:
+        return text
+    values: set[str] = set()
+    for proposal in proposals:
+        value = proposal.get("value")
+        if isinstance(value, str) and len(value) >= _MIN_REDACTED_VALUE_LEN:
+            values.add(value)
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, _OPS_VALUE_PLACEHOLDER)
+    return text
 
 
 def _download_images(
@@ -374,6 +516,8 @@ def _fail(
     reason: str,
     *,
     usage: Mapping[str, Any] | None = None,
+    ops_requests: list[dict[str, Any]] | None = None,
+    ops_note: str | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "run_id": work.run_id,
@@ -382,6 +526,15 @@ def _fail(
         "failure_phase": phase,
     }
     payload.update(_usage_fields(usage))
+    # Attached whenever there is anything ops-related to report at all --
+    # not just a non-empty proposal list, but also a note-only outcome (a
+    # trailer was present but turned out ambiguous/invalid/all-dropped: see
+    # `_run_implement`'s ops block and `ops_requests.build_ops_note`).
+    # Every other `_fail` call site (no trailer, nothing dropped) is
+    # unaffected and keeps sending exactly the payload it always has.
+    if ops_requests or ops_note:
+        payload["ops_requests"] = ops_requests or []
+        payload["ops_note"] = ops_note
     _callback(ctx, work, run, payload)
 
 
@@ -390,4 +543,42 @@ def _callback(
 ) -> None:
     if run.cancel.is_set():
         return
-    run.deliver(lambda: ctx.api.callback(work.run_id, work.lease_id, payload))
+    run.deliver(lambda: _post_callback(ctx, work, payload))
+
+
+def _post_callback(ctx: ServiceContext, work: Work, payload: Mapping[str, Any]) -> None:
+    """One callback delivery attempt, with one extra layer `run.deliver`
+    itself does not have: if the payload carries ops fields and the backend
+    rejects it with a 400/422 (a malformed `ops_requests`/`ops_note` --
+    which, thanks to the checks in `ops_requests.py`, should never happen,
+    but a defense this cheap is worth having anyway), resend ONCE without
+    those two fields rather than losing the run's own real outcome
+    (`pr_opened`/`ops_pending`/`failed`) over a secondary feature. The
+    rejection is logged by status code only -- never the response body,
+    which could otherwise echo back attacker-influenced field values
+    (`kind`/`op`) into the log.
+    """
+    try:
+        ctx.api.callback(work.run_id, work.lease_id, dict(payload))
+    except HttpError as exc:
+        carries_ops = any(key in payload for key in _OPS_CALLBACK_KEYS)
+        if not carries_ops or exc.status not in (400, 422):
+            raise
+        ctx.logger.event(
+            "ops_callback_rejected_retrying_without_ops",
+            level="warning",
+            run_id=work.run_id,
+            status=exc.status,
+        )
+        stripped = {
+            key: value for key, value in payload.items() if key not in _OPS_CALLBACK_KEYS
+        }
+        if stripped.get("status") == "ops_pending":
+            # `ops_pending` is only valid with at least one stored proposal;
+            # without them the backend would reject it too and the run would
+            # never be told anything. Report the no-patch outcome as a failure.
+            stripped["status"] = "failed"
+            stripped["error"] = (
+                "Agent faqat ops so‘rovi qaytardi, lekin so‘rov qabul qilinmadi."
+            )
+        ctx.api.callback(work.run_id, work.lease_id, stripped)
