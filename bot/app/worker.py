@@ -13,6 +13,7 @@ from arq.connections import RedisSettings
 from app.cards import build_card
 from app.config import settings
 from app.handlers.agent_intake import notification_message
+from app.handlers.agent_ops import combine_keyboards, ops_count_line, ops_keyboard, ops_lines
 from app.handlers.agent_release import release_card, release_keyboard
 from app.handlers.project_discussion import discussion_keyboard
 from app.loader import create_bot
@@ -70,11 +71,22 @@ def agent_result_card(notice: dict[str, object]) -> str:
         if sha:
             lines.append(f"Commit: {sha[:12]}")
         lines.append(f"Deploy: {_html_text(notice.get('github_run_url') or '—', 300)}")
+    elif status == "ops_pending":
+        lines.append(
+            "Holat: ⏳ Kod o‘zgarishi kerak emas; muhit sozlamalari egasi tasdig‘ini kutmoqda."
+        )
+    elif status == "ops_applied":
+        lines.append("Holat: ✅ Muhit sozlamalari qo‘llandi.")
     else:
         lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
         lines.append(f"Sabab: {_html_text(notice.get('error') or 'noma’lum', 1200)}")
         if notice.get("github_run_url"):
             lines.append(f"Jarayon: {_html_text(notice['github_run_url'], 300)}")
+    # The legacy/task-origin card is the one place ops details are NOT shown —
+    # only ever a count, and only ever here (owner cards get the full block).
+    count_line = ops_count_line(notice)
+    if count_line:
+        lines.append(count_line)
     return "\n".join(lines)
 
 
@@ -191,6 +203,12 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                         if len(owner_head_sha) == 40
                         else agent_result_card(notice)
                     )
+                    # Full key/op/value detail is owner-only: never on the
+                    # legacy task-origin card built above (that one only ever
+                    # gets a count, via agent_result_card -> ops_count_line).
+                    ops_block = ops_lines(notice)
+                    if ops_block:
+                        owner_text = "\n".join([owner_text, *ops_block])
                     owner_markup = None
                     if len(owner_head_sha) == 40:
                         actions = notice.get("actions") or {}
@@ -199,6 +217,13 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                         owner_markup = release_keyboard(
                             str(run_id), owner_head_sha, actions=actions
                         )
+                        if notice.get("ops_controls_available"):
+                            owner_markup = combine_keyboards(
+                                owner_markup,
+                                ops_keyboard(notice.get("ops_requests")),
+                            )
+                    elif notice.get("ops_controls_available"):
+                        owner_markup = ops_keyboard(notice.get("ops_requests"))
                     # An ID is reusable only alongside the same owner chat ID.
                     reusable_id = (
                         owner_message_id if owner_notice_chat_id == owner_chat_id else None

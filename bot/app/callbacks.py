@@ -45,3 +45,16 @@ class AgentReleaseAction(CallbackData, prefix="ar"):
     action: str  # merge | correct | detail
     run_id: str
     sha12: str
+
+
+class AgentOpsAction(CallbackData, prefix="ao"):
+    """Owner controls for one ops request; ask/yes/no/back stay well under 64 bytes.
+
+    `h` is the first 10 hex characters of the request's `request_hash` — enough to
+    detect a stale card (the request changed since this button was drawn) without
+    paying Telegram's byte budget for the full 64-char hash.
+    """
+
+    action: str  # ask | yes | no | back
+    ops_id: int
+    h: str
