@@ -491,6 +491,47 @@ async def test_get_ops_request_returns_run_detail_with_values(
     ).status_code == 404
 
 
+async def test_get_ops_request_never_refreshes_pr_head_or_writes(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    """P3-4: `GET /agent-ops/{id}` must stay strictly read-only. The old
+    `_load_run_detail(session, run)` call (no `refresh_pr_head=False`) could
+    call out to GitHub for an open PR's live head and, on a mismatch,
+    write/commit `_invalidate_review_and_ci` right here with no lock held —
+    clobbering a concurrent CI/correction callback's own write to the same
+    run. This run's own `pr_opened` + `pr_url` + `head_sha` are exactly the
+    shape that used to trigger that refresh."""
+    task = await _make_task(session, project)
+    run, row = await _run_with_ops_row(
+        session,
+        task,
+        run_status="pr_opened",
+        pr_url=_PR_URL,
+        head_sha=_SHA,
+    )
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("GET /agent-ops/{id} must never call GitHub")
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", _boom)
+
+    resp = await client.get(f"/api/v1/agent-ops/{row.id}", headers=auth(manager))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["head_sha"] == _SHA
+    assert body["status"] == "pr_opened"
+
+    # Same session as the client (see `conftest.client`): an in-place write
+    # inside the endpoint would already be visible on this very object.
+    assert run.head_sha == _SHA
+    assert run.status == "pr_opened"
+    assert run.ci_status is None
+
+
 # --------------------------------------------------------------- lease gating
 
 

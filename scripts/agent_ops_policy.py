@@ -8,13 +8,18 @@ them:
 
 * the trailer parser (`agentsvc/agent_svc/ops_requests.py`, WP-C) calls
   `validate_request` to turn Codex's proposals into `allowed`/`denied`;
-* the backend (`backend/app/services/agent_ops.py`, WP-A) calls
-  `request_hash` to compute the same hash stored on the row and re-checked at
-  approval time;
 * the root oneshot helper (`agentsvc/libexec/env_apply.py`, WP-D) calls
   `load_allowlist`, `validate_request` (to independently re-check what it was
   told, never trusting the caller) and `apply_op` (to compute the new env-file
   line) before it ever touches `/srv/stack/env/*.env`.
+
+The backend (`backend/app/services/agent_ops.py`, WP-A) never imports this
+module and never reads the allowlist file -- only `agent-svc` and
+`env_apply.py` do, both on the same host the file lives on. The backend
+instead independently reimplements `request_hash` and a `SECRET_KEY_RE`
+denylist (its own copy, which must agree with this module's bit-for-bit) so
+it can re-check a stored proposal's hash/key at decision time without ever
+touching this file.
 
 Import contract (spec section 4): this file is loaded two ways -- as an
 ordinary module from `scripts/` (`python3 -m unittest discover -s scripts`,

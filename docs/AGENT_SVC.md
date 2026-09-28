@@ -271,9 +271,11 @@ qayta ishga tushiradi. To'liq loyihaviy hujjat: `agent-svc-notes/ops-requests-sp
    — `replace`/`list_add`/`list_remove`, `value`, `reason`). Bu qator ochiq PR matnidan va
    Codex izohidan doim olib tashlanadi — qiymat hech qachon jamoat ko'radigan joyga
    chiqmaydi.
-2. Backend har bir so'rovni pastdagi root-owned allowlist asosida tekshiradi va Telegramda
-   egasi kartasiga alohida qator sifatida chiqaradi; egasi har birini ikki bosqichda
-   (tanlash → tasdiqlash) ✅/❌ qiladi.
+2. `agent-svc` har bir so'rovni pastdagi root-owned allowlist asosida tekshiradi (ruxsat/rad
+   va sababini backendga yuboradi). **Backend bu allowlist faylini o'zi hech qachon
+   o'qimaydi** — faqat o'zining mustaqil regex/denylist nusxasi bilan qayta tekshiradi va
+   saqlaydi, so'ng Telegramda egasi kartasiga alohida qator sifatida chiqaradi; egasi har
+   birini ikki bosqichda (tanlash → tasdiqlash) ✅/❌ qiladi.
 3. Tasdiqlangan so'rov (kod o'zgarishi bo'lsa — production'ga aynan shu commit deploy
    qilingani va sog'lom ekani tasdiqlangandan keyin) `agent-svc`ning alohida "ops lane"
    oqimi orqali `/run/agent-svc/ops/request.json` faylini (0640, egasi `agent-svc`) yozadi
@@ -299,12 +301,15 @@ qayta ishga tushiradi. To'liq loyihaviy hujjat: `agent-svc-notes/ops-requests-sp
 
 ### Loyihani allowlist'ga qo'shish
 
-`/etc/agent-svc/ops-allowlist.json` (root:root 0644) — `agent-svc` bu faylni FAQAT o'qiydi,
-hech qachon yozmaydi; ham backend, ham `agent-ops-apply.service` uni root-owned, group/
-world-writable bo'lmagan, simlink bo'lmagan holda alohida-alohida tekshiradi. Standart
-o'rnatish (`install_agent_svc.sh`) `ops/ops-allowlist.example.json`ni FAQAT bu fayl mavjud
-bo'lmasa nusxalaydi (`{"version":1,"projects":{}}` — funksiya butunlay o'chirilgan holat).
-Yangi loyiha qo'shish uchun shu faylni **qo'lda**, serverda, root sifatida tahrirlang, masalan:
+`/etc/agent-svc/ops-allowlist.json` (root:root 0644, world-readable bo'lishi SHART — aks
+holda `agent-svc` uni ochib bo'lmay `not_accessible` bilan rad etadi) — buni FAQAT `agent-svc` (taklif
+validatsiyasi uchun) va `agent-ops-apply.service`/`env_apply.py` (qo'llashdan oldin mustaqil
+qayta tekshirish uchun) o'qiydi, har biri alohida-alohida root-owned, group/world-writable
+bo'lmagan, simlink bo'lmagan holda tekshiradi — **backend bu faylni umuman o'qimaydi** (yuqoriga
+qarang). Standart o'rnatish (`install_agent_svc.sh`) `ops/ops-allowlist.example.json`ni FAQAT
+bu fayl mavjud bo'lmasa nusxalaydi (`{"version":1,"projects":{}}` — funksiya butunlay
+o'chirilgan holat). Yangi loyiha qo'shish uchun shu faylni **qo'lda**, serverda, root sifatida
+tahrirlang, masalan:
 
 ```json
 {"version": 1, "projects": {"qurbot": {
@@ -319,8 +324,10 @@ Yangi loyiha qo'shish uchun shu faylni **qo'lda**, serverda, root sifatida tahri
     "description":"Telegram admin IDs"}}}}}
 ```
 
-Tekshiruv qoidalari (`scripts/agent_ops_policy.py`, ikkala tomon — backend va
-`env_apply.py` — bir xil moduldan foydalanadi): `task-manager` va `agent-qa` loyihalari
+Tekshiruv qoidalari (`scripts/agent_ops_policy.py` — buni `agent-svc` va `env_apply.py`
+ishonchli nusxa sifatida fayl yo'li orqali mustaqil yuklaydi; backend bu modulni hech
+qachon import qilmaydi, faqat o'zining alohida regex/denylist nusxasi bilan qayta
+tekshiradi): `task-manager` va `agent-qa` loyihalari
 kod ichida qattiq taqiqlangan (`task-manager.env`da agent-svc/GitHub tokenlari bor;
 task-api'ni qayta ishga tushirish shu lane o'zi hisobot beradigan API'ni uzadi);
 `env_file` doim `/srv/stack/env/<stack>.env` shakliga mos bo'lishi shart; `containers`
@@ -329,6 +336,21 @@ image'lardan bo'lishi kerak; kalit nomlari maxfiy ko'rinadigan so'zlarni (`SECRE
 `TOKEN`, `PASSW`, `KEY`, `URL`, `HOST`, `DATABASE` va h.k.) o'z ichiga olishi mumkin
 emas. Faylni o'zgartirgandan keyin xizmatni qayta ishga tushirish shart emas — har bir
 so'rov qayta tekshirilganda fayl yangidan o'qiladi.
+
+`env_file` (masalan `/srv/stack/env/qurbot.env`)ning o'zi **root yoki `deploy` xizmat
+foydalanuvchisi** tomonidan egallangan bo'lishi shart (mode 600) — `env_apply.py` ikkalasini
+ham qabul qiladi (`deploy`ning uid'i har safar `pwd.getpwnam("deploy")` orqali runtime'da
+aniqlanadi, hech qachon qattiq kodlangan 1000 emas; bu foydalanuvchi serverda yo'q bo'lsa,
+faqat root qabul qilinadi). Boshqa har qanday egasi `env_wrong_owner` bilan rad etiladi.
+Qayta yozishda asl fayl egasi/guruhi/mode'i har doim aynan saqlanadi (hech qachon
+o'zgartirilmaydi).
+
+`restart_services` (Telegram kartasida ko'rsatiladigan, so'rov qaysi xizmatlarni qayta
+ishga tushirishi) — bu allowlist'dan taklif VAQTIDA olingan bir martalik rasm (snapshot):
+agar operator allowlist'ni tasdiqlash bilan qo'llash orasida tahrirlasa, karta hali ham
+eski ro'yxatni ko'rsatadi (qo'llash o'zi doim ENG YANGI allowlist bo'yicha ishlaydi — faqat
+kartadagi matn eskirishi mumkin). Amaliy jihatdan ahamiyatsiz (allowlist tez-tez
+o'zgarmaydi), lekin bilib qo'yish kerak.
 
 ### O'chirish tugmalari (kill switches)
 
@@ -398,11 +420,18 @@ mumkin). Server aylanishida kuzatiladigan keyingi ish sifatida qoldirilgan.
   `restarted`, `env_restored`, `image_tag`, `request_hash` — hech qachon qiymat;
   `agent-svc` buni o'qib API'ga qaytaradi. Qo'lda `rollback` CLI ishga tushirilsa, natijasi
   shu faylni EMAS, `<request_id>.rollback.json`ni yozadi (yuqoriga qarang).
-- **Tezlik chegarasi**: bitta loyiha uchun soatiga eng ko'pi bilan 5 ta muvaffaqiyatli
-  urinish (`/var/lib/agent-ops/ratelimit.json`, root-only, faqat hisoblagich — qiymat
-  saqlanmaydi); undan oshsa `refused`/`rate_limited` bilan rad etiladi. Bu buzilgan/xato
-  agent-svc'ning bitta loyihani qayta-qayta urinishiga qarshi qo'shimcha himoya, egasi
-  tasdiqlagan alohida so'rovlarga odatda hech qachon tegmaydi.
+- **Tezlik chegarasi**: bitta loyiha uchun soatiga eng ko'pi bilan 5 ta URINISH
+  (`/var/lib/agent-ops/ratelimit.json`, root-only, faqat hisoblagich — qiymat saqlanmaydi).
+  Bu konteyner tekshiruvidan (`docker inspect` — hammasi ishlab turishi va bitta xil image
+  SHA'siga ega bo'lishi) O'TGAN har bir urinishni hisoblaydi — FAQAT muvaffaqiyatli
+  qo'llashlarni emas: konteyner tekshiruvidan o'tolmagan urinish (masalan
+  `services_containers_mismatch`) hisoblanmaydi, lekin undan keyingi (env faylni
+  o'zgartirishga yaqinlashgan) har bir urinish — muvaffaqiyatli yoki keyinroq
+  muvaffaqiyatsiz bo'lsa ham — hisoblanadi. Chegaradan oshsa `refused`/`rate_limited`
+  bilan rad etiladi — bu YAKUNIY (terminal) `refused` natija, agent-svc uni avtomatik
+  qayta urinmaydi. Bu buzilgan/xato agent-svc'ning bitta loyihani qayta-qayta urinishiga
+  qarshi qo'shimcha himoya, egasi tasdiqlagan alohida so'rovlarga odatda hech qachon
+  tegmaydi.
 
 **Muhim:** `/run/agent-svc/ops` katalogini `agent-svc.tmpfiles` YARATMAYDI — sababi
 `agent-svc.service`ning o'zi `RuntimeDirectory=agent-svc`dan foydalanadi, ya'ni

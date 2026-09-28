@@ -66,10 +66,19 @@ OPS_APPLY_COMMAND: tuple[str, ...] = (
 # writing `request.json`, so a parallel tick (another agent-svc process, or
 # this one re-leasing after a lease-expiry race) never overwrites the
 # request a currently-running apply unit is reading from.
-OPS_IS_ACTIVE_COMMAND: tuple[str, ...] = (
+#
+# NOT `systemctl is-active --quiet`: that exits non-zero for `activating`,
+# and `agent-ops-apply.service` is `Type=oneshot` -- it is `activating`
+# (never `active`) for the entirety of a run, so an `is-active` returncode
+# check never fires while the unit that matters is actually busy. `show
+# -p ActiveState --value` instead prints the exact state, which this lane
+# then classifies itself (see `_BUSY_ACTIVE_STATES`/`_IDLE_ACTIVE_STATES`).
+OPS_ACTIVE_STATE_COMMAND: tuple[str, ...] = (
     "/usr/bin/systemctl",
-    "is-active",
-    "--quiet",
+    "show",
+    "-p",
+    "ActiveState",
+    "--value",
     "agent-ops-apply.service",
 )
 
@@ -78,6 +87,13 @@ OPS_IS_ACTIVE_COMMAND: tuple[str, ...] = (
 # give up on it from this side.
 APPLY_TIMEOUT_S = 960.0
 _IS_ACTIVE_TIMEOUT_S = 10.0
+# `systemctl show -p ActiveState --value`'s own vocabulary (systemd(1)):
+# busy states must block writing `request.json`; `inactive`/`failed` are the
+# only states that mean it is safe to proceed. Anything else -- empty
+# output, a value from neither set, or a non-zero probe exit -- is treated
+# as "could not tell" and fails closed exactly like a probe exception.
+_BUSY_ACTIVE_STATES = frozenset({"activating", "active", "deactivating", "reloading"})
+_IDLE_ACTIVE_STATES = frozenset({"inactive", "failed"})
 _REQUEST_FILE_MODE = 0o640
 _REQUEST_DIR_MODE = 0o750
 _MAX_RESULT_BYTES = 8 * 1024
@@ -152,7 +168,7 @@ class OpsLane(LoopRunner):
         poll_s: float,
         enabled: bool = False,
         apply_command: Sequence[str] = OPS_APPLY_COMMAND,
-        is_active_command: Sequence[str] = OPS_IS_ACTIVE_COMMAND,
+        is_active_command: Sequence[str] = OPS_ACTIVE_STATE_COMMAND,
         command_runner: Callable[..., Any] | None = None,
         apply_timeout_s: float = APPLY_TIMEOUT_S,
         require_root_owned_result: bool = True,
@@ -357,15 +373,16 @@ class OpsLane(LoopRunner):
         self._settle(work, outcome)
 
     def _apply_unit_already_running(self, work: OpsWork) -> bool:
-        """`systemctl is-active --quiet` on the apply unit, BEFORE ever
-        writing `request.json`: a parallel `systemctl start` while the unit
-        is already active/activating merges into that same running job
-        instead of starting a fresh one, which would then apply whatever
-        `request.json` happens to be on disk when it actually reads it --
-        possibly a DIFFERENT request than the one that triggered it. Returns
-        True (and has already reported retry/busy) when the unit is running
-        or the check itself could not be completed -- callers must not
-        proceed to write/apply in either case."""
+        """`systemctl show -p ActiveState --value` on the apply unit, BEFORE
+        ever writing `request.json`: a parallel `systemctl start` while the
+        unit is busy (`activating`, `active`, `deactivating`, or
+        `reloading`) merges into that same running job instead of starting
+        a fresh one, which would then apply whatever `request.json` happens
+        to be on disk when it actually reads it -- possibly a DIFFERENT
+        request than the one that triggered it. Returns True (and has
+        already reported retry/busy or retry/no_result) when the unit is
+        busy or the check itself could not be completed/trusted -- callers
+        must not proceed to write/apply in either case."""
         try:
             probe = self._run(
                 list(self._is_active_command),
@@ -380,7 +397,21 @@ class OpsLane(LoopRunner):
                 work, "no_result", "could not check whether the apply unit is already running"
             )
             return True
-        if probe.returncode == 0:
+        state = (probe.stdout or "").strip()
+        if probe.returncode != 0 or state not in (_BUSY_ACTIVE_STATES | _IDLE_ACTIVE_STATES):
+            # An untrustworthy probe (non-zero exit, or output that matches
+            # neither vocabulary) fails exactly the same way an exception
+            # above does -- never proceed on a probe we cannot make sense of.
+            self._logger.error(
+                RuntimeError(f"unrecognized ActiveState probe result: {state!r}"),
+                event="ops_is_active_check_failed",
+                run_id=work.run_id,
+            )
+            self._report_retry(
+                work, "no_result", "could not check whether the apply unit is already running"
+            )
+            return True
+        if state in _BUSY_ACTIVE_STATES:
             self._report_retry(work, "busy", "apply unit is already running")
             return True
         return False

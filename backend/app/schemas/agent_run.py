@@ -265,6 +265,8 @@ class AgentActionAvailability(BaseModel):
 
 class AgentRunDetailOut(BaseModel):
     run_id: str
+    task_id: int
+    title: str | None
     repo_full_name: str
     status: str
     summary: str
@@ -280,6 +282,7 @@ class AgentRunDetailOut(BaseModel):
     review: AgentReviewOut
     actions: dict[str, AgentActionAvailability]
     ops_requests: list[AgentOpsRequestOut] = Field(default_factory=list)
+    ops_note: str | None = None
 
 
 class AgentActionOut(BaseModel):
@@ -382,6 +385,7 @@ class AgentNotificationOut(BaseModel):
     ops_requests: list[AgentOpsRequestOut] = Field(default_factory=list)
     ops_controls_available: bool = False
     ops_pending_count: int = 0
+    ops_note: str | None = None
 
 
 class AgentNoticeAck(BaseModel):

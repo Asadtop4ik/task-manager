@@ -445,6 +445,33 @@ def resolve_agent_svc_uid() -> int:
     return pwd.getpwnam("agent-svc").pw_uid
 
 
+def _resolve_deploy_uid() -> int | None:
+    """The `deploy` service user's uid, or `None` if that user does not
+    exist on this host. Looked up by name (never a hardcoded uid, e.g.
+    1000 -- whatever a given host's `useradd`/image build actually
+    assigned) each time `Deps`'s default is built; a missing `deploy` user
+    is not an error here (unlike `resolve_agent_svc_uid`, whose identity is
+    this very process's own) -- it just means `env_owner_uids` falls back
+    to root-only."""
+    override = _test_override("DEPLOY_UID")
+    if override is not None:
+        return int(override) if override else None
+    try:
+        return pwd.getpwnam("deploy").pw_uid
+    except KeyError:
+        return None
+
+
+def _default_env_owner_uids() -> frozenset[int]:
+    """Production env files are owned by root (uid 0, the historical
+    default) or by the `deploy` service user, mode 600 (spec: docs/
+    AGENT_SVC.md's rollout notes) -- accept both. If `deploy` does not
+    exist on this host, accept only uid 0: a lookup failure must never
+    silently widen the accepted owner set."""
+    deploy_uid = _resolve_deploy_uid()
+    return frozenset({0}) if deploy_uid is None else frozenset({0, deploy_uid})
+
+
 def _check_ops_dir(path: Path) -> None:
     try:
         st = os.lstat(path.parent)
@@ -1304,7 +1331,7 @@ class Deps:
     logger_runner: LoggerRunner = default_logger_runner
     now: Clock = time.time
     agent_svc_uid: int | None = None
-    env_owner_uids: frozenset[int] = frozenset({0})
+    env_owner_uids: frozenset[int] = field(default_factory=_default_env_owner_uids)
     rate_limit_max_per_hour: int = RATE_LIMIT_MAX_PER_HOUR
 
 

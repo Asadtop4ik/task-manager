@@ -680,6 +680,42 @@ class OpsRequestsFlowTests(unittest.TestCase):
             self.assertEqual(payload["ops_requests"][0]["policy"], "denied")
             self.assertEqual(payload["ops_requests"][0]["policy_reason"], "not_allowlisted")
 
+    def test_ops_lane_disabled_means_no_prompt_rules_denied_ops_disabled_no_ops_pending(
+        self,
+    ) -> None:
+        # P3-5: `settings.ops_lane_enabled=False` must behave like there is
+        # no allowlist at all -- even when an allowlist entry exists and
+        # would otherwise allow the request (`_install_qurbot_allowlist`
+        # below) -- with its own `policy_reason` so this is distinguishable
+        # from a missing/invalid allowlist file, and it must never leave a
+        # run in `ops_pending` (nothing will ever lease/apply it).
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote, branch="master")
+            ctx = build_test_context(
+                root, github_remote=remote, config_overrides={"ops_lane_enabled": False}
+            )
+            work = _qurbot_work()
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(final_message="No code change needed.\n" + _OPS_MARKER)
+            )
+            ctx.codex.queue_package_result({"patch_b64": "", "changed_paths": []})  # type: ignore[attr-defined]
+
+            with _install_qurbot_allowlist(ctx):
+                handle_implement(ctx, work, threading.Event())
+
+            prompt = ctx.codex.run_exec_calls[0]["prompt"]  # type: ignore[attr-defined]
+            self.assertNotIn("Ops requests:", prompt)
+            self.assertNotIn("AGENT_OPS_REQUESTS", prompt)
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertNotEqual(payload["status"], "ops_pending")
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(len(payload["ops_requests"]), 1)
+            self.assertEqual(payload["ops_requests"][0]["policy"], "denied")
+            self.assertEqual(payload["ops_requests"][0]["policy_reason"], "ops_disabled")
+
     def test_missing_allowlist_means_no_prompt_rules_and_denied_no_allowlist(self) -> None:
         # No `_install_qurbot_allowlist` patch here: the real `load_allowlist`
         # runs against `settings.ops_allowlist_path`, which does not exist in

@@ -13,8 +13,8 @@ from agent_svc.api import InvalidOpsWork, OpsWork
 from agent_svc.log import Logger, Redactor
 from agent_svc.ops import (
     APPLY_TIMEOUT_S,
+    OPS_ACTIVE_STATE_COMMAND,
     OPS_APPLY_COMMAND,
-    OPS_IS_ACTIVE_COMMAND,
     OpsLane,
 )
 from agent_svc.trusted import TrustedModules
@@ -127,25 +127,25 @@ class _StubPolicyModule:
 
 
 def _is_active_call(argv: list[str]) -> bool:
-    return argv[:2] == ["/usr/bin/systemctl", "is-active"]
+    return argv[:2] == ["/usr/bin/systemctl", "show"]
 
 
 class _RecordingRunner:
-    """Routes by argv: an `is-active` probe always answers "inactive"
-    (returncode 3, systemd's usual code -- tests that don't care about the
-    pre-check are unaffected by its presence) unless `is_active_returncode`
-    says otherwise; anything else is the apply command itself."""
+    """Routes by argv: an `ActiveState` probe always answers "inactive"
+    (idle -- tests that don't care about the pre-check are unaffected by its
+    presence) unless `active_state` says otherwise; anything else is the
+    apply command itself."""
 
     def __init__(
         self,
         *,
         raise_timeout: bool = False,
-        is_active_returncode: int = 3,
+        active_state: str = "inactive",
         raise_is_active: BaseException | None = None,
     ) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
         self._raise_timeout = raise_timeout
-        self._is_active_returncode = is_active_returncode
+        self._active_state = active_state
         self._raise_is_active = raise_is_active
 
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -153,9 +153,7 @@ class _RecordingRunner:
         if _is_active_call(argv):
             if self._raise_is_active is not None:
                 raise self._raise_is_active
-            return subprocess.CompletedProcess(
-                argv, self._is_active_returncode, stdout="", stderr=""
-            )
+            return subprocess.CompletedProcess(argv, 0, stdout=self._active_state, stderr="")
         if self._raise_timeout:
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
@@ -177,9 +175,9 @@ class _ApplyingRunner(_RecordingRunner):
         request_id: str,
         result: dict[str, Any],
         result_request_id: str | None = None,
-        is_active_returncode: int = 3,
+        active_state: str = "inactive",
     ) -> None:
-        super().__init__(is_active_returncode=is_active_returncode)
+        super().__init__(active_state=active_state)
         self._results_dir = results_dir
         self._request_id = request_id
         self._result = result
@@ -356,15 +354,59 @@ class IsActivePrecheckTests(OpsLaneTestCase):
     ) -> None:
         work = _work()
         api = _FakeOpsApi(leases=[work])
-        runner = _RecordingRunner(is_active_returncode=0)  # 0 == active
+        runner = _RecordingRunner(active_state="active")
         lane = self._lane(api=api, runner=runner)
         lane.tick()
 
         self.assertEqual(len(runner.calls), 1)  # only the is-active probe
-        self.assertEqual(runner.calls[0][0], list(OPS_IS_ACTIVE_COMMAND))
+        self.assertEqual(runner.calls[0][0], list(OPS_ACTIVE_STATE_COMMAND))
         self.assertFalse((self.request_dir / "request.json").exists())
         self.assertEqual(api.results[0]["status"], "retry")
         self.assertEqual(api.results[0]["code"], "busy")
+
+    def test_activating_oneshot_unit_reports_retry_busy(self) -> None:
+        # The regression this whole probe change guards against: a
+        # `Type=oneshot` unit is `activating`, never `active`, for its
+        # entire run -- `systemctl is-active --quiet` alone never catches
+        # this state, silently letting a concurrent tick clobber
+        # request.json mid-apply.
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _RecordingRunner(active_state="activating")
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertFalse((self.request_dir / "request.json").exists())
+        self.assertEqual(api.results[0]["status"], "retry")
+        self.assertEqual(api.results[0]["code"], "busy")
+
+    def test_deactivating_and_reloading_states_also_report_busy(self) -> None:
+        for state in ("deactivating", "reloading"):
+            with self.subTest(state=state):
+                work = _work()
+                api = _FakeOpsApi(leases=[work])
+                runner = _RecordingRunner(active_state=state)
+                lane = self._lane(api=api, runner=runner)
+                lane.tick()
+
+                self.assertFalse((self.request_dir / "request.json").exists())
+                self.assertEqual(api.results[0]["status"], "retry")
+                self.assertEqual(api.results[0]["code"], "busy")
+
+    def test_failed_state_is_treated_as_idle_and_proceeds(self) -> None:
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _ApplyingRunner(
+            results_dir=self.results_dir,
+            request_id=REQUEST_UUID,
+            result={"code": "applied"},
+            active_state="failed",
+        )
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertEqual(len(runner.calls), 2)  # is-active, then apply
+        self.assertEqual(api.results[0]["status"], "applied")
 
     def test_precheck_failure_reports_retry_no_result_without_writing_request_file(
         self,
@@ -379,6 +421,20 @@ class IsActivePrecheckTests(OpsLaneTestCase):
         self.assertEqual(api.results[0]["status"], "retry")
         self.assertEqual(api.results[0]["code"], "no_result")
 
+    def test_unrecognized_probe_output_reports_retry_no_result(self) -> None:
+        # Neither a busy nor an idle state -- e.g. a `systemctl` version
+        # skew or a unit file this lane has never seen -- must fail closed,
+        # never be read as "safe to proceed".
+        work = _work()
+        api = _FakeOpsApi(leases=[work])
+        runner = _RecordingRunner(active_state="")
+        lane = self._lane(api=api, runner=runner)
+        lane.tick()
+
+        self.assertFalse((self.request_dir / "request.json").exists())
+        self.assertEqual(api.results[0]["status"], "retry")
+        self.assertEqual(api.results[0]["code"], "no_result")
+
     def test_inactive_unit_proceeds_to_apply(self) -> None:
         work = _work()
         api = _FakeOpsApi(leases=[work])
@@ -386,7 +442,7 @@ class IsActivePrecheckTests(OpsLaneTestCase):
             results_dir=self.results_dir,
             request_id=REQUEST_UUID,
             result={"code": "applied"},
-            is_active_returncode=3,
+            active_state="inactive",
         )
         lane = self._lane(api=api, runner=runner)
         lane.tick()
@@ -840,8 +896,15 @@ class ConstantsTests(unittest.TestCase):
 
     def test_is_active_command_needs_no_sudo(self) -> None:
         self.assertEqual(
-            OPS_IS_ACTIVE_COMMAND,
-            ("/usr/bin/systemctl", "is-active", "--quiet", "agent-ops-apply.service"),
+            OPS_ACTIVE_STATE_COMMAND,
+            (
+                "/usr/bin/systemctl",
+                "show",
+                "-p",
+                "ActiveState",
+                "--value",
+                "agent-ops-apply.service",
+            ),
         )
 
 

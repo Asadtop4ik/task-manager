@@ -106,8 +106,15 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
     # decide whether the prompt gets ops-request instructions, and later to
     # validate whatever trailer Codex actually emitted. `None` means "missing
     # or invalid file" -- treated as "no allowlist" throughout, never a crash.
+    # `settings.ops_lane_enabled=False` skips the load entirely and is
+    # treated the same way (no prompt rules, nothing ever "allowed") -- see
+    # `validate_ops_requests`'s own `enabled` parameter, which is what turns
+    # a denied proposal's reason into "ops_disabled" rather than
+    # "no_allowlist" for this case.
     ops_project_key = _ops_project_key(ctx, work)
-    allowlist = _load_ops_allowlist(ctx, work.run_id)
+    allowlist = (
+        _load_ops_allowlist(ctx, work.run_id) if ctx.settings.ops_lane_enabled else None
+    )
     ops_project = (
         allowlist.projects.get(ops_project_key)
         if allowlist is not None and ops_project_key is not None
@@ -165,6 +172,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             repo_full_name=work.repo_full_name,
             allowlist=allowlist,
             policy_module=policy_module,
+            enabled=ctx.settings.ops_lane_enabled,
         )
         ops_note = build_ops_note(
             trailer_note=trailer_note, drop_note=drop_note, policy_module=policy_module

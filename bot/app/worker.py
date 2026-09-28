@@ -13,7 +13,13 @@ from arq.connections import RedisSettings
 from app.cards import build_card
 from app.config import settings
 from app.handlers.agent_intake import notification_message
-from app.handlers.agent_ops import combine_keyboards, ops_count_line, ops_keyboard, ops_lines
+from app.handlers.agent_ops import (
+    combine_keyboards,
+    compose_owner_text,
+    ops_count_line,
+    ops_keyboard,
+    ops_lines,
+)
 from app.handlers.agent_release import release_card, release_keyboard
 from app.handlers.project_discussion import discussion_keyboard
 from app.loader import create_bot
@@ -36,13 +42,19 @@ def _html_text(value: object, limit: int) -> str:
 
 
 def agent_result_card(notice: dict[str, object]) -> str:
-    """A concise, factual status card. PR-ready requires exact-head CI success."""
-    task_id = notice["task_id"]
+    """A concise, factual status card. PR-ready requires exact-head CI success.
+
+    `notice` is either the notification-worker's `AgentNotificationOut` shape
+    (always has `task_id`/`title`) or, for an ops-only run, the backend's
+    `AgentRunDetailOut` (via `agent_ops._owner_card`) — fall back rather than
+    KeyError if either ever omits a field.
+    """
+    task_id = notice.get("task_id")
     project = str(notice.get("repo_full_name") or "").split("/")[-1]
-    title = notice.get("title") or "Vazifa"
-    status = notice["status"]
+    title = notice.get("title") or notice.get("summary") or "Vazifa"
+    status = notice.get("status")
     lines = [
-        f"🤖 #{task_id} · {_html_text(project, 120)}",
+        f"🤖 #{task_id if task_id is not None else '?'} · {_html_text(project, 120)}",
         f"Vazifa: {_html_text(title, 500)}",
     ]
     if status == "pr_ready":
@@ -210,9 +222,10 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                     # Full key/op/value detail is owner-only: never on the
                     # legacy task-origin card built above (that one only ever
                     # gets a count, appended there directly, not here).
-                    ops_block = ops_lines(notice)
-                    if ops_block:
-                        owner_text = "\n".join([owner_text, *ops_block])
+                    # `compose_owner_text` truncates only the release/status
+                    # portion, never the ops block, to stay under Telegram's
+                    # message-length cap.
+                    owner_text = compose_owner_text(owner_text, ops_lines(notice))
                     owner_markup = None
                     if len(owner_head_sha) == 40:
                         actions = notice.get("actions") or {}

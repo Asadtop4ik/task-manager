@@ -225,9 +225,10 @@ async def get_ops_request_run(
     so the bot refreshes the card and builds `decide_ops_request`'s
     `action_id` through this endpoint.
 
-    Read-only: never `FOR UPDATE` here. `_load_run_detail` can call out to
-    GitHub for an open PR's live head, and a lock must never be held across
-    that."""
+    Read-only: never `FOR UPDATE` here, and `refresh_pr_head=False` so
+    `_load_run_detail` never calls out to GitHub or writes to the run —
+    a concurrent CI/correction callback may be locking and updating the same
+    row, and this endpoint must not race or clobber it."""
     run = await session.scalar(
         select(AgentRun)
         .join(AgentOpsRequest, AgentOpsRequest.agent_run_id == AgentRun.id)
@@ -236,7 +237,7 @@ async def get_ops_request_run(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="ops request not found")
-    return await _load_run_detail(session, run)
+    return await _load_run_detail(session, run, refresh_pr_head=False)
 
 
 @router.post("/{ops_id}/decision", response_model=AgentOpsDecisionOut)

@@ -1781,6 +1781,40 @@ class EnvFileNlinkAndOwnerTests(EnvApplyTestCase):
         self.assertEqual(result["message"], "env_wrong_owner")
 
 
+class DefaultEnvOwnerUidsTests(unittest.TestCase):
+    """P3-6: production env files are owned by root (0) or the `deploy`
+    service user, not only root -- `Deps.env_owner_uids`'s default must
+    accept both, resolving `deploy`'s uid by name at runtime rather than a
+    hardcoded 1000, and must never widen past `{0}` when `deploy` does not
+    exist on this host. `AGENT_OPS_APPLY_TEST_DEPLOY_UID` (set module-wide
+    to test mode by this file) is the injection point, exactly like
+    `AGENT_SVC_UID`/`AGENT_SVC_GID` elsewhere in this helper."""
+
+    def _with_deploy_uid_override(self, value: str):
+        from unittest.mock import patch
+
+        return patch.dict(os.environ, {"AGENT_OPS_APPLY_TEST_DEPLOY_UID": value})
+
+    def test_default_accepts_root_and_the_resolved_deploy_uid(self) -> None:
+        with self._with_deploy_uid_override("1234"):
+            self.assertEqual(ea._resolve_deploy_uid(), 1234)
+            self.assertEqual(ea._default_env_owner_uids(), frozenset({0, 1234}))
+            self.assertEqual(ea.Deps().env_owner_uids, frozenset({0, 1234}))
+
+    def test_missing_deploy_user_falls_back_to_root_only(self) -> None:
+        with self._with_deploy_uid_override(""):
+            self.assertIsNone(ea._resolve_deploy_uid())
+            self.assertEqual(ea._default_env_owner_uids(), frozenset({0}))
+            self.assertEqual(ea.Deps().env_owner_uids, frozenset({0}))
+
+    def test_explicit_deps_override_wins_over_the_default_factory(self) -> None:
+        # The injection point every other test in this file already uses
+        # (`self.deps(env_owner_uids=...)`) -- confirms the default factory
+        # never runs/overrides an explicit value.
+        custom = frozenset({42})
+        self.assertEqual(ea.Deps(env_owner_uids=custom).env_owner_uids, custom)
+
+
 class RateLimitTests(EnvApplyTestCase):
     """Per-project rolling-hour apply budget (state in
     `/var/lib/agent-ops/ratelimit.json`, root-only)."""

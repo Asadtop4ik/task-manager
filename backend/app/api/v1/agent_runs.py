@@ -152,6 +152,8 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
     )
     return AgentRunDetailOut(
         run_id=run.run_id,
+        task_id=run.task_id,
+        title=run.task.title,
         repo_full_name=run.repo_full_name,
         status=run.status,
         summary=run.task.title,
@@ -175,6 +177,7 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
                 available=open_pr and run.status in {"pr_opened", "pr_ready"}
             ),
         },
+        ops_note=run.ops_note,
     )
 
 
@@ -1483,6 +1486,7 @@ async def pending_notifications(
                     and any(row.status == "proposed" for row in ops_rows)
                 ),
                 ops_pending_count=sum(1 for row in ops_rows if row.status == "proposed"),
+                ops_note=run.ops_note,
             )
         )
     return notifications
@@ -1958,11 +1962,20 @@ async def list_task_runs(
     return [AgentRunOut.model_validate(row) for row in runs]
 
 
-async def _load_run_detail(session: DbSession, run: AgentRun) -> AgentRunDetailOut:
+async def _load_run_detail(
+    session: DbSession, run: AgentRun, *, refresh_pr_head: bool = True
+) -> AgentRunDetailOut:
     """The full `GET /agent-runs/{run_id}` body for an already-loaded,
     already-locked run: refresh PR-live state if one is open, then the
-    detail plus its owner-only `ops_requests`. Shared with
-    `GET /agent-ops/{ops_id}`, which resolves to the same run a different way."""
+    detail plus its owner-only `ops_requests`.
+
+    `refresh_pr_head=False` skips the GitHub PR-head lookup (and the write it
+    can trigger via `_invalidate_review_and_ci`) entirely, for callers that
+    must stay strictly read-only — see `GET /agent-ops/{ops_id}`, which
+    resolves to the same run a different way and must never clobber a
+    concurrent CI/correction callback's write to the same row."""
+    if not refresh_pr_head:
+        return await _run_detail_with_ops(session, run)
     is_open = False
     if run.pr_url and run.status in {"pr_opened", "pr_ready", "correction_running"}:
         current_head, is_open = await _current_pr_head(run)

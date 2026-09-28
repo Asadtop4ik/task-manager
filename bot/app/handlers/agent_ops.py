@@ -66,6 +66,60 @@ _DECISION_ALERTS = {
 
 STALE_CARD_ALERT = "Karta yangilandi"
 
+# The closed set of machine codes agent-svc can send as the run-level
+# `ops_note` (agentsvc/agent_svc/ops_requests.py `build_ops_note`,
+# agentsvc/agent_svc/implement.py) or as a denied row's `policy_reason`
+# (agentsvc's own `no_allowlist`/`ops_disabled`; see agentsvc/agent_svc/
+# ops_requests.py and implement.py) — mapped to a short Uzbek line so the
+# owner never sees raw agent-svc/policy text. A code outside this set is
+# hidden entirely rather than shown raw.
+_OPS_REASON_LABELS = {
+    "ambiguous": "Codex bir nechta ops so‘rovi qatorini yubordi — birortasi ham qabul qilinmadi.",
+    "invalid_trailer": "Codexning ops so‘rovi formatida xato bor edi.",
+    "ops_unavailable": "Ops tekshiruvi ishlamadi — hech narsa taklif qilinmadi.",
+    "no_allowlist": "Bu loyiha uchun ruxsat ro‘yxati topilmadi.",
+    "ops_disabled": "Ops funksiyasi hozircha o‘chirilgan.",
+}
+_OPS_DROPPED_RE = re.compile(r"dropped_(\d+)\Z")
+
+# A safety margin under Telegram's 4096-character message cap (see
+# bot/app/cards.py's own `MAX_CARD_CHARS`) — the release/status portion is
+# truncated to keep the whole owner message under this; the ops block itself
+# is never truncated (approve/reject evidence must stay intact).
+_OWNER_TEXT_LIMIT = 4000
+
+
+def _ops_reason_label(code: Any) -> str | None:
+    text = str(code or "")
+    if text in _OPS_REASON_LABELS:
+        return _OPS_REASON_LABELS[text]
+    match = _OPS_DROPPED_RE.fullmatch(text)
+    if match:
+        return (
+            f"Codex {match.group(1)} ta ops so‘rovini noto‘g‘ri formatda yubordi — "
+            "ular e’tiborga olinmadi."
+        )
+    return None
+
+
+def ops_note_line(notice: dict[str, Any]) -> str | None:
+    """The run-level `ops_note` as one short Uzbek line — never the raw code,
+    and omitted entirely for an unknown/future one (see `_ops_reason_label`)."""
+    label = _ops_reason_label(notice.get("ops_note"))
+    return f"Ops eslatmasi: {label}" if label else None
+
+
+def compose_owner_text(base: str, block: list[str]) -> str:
+    """`base` (the release/status card) plus the ops block, truncating `base`
+    — never `block` — so the total stays at or under `_OWNER_TEXT_LIMIT`."""
+    if not block:
+        return base
+    tail = "\n".join(block)
+    budget = max(_OWNER_TEXT_LIMIT - len(tail) - 1, 0)
+    if len(base) > budget:
+        base = base[: max(budget - 1, 0)].rstrip() + "…"
+    return "\n".join([base, tail])
+
 
 def _short(value: Any, limit: int) -> str:
     text = " ".join(str(value or "").split())
@@ -102,9 +156,9 @@ def _status_line(row: dict[str, Any]) -> str:
         return _RESULT_CODE_LABELS.get(code, f"⚠️ xato: {_html_text(code or 'noma’lum', 40)}")
     if status == "invalid":
         label = "⛔ siyosat rad etdi"
-        policy_reason = row.get("policy_reason")
-        if policy_reason:
-            label += f" — {_html_text(policy_reason, 200)}"
+        reason_label = _ops_reason_label(row.get("policy_reason"))
+        if reason_label:
+            label += f" — {reason_label}"
         return label
     return _STATUS_LABELS.get(status, _html_text(status or "noma’lum", 40))
 
@@ -127,7 +181,10 @@ def _row_lines(row: dict[str, Any]) -> list[str]:
     key = _safe_key(row)
     op_raw = str(row.get("op") or "")
     op_label = _OP_LABELS.get(op_raw, _html_text(op_raw or "amal", 24))
-    value = _html_text(row.get("value"), 80)
+    # The full value, escaped — never truncated: `AgentOpsProposal.value` is
+    # already capped at 256 chars server-side (`OPS_VALUE_RE`), so this is
+    # just a defensive ceiling, not a display truncation.
+    value = _html_text(row.get("value"), 256)
     services = row.get("restart_services")
     service_names = (
         ", ".join(_html_text(name, 40) for name in services if isinstance(name, str))
@@ -146,15 +203,21 @@ def _row_lines(row: dict[str, Any]) -> list[str]:
 
 
 def ops_lines(notice: dict[str, Any]) -> list[str]:
-    """The full owner-facing ops block: a header plus one entry per request.
+    """The full owner-facing ops block: the run-level `ops_note` (if any),
+    then a header plus one entry per request.
 
-    Empty when there are no ops requests (older API responses, or a run that
-    never proposed any), so callers can append the result unconditionally.
+    Empty when there is nothing to show (older API responses, or a run that
+    never proposed any and has no note), so callers can append the result
+    unconditionally.
     """
     rows = notice.get("ops_requests")
+    note = ops_note_line(notice)
     if not isinstance(rows, list) or not rows:
-        return []
-    lines = ["", f"<b>Ops so‘rovlari ({len(rows)}):</b>"]
+        return ["", note] if note else []
+    lines = [""]
+    if note:
+        lines.append(note)
+    lines.append(f"<b>Ops so‘rovlari ({len(rows)}):</b>")
     for row in rows:
         if isinstance(row, dict):
             lines.extend(_row_lines(row))
@@ -246,8 +309,12 @@ def _find_row(run: dict[str, Any], ops_id: int) -> dict[str, Any] | None:
 
 
 def _decision_alert(error: ApiError) -> str:
-    if error.code in _DECISION_ALERTS:
-        return _DECISION_ALERTS[error.code]
+    # The backend sends a plain `detail` string ("conflict", "not_pending", …),
+    # not the `{"error": {"code": ...}}` shape `TaskApi` parses a `code` from —
+    # so `error.code` is None here and the real signal is in `error.detail`.
+    key = error.code or error.detail
+    if key in _DECISION_ALERTS:
+        return _DECISION_ALERTS[key]
     if error.status == 409:
         return "Bu amal endi mumkin emas (run yopilgan)."
     return _short(error.detail, 180)
@@ -288,7 +355,7 @@ def _owner_card(
         base = agent_result_card(run)
         markup = ops_markup
 
-    text = "\n".join([base, *block]) if block else base
+    text = compose_owner_text(base, block)
     return text, markup
 
 

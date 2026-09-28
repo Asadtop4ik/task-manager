@@ -425,6 +425,18 @@ class ValidatePolicyOutcomeTests(OpsRequestsTestCase):
         self.assertEqual(proposals[0]["policy_reason"], "no_allowlist")
         self.assertEqual(proposals[0]["restart_services"], [])
 
+    def test_disabled_lane_denies_every_request_as_ops_disabled_even_with_an_allowlist(
+        self,
+    ) -> None:
+        # P3-5: `enabled=False` must win over a real, otherwise-allowing
+        # allowlist -- never fall back to `validate_request`/"no_allowlist".
+        raw = json.dumps([_one()])
+        proposals, _note = self._validate(raw, allowlist=self.allowlist, enabled=False)
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["policy"], "denied")
+        self.assertEqual(proposals[0]["policy_reason"], "ops_disabled")
+        self.assertEqual(proposals[0]["restart_services"], [])
+
     def test_reason_is_sanitized_and_capped(self) -> None:
         raw = json.dumps([_one(reason="line1\nline2\x00" + "y" * 400)])
         proposals, _note = self._validate(raw)

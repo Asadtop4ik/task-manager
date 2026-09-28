@@ -185,6 +185,7 @@ def _validate_one(
     repo_full_name: str,
     allowlist: Any | None,
     policy_module: Any,
+    enabled: bool,
 ) -> dict[str, Any] | None:
     # `kind`/`op` MUST be one of the exact values the backend's
     # `AgentOpsProposal` schema accepts (Literal fields) before a row is
@@ -209,7 +210,14 @@ def _validate_one(
     if not policy_module.VALUE_RE.fullmatch(value) or "://" in value:
         return None
 
-    if allowlist is None:
+    if not enabled:
+        # The ops lane itself is off (`settings.ops_lane_enabled=False`):
+        # treated exactly like "no allowlist" for policy purposes, but with
+        # its own code so the owner card (and any operator reading the
+        # logs) can tell "feature is off" apart from "allowlist file is
+        # missing/invalid" -- see agentsvc-notes and P3-5.
+        allowed, reason_code = False, "ops_disabled"
+    elif allowlist is None:
         allowed, reason_code = False, "no_allowlist"
     else:
         allowed, reason_code = policy_module.validate_request(
@@ -243,6 +251,7 @@ def validate(
     repo_full_name: str,
     allowlist: Any | None,
     policy_module: Any,
+    enabled: bool = True,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Turn one trusted trailer JSON blob into `AgentRunCallback.ops_requests`
     proposal dicts.
@@ -250,9 +259,13 @@ def validate(
     `allowlist` is the already-loaded `agent_ops_policy.Allowlist`, or `None`
     when the allowlist file itself was missing/invalid for this run (every
     proposal is then denied with `policy_reason="no_allowlist"`, never
-    crashing). `policy_module` is the trusted `agent_ops_policy` module
-    (`ctx.trusted.agent_ops_policy`), passed in rather than imported so this
-    file never has its own import on `scripts/agent_ops_policy.py`.
+    crashing). `enabled=False` (`settings.ops_lane_enabled` is off) is
+    treated the same way regardless of `allowlist` -- no proposal is ever
+    `allowed` -- but with its own `policy_reason="ops_disabled"`, so a
+    denied row's reason distinguishes "feature is off" from "allowlist is
+    missing/invalid". `policy_module` is the trusted `agent_ops_policy`
+    module (`ctx.trusted.agent_ops_policy`), passed in rather than imported
+    so this file never has its own import on `scripts/agent_ops_policy.py`.
 
     Returns `(proposals, drop_note)`. `drop_note` is `"invalid_trailer"` when
     `raw` itself failed the whole-batch structural check (so `proposals` is
@@ -276,6 +289,7 @@ def validate(
             repo_full_name=repo_full_name,
             allowlist=allowlist,
             policy_module=policy_module,
+            enabled=enabled,
         )
         if proposal is not None:
             proposals.append(proposal)

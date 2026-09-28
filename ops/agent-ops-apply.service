@@ -3,11 +3,16 @@ Description=Task Manager agent-ops root env-apply helper (agent-ops-apply)
 # Started ONLY on demand: agent-svc's `sudo -n systemctl start
 # agent-ops-apply.service` (ops/agent-svc.sudoers, the single fixed-argv
 # rule -- no request data ever reaches this process through sudo/systemctl
-# itself), or by an operator running the same command by hand for the
-# `rollback` CLI. Deliberately no [Install] section: this unit is never
-# `enable`d and never starts on boot. One-time install steps, users, paths
-# and rollback: docs/AGENT_SVC.md. Installed by ops/install_agent_svc.sh;
-# do not hand-edit on the server.
+# itself). Deliberately no [Install] section: this unit is never `enable`d
+# and never starts on boot. Rollback is NOT "start this unit by hand" -- it
+# is a direct, separate command: `sudo /usr/bin/python3 -I
+# /opt/agent-svc/libexec/env_apply.py rollback --request-id <uuid>` (see
+# docs/AGENT_SVC.md). Starting THIS unit by hand (e.g. to debug) still
+# requires agent-svc.service to be running: ReadOnlyPaths=/run/agent-svc
+# below needs that directory to exist, and only agent-svc.service's own
+# RuntimeDirectory= creates/removes it. One-time install steps, users,
+# paths and rollback: docs/AGENT_SVC.md. Installed by
+# ops/install_agent_svc.sh; do not hand-edit on the server.
 
 StartLimitIntervalSec=0
 
