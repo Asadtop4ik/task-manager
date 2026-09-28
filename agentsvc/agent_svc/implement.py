@@ -129,6 +129,9 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
             load_policy_error_text=lambda: None,
             load_fast_error_text=lambda: None,
         )
+        if result.error_message and not result.final_message:
+            # e.g. a usage limit or model error reported by Codex itself.
+            reason = f"{reason} (Codex: {result.error_message[:300]})"
         _fail(ctx, work, run, "implement", reason, usage=result.usage)
         return
 

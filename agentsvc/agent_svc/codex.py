@@ -82,6 +82,17 @@ class CodexResult:
     usage: dict[str, int] | None
     stderr_tail: list[str]
     frame: dict[str, Any] | None
+    # Codex reports API/model failures as `error` / `turn.failed` JSONL events
+    # on stdout (not stderr); the last such message, truncated, for logs.
+    error_message: str = ""
+
+
+def _event_error_message(event: dict[str, Any]) -> str:
+    message = event.get("message")
+    error = event.get("error")
+    if not isinstance(message, str) and isinstance(error, dict):
+        message = error.get("message")
+    return message[:500] if isinstance(message, str) else ""
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -461,6 +472,7 @@ class CodexRunner:
 
         deadline = time.monotonic() + hard_wall_s
         frame: dict[str, Any] | None = None
+        error_message = ""
         terminate_reason: str | None = None
         grace_deadline: float | None = None
 
@@ -494,6 +506,8 @@ class CodexRunner:
                     continue
                 if not isinstance(event, dict):
                     continue
+                if event.get("type") in ("error", "turn.failed"):
+                    error_message = _event_error_message(event) or error_message
                 if event.get("type") == "agent_svc.result":
                     # Keep reading to EOF and remember the LAST valid frame,
                     # rather than trusting (and stopping at) the first one:
@@ -541,6 +555,7 @@ class CodexRunner:
                 usage=_frame_usage(frame),
                 stderr_tail=list(stderr_tail),
                 frame=frame,
+                error_message=error_message,
             )
         return CodexResult(
             exit_code=exit_code,
@@ -551,6 +566,7 @@ class CodexRunner:
             usage=None,
             stderr_tail=list(stderr_tail),
             frame=None,
+            error_message=error_message,
         )
 
     @staticmethod

@@ -49,21 +49,26 @@ GENERIC_FAILURE_SUMMARY = (
 # The JSON shape `_parse_result` (in the trusted script) requires, passed to
 # Codex as `--output-schema` so its final message already matches it.
 REVIEW_OUTPUT_SCHEMA: dict[str, Any] = {
+    # Strict structured output (`codex exec --output-schema`): every object
+    # needs `additionalProperties: false` and every property listed in
+    # `required`; optional values are expressed as nullable instead.
     "type": "object",
+    "additionalProperties": False,
     "properties": {
         "summary": {"type": "string"},
         "findings": {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "severity": {"type": "string", "enum": ["P1", "P2", "P3"]},
                     "title": {"type": "string"},
                     "evidence": {"type": "string"},
-                    "file": {"type": "string"},
-                    "line": {"type": "integer"},
+                    "file": {"type": ["string", "null"]},
+                    "line": {"type": ["integer", "null"]},
                 },
-                "required": ["severity", "title", "evidence"],
+                "required": ["severity", "title", "evidence", "file", "line"],
             },
         },
     },
@@ -195,6 +200,7 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
                 exit_code=result.exit_code,
                 timed_out=result.timed_out,
                 idle_killed=result.idle_killed,
+                error=result.error_message,
             )
             _post_error_review(api, github, work, logger)
             return
