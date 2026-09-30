@@ -1652,11 +1652,24 @@ async def test_lease_never_hands_out_two_in_progress_corrections_of_one_run(
     second_id = second.action_id
     first = await _action_row(session, first_id)
     first.created_at = datetime.now(UTC) - timedelta(minutes=5)
+    # An `accepted` duplicate is outside the lease scan's page entirely: the
+    # bulk supersede after the pick is what guarantees it cannot survive.
+    hidden = AgentRunAction(
+        action_id=str(uuid4()),
+        agent_run_id=row.id,
+        kind="correction",
+        request_hash="2" * 64,
+        request_data={"expected_head_sha": _SHA, "instruction": "hidden"},
+        status="accepted",
+    )
+    session.add(hidden)
     await session.commit()
+    hidden_id = hidden.action_id
 
     work = await _lease_correction(client)
     assert work["action_id"] == second_id
     assert (await _action_row(session, first_id)).status == "rejected"
+    assert (await _action_row(session, hidden_id)).status == "rejected"
 
 
 async def test_watchdog_rejects_an_orphaned_correction_on_a_drifted_run(
@@ -1683,6 +1696,319 @@ async def test_watchdog_rejects_an_orphaned_correction_on_a_drifted_run(
     rejected = await _action_row(session, action_id)
     assert rejected.status == "rejected"
     assert (await _run_row(session, run_id)).status == "pr_opened"
+
+
+# ------------------------------------------- review round: takeover / heal / settle
+
+
+async def _orphan_setup(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    *,
+    status: str = "pr_opened",
+) -> tuple[str, str]:
+    """A run with an in_progress correction whose status drifted to `status`."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+    row = await _run_row(session, run_id)
+    row.status = status
+    await session.commit()
+    return run_id, action_id
+
+
+@pytest.mark.parametrize("terminal", ["merged", "cancelled", "failed", "deployed"])
+async def test_refused_correction_never_resurrects_a_finished_run(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    terminal: str,
+) -> None:
+    run_id, action_id = await _orphan_setup(
+        client, session, manager, project, monkeypatch, status=terminal
+    )
+    row = await _run_row(session, run_id)
+    row.lease_id = str(uuid4())
+    row.lease_kind = "correction"
+    row.lease_until = datetime.now(UTC) + timedelta(minutes=3)
+    await session.commit()
+    lease_id = row.lease_id
+
+    # GitHub reports a different head too: adopting it must not revive the run.
+    async def moved(run) -> tuple[str, bool]:
+        return _NEW_SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", moved)
+    _new_id, refused = await _request_correction(client, manager, run_id)
+    assert refused["status_code"] == 409
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == terminal  # never pushed back to pr_opened
+    assert row.head_sha == _SHA
+    plan = await agent_runs._plan_local_correction_takeover(session, row, "x")
+    assert plan.stuck == [] and not plan.live and not plan.expired_lease
+    assert row.lease_id == lease_id  # a (live) lease is never cleared here
+    assert (await _action_row(session, action_id)).status == "in_progress"
+
+
+async def test_refused_correction_request_has_no_side_effects_on_an_orphan(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Stale expected head / closed PR: the request is refused, so the old
+    in_progress correction must not be superseded nor the run touched."""
+    run_id, action_id = await _orphan_setup(client, session, manager, project, monkeypatch)
+
+    _id, stale = await _request_correction(client, manager, run_id, _NEW_SHA)
+    assert stale["status_code"] == 409
+
+    async def closed(run) -> tuple[str, bool]:
+        return _SHA, False
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", closed)
+    _id, not_open = await _request_correction(client, manager, run_id)
+    assert not_open["status_code"] == 409
+
+    assert (await _action_row(session, action_id)).status == "in_progress"
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == "pr_opened"
+
+
+async def test_refused_request_keeps_a_correction_running_run_with_an_expired_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    action_id, _ = await _request_correction(client, manager, run_id)
+    work = await _lease_correction(client)
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    await session.commit()
+
+    _id, refused = await _request_correction(client, manager, run_id, _NEW_SHA)  # stale
+    assert refused["status_code"] == 409
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == "correction_running"
+    assert row.lease_id == work["lease_id"]
+    assert (await _action_row(session, action_id)).status == "in_progress"
+
+
+async def test_live_correction_lease_on_a_drifted_run_is_left_alone(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, action_id = await _orphan_setup(client, session, manager, project, monkeypatch)
+    row = await _run_row(session, run_id)
+    row.lease_id = str(uuid4())
+    row.lease_kind = "correction"
+    row.lease_until = datetime.now(UTC) + timedelta(minutes=3)
+    await session.commit()
+    lease_id = row.lease_id
+
+    _id, refused = await _request_correction(client, manager, run_id)
+    assert refused["status_code"] == 409  # never two at once
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.lease_id == lease_id
+    assert row.lease_kind == "correction"
+    assert (await _action_row(session, action_id)).status == "in_progress"
+
+
+async def test_heal_rejects_an_orphan_when_a_merge_is_in_flight(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, action_id = await _orphan_setup(
+        client, session, manager, project, monkeypatch, status="pr_ready"
+    )
+    row = await _run_row(session, run_id)
+    session.add(
+        AgentRunAction(
+            action_id=str(uuid4()),
+            agent_run_id=row.id,
+            kind="merge",
+            request_hash="1" * 64,
+            request_data={"expected_head_sha": _SHA},
+            status="in_progress",
+        )
+    )
+    await session.commit()
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 204  # nothing leased: no correction races the merge
+    assert (await _action_row(session, action_id)).status == "rejected"
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == "pr_ready"
+    assert row.lease_id is None
+
+
+async def test_heal_rejects_an_orphan_whose_expected_head_is_no_longer_the_run_head(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, action_id = await _orphan_setup(client, session, manager, project, monkeypatch)
+    row = await _run_row(session, run_id)
+    row.head_sha = _NEW_SHA
+    await session.commit()
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 204
+    assert (await _action_row(session, action_id)).status == "rejected"
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == "pr_opened"
+
+
+async def test_heal_rejects_a_stale_orphan(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    _run_id, action_id = await _orphan_setup(client, session, manager, project, monkeypatch)
+    action = await _action_row(session, action_id)
+    action.updated_at = datetime.now(UTC) - timedelta(minutes=31)
+    await session.commit()
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 204
+    assert (await _action_row(session, action_id)).status == "rejected"
+
+
+async def test_cancel_retires_an_orphaned_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, action_id = await _orphan_setup(client, session, manager, project, monkeypatch)
+
+    async def close_pr(run) -> None:
+        return None
+
+    monkeypatch.setattr(agent_runs, "_close_pr", close_pr)
+    resp = await client.post(f"/api/v1/agent-runs/{run_id}/cancel", headers=auth(manager))
+    assert resp.status_code == 200
+    assert (await _action_row(session, action_id)).status == "rejected"
+
+
+async def test_retire_open_corrections_rejects_orphans_and_drops_the_lease(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """What a merge result does to a run, so no orphan survives a merged run."""
+    run_id, action_id = await _orphan_setup(client, session, manager, project, monkeypatch)
+    row = await _run_row(session, run_id)
+    row.lease_id = str(uuid4())
+    row.lease_kind = "correction"
+    row.lease_until = datetime.now(UTC) + timedelta(minutes=3)
+    await session.commit()
+
+    await agent_runs._retire_open_corrections(session, row, "retired")
+    await session.commit()
+    assert (await _action_row(session, action_id)).status == "rejected"
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.lease_id is None
+
+
+async def test_correction_result_for_a_closed_pr_is_a_distinct_409_without_waiting(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    action_id, _ = await _request_correction(client, manager, run_id)
+    work = await _lease_correction(client)
+    calls = {"n": 0}
+
+    async def closed(run) -> tuple[str, bool]:
+        calls["n"] += 1
+        return _SHA, False
+
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", closed)
+    monkeypatch.setattr(agent_runs.asyncio, "sleep", fake_sleep)
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result",
+        json={"action_id": action_id, "status": "completed", "head_sha": _NEW_SHA},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": work["lease_id"]},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "correction PR is no longer open"
+    assert calls["n"] == 1 and slept == []
+
+
+async def test_settle_respects_its_wall_clock_deadline(monkeypatch) -> None:
+    """Sleep and clock are patched with a fake timeline (not zeroed): the wait
+    never exceeds the budget, however long the configured delays are."""
+    timeline = {"now": 0.0}
+    slept: list[float] = []
+    reads: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+        timeline["now"] += delay
+
+    async def never_settles(run) -> tuple[str, bool]:
+        reads.append(timeline["now"])
+        timeline["now"] += 0.4  # GitHub call time counts against the budget too
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(agent_runs, "_settle_clock", lambda: timeline["now"])
+    monkeypatch.setattr(agent_runs, "_current_pr_head", never_settles)
+    monkeypatch.setattr(agent_runs, "_PR_HEAD_SETTLE_DELAYS_S", (10.0, 10.0, 10.0))
+
+    head, is_open = await agent_runs._settled_pr_head(None, _NEW_SHA)  # type: ignore[arg-type]
+    assert (head, is_open) == (_SHA, True)
+    assert timeline["now"] <= agent_runs._PR_HEAD_SETTLE_BUDGET_S + 0.5
+    assert sum(slept) <= agent_runs._PR_HEAD_SETTLE_BUDGET_S
+    assert slept[0] < 10.0  # capped to what is left of the budget
+
+
+async def test_settle_default_schedule_fits_well_inside_agent_svcs_timeout(
+    monkeypatch,
+) -> None:
+    assert (
+        sum(agent_runs._PR_HEAD_SETTLE_DELAYS_S) <= agent_runs._PR_HEAD_SETTLE_BUDGET_S <= 6.0
+    )
+
+
+async def test_github_executor_run_detail_still_adopts_a_new_head_during_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """The suppression is for the local executor only; legacy runs keep the
+    previous recovery."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    row = await _run_row(session, run_id)
+    row.executor = "github"
+    row.status = "correction_running"
+    await session.commit()
+
+    async def pushed(run) -> tuple[str, bool]:
+        return _NEW_SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", pushed)
+    resp = await client.get(f"/api/v1/agent-runs/{run_id}", headers=auth(manager))
+    assert resp.status_code == 200
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.head_sha == _NEW_SHA
+    assert row.status == "pr_opened"
 
 
 # --------------------------------------------------------------- IntakeBrief validation

@@ -141,6 +141,12 @@ class HeadNotSettled(Exception):
         self.detail = detail
 
 
+# The backend may hold an `action-result` for a correction open for several
+# seconds (bounded re-reads of GitHub's lagging PR view) before answering;
+# the default 15s client timeout must never fire first and turn a slow but
+# healthy answer into a generic failure.
+ACTION_RESULT_TIMEOUT_S = 45.0
+
 # Exact `detail` strings of the backend's 409s (backend/app/api/v1/agent_runs.py).
 LEASE_MISMATCH_DETAIL = "lease_mismatch"
 CORRECTION_HEAD_CHANGED_DETAIL = "correction PR head changed before recording"
@@ -787,7 +793,13 @@ class TaskManagerApi:
         return self._http.send(request, max_bytes=max_bytes, timeout=timeout)
 
     def _callback_call(
-        self, method: str, path: str, *, lease_id: str | None = None, body: Any = None
+        self,
+        method: str,
+        path: str,
+        *,
+        lease_id: str | None = None,
+        body: Any = None,
+        timeout: float | None = None,
     ) -> HttpResponse:
         extra = (("X-Agent-Lease-ID", lease_id),) if lease_id is not None else ()
         request = self._http.build_request(
@@ -798,7 +810,7 @@ class TaskManagerApi:
             body=_encode(body),
             content_type="application/json" if body is not None else None,
         )
-        return self._http.send(request)
+        return self._http.send(request, timeout=timeout)
 
     def lease(self, lane: str) -> Work | None:
         response = self._svc_call("POST", "/lease", body={"lane": lane})
@@ -868,7 +880,11 @@ class TaskManagerApi:
         lease_id = _require_lease_id(lease_id)
         try:
             response = self._callback_call(
-                "POST", f"/{run_id}/action-result", lease_id=lease_id, body=dict(payload)
+                "POST",
+                f"/{run_id}/action-result",
+                lease_id=lease_id,
+                body=dict(payload),
+                timeout=ACTION_RESULT_TIMEOUT_S,
             )
         except HttpError as exc:
             if exc.status == 409 and _detail(exc) == CORRECTION_HEAD_CHANGED_DETAIL:
