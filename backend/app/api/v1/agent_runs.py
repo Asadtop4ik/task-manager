@@ -623,6 +623,8 @@ async def _issue_lease(
             if action is not None
             else None
         ),
+        ci_status=run.ci_status,
+        ci_url=run.ci_url,
     )
 
 

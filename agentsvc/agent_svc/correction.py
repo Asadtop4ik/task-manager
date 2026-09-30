@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .api import Work
+from .ci_logs import correction_ci_block
 from .context import ServiceContext
 from .ops_requests import split_trailer
 from .prompts import compose_correction_prompt, route_correction
@@ -99,7 +100,11 @@ def _run_correction(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         work.expected_head_sha,
         work.instruction,
     )
-    prompt = compose_correction_prompt(base_prompt, complex_route=route.complex)
+    prompt = compose_correction_prompt(
+        base_prompt,
+        complex_route=route.complex,
+        ci_log_block=correction_ci_block(ctx, work, run.cancel),
+    )
 
     run.stage("codex_started")
     result = ctx.codex.run_exec(

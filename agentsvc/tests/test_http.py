@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email.message
 import io
+import time
 import unittest
 import urllib.error
 
@@ -166,6 +167,81 @@ class JsonHttpSendTests(unittest.TestCase):
         http = JsonHttp(opener=_RecordingOpener(), timeout=15.0)
         http.send(JsonHttp.build_request("GET", "http://x/y"))
         self.assertEqual(seen_timeouts, [15.0])
+
+
+class RetryBudgetTests(unittest.TestCase):
+    def _http(self, opener: FakeOpener, sleeps: list[float]) -> JsonHttp:
+        return JsonHttp(opener=opener, sleep=sleeps.append)
+
+    def test_retries_caps_the_extra_attempts(self) -> None:
+        for retries, expected_calls in ((0, 1), (1, 2), (None, 4)):
+            with self.subTest(retries=retries):
+                opener = FakeOpener([_http_error(503) for _ in range(4)])
+                sleeps: list[float] = []
+                request = JsonHttp.build_request("GET", "http://x/y")
+                with self.assertRaises(HttpError):
+                    self._http(opener, sleeps).send(request, retries=retries)
+                self.assertEqual(len(opener.calls), expected_calls)
+                self.assertEqual(len(sleeps), expected_calls - 1)
+
+    def test_an_expired_deadline_makes_no_attempt(self) -> None:
+        opener = FakeOpener([FakeResponse(b"{}")])
+        with self.assertRaises(HttpError) as caught:
+            self._http(opener, []).send(
+                JsonHttp.build_request("GET", "http://x/y"), deadline=time.monotonic() - 1
+            )
+        self.assertIn("deadline", str(caught.exception))
+        self.assertEqual(opener.calls, [])
+
+    def test_a_backoff_that_would_cross_the_deadline_is_not_slept(self) -> None:
+        opener = FakeOpener([_http_error(503), _http_error(503)])
+        sleeps: list[float] = []
+        with self.assertRaises(HttpError):
+            self._http(opener, sleeps).send(
+                JsonHttp.build_request("GET", "http://x/y"), deadline=time.monotonic() + 0.2
+            )
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_attempt_timeout_is_clamped_to_the_remaining_budget(self) -> None:
+        seen: list[float | None] = []
+
+        def opener(request: object, timeout: float | None = None) -> FakeResponse:
+            seen.append(timeout)
+            return FakeResponse(b"{}")
+
+        JsonHttp(opener=opener).send(
+            JsonHttp.build_request("GET", "http://x/y"),
+            timeout=10,
+            deadline=time.monotonic() + 2,
+        )
+        self.assertLessEqual(seen[0] or 99, 2.0)
+
+    def test_keep_tail_reports_truncation_and_honours_the_deadline(self) -> None:
+        opener = FakeOpener([FakeResponse(b"abcdefghij")])
+        response = self._http(opener, []).send(
+            JsonHttp.build_request("GET", "http://x/y"), max_bytes=4, keep_tail=True
+        )
+        self.assertEqual((response.body, response.truncated), (b"ghij", True))
+        whole = self._http(FakeOpener([FakeResponse(b"abc")]), []).send(
+            JsonHttp.build_request("GET", "http://x/y"), max_bytes=4, keep_tail=True
+        )
+        self.assertEqual((whole.body, whole.truncated), (b"abc", False))
+
+        class Endless(FakeResponse):
+            def read(self, size: int = -1) -> bytes:
+                time.sleep(0.05)
+                return b"x" * 10
+
+        started = time.monotonic()
+        with self.assertRaises(HttpError):
+            self._http(FakeOpener([Endless()]), []).send(
+                JsonHttp.build_request("GET", "http://x/y"),
+                max_bytes=100,
+                keep_tail=True,
+                deadline=started + 0.3,
+            )
+        self.assertLess(time.monotonic() - started, 1.0)
 
 
 if __name__ == "__main__":

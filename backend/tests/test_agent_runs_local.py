@@ -962,6 +962,43 @@ async def test_local_correction_is_leased_instead_of_dispatched(
     assert row.status == "correction_running"
 
 
+async def test_correction_lease_carries_the_ci_status_and_run_url(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """agent-svc fetches the failed job log for a correction from `ci_url`,
+    and only when `ci_status` is `failure` for the leased head."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    row = await _run_row(session, run_id)
+    ci_url = "https://github.com/Asadtop4ik/task-manager/actions/runs/42"
+    row.ci_status = "failure"
+    row.ci_url = ci_url
+    await session.commit()
+
+    req = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={
+            "expected_head_sha": _SHA,
+            "action_id": str(uuid4()),
+            "instruction": "CI failed",
+        },
+        headers=auth(manager),
+    )
+    assert req.status_code == 200
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    body = leased.json()
+    assert body["kind"] == "correction"
+    assert body["head_sha"] == _SHA
+    assert body["ci_status"] == "failure"
+    assert body["ci_url"] == ci_url
+
+
 async def test_task_edited_while_a_correction_is_queued_rejects_only_the_correction(
     client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
 ) -> None:

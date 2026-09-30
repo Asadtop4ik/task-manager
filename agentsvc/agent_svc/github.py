@@ -74,7 +74,9 @@ class GitHubClient:
         token_for: Callable[[str], str],
         http: JsonHttp,
         api_base: str = _API_BASE,
+        log_redirect_schemes: Iterable[str] = ("https",),
     ) -> None:
+        self._log_redirect_schemes = tuple(log_redirect_schemes)
         self._token_for = token_for
         self._http = http
         self._api_base = api_base.rstrip("/")
@@ -88,6 +90,11 @@ class GitHubClient:
         body: Any = None,
         accept: str = "application/vnd.github+json",
         max_bytes: int | None = None,
+        timeout: float | None = None,
+        keep_tail: bool = False,
+        retries: int | None = None,
+        deadline: float | None = None,
+        redirect_schemes: Iterable[str] | None = None,
     ) -> HttpResponse:
         token = self._token_for(repo)
         request = self._http.build_request(
@@ -99,7 +106,17 @@ class GitHubClient:
             content_type="application/json" if body is not None else None,
             accept=accept,
         )
-        return self._http.send(request, max_bytes=max_bytes)
+        extra: dict[str, Any] = {}
+        # Only passed when set, so a stand-in `send` without them keeps working.
+        if retries is not None:
+            extra["retries"] = retries
+        if deadline is not None:
+            extra["deadline"] = deadline
+        if redirect_schemes is not None:
+            extra["redirect_schemes"] = redirect_schemes
+        return self._http.send(
+            request, max_bytes=max_bytes, timeout=timeout, keep_tail=keep_tail, **extra
+        )
 
     def get_ref(self, repo: str, branch: str) -> str | None:
         try:
@@ -234,3 +251,63 @@ class GitHubClient:
         if not isinstance(jobs, list):
             raise InvalidResponse("GitHub run-jobs response has no job list")
         return jobs
+
+    def latest_run_jobs(
+        self,
+        repo: str,
+        run_id: int,
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        retries: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Jobs of the latest attempt of a run (re-runs supersede earlier attempts)."""
+        response = self._call(
+            "GET",
+            f"/repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100",
+            repo=repo,
+            timeout=timeout,
+            deadline=deadline,
+            retries=retries,
+        )
+        payload = self._http.json(response)
+        jobs = payload.get("jobs") if isinstance(payload, dict) else None
+        if not isinstance(jobs, list):
+            raise InvalidResponse("GitHub run-jobs response has no job list")
+        return jobs
+
+    def job_log_tail(
+        self,
+        repo: str,
+        job_id: int,
+        *,
+        tail_bytes: int,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        retries: int | None = None,
+    ) -> str:
+        """The last `tail_bytes` of a job's plain-text log (a cut-off first
+        line is dropped).
+
+        GitHub answers with a 302 to a short-lived signed blob URL. urllib
+        follows it, and `JsonHttp.build_request` attaches the token as an
+        *unredirected* header, so the Authorization header is never sent to
+        the blob host; only https redirects are followed.
+        """
+        response = self._call(
+            "GET",
+            f"/repos/{repo}/actions/jobs/{job_id}/logs",
+            repo=repo,
+            accept="*/*",
+            max_bytes=tail_bytes,
+            timeout=timeout,
+            keep_tail=True,
+            deadline=deadline,
+            retries=retries,
+            redirect_schemes=self._log_redirect_schemes,
+        )
+        text = response.body.decode("utf-8", "replace")
+        if response.truncated:
+            _, newline, rest = text.partition("\n")
+            text = rest if newline else ""
+        return text

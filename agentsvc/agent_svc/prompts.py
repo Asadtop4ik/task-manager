@@ -153,8 +153,15 @@ def compose_implement_prompt(
     return "\n".join(parts)
 
 
-def compose_correction_prompt(base_prompt: str, *, complex_route: bool) -> str:
-    parts = [base_prompt, EFFICIENCY_RULES]
+def compose_correction_prompt(
+    base_prompt: str, *, complex_route: bool, ci_log_block: str | None = None
+) -> str:
+    """`ci_log_block` is the already delimited/redacted failed-CI excerpt from
+    `ci_logs.correction_ci_block` (untrusted data), or `None`."""
+    parts = [base_prompt]
+    if ci_log_block:
+        parts.append(ci_log_block)
+    parts.append(EFFICIENCY_RULES)
     if complex_route:
         parts.append(ORCHESTRATOR_RULES)
     return "\n".join(parts)

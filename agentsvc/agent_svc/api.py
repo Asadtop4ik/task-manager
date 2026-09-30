@@ -177,6 +177,10 @@ class Work:
     action_id: str | None
     instruction: str | None
     expected_head_sha: str | None
+    # CI conclusion for `head_sha` and its run URL (correction leases only
+    # matter; best-effort, never validated as hard as the fields above).
+    ci_status: str | None = None
+    ci_url: str | None = None
 
 
 def _bad_int(value: Any, *, minimum: int) -> bool:
@@ -331,6 +335,9 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     instruction = payload.get("instruction")
     if instruction is not None and not isinstance(instruction, str):
         fail("lease response has an invalid instruction")
+    # Best-effort CI context: a malformed value is dropped, never a lease failure.
+    ci_status = payload.get("ci_status")
+    ci_url = payload.get("ci_url")
 
     return Work(
         run_id=run_id,
@@ -356,6 +363,8 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
         action_id=action_id,
         instruction=instruction,
         expected_head_sha=expected_head_sha,
+        ci_status=ci_status if isinstance(ci_status, str) else None,
+        ci_url=ci_url if isinstance(ci_url, str) else None,
     )
 
 
