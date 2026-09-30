@@ -391,6 +391,29 @@ class HandleImplementFailurePathTests(unittest.TestCase):
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["failure_phase"], "implement")
 
+    def test_child_refusal_stderr_reaches_the_failure_reason(self) -> None:
+        # A child refusal (e.g. a model missing from the child's allowlist)
+        # ends Codex before its first event; only stderr says why.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            make_github_remote(remote)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.codex.queue_exec_result(  # type: ignore[attr-defined]
+                _exec_result(
+                    exit_code=2,
+                    final_message="",
+                    usage=None,
+                    stderr_tail=["codex_child: refused: invalid model"],
+                )
+            )
+
+            handle_implement(ctx, _work(), threading.Event())
+
+            payload = ctx.api.callbacks[0]  # type: ignore[attr-defined]
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn("invalid model", payload["error"])
+
     def test_fast_mode_is_never_handled_here(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

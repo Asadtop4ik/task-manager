@@ -157,6 +157,11 @@ _STR_KEYS = (
 # `model_matrix`/`timeouts` entry shapes, for the deep-merge validation in
 # `_merge_model_matrix`/`_merge_timeouts` below.
 _MODEL_MATRIX_ENTRY_FIELDS = frozenset({"model", "effort", "multi_agent", "sandbox"})
+# Must match `MODELS`/`EFFORTS` in libexec/codex_child.py (a test pins this):
+# the root-run child refuses anything else, and a lane configured with a
+# model the child rejects failed every run silently instead of at startup.
+SUPPORTED_MODELS = frozenset({"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"})
+SUPPORTED_EFFORTS = frozenset({"low", "medium", "high"})
 
 
 class ConfigError(ValueError):
@@ -254,11 +259,16 @@ def _validate_model_matrix_entry(name: str, entry: dict[str, Any]) -> None:
             f"model_matrix.{name!r} is missing field(s): " + ", ".join(sorted(missing))
         )
     model = entry["model"]
-    if not isinstance(model, str) or not model.strip():
-        raise ConfigError(f"model_matrix.{name}.model must be a non-empty string")
+    if not isinstance(model, str) or model not in SUPPORTED_MODELS:
+        raise ConfigError(
+            f"model_matrix.{name}.model must be one of: " + ", ".join(sorted(SUPPORTED_MODELS))
+        )
     effort = entry["effort"]
-    if not isinstance(effort, str) or not effort.strip():
-        raise ConfigError(f"model_matrix.{name}.effort must be a non-empty string")
+    if not isinstance(effort, str) or effort not in SUPPORTED_EFFORTS:
+        raise ConfigError(
+            f"model_matrix.{name}.effort must be one of: "
+            + ", ".join(sorted(SUPPORTED_EFFORTS))
+        )
     multi_agent = entry["multi_agent"]
     if not isinstance(multi_agent, bool):
         raise ConfigError(f"model_matrix.{name}.multi_agent must be a boolean")

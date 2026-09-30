@@ -98,6 +98,39 @@ class LoadConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_config(path)
 
+    def test_model_outside_the_child_allowlist_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"model_matrix": {"review": {"model": "gpt-9-x"}}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_supported_models_match_the_child_allowlist(self) -> None:
+        import sys
+
+        libexec = Path(__file__).resolve().parent.parent / "libexec"
+        sys.path.insert(0, str(libexec))
+        try:
+            import codex_child
+        finally:
+            sys.path.remove(str(libexec))
+        from agent_svc import config as config_module
+
+        self.assertEqual(set(config_module.SUPPORTED_MODELS), set(codex_child.MODELS))
+        self.assertEqual(set(config_module.SUPPORTED_EFFORTS), set(codex_child.EFFORTS))
+
+    def test_gpt_61_sol_is_accepted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {"model_matrix": {"review": {"model": "gpt-6.1-sol", "effort": "high"}}}
+                )
+            )
+            self.assertEqual(
+                load_config(path)["model_matrix"]["review"]["model"], "gpt-6.1-sol"
+            )
+
     def test_secret_key_in_config_file_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
