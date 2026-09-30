@@ -10,6 +10,7 @@ from typing import Any
 
 from agent_svc.api import (
     DiscussionLeaseInvalid,
+    HeadNotSettled,
     IntakeImage,
     IntakeLeaseInvalid,
     InvalidOpsWork,
@@ -242,6 +243,25 @@ class CallbackFamilyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             api.action_result("run-1", "not-a-uuid", {"action_id": "a1"})
         self.assertEqual(opener.requests, [])
+
+    def test_action_result_head_lag_409_is_not_a_lost_lease(self) -> None:
+        api, _opener = _api(
+            [_http_error(409, {"detail": "correction PR head changed before recording"})]
+        )
+        with self.assertRaises(HeadNotSettled):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
+
+    def test_action_result_lease_mismatch_409_is_still_a_lost_lease(self) -> None:
+        api, _opener = _api([_http_error(409, {"detail": "lease_mismatch"})])
+        with self.assertRaises(LeaseLost):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
+
+    def test_action_result_other_409_stays_a_lost_lease(self) -> None:
+        api, _opener = _api(
+            [_http_error(409, {"detail": "correction action is no longer current"})]
+        )
+        with self.assertRaises(LeaseLost):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
 
     def test_action_result_returns_parsed_body(self) -> None:
         api, _opener = _api(

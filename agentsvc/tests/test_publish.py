@@ -399,6 +399,75 @@ class PublishCorrectionTests(unittest.TestCase):
             self.assertIn("fix(agent): apply owner correction for task 9", log)
             self.assertIn(f"Agent-Run-ID: {work.run_id}", log)
 
+    def _publish_correction_with_lagging_pr(
+        self, stale_reads: int, backoff: tuple[float, ...]
+    ) -> tuple[str, list[str | None]]:
+        """Run `publish_correction` against a GitHub whose PR API reports the
+        OLD head for the first `stale_reads` reads after the push."""
+        from agent_svc import publish as publish_module
+        from unittest import mock
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            branch = "codex/task-9-22222222-2222-2222-2222-222222222222"
+            push_new_branch(remote, base_sha, branch)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.mirrors.fetch("Asadtop4ik/task-manager", branch)
+            work = _work(
+                run_id="22222222-2222-2222-2222-222222222222",
+                task_id=9,
+                branch=branch,
+                pr_number=5,
+                action_id="33333333-3333-3333-3333-333333333333",
+                instruction="Fix the typo",
+                expected_head_sha=base_sha,
+            )
+            patch_bytes = make_patch(remote, base_sha, {"FIX.md": "fixed\n"})
+            seen: list[str | None] = []
+            remaining = {"stale": stale_reads}
+
+            def lagging_get_pull(repo: str, number: int) -> dict[str, object]:
+                tip = rev_parse_or_none(remote, branch)
+                if remaining["stale"] > 0:
+                    remaining["stale"] -= 1
+                    head_sha = base_sha
+                else:
+                    head_sha = tip  # type: ignore[assignment]
+                seen.append(head_sha)
+                return {"head": {"sha": head_sha, "ref": branch}, "state": "open"}
+
+            with (
+                mock.patch.object(publish_module, "PR_HEAD_WAIT_BACKOFF_S", backoff),
+                mock.patch.object(ctx.github, "get_pull", lagging_get_pull),
+            ):
+                result = publish_correction(
+                    ctx,
+                    work,
+                    expected_head_sha=base_sha,
+                    patch=patch_bytes,
+                    cancel=threading.Event(),
+                    report_stage=lambda _s: None,
+                )
+            return result.head_sha, seen
+
+    def test_publish_waits_until_github_reports_the_pushed_head(self) -> None:
+        head_sha, seen = self._publish_correction_with_lagging_pr(3, (0.0,) * 10)
+        # Three stale reads, then the pushed head: returned only after GitHub
+        # caught up, so the report that follows can never race the PR view.
+        self.assertEqual(len(seen), 4)
+        self.assertEqual(seen[-1], head_sha)
+        self.assertEqual(seen[:3], [seen[0]] * 3)
+        self.assertNotEqual(seen[0], head_sha)
+
+    def test_publish_gives_up_waiting_but_still_returns_the_pushed_head(self) -> None:
+        head_sha, seen = self._publish_correction_with_lagging_pr(99, (0.0, 0.0, 0.0))
+        # Bounded: 1 immediate poll + 3 backoff polls, never raises -- the
+        # commit is already pushed, backend retry absorbs the remaining lag.
+        self.assertEqual(len(seen), 4)
+        self.assertNotIn(head_sha, seen)
+
     def test_remote_moved_before_publication_is_refused(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

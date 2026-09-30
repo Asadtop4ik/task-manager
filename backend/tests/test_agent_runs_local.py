@@ -1392,6 +1392,299 @@ async def test_watchdog_times_out_a_correction_that_was_never_leased(
     assert action.status == "rejected"
 
 
+# ------------------------------------- correction head race / orphaned corrections
+
+_NEW_SHA = "b" * 40
+
+
+async def _request_correction(
+    client: AsyncClient, manager: User, run_id: str, expected: str = _SHA
+) -> tuple[str, dict]:
+    action_id = str(uuid4())
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": expected, "action_id": action_id, "instruction": "fix"},
+        headers=auth(manager),
+    )
+    return action_id, {"status_code": resp.status_code, **resp.json()}
+
+
+async def _lease_correction(client: AsyncClient) -> dict:
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    assert leased.json()["kind"] == "correction"
+    return leased.json()
+
+
+async def _action_row(session: AsyncSession, action_id: str) -> AgentRunAction:
+    await session.rollback()  # see the API's committed writes, not a stale snapshot
+    row = await session.scalar(
+        select(AgentRunAction)
+        .where(AgentRunAction.action_id == action_id)
+        .execution_options(populate_existing=True)
+    )
+    assert row is not None
+    return row
+
+
+async def test_correction_result_waits_for_a_lagging_github_pr_head(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Production 2026-09-30 (ab51aab4): GitHub's PR API still returned the old
+    head right after agent-svc pushed, so a correct report was refused."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    calls = {"n": 0}
+
+    async def request_time_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", request_time_head)
+    action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+    work = await _lease_correction(client)
+
+    async def lagging_head(run) -> tuple[str, bool]:
+        calls["n"] += 1
+        return (_SHA if calls["n"] <= 2 else _NEW_SHA), True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", lagging_head)
+    monkeypatch.setattr(agent_runs, "_PR_HEAD_SETTLE_DELAYS_S", (0.0, 0.0, 0.0, 0.0))
+    done = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result",
+        json={"action_id": action_id, "status": "completed", "head_sha": _NEW_SHA},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": work["lease_id"]},
+    )
+    assert done.status_code == 200, done.text
+    assert calls["n"] == 3  # two stale reads, then the pushed head
+    row = await _run_row(session, run_id)
+    assert row.head_sha == _NEW_SHA
+    assert row.status == "pr_opened"
+    assert row.lease_id is None
+    assert (await _action_row(session, action_id)).status == "completed"
+
+
+async def test_correction_result_still_409s_when_github_never_reports_the_head(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """The security check is unchanged: a head GitHub never shows as the PR
+    head is refused after the bounded wait, the lease stays live, and the same
+    report succeeds once GitHub catches up."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    calls = {"n": 0, "head": _SHA}
+
+    async def current_head(run) -> tuple[str, bool]:
+        calls["n"] += 1
+        return calls["head"], True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", current_head)
+    monkeypatch.setattr(agent_runs, "_PR_HEAD_SETTLE_DELAYS_S", (0.0, 0.0, 0.0, 0.0))
+    action_id, _created = await _request_correction(client, manager, run_id)
+    work = await _lease_correction(client)
+    headers = {**_CALLBACK, "X-Agent-Lease-ID": work["lease_id"]}
+    body = {"action_id": action_id, "status": "completed", "head_sha": _NEW_SHA}
+
+    calls["n"] = 0
+    refused = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result", json=body, headers=headers
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "correction PR head changed before recording"
+    assert calls["n"] == 5  # 1 + one re-read per settle delay: bounded
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.lease_id == work["lease_id"]  # not a lost lease
+
+    calls["head"] = _NEW_SHA
+    retried = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result", json=body, headers=headers
+    )
+    assert retried.status_code == 200
+    assert (await _run_row(session, run_id)).head_sha == _NEW_SHA
+
+
+async def test_run_refresh_during_a_correction_does_not_orphan_its_action(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """The owner UI polls GET /agent-runs/{id}. It saw the correction's own
+    push as a "new head" and flipped the run to pr_opened under the still
+    in_progress action, which then could not be recorded nor re-leased."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    action_id, _created = await _request_correction(client, manager, run_id)
+    work = await _lease_correction(client)
+
+    async def pushed_head(run) -> tuple[str, bool]:
+        return _NEW_SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", pushed_head)
+    detail = await client.get(f"/api/v1/agent-runs/{run_id}", headers=auth(manager))
+    assert detail.status_code == 200
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.head_sha == _SHA
+
+    done = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result",
+        json={"action_id": action_id, "status": "completed", "head_sha": _NEW_SHA},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": work["lease_id"]},
+    )
+    assert done.status_code == 200, done.text
+    assert (await _run_row(session, run_id)).head_sha == _NEW_SHA
+
+
+async def test_second_correction_after_a_stuck_first_is_leased_and_processed(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Run ab51aab4 replay: correction #1's lease died unreported while its
+    commit landed; the owner's correction #2 (against the new head) must
+    supersede it and be leased, never sit in_progress forever."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    first_id, _ = await _request_correction(client, manager, run_id)
+    await _lease_correction(client)
+
+    # While #1's lease is live, a second request is refused: never two at once.
+    blocked_id, blocked = await _request_correction(client, manager, run_id)
+    assert blocked["status_code"] == 409
+    assert await session.get(AgentRunAction, blocked_id) is None
+
+    # agent-svc dies without reporting; the lease expires. GitHub moved on.
+    row = await _run_row(session, run_id)
+    row.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    await session.commit()
+
+    async def new_head(run) -> tuple[str, bool]:
+        return _NEW_SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", new_head)
+    second_id, second = await _request_correction(client, manager, run_id, _NEW_SHA)
+    assert second["status_code"] == 200, second
+    assert second["status"] == "in_progress"
+
+    first = await _action_row(session, first_id)
+    assert first.status == "rejected"
+    assert first.result == {"message": agent_runs._CORRECTION_SUPERSEDED_ERROR}
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.head_sha == _NEW_SHA
+
+    work = await _lease_correction(client)
+    assert work["action_id"] == second_id
+    assert work["expected_head_sha"] == _NEW_SHA
+
+
+async def test_in_progress_correction_on_a_drifted_run_is_leased_again(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Rows already corrupted in production: in_progress correction, run back
+    at pr_opened, no lease. /lease must pick it up instead of ignoring it."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    action_id, _ = await _request_correction(client, manager, run_id)
+    row = await _run_row(session, run_id)
+    row.status = "pr_opened"
+    await session.commit()
+
+    work = await _lease_correction(client)
+    assert work["action_id"] == action_id
+    row = await _run_row(session, run_id)
+    assert row.status == "correction_running"
+    assert row.lease_kind == "correction"
+    assert (await _action_row(session, action_id)).attempts == 1
+
+
+async def test_a_new_correction_supersedes_an_orphaned_one_and_is_leased(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    first_id, _ = await _request_correction(client, manager, run_id)
+    row = await _run_row(session, run_id)
+    row.status = "pr_opened"  # drifted: in_progress action, run no longer correction_running
+    await session.commit()
+
+    second_id, second = await _request_correction(client, manager, run_id)
+    assert second["status_code"] == 200
+    assert (await _action_row(session, first_id)).status == "rejected"
+    work = await _lease_correction(client)
+    assert work["action_id"] == second_id
+
+
+async def test_lease_never_hands_out_two_in_progress_corrections_of_one_run(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """Rows written before the one-at-a-time guard can hold two in_progress
+    corrections: only the newest is leased, the older is rejected."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    first_id, _ = await _request_correction(client, manager, run_id)
+    row = await _run_row(session, run_id)
+    second = AgentRunAction(
+        action_id=str(uuid4()),
+        agent_run_id=row.id,
+        kind="correction",
+        request_hash="0" * 64,
+        request_data={"expected_head_sha": _SHA, "instruction": "again"},
+        status="in_progress",
+    )
+    session.add(second)
+    await session.commit()
+    second_id = second.action_id
+    first = await _action_row(session, first_id)
+    first.created_at = datetime.now(UTC) - timedelta(minutes=5)
+    await session.commit()
+
+    work = await _lease_correction(client)
+    assert work["action_id"] == second_id
+    assert (await _action_row(session, first_id)).status == "rejected"
+
+
+async def test_watchdog_rejects_an_orphaned_correction_on_a_drifted_run(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    """agent-svc is dead and the run drifted to pr_opened beside an
+    in_progress correction: the watchdog must still recover it."""
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    action_id, _ = await _request_correction(client, manager, run_id)
+    row = await _run_row(session, run_id)
+    row.status = "pr_opened"
+    await session.commit()
+    action = await _action_row(session, action_id)
+    action.updated_at = datetime.now(UTC) - timedelta(minutes=31)
+    await session.commit()
+
+    resp = await client.get("/api/v1/agent-runs/notifications", headers=_worker())
+    assert resp.status_code == 200
+    rejected = await _action_row(session, action_id)
+    assert rejected.status == "rejected"
+    assert (await _run_row(session, run_id)).status == "pr_opened"
+
+
 # --------------------------------------------------------------- IntakeBrief validation
 
 

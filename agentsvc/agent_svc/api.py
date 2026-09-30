@@ -129,6 +129,23 @@ class LeaseLost(Exception):
         self.detail = detail
 
 
+class HeadNotSettled(Exception):
+    """`action-result` refused a correction because GitHub's PR API still
+    reports a different head than the one just pushed (eventual consistency).
+
+    Not a lost lease: the lease is still live and the very same report will
+    be accepted once GitHub catches up, so the caller retries it (bounded)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+# Exact `detail` strings of the backend's 409s (backend/app/api/v1/agent_runs.py).
+LEASE_MISMATCH_DETAIL = "lease_mismatch"
+CORRECTION_HEAD_CHANGED_DETAIL = "correction PR head changed before recording"
+
+
 @dataclass(frozen=True)
 class Work:
     run_id: str
@@ -854,6 +871,8 @@ class TaskManagerApi:
                 "POST", f"/{run_id}/action-result", lease_id=lease_id, body=dict(payload)
             )
         except HttpError as exc:
+            if exc.status == 409 and _detail(exc) == CORRECTION_HEAD_CHANGED_DETAIL:
+                raise HeadNotSettled(CORRECTION_HEAD_CHANGED_DETAIL) from exc
             _reraise_lease_conflict(exc)
         return None if response.status == 204 else self._http.json(response)
 

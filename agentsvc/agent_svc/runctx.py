@@ -24,7 +24,7 @@ from pathlib import Path
 from types import TracebackType
 
 from . import repos
-from .api import LeaseLost, Work
+from .api import HeadNotSettled, LeaseLost, Work
 from .context import ServiceContext
 from .journal import JournalEntry
 
@@ -35,6 +35,10 @@ _JOIN_TIMEOUT_S = 5.0
 # should not cost a run its one chance to report its own outcome: 3 attempts
 # total, 1s then 3s apart.
 DELIVERY_RETRY_BACKOFF_S: tuple[float, ...] = (1.0, 3.0)
+# A correction result the backend refused only because GitHub's PR API still
+# showed the previous head (`HeadNotSettled`): the backend already waits a few
+# seconds itself, so these retries are spaced out further (~20s more, bounded).
+HEAD_LAG_RETRY_BACKOFF_S: tuple[float, ...] = (2.0, 4.0, 6.0, 8.0)
 
 
 def _now_iso() -> str:
@@ -52,12 +56,16 @@ class RunScaffold:
         *,
         heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S,
         delivery_backoff_s: tuple[float, ...] = DELIVERY_RETRY_BACKOFF_S,
+        head_lag_backoff_s: tuple[float, ...] | None = None,
     ) -> None:
         self._ctx = ctx
         self._work = work
         self.cancel = cancel
         self._heartbeat_interval_s = heartbeat_interval_s
         self._delivery_backoff_s = delivery_backoff_s
+        self._head_lag_backoff_s = (
+            HEAD_LAG_RETRY_BACKOFF_S if head_lag_backoff_s is None else head_lag_backoff_s
+        )
         self._delivery_failed = False
         self.run_dir: Path = repos.make_run_dir(ctx.settings.work_root, work.run_id)
         self._started_at = _now_iso()
@@ -114,7 +122,9 @@ class RunScaffold:
         removing it.
         """
         attempts = 1 + len(self._delivery_backoff_s)
-        for attempt in range(attempts):
+        attempt = 0
+        head_lag_retries = 0
+        while attempt < attempts:
             try:
                 fn()
                 return
@@ -127,6 +137,29 @@ class RunScaffold:
                 )
                 self.cancel.set()
                 return
+            except HeadNotSettled as exc:
+                # The lease is still live (a lost one would have been
+                # `LeaseLost` above); only GitHub's PR view lags. Retried on
+                # its own bounded budget, never counted as a generic failure.
+                if head_lag_retries >= len(self._head_lag_backoff_s):
+                    self._ctx.logger.event(
+                        "delivery_head_not_settled",
+                        level="warning",
+                        run_id=self._work.run_id,
+                        detail=exc.detail,
+                    )
+                    break
+                delay = self._head_lag_backoff_s[head_lag_retries]
+                head_lag_retries += 1
+                self._ctx.logger.event(
+                    "delivery_head_lag_retry",
+                    level="warning",
+                    run_id=self._work.run_id,
+                    attempt=head_lag_retries,
+                )
+                if self.cancel.wait(delay):
+                    return
+                continue
             except Exception as exc:
                 self._ctx.logger.error(
                     exc,
@@ -136,6 +169,7 @@ class RunScaffold:
                 )
                 if attempt < attempts - 1:
                     time.sleep(self._delivery_backoff_s[attempt])
+            attempt += 1
         self._delivery_failed = True
 
     def _cleanup_leftovers(self) -> None:
