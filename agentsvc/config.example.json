@@ -40,8 +40,8 @@
       "sandbox": "workspace-write"
     },
     "implement_complex": {
-      "model": "gpt-6-sol",
-      "effort": "medium",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
       "multi_agent": true,
       "sandbox": "workspace-write"
     },
@@ -52,14 +52,14 @@
       "sandbox": "workspace-write"
     },
     "correction_complex": {
-      "model": "gpt-6-sol",
-      "effort": "medium",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
       "multi_agent": true,
       "sandbox": "workspace-write"
     },
     "review": {
-      "model": "gpt-6-sol",
-      "effort": "medium",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
       "multi_agent": false,
       "sandbox": "read-only"
     }
