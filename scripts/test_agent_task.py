@@ -725,6 +725,8 @@ class BranchNameAndPromptTests(unittest.TestCase):
             "timeouts",
             "one error model",
             "what you verified and what you could not run",
+            "never full suites or dependency installs",
+            "worker sub-agent",
         ):
             self.assertIn(needle, ENGINEERING_CHECKLIST)
         # Stays concise and ahead of the task text.

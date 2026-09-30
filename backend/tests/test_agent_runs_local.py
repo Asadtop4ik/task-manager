@@ -1944,7 +1944,7 @@ async def test_merge_result_retires_an_open_correction_with_a_merge_message(
     }
 
 
-@pytest.mark.parametrize("merge_status", ["accepted", "in_progress", "retryable"])
+@pytest.mark.parametrize("merge_status", ["accepted", "in_progress"])
 async def test_correction_request_is_refused_while_a_merge_is_open(
     client: AsyncClient,
     session: AsyncSession,
@@ -1996,6 +1996,105 @@ async def test_correction_request_is_refused_while_a_merge_is_open(
     assert allowed["status_code"] == 200
 
 
+async def _open_pr_with_merge(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    *,
+    merge_status: str,
+    expected_head: str = _SHA,
+    age: timedelta = timedelta(0),
+) -> tuple[str, str]:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    row = await _run_row(session, run_id)
+    merge_id = str(uuid4())
+    merge = AgentRunAction(
+        action_id=merge_id,
+        agent_run_id=row.id,
+        kind="merge",
+        request_hash="4" * 64,
+        request_data={"expected_head_sha": expected_head},
+        status=merge_status,
+    )
+    session.add(merge)
+    await session.commit()
+    if age:
+        merge.updated_at = datetime.now(UTC) - age
+        await session.commit()
+    return run_id, merge_id
+
+
+async def test_retryable_merge_never_blocks_a_correction_and_is_superseded(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, merge_id = await _open_pr_with_merge(
+        client, session, manager, project, monkeypatch, merge_status="retryable"
+    )
+    _action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+    merge = await _action_row(session, merge_id)
+    assert merge.status == "rejected"
+    assert merge.result == {"message": "superseded by correction request"}
+
+
+async def test_stale_accepted_merge_does_not_block_a_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _merge_id = await _open_pr_with_merge(
+        client,
+        session,
+        manager,
+        project,
+        monkeypatch,
+        merge_status="accepted",
+        age=timedelta(minutes=31),
+    )
+    _action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+
+
+async def test_accepted_merge_for_an_older_head_does_not_block_a_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _merge_id = await _open_pr_with_merge(
+        client,
+        session,
+        manager,
+        project,
+        monkeypatch,
+        merge_status="accepted",
+        expected_head=_NEW_SHA,
+    )
+    _action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+
+
+async def test_head_change_rejects_stale_retryable_merges(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, merge_id = await _open_pr_with_merge(
+        client, session, manager, project, monkeypatch, merge_status="retryable"
+    )
+
+    # GitHub now reports a different head than the retryable merge asked for.
+    async def moved(run) -> tuple[str, bool]:
+        return _NEW_SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", moved)
+    resp = await client.get(f"/api/v1/agent-runs/{run_id}", headers=auth(manager))
+    assert resp.status_code == 200
+    merge = await _action_row(session, merge_id)
+    assert merge.status == "rejected"
+    assert merge.result == {"message": "PR head changed; merge request no longer applies"}
+
+
 async def test_pr_head_read_is_hard_capped_even_when_github_trickles(monkeypatch) -> None:
     """One `_current_pr_head` call must end within its timeout, however slowly
     the (fake) GitHub answers: per-phase httpx timeouts alone would not."""
@@ -2019,11 +2118,31 @@ async def test_pr_head_read_is_hard_capped_even_when_github_trickles(monkeypatch
     token = agent_runs._pr_head_timeout_s.set(0.2)
     try:
         started = asyncio.get_running_loop().time()
-        with pytest.raises(agent_runs.httpx.TimeoutException):
+        with pytest.raises(agent_runs.HTTPException) as excinfo:
             await agent_runs._current_pr_head(run)
+        assert excinfo.value.status_code == 502  # never a bare httpx error (-> 500)
         assert asyncio.get_running_loop().time() - started < 2.0
     finally:
         agent_runs._pr_head_timeout_s.reset(token)
+
+
+async def test_settle_keeps_the_last_good_read_when_a_later_call_times_out(
+    monkeypatch,
+) -> None:
+    calls = {"n": 0}
+
+    async def flaky(run) -> tuple[str, bool]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _SHA, True
+        raise agent_runs.HTTPException(
+            status_code=502, detail="GitHub PR status is unavailable"
+        )
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", flaky)
+    monkeypatch.setattr(agent_runs, "_PR_HEAD_SETTLE_DELAYS_S", (0.0, 0.0))
+    assert await agent_runs._settled_pr_head(None, _NEW_SHA) == (_SHA, True)  # type: ignore[arg-type]
+    assert calls["n"] == 3
 
 
 async def test_settled_pr_head_one_slow_call_cannot_exceed_its_cap(monkeypatch) -> None:
