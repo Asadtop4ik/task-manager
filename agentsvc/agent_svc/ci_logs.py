@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -27,6 +28,7 @@ from .publish import _neutralize_mentions
 REQUEST_TIMEOUT_S = 10.0
 TOTAL_BUDGET_S = 25.0
 MAX_JOBS = 2
+_FAILED_CONCLUSIONS = frozenset({"failure", "timed_out"})
 MAX_LINES_PER_JOB = 150
 MAX_BYTES_PER_JOB = 8 * 1024
 MAX_BYTES_TOTAL = 12 * 1024
@@ -38,6 +40,11 @@ LOG_TAIL_BYTES = 1024 * 1024
 _SEARCH_LINES = 400
 _CONTEXT_BEFORE = 10
 _MIN_JOB_BUDGET = 400
+# Error lines closer together than this belong to one cluster (a traceback and
+# its summary); the window is anchored on the LAST cluster near the log's end.
+_CLUSTER_GAP = 30
+_GENERIC_EXIT_RE = re.compile(r"##\[error\]Process completed with exit code")
+_INLINE_WS_RE = re.compile(r"[\r\n\t]+")
 
 _RUN_URL_RE = re.compile(
     r"https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
@@ -86,16 +93,25 @@ def clean_log(text: str) -> list[str]:
 
 
 def select_window(lines: Sequence[str]) -> list[str]:
-    """Up to `MAX_LINES_PER_JOB` lines starting shortly before the first error
-    marker in the last `_SEARCH_LINES` lines; with no marker, the last lines."""
+    """Up to `MAX_LINES_PER_JOB` lines starting shortly before the last
+    cluster of error markers in the last `_SEARCH_LINES` lines (the runner's
+    generic "exit code" line only anchors when nothing else matches); with no
+    marker at all, the last lines."""
     if len(lines) <= MAX_LINES_PER_JOB:
         return list(lines)
     tail_start = max(0, len(lines) - _SEARCH_LINES)
-    for index in range(tail_start, len(lines)):
-        if _ERROR_RE.search(lines[index]):
-            start = max(tail_start, index - _CONTEXT_BEFORE)
-            return list(lines[start : start + MAX_LINES_PER_JOB])
-    return list(lines[-MAX_LINES_PER_JOB:])
+    hits = [i for i in range(tail_start, len(lines)) if _ERROR_RE.search(lines[i])]
+    specific = [i for i in hits if not _GENERIC_EXIT_RE.search(lines[i])]
+    hits = specific or hits
+    if not hits:
+        return list(lines[-MAX_LINES_PER_JOB:])
+    first = hits[-1]
+    for index in reversed(hits[:-1]):
+        if first - index > _CLUSTER_GAP:
+            break
+        first = index
+    start = max(tail_start, first - _CONTEXT_BEFORE)
+    return list(lines[start : start + MAX_LINES_PER_JOB])
 
 
 def _fit_bytes(lines: Sequence[str], limit: int) -> str:
@@ -125,6 +141,12 @@ def _fit_bytes(lines: Sequence[str], limit: int) -> str:
     return "\n".join([*head, _TRUNCATED_NOTE, *tail])
 
 
+def _inline(text: str) -> str:
+    """One safe line: no ANSI, control characters or line breaks."""
+    text = _ANSI_RE.sub("", text)
+    return _CONTROL_RE.sub("", _INLINE_WS_RE.sub(" ", text)).strip()
+
+
 def build_job_excerpt(
     raw_log: str, *, redact: Any, step_name: str | None, job_name: str, limit: int
 ) -> str:
@@ -135,9 +157,9 @@ def build_job_excerpt(
     body_lines = [
         _neutralize_mentions(redact(line))[:MAX_LINE_CHARS] for line in window
     ]
-    title = f"### Failed job: {job_name}"
+    title = f"### Failed job: {_inline(job_name)}"
     if step_name:
-        title += f" / failed step: {step_name}"
+        title += f" / failed step: {_inline(step_name)}"
     header = _neutralize_mentions(redact(title))[:MAX_LINE_CHARS]
     budget = max(limit - len(header.encode("utf-8")) - 1, 0)
     return header + "\n" + _fit_bytes(body_lines, budget)
@@ -151,19 +173,33 @@ def _failed_step(job: dict[str, Any]) -> str | None:
     return None
 
 
-def build_excerpt(ctx: ServiceContext, repo: str, run_id: int, head_sha: str) -> str | None:
-    """The failed jobs' excerpts for one CI run, or `None` when there is nothing to show."""
+def build_excerpt(
+    ctx: ServiceContext,
+    repo: str,
+    run_id: int,
+    head_sha: str,
+    cancel: threading.Event | None = None,
+) -> str | None:
+    """The failed jobs' excerpts for one CI run, or `None` when there is nothing to show.
+
+    One job's failure keeps the other jobs' parts. Every GitHub call shares one
+    deadline (`TOTAL_BUDGET_S`) and is retried at most once."""
     deadline = time.monotonic() + TOTAL_BUDGET_S
 
-    def timeout() -> float:
-        return max(1.0, min(REQUEST_TIMEOUT_S, deadline - time.monotonic()))
+    def stop() -> bool:
+        return time.monotonic() >= deadline or (cancel is not None and cancel.is_set())
 
-    jobs = ctx.github.latest_run_jobs(repo, run_id, timeout=timeout())
+    def call_args() -> dict[str, Any]:
+        return {"timeout": REQUEST_TIMEOUT_S, "deadline": deadline, "retries": 1}
+
+    if stop():
+        return None
+    jobs = ctx.github.latest_run_jobs(repo, run_id, **call_args())
     failed = [
         job
         for job in jobs
         if isinstance(job, dict)
-        and job.get("conclusion") == "failure"
+        and job.get("conclusion") in _FAILED_CONCLUSIONS
         and isinstance(job.get("id"), int)
         # The run must be for exactly the head being corrected.
         and job.get("head_sha") == head_sha
@@ -171,17 +207,26 @@ def build_excerpt(ctx: ServiceContext, repo: str, run_id: int, head_sha: str) ->
     parts: list[str] = []
     remaining = MAX_BYTES_TOTAL
     for job in failed[:MAX_JOBS]:
-        if remaining < _MIN_JOB_BUDGET or time.monotonic() >= deadline:
+        if remaining < _MIN_JOB_BUDGET or stop():
             break
-        raw = ctx.github.job_log_tail(repo, job["id"], tail_bytes=LOG_TAIL_BYTES, timeout=timeout())
-        name = job.get("name")
-        part = build_job_excerpt(
-            raw,
-            redact=ctx.redactor.redact,
-            step_name=_failed_step(job),
-            job_name=name if isinstance(name, str) else f"job {job['id']}",
-            limit=min(MAX_BYTES_PER_JOB, remaining),
-        )
+        try:
+            raw = ctx.github.job_log_tail(repo, job["id"], tail_bytes=LOG_TAIL_BYTES, **call_args())
+            name = job.get("name")
+            part = build_job_excerpt(
+                raw,
+                redact=ctx.redactor.redact,
+                step_name=_failed_step(job),
+                job_name=name if isinstance(name, str) else f"job {job['id']}",
+                limit=min(MAX_BYTES_PER_JOB, remaining),
+            )
+        except Exception as exc:
+            ctx.logger.event(
+                "ci_log_job_failed",
+                level="warning",
+                error_type=type(exc).__name__,
+                status=getattr(exc, "status", None),
+            )
+            continue
         parts.append(part)
         remaining -= len(part.encode("utf-8")) + 2
     return "\n\n".join(parts) if parts else None
@@ -197,9 +242,11 @@ def wrap_for_prompt(excerpt: str) -> str:
     )
 
 
-def correction_ci_block(ctx: ServiceContext, work: Work) -> str | None:
+def correction_ci_block(
+    ctx: ServiceContext, work: Work, cancel: threading.Event | None = None
+) -> str | None:
     """The prompt block for a correction, or `None`. Never raises."""
-    if work.ci_status != "failure":
+    if work.ci_status != "failure" or (cancel is not None and cancel.is_set()):
         return None
     head = work.expected_head_sha
     if not head or work.head_sha != head:
@@ -210,7 +257,7 @@ def correction_ci_block(ctx: ServiceContext, work: Work) -> str | None:
         ctx.logger.event("ci_log_skipped", run_id=work.run_id, reason="no_run_url")
         return None
     try:
-        excerpt = build_excerpt(ctx, work.repo_full_name, run_id, head)
+        excerpt = build_excerpt(ctx, work.repo_full_name, run_id, head, cancel)
     except Exception as exc:  # best effort: a correction never fails on this
         # Type (and HTTP status) only -- never the response or log contents.
         ctx.logger.event(
@@ -222,7 +269,7 @@ def correction_ci_block(ctx: ServiceContext, work: Work) -> str | None:
         )
         return None
     if excerpt is None:
-        ctx.logger.event("ci_log_skipped", run_id=work.run_id, reason="no_failed_job")
+        ctx.logger.event("ci_log_skipped", run_id=work.run_id, reason="no_excerpt")
         return None
     ctx.logger.event("ci_log_attached", run_id=work.run_id, bytes=len(excerpt.encode("utf-8")))
     return wrap_for_prompt(excerpt)

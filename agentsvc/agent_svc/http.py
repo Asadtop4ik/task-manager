@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -40,6 +41,22 @@ class HttpResponse:
     status: int
     body: bytes
     headers: Mapping[str, str]
+    # Only with `send(keep_tail=True)`: the body was cut to its last bytes.
+    truncated: bool = False
+
+
+class _SchemeRestrictedRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows redirects only to the given URL schemes (per call, never global)."""
+
+    def __init__(self, schemes: Iterable[str]) -> None:
+        self._schemes = frozenset(scheme.lower() for scheme in schemes)
+
+    def redirect_request(  # type: ignore[no-untyped-def,override]
+        self, req, fp, code, msg, headers, newurl
+    ):
+        if urllib.parse.urlparse(newurl).scheme.lower() not in self._schemes:
+            raise HttpError(0, "redirect to a disallowed URL scheme")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class JsonHttp:
@@ -89,21 +106,39 @@ class JsonHttp:
         max_bytes: int | None = None,
         timeout: float | None = None,
         keep_tail: bool = False,
+        retries: int | None = None,
+        deadline: float | None = None,
+        redirect_schemes: Iterable[str] | None = None,
     ) -> HttpResponse:
         """`keep_tail`: instead of failing when the body exceeds `max_bytes`,
         return only its last `max_bytes` bytes (CI job logs are large and only
         their end matters). `timeout` overrides this instance's own default for this one
         call only (used by the chat lane to clamp a call to whatever
         remains of its own job budget); omitted, this reproduces the exact
-        prior behavior."""
+        prior behavior. `retries` caps the extra attempts of a GET (default: all
+        backoff steps). `deadline` is a `time.monotonic()` instant: no attempt,
+        backoff sleep or body read runs past it. `redirect_schemes` restricts
+        the URL schemes a redirect may lead to (default urlopen only; an
+        injected opener is used as is)."""
         cap = max_bytes if max_bytes is not None else self.max_json_bytes
         call_timeout = timeout if timeout is not None else self._timeout
         idempotent_get = request.get_method() == "GET"
         attempts = (len(_RETRY_BACKOFF_S) + 1) if idempotent_get else 1
+        if retries is not None and idempotent_get:
+            attempts = min(attempts, max(retries, 0) + 1)
+        opener = self._opener
+        if redirect_schemes is not None and opener is urllib.request.urlopen:
+            opener = urllib.request.build_opener(_SchemeRestrictedRedirect(redirect_schemes)).open
         last_error: HttpError | None = None
         for attempt in range(attempts):
+            attempt_timeout = call_timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise last_error or HttpError(0, "deadline exceeded")
+                attempt_timeout = min(call_timeout, remaining)
             try:
-                return self._send_once(request, cap, call_timeout, keep_tail)
+                return self._send_once(request, cap, attempt_timeout, keep_tail, opener, deadline)
             except HttpError as exc:
                 if not idempotent_get or exc.status < 500:
                     raise
@@ -111,7 +146,10 @@ class JsonHttp:
             except urllib.error.URLError as exc:
                 last_error = HttpError(0, self._snippet(str(exc.reason)))
             if attempt < attempts - 1:
-                self._sleep(_RETRY_BACKOFF_S[attempt])
+                backoff = _RETRY_BACKOFF_S[attempt]
+                if deadline is not None and time.monotonic() + backoff >= deadline:
+                    break
+                self._sleep(backoff)
         assert last_error is not None
         raise last_error
 
@@ -121,14 +159,18 @@ class JsonHttp:
         cap: int,
         timeout: float,
         keep_tail: bool = False,
+        opener: Callable[..., Any] | None = None,
+        deadline: float | None = None,
     ) -> HttpResponse:
         try:
-            with self._opener(request, timeout=timeout) as response:
+            with (opener or self._opener)(request, timeout=timeout) as response:
                 status = int(getattr(response, "status", getattr(response, "code", 200)))
                 if keep_tail and status < 400:
-                    raw = self._read_tail(response, cap)
+                    raw, truncated = self._read_tail(response, cap, deadline)
                     headers = dict(getattr(response, "headers", {}) or {})
-                    return HttpResponse(status=status, body=raw, headers=headers)
+                    return HttpResponse(
+                        status=status, body=raw, headers=headers, truncated=truncated
+                    )
                 raw = response.read(cap + 1)
                 headers = dict(getattr(response, "headers", {}) or {})
         except urllib.error.HTTPError as exc:
@@ -142,19 +184,26 @@ class JsonHttp:
         return HttpResponse(status=status, body=raw, headers=headers)
 
     @staticmethod
-    def _read_tail(response: Any, cap: int) -> bytes:
+    def _read_tail(response: Any, cap: int, deadline: float | None) -> tuple[bytes, bool]:
         tail = bytearray()
         scanned = 0
+        truncated = False
         while True:
-            chunk = response.read(_TAIL_READ_CHUNK)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise HttpError(0, "deadline exceeded while reading the response")
+            # `read1` returns what is available after one socket read;
+            # `read(n)` would block until n bytes arrive, defeating the deadline.
+            reader = getattr(response, "read1", None) or response.read
+            chunk = reader(_TAIL_READ_CHUNK)
             if not chunk:
-                return bytes(tail)
+                return bytes(tail), truncated
             scanned += len(chunk)
             if scanned > _MAX_TAIL_SCAN_BYTES:
                 raise HttpError(0, "response exceeded the scan cap")
             tail += chunk
             if len(tail) > cap:
                 del tail[: len(tail) - cap]
+                truncated = True
 
     def _snippet(self, text: str) -> str:
         text = text[:_SNIPPET_CHARS]

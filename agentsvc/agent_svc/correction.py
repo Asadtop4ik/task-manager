@@ -103,7 +103,7 @@ def _run_correction(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
     prompt = compose_correction_prompt(
         base_prompt,
         complex_route=route.complex,
-        ci_log_block=correction_ci_block(ctx, work),
+        ci_log_block=correction_ci_block(ctx, work, run.cancel),
     )
 
     run.stage("codex_started")
