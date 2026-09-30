@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_task import ENGINEERING_CHECKLIST
 from public_agent_task import (
     approved_repositories,
     build_prompt,
@@ -203,6 +204,13 @@ class ParametrizedCheckDiffTests(unittest.TestCase):
             "description": PAYLOAD["description"].strip(),
         }
         self.assertEqual(written, build_prompt(normalized))
+
+    def test_build_prompt_includes_the_engineering_checklist(self) -> None:
+        prompt = build_prompt(PAYLOAD | {"title": "T", "description": "D"})
+        self.assertIn(ENGINEERING_CHECKLIST, prompt)
+        self.assertLess(
+            prompt.index(ENGINEERING_CHECKLIST), prompt.index("Task Manager task #")
+        )
 
     def test_qa_enabled_argument_bypasses_the_environment(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

@@ -201,6 +201,36 @@ class ComposeImplementPromptOpsRulesTests(unittest.TestCase):
         self.assertIn("Ops requests:", prompt)
 
 
+class ComposeImplementPromptChecklistTests(unittest.TestCase):
+    """The engineering checklist lives in the trusted `build_prompt` text
+    (shared with the legacy GitHub path); `compose_implement_prompt` must
+    carry it through unchanged and never duplicate it."""
+
+    def test_checklist_from_the_real_trusted_builders_reaches_the_prompt(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from agent_svc.trusted import TrustedModules
+
+        from .support import copy_trusted_dir
+
+        with tempfile.TemporaryDirectory() as temp:
+            trusted = TrustedModules(copy_trusted_dir(Path(temp) / "trusted"))
+            task = {
+                "task_id": 7,
+                "run_id": "11111111-1111-1111-1111-111111111111",
+                "title": "t",
+                "description": "d",
+                "base_branch": "main",
+                "mode": "pr",
+            }
+            private = trusted.agent_task.build_prompt(task)
+            self.assertIn("Engineering checklist", private)
+            composed = compose_implement_prompt(private, _work(), complex_route=False)
+            self.assertEqual(composed.count("Engineering checklist"), 1)
+            self.assertIn("never a 500", composed)
+
+
 class ComposeCorrectionPromptTests(unittest.TestCase):
     def test_simple_has_no_orchestrator_rules(self) -> None:
         prompt = compose_correction_prompt("BASE", complex_route=False)

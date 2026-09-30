@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_task import (
+    ENGINEERING_CHECKLIST,
     _changed_fragments,
     _safe_fast_patch,
     _task,
@@ -705,6 +706,30 @@ class BranchNameAndPromptTests(unittest.TestCase):
                 prepare()
             written = (Path(temp) / "agent-prompt.txt").read_text(encoding="utf-8")
         self.assertEqual(written, build_prompt(task))
+
+    def test_build_prompt_includes_the_engineering_checklist(self) -> None:
+        task = {
+            "task_id": 9,
+            "run_id": "00000000-0000-0000-0000-000000000009",
+            "title": "Fix menu",
+            "description": "Do the thing",
+            "base_branch": "main",
+            "mode": "pr",
+        }
+        prompt = build_prompt(task)
+        self.assertIn(ENGINEERING_CHECKLIST, prompt)
+        for needle in (
+            "EXISTING tests",
+            "4xx, never a 500",
+            "Never swallow exceptions",
+            "timeouts",
+            "one error model",
+            "what you verified and what you could not run",
+        ):
+            self.assertIn(needle, ENGINEERING_CHECKLIST)
+        # Stays concise and ahead of the task text.
+        self.assertLessEqual(len(ENGINEERING_CHECKLIST.splitlines()), 25)
+        self.assertLess(prompt.index(ENGINEERING_CHECKLIST), prompt.index("Task #9"))
 
 
 def _const(value):

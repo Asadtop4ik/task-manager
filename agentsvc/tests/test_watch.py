@@ -270,6 +270,60 @@ class CheckCiTests(unittest.TestCase):
         self.assertEqual((run_id, sha, conclusion), (RUN_ID, "a" * 40, "success"))
         self.assertIn("actions/runs/100", url or "")
 
+    def test_successful_post_logs_an_info_event_without_secrets(self) -> None:
+        stream = io.StringIO()
+        logger = Logger(Redactor(["tok-secret-value"]), stream=stream)
+        api = FakeApi()
+        api.ci_pending_pages = [[_ci_pending_row()]]
+        github = FakeGitHub()
+        github.get_pull_results[(PUBLIC_REPO, 5)] = {
+            "state": "open",
+            "head": {"sha": "a" * 40, "ref": "feature", "repo": {"full_name": PUBLIC_REPO}},
+        }
+        github.workflow_runs[(PUBLIC_REPO, "ci.yml", "pull_request", "a" * 40)] = [
+            _completed_run(run_id=100, sha="a" * 40, branch="feature")
+        ]
+        github.jobs[(PUBLIC_REPO, 100)] = [{"name": "check", "conclusion": "success"}]
+
+        WatchChecks(_ctx(api=api, github=github, logger=logger)).check_ci()
+
+        lines = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+        events = [line for line in lines if line["event"] == "watch_ci_result_reported"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["level"], "info")
+        self.assertEqual(events[0]["run_id"], RUN_ID)
+        self.assertEqual(events[0]["conclusion"], "success")
+        self.assertEqual(events[0]["sha"], "a" * 40)
+        self.assertNotIn("tok-secret-value", stream.getvalue())
+
+    def test_no_change_logs_nothing(self) -> None:
+        stream = io.StringIO()
+        logger = Logger(Redactor([]), stream=stream)
+        api = FakeApi()
+        sha = "a" * 40
+        url = f"https://github.com/{PUBLIC_REPO}/actions/runs/100"
+        api.ci_pending_pages = [
+            [
+                _ci_pending_row(
+                    head_sha=sha, ci_status="success", ci_verified_sha=sha, ci_url=url
+                )
+            ]
+        ]
+        github = FakeGitHub()
+        github.get_pull_results[(PUBLIC_REPO, 5)] = {
+            "state": "open",
+            "head": {"sha": sha, "ref": "feature", "repo": {"full_name": PUBLIC_REPO}},
+        }
+        github.workflow_runs[(PUBLIC_REPO, "ci.yml", "pull_request", sha)] = [
+            _completed_run(run_id=100, sha=sha, branch="feature")
+        ]
+        github.jobs[(PUBLIC_REPO, 100)] = [{"name": "check", "conclusion": "success"}]
+
+        WatchChecks(_ctx(api=api, github=github, logger=logger)).check_ci()
+
+        self.assertEqual(api.ci_result_calls, [])
+        self.assertNotIn("watch_ci_result_reported", stream.getvalue())
+
     def test_no_change_skips_post(self) -> None:
         api = FakeApi()
         sha = "a" * 40
@@ -399,6 +453,59 @@ class CheckMergeDeployTests(unittest.TestCase):
         checks.check_merge_deploy()
 
         self.assertEqual(api.merged_calls, [(RUN_ID, "b" * 40)])
+
+    def test_merged_and_deployed_reports_are_logged(self) -> None:
+        stream = io.StringIO()
+        logger = Logger(Redactor([]), stream=stream)
+        api = FakeApi()
+        api.external_pending_pages = [[_external_pending_row(status="pr_ready")]]
+        github = FakeGitHub()
+        github.get_pull_results[(PUBLIC_REPO, 5)] = {
+            "merged": True,
+            "merge_commit_sha": "b" * 40,
+        }
+        WatchChecks(_ctx(api=api, github=github, logger=logger)).check_merge_deploy()
+        lines = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+        merged = [line for line in lines if line["event"] == "watch_merged_reported"]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual((merged[0]["level"], merged[0]["sha"]), ("info", "b" * 40))
+
+        sha = "c" * 40
+        stream2 = io.StringIO()
+        api2 = FakeApi()
+        api2.external_pending_pages = [[_external_pending_row(status="merged", merged_sha=sha)]]
+        github2 = FakeGitHub()
+        github2.workflow_runs[(PUBLIC_REPO, "deploy.yml", "push", sha)] = [
+            {
+                "id": 200,
+                "head_sha": sha,
+                "head_branch": "main",
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+        github2.jobs[(PUBLIC_REPO, 200)] = [
+            {"name": "ci / check", "conclusion": "success"},
+            {"name": "deploy", "conclusion": "success"},
+        ]
+        healthy = _image_state_runner(
+            {
+                "demo-web": {
+                    "image": f"ghcr.io/muradjanov-dev/demo-web:{sha}",
+                    "running": True,
+                    "health": "healthy",
+                }
+            }
+        )
+        WatchChecks(
+            _ctx(api=api2, github=github2, logger=Logger(Redactor([]), stream=stream2)),
+            command_runner=healthy,
+        ).check_merge_deploy()
+        lines = [json.loads(line) for line in stream2.getvalue().splitlines() if line]
+        deployed = [line for line in lines if line["event"] == "watch_deployed_reported"]
+        self.assertEqual(len(deployed), 1)
+        self.assertEqual(deployed[0]["run_id"], RUN_ID)
 
     def test_not_yet_merged_posts_nothing(self) -> None:
         api = FakeApi()

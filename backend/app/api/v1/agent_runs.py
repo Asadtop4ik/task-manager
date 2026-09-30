@@ -113,6 +113,10 @@ _CORRECTION_HEAD_CHANGED_DETAIL = "correction PR head changed before recording"
 _CORRECTION_PR_CLOSED_DETAIL = "correction PR is no longer open"
 _CORRECTION_SUPERSEDED_ERROR = "Superseded by a newer correction request"
 _CORRECTION_ORPHANED_ERROR = "Correction could not start any more; request it again"
+_CORRECTION_PR_MERGED_ERROR = "PR merged; correction not applied"
+_CORRECTION_RUN_CANCELLED_ERROR = "Run cancelled; correction not applied"
+_CORRECTION_PR_CLOSED_ERROR = "PR is no longer open"
+_MERGE_IN_PROGRESS_DETAIL = "merge in progress"
 _ORPHAN_CORRECTION_MAX_AGE = timedelta(minutes=30)
 _AGENT_SVC_TIMEOUT_ERROR = "agent-svc javob bermadi"
 _TASK_REVISION_STALE_ERROR = "Task tasdiqlangandan keyin o'zgartirildi; qayta yuboring."
@@ -620,6 +624,21 @@ async def _issue_lease(
     )
 
 
+async def _merge_action_open(session: DbSession, run: AgentRun) -> bool:
+    """A merge action of this run is accepted, in progress or waiting to be
+    retried: the PR may merge at any moment."""
+    merge_open = await session.scalar(
+        select(AgentRunAction.action_id)
+        .where(
+            AgentRunAction.agent_run_id == run.id,
+            AgentRunAction.kind == "merge",
+            AgentRunAction.status.in_(["in_progress", "accepted", "retryable"]),
+        )
+        .limit(1)
+    )
+    return merge_open is not None
+
+
 async def _orphan_is_healable(
     session: DbSession, run: AgentRun, action: AgentRunAction, now: datetime
 ) -> bool:
@@ -632,16 +651,7 @@ async def _orphan_is_healable(
         return False
     if now - action.updated_at > _ORPHAN_CORRECTION_MAX_AGE:
         return False
-    merge_open = await session.scalar(
-        select(AgentRunAction.action_id)
-        .where(
-            AgentRunAction.agent_run_id == run.id,
-            AgentRunAction.kind == "merge",
-            AgentRunAction.status.in_(["in_progress", "accepted", "retryable"]),
-        )
-        .limit(1)
-    )
-    return merge_open is None
+    return not await _merge_action_open(session, run)
 
 
 def _reject_orphaned_correction(
@@ -887,11 +897,19 @@ async def _current_pr_head(run: AgentRun) -> tuple[str, bool]:
     pr_number = run.pr_url.removeprefix(prefix)
     if not run.pr_url.startswith(prefix) or not pr_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
-    async with httpx.AsyncClient(timeout=_pr_head_timeout_s.get()) as client:
-        response = await client.get(
-            f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
-            headers=_headers(run.repo_full_name),
-        )
+    timeout_s = _pr_head_timeout_s.get()
+    # httpx's per-phase timeouts alone let a trickling server stretch one call
+    # to several times the limit; the wall-clock `wait_for` makes it a hard cap.
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+                response = await client.get(
+                    f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
+                    headers=_headers(run.repo_full_name),
+                )
+    except TimeoutError:
+        # Surfaces as the same httpx error family every caller already handles.
+        raise httpx.ReadTimeout("GitHub PR read exceeded its time limit") from None
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub PR status is unavailable")
     pr = response.json()
@@ -2381,6 +2399,11 @@ async def _request_owner_action(
         and not (run.status == "correction_running" and takeover.expired_lease)
     ):
         return _action_error("not_ready", "PR is not open for correction", status_code=409)
+    if kind == "correction" and await _merge_action_open(session, run):
+        # A merge that is accepted/in flight (or waiting to be retried) lands
+        # regardless; a correction started beside it would push to a PR that
+        # is about to merge and then be silently orphaned.
+        return _action_error("not_ready", _MERGE_IN_PROGRESS_DETAIL, status_code=409)
     target_token = (
         settings.github_public_agent_token
         if run.repo_full_name in PUBLIC_REPOSITORIES
@@ -2595,7 +2618,7 @@ async def agent_action_result(
         run.merged_sha = payload.merge_sha
         run.merged_at = run.merged_at or datetime.now(UTC)
         run.notified_at = None
-        await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
+        await _retire_open_corrections(session, run, _CORRECTION_PR_MERGED_ERROR)
         if settings.agent_qa_enabled and run.repo_full_name == settings.agent_qa_repository:
             run.qa_deploy_dispatch_status = "pending"
             run.qa_deploy_dispatch_error = None
@@ -2623,6 +2646,22 @@ async def agent_action_result(
             raise HTTPException(status_code=409, detail="invalid agent PR reference")
         current_head, is_open = await _settled_pr_head(run, payload.head_sha)
         if not is_open:
+            # Waiting cannot help once the PR is closed/merged, and agent-svc
+            # treats this 409 as terminal (LeaseLost): settle our side first so
+            # the action is not left in_progress and the run not stuck in
+            # correction_running, then refuse.
+            action.status = "rejected"
+            action.result = {"message": _CORRECTION_PR_CLOSED_ERROR}
+            if run.executor == "local":
+                _clear_lease(run)
+            if run.status == "correction_running":
+                run.status = "pr_opened"
+                _refresh_pr_ready(run)
+            run.notified_at = None
+            agent_events.record(
+                session, run, phase="correction", error=_CORRECTION_PR_CLOSED_ERROR
+            )
+            await session.commit()
             raise HTTPException(status_code=409, detail=_CORRECTION_PR_CLOSED_DETAIL)
         if current_head != payload.head_sha:
             raise HTTPException(status_code=409, detail=_CORRECTION_HEAD_CHANGED_DETAIL)
@@ -2952,7 +2991,7 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         )
         .values(status="cancelled")
     )
-    await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
+    await _retire_open_corrections(session, run, _CORRECTION_RUN_CANCELLED_ERROR)
     _clear_lease(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
@@ -2983,7 +3022,7 @@ async def agent_run_merged(
     run.merged_at = run.merged_at or datetime.now(UTC)
     run.status = "merged"
     run.notified_at = None
-    await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
+    await _retire_open_corrections(session, run, _CORRECTION_PR_MERGED_ERROR)
     agent_events.record(session, run)
     await session.commit()
     return AgentRunOut.model_validate(run)

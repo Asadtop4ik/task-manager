@@ -82,6 +82,31 @@ def branch_name(task: Mapping[str, object]) -> str:
     return f"{prefix}/task-{validated['task_id']}-{validated['run_id']}"
 
 
+# Appended to both trusted implement prompts (private and public repos), so the
+# legacy GitHub Actions path and agent-svc (which builds its base prompt with
+# these same functions) stay identical. An audit of agent-built features found
+# the agent meets stated requirements but misses unstated engineering basics.
+ENGINEERING_CHECKLIST = (
+    "Engineering checklist (requirements you were not told explicitly):\n"
+    "- Update or extend EXISTING tests affected by your change (e.g. adding auth to an "
+    "endpoint breaks older tests that call it without credentials): search the test suite "
+    "for callers of anything you change.\n"
+    "- You usually cannot run network/socket tests in this sandbox: reason carefully about "
+    "them, and still run what you can (unit tests, python -m compileall, import checks).\n"
+    "- Validate and bound all external input (sizes, numeric ranges including huge ints, "
+    "nesting depth, lengths); malformed input must produce a 4xx, never a 500.\n"
+    "- Never swallow exceptions silently: log unexpected errors with context (never secrets).\n"
+    "- Network I/O needs timeouts; no unbounded resource growth from client-controlled "
+    "values (labels, keys, caches).\n"
+    "- Keep one error model; do not add parallel error hierarchies; keep layers separated.\n"
+    "- Keep routing, docs and tests in sync when adding endpoints (route tables, OpenAPI, "
+    "README).\n"
+    "- Fix the root cause instead of adapting code to fit brittle tests; do not reorder or "
+    "rename things just to make tautological tests pass.\n"
+    "- In your final message, list what you verified and what you could not run.\n"
+)
+
+
 def build_prompt(task: Mapping[str, object]) -> str:
     """The exact Codex prompt text ``prepare`` writes to agent-prompt.txt.
 
@@ -98,6 +123,7 @@ def build_prompt(task: Mapping[str, object]) -> str:
         "Sensitive paths require human review and will become a PR instead of direct deployment.\n"
         "If the task needs a business decision, explain exactly what is missing.\n"
         "Do not push, open a PR, deploy, or read credentials. A later workflow step handles GitHub.\n"
+        f"{ENGINEERING_CHECKLIST}"
         f"Task #{validated['task_id']}: {validated['title']}\n"
         f"Description:\n{validated['description']}\n"
     )

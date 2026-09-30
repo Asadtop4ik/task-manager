@@ -282,6 +282,17 @@ class WatchChecks:
         ):
             return
         api.ci_result(record["run_id"], sha=sha, conclusion=conclusion, github_run_url=url)
+        # Only after the API accepted it: lets an operator see the watch lane
+        # actually moving runs (ids and a conclusion only, never a secret).
+        self._ctx.logger.event(
+            "watch_ci_result_reported",
+            level="info",
+            run_id=record["run_id"],
+            repo=record["repo"],
+            pr_number=record["pr_number"],
+            sha=sha,
+            conclusion=conclusion,
+        )
 
     def _ci_conclusion(self, repo_info: Any, sha: str, branch: str) -> tuple[str, str | None]:
         github = self._ctx.github
@@ -381,6 +392,14 @@ class WatchChecks:
             sha = pr.get("merge_commit_sha")
             if pr.get("merged") and _valid_sha(sha):
                 api.merged(record["run_id"], sha=sha)
+                self._ctx.logger.event(
+                    "watch_merged_reported",
+                    level="info",
+                    run_id=record["run_id"],
+                    repo=repo,
+                    pr_number=record["pr_number"],
+                    sha=sha,
+                )
                 # The run now becomes "merged" under the same id; let it be
                 # rescheduled fresh (it may take a while to actually deploy).
                 self._deploy_schedule.forget(record["run_id"])
@@ -389,6 +408,13 @@ class WatchChecks:
         run_url = self._successful_deploy_run(repo_info, sha)
         if run_url is not None and self._production_matches(repo_info, sha):
             api.deployed(record["run_id"], sha=sha, github_run_url=run_url)
+            self._ctx.logger.event(
+                "watch_deployed_reported",
+                level="info",
+                run_id=record["run_id"],
+                repo=repo,
+                sha=sha,
+            )
 
     def _successful_deploy_run(self, repo_info: Any, sha: str) -> str | None:
         github = self._ctx.github
