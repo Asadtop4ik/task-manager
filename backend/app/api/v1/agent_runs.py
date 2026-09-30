@@ -113,6 +113,12 @@ _CORRECTION_HEAD_CHANGED_DETAIL = "correction PR head changed before recording"
 _CORRECTION_PR_CLOSED_DETAIL = "correction PR is no longer open"
 _CORRECTION_SUPERSEDED_ERROR = "Superseded by a newer correction request"
 _CORRECTION_ORPHANED_ERROR = "Correction could not start any more; request it again"
+_CORRECTION_PR_MERGED_ERROR = "PR merged; correction not applied"
+_CORRECTION_RUN_CANCELLED_ERROR = "Run cancelled; correction not applied"
+_CORRECTION_PR_CLOSED_ERROR = "PR is no longer open"
+_MERGE_IN_PROGRESS_DETAIL = "merge in progress"
+_MERGE_STALE_HEAD_MESSAGE = "PR head changed; merge request no longer applies"
+_MERGE_SUPERSEDED_MESSAGE = "superseded by correction request"
 _ORPHAN_CORRECTION_MAX_AGE = timedelta(minutes=30)
 _AGENT_SVC_TIMEOUT_ERROR = "agent-svc javob bermadi"
 _TASK_REVISION_STALE_ERROR = "Task tasdiqlangandan keyin o'zgartirildi; qayta yuboring."
@@ -620,6 +626,54 @@ async def _issue_lease(
     )
 
 
+# An accepted/in-progress merge that has not reported back for this long is a
+# crash leftover, not a merge that is about to land: it no longer blocks a
+# correction request.
+_MERGE_BLOCKS_CORRECTION_MAX_AGE = timedelta(minutes=30)
+
+
+async def _merge_action_open(session: DbSession, run: AgentRun) -> bool:
+    """A merge of the current PR head is genuinely in flight: accepted or
+    in progress for exactly `run.head_sha` and touched within the last 30
+    minutes, so the PR may merge at any moment. A `retryable` merge never
+    reached GitHub (dispatch failed) and never counts; neither does one for an
+    older head or a crash leftover that stopped updating."""
+    now = datetime.now(UTC)
+    rows = await session.scalars(
+        select(AgentRunAction).where(
+            AgentRunAction.agent_run_id == run.id,
+            AgentRunAction.kind == "merge",
+            AgentRunAction.status.in_(["in_progress", "accepted"]),
+        )
+    )
+    return any(
+        row.request_data.get("expected_head_sha") == run.head_sha
+        and now - row.updated_at <= _MERGE_BLOCKS_CORRECTION_MAX_AGE
+        for row in rows
+    )
+
+
+async def _reject_retryable_merges(
+    session: DbSession, run: AgentRun, message: str, *, stale_head_only: bool = False
+) -> None:
+    """Reject this run's `retryable` merge actions (never dispatched, so
+    nothing is in flight). With `stale_head_only`, only those that asked to
+    merge a head the PR no longer has."""
+    rows = await session.scalars(
+        select(AgentRunAction)
+        .where(
+            AgentRunAction.agent_run_id == run.id,
+            AgentRunAction.kind == "merge",
+            AgentRunAction.status == "retryable",
+        )
+        .with_for_update()
+    )
+    for row in rows:
+        if stale_head_only and row.request_data.get("expected_head_sha") == run.head_sha:
+            continue
+        _reject_retryable_action(row, message)
+
+
 async def _orphan_is_healable(
     session: DbSession, run: AgentRun, action: AgentRunAction, now: datetime
 ) -> bool:
@@ -632,16 +686,7 @@ async def _orphan_is_healable(
         return False
     if now - action.updated_at > _ORPHAN_CORRECTION_MAX_AGE:
         return False
-    merge_open = await session.scalar(
-        select(AgentRunAction.action_id)
-        .where(
-            AgentRunAction.agent_run_id == run.id,
-            AgentRunAction.kind == "merge",
-            AgentRunAction.status.in_(["in_progress", "accepted", "retryable"]),
-        )
-        .limit(1)
-    )
-    return merge_open is None
+    return not await _merge_action_open(session, run)
 
 
 def _reject_orphaned_correction(
@@ -887,11 +932,23 @@ async def _current_pr_head(run: AgentRun) -> tuple[str, bool]:
     pr_number = run.pr_url.removeprefix(prefix)
     if not run.pr_url.startswith(prefix) or not pr_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
-    async with httpx.AsyncClient(timeout=_pr_head_timeout_s.get()) as client:
-        response = await client.get(
-            f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
-            headers=_headers(run.repo_full_name),
-        )
+    timeout_s = _pr_head_timeout_s.get()
+    # httpx's per-phase timeouts alone let a trickling server stretch one call
+    # to several times the limit; the wall-clock `asyncio.timeout` makes it a
+    # hard cap.
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+                response = await client.get(
+                    f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
+                    headers=_headers(run.repo_full_name),
+                )
+    except (TimeoutError, httpx.HTTPError):
+        # Callers only handle HTTPException; a bare httpx/timeout error
+        # would surface as a 500.
+        raise HTTPException(
+            status_code=502, detail="GitHub PR status is unavailable"
+        ) from None
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub PR status is unavailable")
     pr = response.json()
@@ -928,11 +985,12 @@ async def _settled_pr_head(run: AgentRun, reported_sha: str) -> tuple[str, bool]
         token = _pr_head_timeout_s.set(call_timeout)
         try:
             last = await _current_pr_head(run)
-        except httpx.HTTPError:
-            if last is None:
-                raise HTTPException(
-                    status_code=502, detail="GitHub PR status is unavailable"
-                ) from None
+        except HTTPException as exc:
+            # A 502 is GitHub being slow/unavailable: keep the last good read
+            # and let the deadline decide. Anything else (PR mismatch, ...)
+            # is final.
+            if exc.status_code != 502 or last is None:
+                raise
         finally:
             _pr_head_timeout_s.reset(token)
         if last[0] == reported_sha or not last[1]:
@@ -1593,6 +1651,9 @@ async def pending_notifications(
                 continue  # Fail closed; the CI monitor will reconcile next tick.
             if current_head != run.head_sha:
                 _invalidate_review_and_ci(run, current_head)
+                await _reject_retryable_merges(
+                    session, run, _MERGE_STALE_HEAD_MESSAGE, stale_head_only=True
+                )
                 await session.commit()
                 continue
             if not is_open:
@@ -2169,6 +2230,9 @@ async def _load_run_detail(
             run.status == "correction_running" and run.executor == "local"
         ):
             _invalidate_review_and_ci(run, current_head)
+            await _reject_retryable_merges(
+                session, run, _MERGE_STALE_HEAD_MESSAGE, stale_head_only=True
+            )
             await session.commit()
     detail = await _run_detail_with_ops(session, run)
     if not is_open:
@@ -2336,6 +2400,9 @@ async def _request_owner_action(
             _reject_retryable_action(
                 action, "PR head changed; fetch the current run and retry"
             )
+        await _reject_retryable_merges(
+            session, run, _MERGE_STALE_HEAD_MESSAGE, stale_head_only=True
+        )
         await session.commit()
     if not is_open:
         if retry_existing:
@@ -2381,6 +2448,16 @@ async def _request_owner_action(
         and not (run.status == "correction_running" and takeover.expired_lease)
     ):
         return _action_error("not_ready", "PR is not open for correction", status_code=409)
+    if kind == "correction" and await _merge_action_open(session, run):
+        # A merge that is accepted/in flight lands regardless; a correction
+        # started beside it would push to a PR that is about to merge and then
+        # be silently orphaned.
+        return _action_error("not_ready", _MERGE_IN_PROGRESS_DETAIL, status_code=409)
+    if kind == "correction":
+        # A retryable merge never reached GitHub; once a correction is going
+        # ahead it could only be replayed against a head that is about to
+        # change, so retire it instead of letting it block or linger.
+        await _reject_retryable_merges(session, run, _MERGE_SUPERSEDED_MESSAGE)
     target_token = (
         settings.github_public_agent_token
         if run.repo_full_name in PUBLIC_REPOSITORIES
@@ -2595,7 +2672,7 @@ async def agent_action_result(
         run.merged_sha = payload.merge_sha
         run.merged_at = run.merged_at or datetime.now(UTC)
         run.notified_at = None
-        await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
+        await _retire_open_corrections(session, run, _CORRECTION_PR_MERGED_ERROR)
         if settings.agent_qa_enabled and run.repo_full_name == settings.agent_qa_repository:
             run.qa_deploy_dispatch_status = "pending"
             run.qa_deploy_dispatch_error = None
@@ -2623,6 +2700,23 @@ async def agent_action_result(
             raise HTTPException(status_code=409, detail="invalid agent PR reference")
         current_head, is_open = await _settled_pr_head(run, payload.head_sha)
         if not is_open:
+            # Waiting cannot help once the PR is closed/merged, and agent-svc
+            # treats this 409 as terminal (LeaseLost): settle our side first so
+            # the action is not left in_progress and the run not stuck in
+            # correction_running, then refuse.
+            action.status = "rejected"
+            action.result = {"message": _CORRECTION_PR_CLOSED_ERROR}
+            if run.executor == "local":
+                _clear_lease(run)
+            if run.status == "correction_running":
+                # Not `_refresh_pr_ready`: on a dead PR it could re-enable Merge.
+                run.status = "pr_opened"
+                run.pr_ready_at = None
+            run.notified_at = None
+            agent_events.record(
+                session, run, phase="correction", error=_CORRECTION_PR_CLOSED_ERROR
+            )
+            await session.commit()
             raise HTTPException(status_code=409, detail=_CORRECTION_PR_CLOSED_DETAIL)
         if current_head != payload.head_sha:
             raise HTTPException(status_code=409, detail=_CORRECTION_HEAD_CHANGED_DETAIL)
@@ -2952,7 +3046,7 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         )
         .values(status="cancelled")
     )
-    await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
+    await _retire_open_corrections(session, run, _CORRECTION_RUN_CANCELLED_ERROR)
     _clear_lease(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
@@ -2983,7 +3077,7 @@ async def agent_run_merged(
     run.merged_at = run.merged_at or datetime.now(UTC)
     run.status = "merged"
     run.notified_at = None
-    await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
+    await _retire_open_corrections(session, run, _CORRECTION_PR_MERGED_ERROR)
     agent_events.record(session, run)
     await session.commit()
     return AgentRunOut.model_validate(run)

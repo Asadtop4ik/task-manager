@@ -1897,6 +1897,282 @@ async def test_cancel_retires_an_orphaned_correction(
     resp = await client.post(f"/api/v1/agent-runs/{run_id}/cancel", headers=auth(manager))
     assert resp.status_code == 200
     assert (await _action_row(session, action_id)).status == "rejected"
+    assert (await _action_row(session, action_id)).result == {
+        "message": "Run cancelled; correction not applied"
+    }
+
+
+async def test_merge_result_retires_an_open_correction_with_a_merge_message(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, action_id = await _orphan_setup(
+        client, session, manager, project, monkeypatch, status="pr_ready"
+    )
+    row = await _run_row(session, run_id)
+    merge_id = str(uuid4())
+    session.add(
+        AgentRunAction(
+            action_id=merge_id,
+            agent_run_id=row.id,
+            kind="merge",
+            request_hash="2" * 64,
+            request_data={"expected_head_sha": _SHA},
+            status="in_progress",
+        )
+    )
+    await session.commit()
+
+    async def verified(run, sha) -> str:
+        return _SHA
+
+    monkeypatch.setattr(agent_runs, "_verify_deployment", verified)
+    monkeypatch.setattr(agent_runs, "_owner_release_supported", lambda run: True)
+    resp = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result",
+        json={
+            "action_id": merge_id,
+            "status": "completed",
+            "head_sha": _SHA,
+            "merge_sha": "c" * 40,
+        },
+        headers=_CALLBACK,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "merged"
+    assert (await _action_row(session, action_id)).result == {
+        "message": "PR merged; correction not applied"
+    }
+
+
+@pytest.mark.parametrize("merge_status", ["accepted", "in_progress"])
+async def test_correction_request_is_refused_while_a_merge_is_open(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    merge_status: str,
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    row = await _run_row(session, run_id)
+    merge_id = str(uuid4())
+    session.add(
+        AgentRunAction(
+            action_id=merge_id,
+            agent_run_id=row.id,
+            kind="merge",
+            request_hash="3" * 64,
+            request_data={"expected_head_sha": _SHA},
+            status=merge_status,
+        )
+    )
+    await session.commit()
+
+    action_id, refused = await _request_correction(client, manager, run_id)
+    assert refused["status_code"] == 409
+    assert refused["error"]["message"] == "merge in progress"
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == "pr_opened"  # never flipped to correction_running
+    assert row.lease_id is None
+    created = (
+        await session.scalars(
+            select(AgentRunAction).where(AgentRunAction.action_id == action_id)
+        )
+    ).first()
+    assert created is None
+
+    # Once the merge action is finished, a correction is accepted again.
+    merge = await _action_row(session, merge_id)
+    merge.status = "rejected"
+    await session.commit()
+    await session.refresh(manager)
+    _id, allowed = await _request_correction(client, manager, run_id)
+    assert allowed["status_code"] == 200
+
+
+async def _open_pr_with_merge(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: Project,
+    monkeypatch,
+    *,
+    merge_status: str,
+    expected_head: str = _SHA,
+    age: timedelta = timedelta(0),
+) -> tuple[str, str]:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+
+    async def head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", head)
+    row = await _run_row(session, run_id)
+    merge_id = str(uuid4())
+    merge = AgentRunAction(
+        action_id=merge_id,
+        agent_run_id=row.id,
+        kind="merge",
+        request_hash="4" * 64,
+        request_data={"expected_head_sha": expected_head},
+        status=merge_status,
+    )
+    session.add(merge)
+    await session.commit()
+    if age:
+        merge.updated_at = datetime.now(UTC) - age
+        await session.commit()
+    return run_id, merge_id
+
+
+async def test_retryable_merge_never_blocks_a_correction_and_is_superseded(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, merge_id = await _open_pr_with_merge(
+        client, session, manager, project, monkeypatch, merge_status="retryable"
+    )
+    _action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+    merge = await _action_row(session, merge_id)
+    assert merge.status == "rejected"
+    assert merge.result == {"message": "superseded by correction request"}
+
+
+async def test_stale_accepted_merge_does_not_block_a_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _merge_id = await _open_pr_with_merge(
+        client,
+        session,
+        manager,
+        project,
+        monkeypatch,
+        merge_status="accepted",
+        age=timedelta(minutes=31),
+    )
+    _action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+
+
+async def test_accepted_merge_for_an_older_head_does_not_block_a_correction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _merge_id = await _open_pr_with_merge(
+        client,
+        session,
+        manager,
+        project,
+        monkeypatch,
+        merge_status="accepted",
+        expected_head=_NEW_SHA,
+    )
+    _action_id, created = await _request_correction(client, manager, run_id)
+    assert created["status_code"] == 200
+
+
+async def test_head_change_rejects_stale_retryable_merges(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, merge_id = await _open_pr_with_merge(
+        client, session, manager, project, monkeypatch, merge_status="retryable"
+    )
+
+    # GitHub now reports a different head than the retryable merge asked for.
+    async def moved(run) -> tuple[str, bool]:
+        return _NEW_SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", moved)
+    resp = await client.get(f"/api/v1/agent-runs/{run_id}", headers=auth(manager))
+    assert resp.status_code == 200
+    merge = await _action_row(session, merge_id)
+    assert merge.status == "rejected"
+    assert merge.result == {"message": "PR head changed; merge request no longer applies"}
+
+
+async def test_pr_head_read_is_hard_capped_even_when_github_trickles(monkeypatch) -> None:
+    """One `_current_pr_head` call must end within its timeout, however slowly
+    the (fake) GitHub answers: per-phase httpx timeouts alone would not."""
+
+    class SlowClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self) -> "SlowClient":
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def get(self, *args, **kwargs):
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", SlowClient)
+    monkeypatch.setattr(agent_runs, "_headers", lambda repo: {})
+    run = _run_stub(repo_full_name="Asadtop4ik/task-manager")
+    token = agent_runs._pr_head_timeout_s.set(0.2)
+    try:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(agent_runs.HTTPException) as excinfo:
+            await agent_runs._current_pr_head(run)
+        assert excinfo.value.status_code == 502  # never a bare httpx error (-> 500)
+        assert asyncio.get_running_loop().time() - started < 2.0
+    finally:
+        agent_runs._pr_head_timeout_s.reset(token)
+
+
+async def test_settle_keeps_the_last_good_read_when_a_later_call_times_out(
+    monkeypatch,
+) -> None:
+    calls = {"n": 0}
+
+    async def flaky(run) -> tuple[str, bool]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _SHA, True
+        raise agent_runs.HTTPException(
+            status_code=502, detail="GitHub PR status is unavailable"
+        )
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", flaky)
+    monkeypatch.setattr(agent_runs, "_PR_HEAD_SETTLE_DELAYS_S", (0.0, 0.0))
+    assert await agent_runs._settled_pr_head(None, _NEW_SHA) == (_SHA, True)  # type: ignore[arg-type]
+    assert calls["n"] == 3
+
+
+async def test_settled_pr_head_one_slow_call_cannot_exceed_its_cap(monkeypatch) -> None:
+    timeouts: list[object] = []
+
+    class SlowClient:
+        def __init__(self, *args, **kwargs) -> None:
+            timeouts.append(kwargs.get("timeout"))
+
+        async def __aenter__(self) -> "SlowClient":
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def get(self, *args, **kwargs):
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr(agent_runs.httpx, "AsyncClient", SlowClient)
+    monkeypatch.setattr(agent_runs, "_headers", lambda repo: {})
+    monkeypatch.setattr(agent_runs, "_PR_HEAD_SETTLE_CALL_TIMEOUT_S", 0.2)
+    run = _run_stub(repo_full_name="Asadtop4ik/task-manager")
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(agent_runs.HTTPException) as excinfo:
+        await agent_runs._settled_pr_head(run, _NEW_SHA)
+    assert excinfo.value.status_code == 502
+    assert asyncio.get_running_loop().time() - started < 2.0
+    timeout = timeouts[0]
+    assert isinstance(timeout, agent_runs.httpx.Timeout)
+    assert max(timeout.connect, timeout.read, timeout.write, timeout.pool) <= 0.5
 
 
 async def test_retire_open_corrections_rejects_orphans_and_drops_the_lease(
@@ -1950,6 +2226,22 @@ async def test_correction_result_for_a_closed_pr_is_a_distinct_409_without_waiti
     assert resp.status_code == 409
     assert resp.json()["detail"] == "correction PR is no longer open"
     assert calls["n"] == 1 and slept == []
+    # The 409 is terminal for agent-svc (LeaseLost), so our side is settled
+    # too: action rejected, lease gone, run back to an open-PR state.
+    action = await _action_row(session, action_id)
+    assert action.status == "rejected"
+    assert action.result == {"message": "PR is no longer open"}
+    row = await _run_row(session, run_id)
+    await session.refresh(row)
+    assert row.status == "pr_opened"
+    assert row.lease_id is None and row.lease_kind is None
+    # A replay of the same result is now an idempotent no-op, not a new 409.
+    replay = await client.post(
+        f"/api/v1/agent-runs/{run_id}/action-result",
+        json={"action_id": action_id, "status": "completed", "head_sha": _NEW_SHA},
+        headers={**_CALLBACK, "X-Agent-Lease-ID": work["lease_id"]},
+    )
+    assert replay.status_code == 200
 
 
 async def test_settle_respects_its_wall_clock_deadline(monkeypatch) -> None:
