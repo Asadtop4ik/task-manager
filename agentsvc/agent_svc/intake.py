@@ -33,6 +33,13 @@ MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
 _MAX_RELEVANT_FILES = 12
+# Mirrors backend `IntakeBrief` (backend/app/schemas/agent_intake.py).
+_MAX_TITLE = 255
+_MAX_GOAL = 800
+_MAX_CRITERIA = 5
+_MAX_CRITERION = 250
+_MAX_ASSUMPTIONS = 5
+_MAX_ASSUMPTION = 150
 _RELEVANT_FILE_RE = re.compile(r"^[A-Za-z0-9_./-]{1,200}$")
 
 _TIMED_OUT_MESSAGE = "Task analysis timed out."
@@ -200,6 +207,11 @@ def _parse_final_message(text: str) -> Any:
         raise IntakeError("Codex returned invalid JSON") from None
 
 
+def _fit(value: str, limit: int) -> str:
+    text = value.strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _valid_relevant_file(path: Any) -> bool:
     return (
         isinstance(path, str)
@@ -235,37 +247,38 @@ def _validate_result(payload: Any) -> dict[str, Any]:
         assumptions = brief.get("assumptions")
         complexity = brief.get("complexity")
         relevant_files = brief.get("relevant_files")
+        # Types are a hard contract; sizes are not. A detailed request makes
+        # Codex write more or longer criteria than the Task Manager brief
+        # holds, and rejecting the whole brief for that failed every large
+        # task. The original request is kept in full in the task description,
+        # so fitting the brief to its limits loses no requirement.
         if (
             not isinstance(title, str)
             or not title.strip()
-            or len(title) > 255
             or not isinstance(goal, str)
             or not goal.strip()
-            or len(goal) > 800
             or not isinstance(acceptance, list)
-            or not 1 <= len(acceptance) <= 5
-            or any(
-                not isinstance(value, str) or not value.strip() or len(value) > 250
-                for value in acceptance
-            )
+            or not any(isinstance(value, str) and value.strip() for value in acceptance)
+            or any(not isinstance(value, str) for value in acceptance)
             or not isinstance(assumptions, list)
-            or len(assumptions) > 5
-            or any(not isinstance(value, str) or len(value) > 150 for value in assumptions)
+            or any(not isinstance(value, str) for value in assumptions)
             or (complexity is not None and complexity not in ("simple", "complex"))
             or not isinstance(relevant_files, list)
-            or len(relevant_files) > _MAX_RELEVANT_FILES
-            or any(not _valid_relevant_file(value) for value in relevant_files)
         ):
             raise IntakeError("Codex returned an invalid brief")
+        criteria = [_fit(value, _MAX_CRITERION) for value in acceptance if value.strip()]
+        notes = [_fit(value, _MAX_ASSUMPTION) for value in assumptions if value.strip()]
         return {
             "status": status,
             "brief": {
-                "title": title.strip(),
-                "goal": goal.strip(),
-                "acceptance": [value.strip() for value in acceptance],
-                "assumptions": [value.strip() for value in assumptions],
+                "title": _fit(title, _MAX_TITLE),
+                "goal": _fit(goal, _MAX_GOAL),
+                "acceptance": criteria[:_MAX_CRITERIA],
+                "assumptions": notes[:_MAX_ASSUMPTIONS],
                 "complexity": complexity,
-                "relevant_files": list(relevant_files),
+                "relevant_files": [
+                    value for value in relevant_files if _valid_relevant_file(value)
+                ][:_MAX_RELEVANT_FILES],
             },
         }
     raise IntakeError("Codex returned an invalid status")
@@ -285,7 +298,11 @@ def _build_prompt(lease: IntakeLease) -> str:
         "Keep exact UI copy requested by the user and technical identifiers unchanged.\n"
         "If the desired behavior is clear enough to implement, return status=ready, "
         "a brief with a short title, goal, concrete acceptance criteria, only necessary "
-        "assumptions, and questions=[]. If a material product decision or required outcome "
+        "assumptions, and questions=[]. Keep the brief compact: title at most 255 "
+        "characters, goal at most 800, at most 5 acceptance criteria of at most 250 "
+        "characters each (group related checks into one criterion), and at most 5 "
+        "assumptions of at most 150 characters; the full original request is kept "
+        "with the task, so the brief only needs the essentials. If a material product decision or required outcome "
         "is missing, return status=needs_answers, brief=null, and one to three focused "
         "questions. Do not ask about details "
         "that can be derived from the repository.\n"

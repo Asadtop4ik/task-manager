@@ -534,10 +534,16 @@ def _description(row: AgentIntake, fallback: bool) -> tuple[str, str]:
     # assistant replies and pasted error cards. The user approved the concise
     # brief above; duplicating that transcript made Telegram cards too long and
     # accidentally promoted unverified old answers into new requirements.
+    answers = f"Javoblar: {row.answer_text}" if row.answer_text else ""
     if not row.text.startswith("@codex Quyidagi loyiha suhbatidagi"):
-        pieces.extend(["", f"Asl so‘rov: {row.text[:3000]}"])
-    if row.answer_text:
-        pieces.append(f"Javoblar: {row.answer_text}")
+        # The brief is capped to a few short criteria, so the original request
+        # is the only place a large feature's full detail survives: give it
+        # every character the 12000-character task limit leaves over.
+        prefix = "\nAsl so‘rov: "
+        budget = 12000 - len("\n".join(pieces)) - len(prefix) - len(answers) - 1
+        pieces.extend(["", f"Asl so‘rov: {row.text[: max(budget, 0)]}"])
+    if answers:
+        pieces.append(answers)
     return title, "\n".join(pieces)[:12000]
 
 

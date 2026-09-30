@@ -112,23 +112,68 @@ class HandleIntakeTests(unittest.TestCase):
         self.assertEqual(exec_request["sandbox"], "read-only")
         self.assertEqual(exec_request["output_schema"], OUTPUT_SCHEMA)
 
-    def test_invalid_relevant_files_rejected(self) -> None:
+    def _run_ready(self, **brief_overrides: object) -> dict[str, object]:
         with TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
             remote = tmp / "remote.git"
             make_github_remote(remote)
             codex = FakeCodexRunner()
-            codex.queue_exec_result(
-                _exec_ok(_ready_final_message(relevant_files=["../etc/passwd"]))
-            )
+            codex.queue_exec_result(_exec_ok(_ready_final_message(**brief_overrides)))
             api = FakeChatApi()
             ctx = build_test_context(tmp, github_remote=remote, codex=codex, api=api)
 
             handle_intake(ctx, _lease())
 
-        result = api.intake_results[0]
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("invalid brief", result["error"])
+        return api.intake_results[0]
+
+    def test_unsafe_relevant_files_are_dropped_not_fatal(self) -> None:
+        result = self._run_ready(
+            relevant_files=["../etc/passwd", "/abs/path.py", "app.py", "ok dir/x.py"]
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["brief"]["relevant_files"], ["app.py"])
+
+    def test_oversized_brief_is_fitted_to_backend_limits(self) -> None:
+        # A detailed request used to fail the whole brief ("invalid brief");
+        # every large-feature task hit this in the end-to-end suite.
+        result = self._run_ready(
+            title="T" * 300,
+            goal="g" * 1200,
+            acceptance=[f"mezon {i} " + "x" * 400 for i in range(9)] + ["   "],
+            assumptions=["a" * 200] * 7,
+            relevant_files=[f"f{i}.py" for i in range(20)],
+        )
+        self.assertEqual(result["status"], "ready")
+        brief = result["brief"]
+        self.assertEqual(len(brief["title"]), 255)
+        self.assertEqual(len(brief["goal"]), 800)
+        self.assertEqual(len(brief["acceptance"]), 5)
+        self.assertTrue(all(len(item) <= 250 for item in brief["acceptance"]))
+        self.assertTrue(brief["acceptance"][0].startswith("mezon 0"))
+        self.assertTrue(brief["acceptance"][0].endswith("…"))
+        self.assertEqual(len(brief["assumptions"]), 5)
+        self.assertTrue(all(len(item) <= 150 for item in brief["assumptions"]))
+        self.assertEqual(len(brief["relevant_files"]), 12)
+
+    def test_wrong_brief_types_still_fail(self) -> None:
+        for overrides in (
+            {"title": ""},
+            {"goal": 5},
+            {"acceptance": []},
+            {"acceptance": ["   "]},
+            {"acceptance": ["ok", 3]},
+            {"assumptions": "x"},
+            {"complexity": "huge"},
+            {"relevant_files": "app.py"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self._run_ready(**overrides)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("invalid brief", result["error"])
+
+    def test_prompt_states_the_brief_limits(self) -> None:
+        prompt = _build_prompt(_lease())
+        self.assertIn("at most 5 acceptance criteria", prompt)
 
     def test_second_round_needs_answers_becomes_failed(self) -> None:
         with TemporaryDirectory() as tmp_str:

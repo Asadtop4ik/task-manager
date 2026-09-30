@@ -886,3 +886,21 @@ def test_discussion_task_description_keeps_approved_brief_without_raw_transcript
     assert title == "Opus 5.5 yangilash"
     assert ".env.example o‘zgarmasin" in description
     assert "old log" not in description
+
+
+def test_large_request_keeps_its_full_text_in_the_task_description() -> None:
+    long_request = "@codex " + "katta feature tafsiloti. " * 400  # ~10 KB
+    row = AgentIntake(
+        text=long_request,
+        answer_text="ha, shunday",
+        brief={
+            "title": "Katta feature",
+            "goal": "Maqsad",
+            "acceptance": ["Birinchi mezon"],
+            "assumptions": [],
+        },
+    )
+    _title, description = _description(row, False)
+    assert len(description) <= 12000
+    assert long_request in description
+    assert description.endswith("Javoblar: ha, shunday")
