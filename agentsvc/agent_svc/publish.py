@@ -344,7 +344,19 @@ def _pr_body(
     if summary:
         body += f"\nCodex summary:\n\n{summary}\n"
     body += f"\nTrusted publisher preflight: {preflight_result}.\n"
-    return body
+    return _neutralize_mentions(body)
+
+
+# A GitHub @-mention in a PR body notifies that user or app. The task text
+# comes from a Telegram request that starts with "@codex", and that mention
+# made the Codex Cloud GitHub app review every agent PR (spending the owner's
+# Codex limit) even with auto-review switched off. A zero-width space after
+# "@" keeps the text readable but is not a mention.
+_MENTION_RE = re.compile(r"@(?=[A-Za-z0-9])")
+
+
+def _neutralize_mentions(text: str) -> str:
+    return _MENTION_RE.sub("@\u200b", text)
 
 
 def publish_implement(
