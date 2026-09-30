@@ -200,6 +200,23 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         if result.error_message and not result.final_message:
             # e.g. a usage limit or model error reported by Codex itself.
             reason = f"{reason} (Codex: {result.error_message[:300]})"
+        elif not result.final_message and result.stderr_tail:
+            # No Codex output at all: the child refused the request or Codex
+            # died before its first event. Its last stderr line is the only
+            # diagnosis (e.g. "invalid model"); without it the run showed a
+            # generic failure.
+            tail = ctx.redactor.redact(result.stderr_tail[-1].strip())[:300]
+            reason = f"{reason} (Codex stderr: {tail})"
+        ctx.logger.event(
+            "implement_codex_failed",
+            level="error",
+            run_id=work.run_id,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            idle_killed=result.idle_killed,
+            error=result.error_message[:300] or None,
+            stderr_tail=[ctx.redactor.redact(line)[:300] for line in result.stderr_tail[-3:]],
+        )
         reason = _redact_ops_values(reason, proposals)
         _fail(ctx, work, run, "implement", reason, usage=result.usage)
         return
