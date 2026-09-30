@@ -751,3 +751,17 @@ class RejectBadModesUnitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NeutralizeMentionsTests(unittest.TestCase):
+    def test_pr_body_never_contains_a_github_mention(self) -> None:
+        body = publish_module._neutralize_mentions(
+            "@codex /version qo‘shing\nping @octocat and @Codex-bot; mail a@b.uz"
+        )
+        self.assertNotRegex(body, r"@[A-Za-z0-9]")
+        self.assertIn("@​codex /version", body)
+        self.assertIn("@​octocat", body)
+
+    def test_text_without_mentions_is_unchanged(self) -> None:
+        text = "No mentions here: email @ symbol alone, @ -dash, 100%"
+        self.assertEqual(publish_module._neutralize_mentions(text), text)

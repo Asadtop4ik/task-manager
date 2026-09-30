@@ -902,5 +902,17 @@ def test_large_request_keeps_its_full_text_in_the_task_description() -> None:
     )
     _title, description = _description(row, False)
     assert len(description) <= 12000
-    assert long_request in description
+    assert long_request.removeprefix("@codex ") in description
+    assert "@codex" not in description
     assert description.endswith("Javoblar: ha, shunday")
+
+
+def test_codex_routing_prefix_never_reaches_the_task_text() -> None:
+    row = AgentIntake(
+        text="@Codex  /version endpointini qo‘shing",
+        brief={"title": "T", "goal": "G", "acceptance": ["A"], "assumptions": []},
+    )
+    _title, description = _description(row, False)
+    assert "Asl so‘rov: /version endpointini qo‘shing" in description
+    title, fallback = _description(row, True)
+    assert title == fallback == "/version endpointini qo‘shing"

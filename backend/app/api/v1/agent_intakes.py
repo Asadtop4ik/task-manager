@@ -520,9 +520,20 @@ async def cancel_intake(
     return _as_out(row)
 
 
+def _request_text(row: AgentIntake) -> str:
+    # The bot only accepts requests that start with "@codex"; that prefix is a
+    # routing marker, not content. Left in the task text it reaches agent PR
+    # bodies as a GitHub mention and summons the Codex Cloud reviewer.
+    text = row.text
+    if text[:6].lower() == "@codex":
+        text = text[6:].lstrip()
+    return text
+
+
 def _description(row: AgentIntake, fallback: bool) -> tuple[str, str]:
     if fallback:
-        return row.text[:255], row.text[:12000]
+        text = _request_text(row)
+        return text[:255], text[:12000]
     brief = row.brief
     title = str(brief["title"])[:255]
     pieces = [str(brief["goal"]), "", "Qabul mezonlari:"]
@@ -541,7 +552,7 @@ def _description(row: AgentIntake, fallback: bool) -> tuple[str, str]:
         # every character the 12000-character task limit leaves over.
         prefix = "\nAsl so‘rov: "
         budget = 12000 - len("\n".join(pieces)) - len(prefix) - len(answers) - 1
-        pieces.extend(["", f"Asl so‘rov: {row.text[: max(budget, 0)]}"])
+        pieces.extend(["", f"Asl so‘rov: {_request_text(row)[: max(budget, 0)]}"])
     if answers:
         pieces.append(answers)
     return title, "\n".join(pieces)[:12000]
