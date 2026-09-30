@@ -135,7 +135,7 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
             return
 
         model_config = ctx.settings.model_matrix.get(REVIEW_MODEL_KEY, {})
-        model = model_config.get("model", "gpt-6-sol")
+        model = model_config.get("model", "gpt-6.1-sol")
         effort = model_config.get("effort", "medium")
         timeout_s = ctx.settings.timeouts.get(REVIEW_MODEL_KEY, 480)
 
