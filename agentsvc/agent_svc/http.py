@@ -22,6 +22,8 @@ DEFAULT_MAX_JSON_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_TEXT_BYTES = 1024 * 1024
 _RETRY_BACKOFF_S: tuple[float, ...] = (0.5, 1.0, 2.0)
 _SNIPPET_CHARS = 500
+_TAIL_READ_CHUNK = 64 * 1024
+_MAX_TAIL_SCAN_BYTES = 64 * 1024 * 1024
 
 
 class HttpError(Exception):
@@ -86,8 +88,11 @@ class JsonHttp:
         *,
         max_bytes: int | None = None,
         timeout: float | None = None,
+        keep_tail: bool = False,
     ) -> HttpResponse:
-        """`timeout` overrides this instance's own default for this one
+        """`keep_tail`: instead of failing when the body exceeds `max_bytes`,
+        return only its last `max_bytes` bytes (CI job logs are large and only
+        their end matters). `timeout` overrides this instance's own default for this one
         call only (used by the chat lane to clamp a call to whatever
         remains of its own job budget); omitted, this reproduces the exact
         prior behavior."""
@@ -98,7 +103,7 @@ class JsonHttp:
         last_error: HttpError | None = None
         for attempt in range(attempts):
             try:
-                return self._send_once(request, cap, call_timeout)
+                return self._send_once(request, cap, call_timeout, keep_tail)
             except HttpError as exc:
                 if not idempotent_get or exc.status < 500:
                     raise
@@ -111,11 +116,19 @@ class JsonHttp:
         raise last_error
 
     def _send_once(
-        self, request: urllib.request.Request, cap: int, timeout: float
+        self,
+        request: urllib.request.Request,
+        cap: int,
+        timeout: float,
+        keep_tail: bool = False,
     ) -> HttpResponse:
         try:
             with self._opener(request, timeout=timeout) as response:
                 status = int(getattr(response, "status", getattr(response, "code", 200)))
+                if keep_tail and status < 400:
+                    raw = self._read_tail(response, cap)
+                    headers = dict(getattr(response, "headers", {}) or {})
+                    return HttpResponse(status=status, body=raw, headers=headers)
                 raw = response.read(cap + 1)
                 headers = dict(getattr(response, "headers", {}) or {})
         except urllib.error.HTTPError as exc:
@@ -127,6 +140,21 @@ class JsonHttp:
         if status >= 400:
             raise HttpError(status, self._snippet(raw.decode("utf-8", "replace")))
         return HttpResponse(status=status, body=raw, headers=headers)
+
+    @staticmethod
+    def _read_tail(response: Any, cap: int) -> bytes:
+        tail = bytearray()
+        scanned = 0
+        while True:
+            chunk = response.read(_TAIL_READ_CHUNK)
+            if not chunk:
+                return bytes(tail)
+            scanned += len(chunk)
+            if scanned > _MAX_TAIL_SCAN_BYTES:
+                raise HttpError(0, "response exceeded the scan cap")
+            tail += chunk
+            if len(tail) > cap:
+                del tail[: len(tail) - cap]
 
     def _snippet(self, text: str) -> str:
         text = text[:_SNIPPET_CHARS]

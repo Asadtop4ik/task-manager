@@ -444,6 +444,10 @@ class AgentWorkOut(BaseModel):
     action_id: str | None
     instruction: str | None
     expected_head_sha: str | None
+    # CI conclusion for `head_sha` (and its GitHub run URL). Lets a correction
+    # fetch the failed job log; always for the run's current head.
+    ci_status: str | None = None
+    ci_url: str | None = None
 
 
 class AgentLeaseHeartbeat(BaseModel):
