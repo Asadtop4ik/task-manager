@@ -1,9 +1,13 @@
 """Start one coding run for a task and record verified GitHub results."""
 
+import asyncio
+import contextvars
 import hashlib
 import hmac
 import json
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Literal, cast
@@ -12,7 +16,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Response, status
-from sqlalchemy import ColumnElement, func, or_, select, update
+from sqlalchemy import ColumnElement, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -91,6 +95,25 @@ _WATCHDOG_LIVENESS_MINUTES = 5
 # times it has been heartbeat-renewed: an agent-svc that keeps heartbeating
 # without ever finishing must not hold a lease forever.
 _LEASE_MAX_DURATION_MINUTES = 60
+# GitHub's PR API can keep returning the previous head for a few seconds after
+# a push. agent-svc already waits for the PR view to show the pushed head
+# before it reports, so this re-check is only a safety net: a correction result
+# that names the freshly pushed head is re-read until a hard wall-clock budget
+# (GitHub call time included, each call capped) runs out, then refused. Kept
+# well under agent-svc's action-result HTTP timeout (~45s). The run row stays
+# locked for at most this long (a Postgres idle_in_transaction_session_timeout
+# must therefore stay above it).
+_PR_HEAD_SETTLE_BUDGET_S = 6.0
+_PR_HEAD_SETTLE_CALL_TIMEOUT_S = 3.0
+_PR_HEAD_SETTLE_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
+_settle_clock = time.monotonic
+_CORRECTION_HEAD_CHANGED_DETAIL = "correction PR head changed before recording"
+# Distinct from the above on purpose: waiting cannot help once the PR is
+# closed or merged, so agent-svc must treat this one as terminal.
+_CORRECTION_PR_CLOSED_DETAIL = "correction PR is no longer open"
+_CORRECTION_SUPERSEDED_ERROR = "Superseded by a newer correction request"
+_CORRECTION_ORPHANED_ERROR = "Correction could not start any more; request it again"
+_ORPHAN_CORRECTION_MAX_AGE = timedelta(minutes=30)
 _AGENT_SVC_TIMEOUT_ERROR = "agent-svc javob bermadi"
 _TASK_REVISION_STALE_ERROR = "Task tasdiqlangandan keyin o'zgartirildi; qayta yuboring."
 
@@ -597,6 +620,39 @@ async def _issue_lease(
     )
 
 
+async def _orphan_is_healable(
+    session: DbSession, run: AgentRun, action: AgentRunAction, now: datetime
+) -> bool:
+    """An in_progress correction beside a run that is not `correction_running`
+    may be re-entered only while it is still exactly what the owner asked for:
+    the PR head is the one they saw, nothing else is releasing the PR (a merge
+    in flight would land regardless), and the request is not stale. Otherwise
+    it is rejected and the owner asks again."""
+    if action.request_data.get("expected_head_sha") != run.head_sha:
+        return False
+    if now - action.updated_at > _ORPHAN_CORRECTION_MAX_AGE:
+        return False
+    merge_open = await session.scalar(
+        select(AgentRunAction.action_id)
+        .where(
+            AgentRunAction.agent_run_id == run.id,
+            AgentRunAction.kind == "merge",
+            AgentRunAction.status.in_(["in_progress", "accepted", "retryable"]),
+        )
+        .limit(1)
+    )
+    return merge_open is None
+
+
+def _reject_orphaned_correction(
+    session: DbSession, run: AgentRun, action: AgentRunAction
+) -> None:
+    action.status = "rejected"
+    action.result = {"message": _CORRECTION_ORPHANED_ERROR}
+    run.notified_at = None
+    agent_events.record(session, run, phase="correction", error=_CORRECTION_ORPHANED_ERROR)
+
+
 async def _reclaim_expired_lease(session: DbSession, run: AgentRun, now: datetime) -> None:
     """One local-executor lease whose `lease_until` has passed.
 
@@ -681,6 +737,8 @@ async def _reclaim_expired_lease(session: DbSession, run: AgentRun, now: datetim
                 AgentRunAction.kind == "correction",
                 AgentRunAction.status == "in_progress",
             )
+            .order_by(AgentRunAction.created_at.desc())
+            .limit(1)
             .with_for_update()
         )
         if action is not None and action.attempts >= 2:
@@ -814,6 +872,14 @@ async def _verify_pr(run: AgentRun, pr_number: str, sha: str) -> None:
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
 
 
+# Per-call GitHub timeout of `_current_pr_head`; `_settled_pr_head` lowers it
+# for its bounded re-reads (a context variable, so `_current_pr_head` keeps its
+# one-argument signature).
+_pr_head_timeout_s: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "pr_head_timeout_s", default=15.0
+)
+
+
 async def _current_pr_head(run: AgentRun) -> tuple[str, bool]:
     if not run.pr_url:
         raise HTTPException(status_code=409, detail="agent PR has no URL")
@@ -821,7 +887,7 @@ async def _current_pr_head(run: AgentRun) -> tuple[str, bool]:
     pr_number = run.pr_url.removeprefix(prefix)
     if not run.pr_url.startswith(prefix) or not pr_number.isdecimal():
         raise HTTPException(status_code=409, detail="invalid agent PR reference")
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=_pr_head_timeout_s.get()) as client:
         response = await client.get(
             f"{_GITHUB}/repos/{run.repo_full_name}/pulls/{pr_number}",
             headers=_headers(run.repo_full_name),
@@ -839,6 +905,68 @@ async def _current_pr_head(run: AgentRun) -> tuple[str, bool]:
     ):
         raise HTTPException(status_code=409, detail="PR does not match this agent run")
     return sha, pr.get("state") == "open" and not pr.get("merged")
+
+
+async def _settled_pr_head(run: AgentRun, reported_sha: str) -> tuple[str, bool]:
+    """`_current_pr_head`, re-read while it disagrees with `reported_sha`.
+
+    Only ever *waits* for GitHub's eventually consistent PR view to catch up
+    with a head the lease holder reported; it never trusts the reported value
+    itself. The caller still requires the final GitHub answer to equal the
+    reported head, so the security property (the recorded head is really the
+    PR head) is unchanged. Bounded by a wall-clock deadline of
+    `_PR_HEAD_SETTLE_BUDGET_S` that includes GitHub call time (each call is
+    capped at `_PR_HEAD_SETTLE_CALL_TIMEOUT_S`); a closed PR stops the wait
+    at once since waiting cannot change that."""
+    deadline = _settle_clock() + _PR_HEAD_SETTLE_BUDGET_S
+    last: tuple[str, bool] | None = None
+    delays = iter(_PR_HEAD_SETTLE_DELAYS_S)
+    while True:
+        call_timeout = max(
+            0.5, min(_PR_HEAD_SETTLE_CALL_TIMEOUT_S, deadline - _settle_clock())
+        )
+        token = _pr_head_timeout_s.set(call_timeout)
+        try:
+            last = await _current_pr_head(run)
+        except httpx.HTTPError:
+            if last is None:
+                raise HTTPException(
+                    status_code=502, detail="GitHub PR status is unavailable"
+                ) from None
+        finally:
+            _pr_head_timeout_s.reset(token)
+        if last[0] == reported_sha or not last[1]:
+            return last
+        remaining = deadline - _settle_clock()
+        delay = next(delays, None)
+        if delay is None or remaining <= 0:
+            return last
+        await asyncio.sleep(min(delay, remaining))
+
+
+async def _retire_open_corrections(
+    session: DbSession, run: AgentRun, message: str, *, except_action_id: str | None = None
+) -> None:
+    """Reject every still-open correction action of a run (and drop a
+    correction lease) in the caller's transaction: once the run merged or was
+    cancelled nothing may keep an orphaned in_progress correction around."""
+    rows = (
+        await session.scalars(
+            select(AgentRunAction)
+            .where(
+                AgentRunAction.agent_run_id == run.id,
+                AgentRunAction.kind == "correction",
+                AgentRunAction.status.in_(["in_progress", "accepted"]),
+            )
+            .with_for_update()
+        )
+    ).all()
+    for row in rows:
+        if row.action_id != except_action_id:
+            row.status = "rejected"
+            row.result = {"message": message}
+    if run.lease_kind == "correction":
+        _clear_lease(run)
 
 
 def _invalidate_review_and_ci(run: AgentRun, head_sha: str) -> None:
@@ -1122,30 +1250,68 @@ async def lease_agent_work(
             .where(
                 AgentRun.executor == "local",
                 AgentRun.lease_id.is_(None),
-                AgentRun.status == "correction_running",
+                # An in_progress correction is also considered when the run's
+                # status drifted to pr_opened/pr_ready (an "orphan"): it is
+                # healed below if still valid, rejected otherwise, instead of
+                # sitting unleasable forever.
+                AgentRun.status.in_(["correction_running", "pr_opened", "pr_ready"]),
                 AgentRunAction.kind == "correction",
                 AgentRunAction.status == "in_progress",
             )
             .options(selectinload(AgentRun.task).selectinload(Task.project))
-            .order_by(AgentRunAction.agent_run_id)
+            .order_by(AgentRunAction.agent_run_id, AgentRunAction.created_at.desc())
             .limit(20)
             .with_for_update(of=[AgentRun, AgentRunAction], skip_locked=True)
         )
     ).all()
     correction_pick: tuple[AgentRun, AgentRunAction] | None = None
+    seen_correction_runs: set[int] = set()
     for candidate_run, candidate_action in correction_candidates:
+        if correction_pick is not None and candidate_run.id != correction_pick[0].id:
+            continue  # only the picked run's older duplicates still need rejecting
+        if candidate_run.id in seen_correction_runs:
+            # An older in_progress correction beside a newer one for the same
+            # run (only reachable from rows written before the one-at-a-time
+            # guard in `_request_owner_action`): never two at once.
+            candidate_action.status = "rejected"
+            candidate_action.result = {"message": _CORRECTION_SUPERSEDED_ERROR}
+            continue
+        seen_correction_runs.add(candidate_run.id)
+        if candidate_run.status != "correction_running" and not await _orphan_is_healable(
+            session, candidate_run, candidate_action, now
+        ):
+            _reject_orphaned_correction(session, candidate_run, candidate_action)
+            continue
         if _revision(candidate_run.task, candidate_run.mode) != candidate_run.task_revision:
             _reject_correction_for_stale_task_revision(
                 session, candidate_run, candidate_action
             )
             continue
         correction_pick = (candidate_run, candidate_action)
-        break
     if correction_candidates:
         await session.flush()
     if correction_pick is not None:
         correction_run, correction_action = correction_pick
+        if correction_run.status != "correction_running":
+            # Orphaned in_progress action on a run whose status drifted back
+            # to pr_opened/pr_ready: re-enter correction_running so the
+            # result can be recorded and no merge/review races it.
+            correction_run.status = "correction_running"
+            correction_run.pr_ready_at = None
+            correction_run.notified_at = None
         correction_action.attempts += 1
+        # Never two open corrections per run, however the candidate page was
+        # cut: every other open one is superseded by the one being leased.
+        await session.execute(
+            update(AgentRunAction)
+            .where(
+                AgentRunAction.agent_run_id == correction_run.id,
+                AgentRunAction.kind == "correction",
+                AgentRunAction.status.in_(["in_progress", "accepted"]),
+                AgentRunAction.action_id != correction_action.action_id,
+            )
+            .values(status="rejected", result={"message": _CORRECTION_SUPERSEDED_ERROR})
+        )
         return await _issue_lease(
             session, correction_run, "correction", now, action=correction_action
         )
@@ -1305,14 +1471,26 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
             .with_for_update(skip_locked=True)
         )
     ).all()
+    # A queued correction the run row says is `correction_running`, or an
+    # in_progress action orphaned beside a run whose status drifted back to
+    # pr_opened/pr_ready: neither has a lease, both time out the same way.
+    orphaned_action = exists().where(
+        AgentRunAction.agent_run_id == AgentRun.id,
+        AgentRunAction.kind == "correction",
+        AgentRunAction.status == "in_progress",
+        AgentRunAction.updated_at < dispatched_cutoff,
+    )
     unclaimed_corrections = (
         await session.scalars(
             select(AgentRun)
             .where(
                 AgentRun.executor == "local",
-                AgentRun.status == "correction_running",
                 AgentRun.lease_id.is_(None),
-                AgentRun.updated_at < dispatched_cutoff,
+                or_(
+                    (AgentRun.status == "correction_running")
+                    & (AgentRun.updated_at < dispatched_cutoff),
+                    AgentRun.status.in_(["pr_opened", "pr_ready"]) & orphaned_action,
+                ),
             )
             .options(selectinload(AgentRun.task))
             .order_by(AgentRun.id)
@@ -1338,6 +1516,8 @@ async def _fail_stale_local_runs(session: DbSession) -> None:
                 AgentRunAction.kind == "correction",
                 AgentRunAction.status == "in_progress",
             )
+            .order_by(AgentRunAction.created_at.desc())
+            .limit(1)
             .with_for_update()
         )
         _reject_stale_correction(session, run, action)
@@ -1979,7 +2159,15 @@ async def _load_run_detail(
     is_open = False
     if run.pr_url and run.status in {"pr_opened", "pr_ready", "correction_running"}:
         current_head, is_open = await _current_pr_head(run)
-        if current_head != run.head_sha:
+        # While a LOCAL correction is running, the new head on GitHub is
+        # usually that correction's own push. Adopting it here would flip the
+        # run back to pr_opened under the still-in_progress action (the lease
+        # holder's result would then be refused, and the action orphaned);
+        # the correction result recording owns the head change instead.
+        # GitHub-executor runs keep their previous behaviour.
+        if current_head != run.head_sha and not (
+            run.status == "correction_running" and run.executor == "local"
+        ):
             _invalidate_review_and_ci(run, current_head)
             await session.commit()
     detail = await _run_detail_with_ops(session, run)
@@ -2004,6 +2192,82 @@ async def agent_run_detail(
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return await _load_run_detail(session, run)
+
+
+@dataclass
+class _CorrectionTakeover:
+    """What a new local correction request finds already on its run.
+
+    `live` — a correction lease is still live: a correction is genuinely
+    running and the request must be refused. `expired_lease` — the correction
+    lease ran out (agent-svc died or lost it). `stuck` — open correction
+    actions the new request replaces. Nothing is written until the request
+    passed every check (see `_apply_correction_takeover`)."""
+
+    live: bool = False
+    expired_lease: bool = False
+    stuck: list[AgentRunAction] = field(default_factory=list)
+
+
+async def _plan_local_correction_takeover(
+    session: DbSession, run: AgentRun, new_action_id: str
+) -> _CorrectionTakeover:
+    """Read-only: is the run's previous local correction stuck, so a fresh
+    owner request can replace it instead of bouncing off it (or, worse,
+    queueing beside it and never being leased)?
+
+    Only a run that is still an open PR (`correction_running`, `pr_opened`,
+    `pr_ready`) is ever considered; merged, cancelled, failed, deployed and
+    ops runs are never touched. Stuck means one of:
+    - the run is `correction_running` but its correction lease has expired;
+    - an `in_progress`/`accepted` correction exists although the run is no
+      longer `correction_running` (status drifted back to pr_opened/pr_ready)
+      and no correction lease is live.
+    A correction that is queued (no lease yet) or whose lease is still live is
+    never replaced: the caller refuses the request, so two corrections never
+    run at once."""
+    plan = _CorrectionTakeover()
+    if run.status not in {"correction_running", "pr_opened", "pr_ready"}:
+        return plan
+    if run.lease_kind == "correction" and run.lease_id is not None:
+        if run.lease_until is not None and run.lease_until >= datetime.now(UTC):
+            plan.live = True
+            return plan
+        plan.expired_lease = True
+    if run.status == "correction_running" and not plan.expired_lease:
+        return plan  # queued, not yet leased: the caller's status check refuses
+    plan.stuck = list(
+        (
+            await session.scalars(
+                select(AgentRunAction)
+                .where(
+                    AgentRunAction.agent_run_id == run.id,
+                    AgentRunAction.kind == "correction",
+                    AgentRunAction.status.in_(["in_progress", "accepted"]),
+                    AgentRunAction.action_id != new_action_id,
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    return plan
+
+
+def _apply_correction_takeover(
+    run: AgentRun, plan: _CorrectionTakeover, current_head: str
+) -> None:
+    """Commit-side of `_plan_local_correction_takeover`, run in the same
+    transaction that creates the replacing action (all checks passed)."""
+    for old in plan.stuck:
+        old.status = "rejected"
+        old.result = {"message": _CORRECTION_SUPERSEDED_ERROR}
+    if plan.expired_lease:
+        _clear_lease(run)
+        if current_head != run.head_sha:
+            # The dead correction's own push (or anything else) moved the PR:
+            # adopt it now, since the suppression during `correction_running`
+            # only protects a correction that can still report.
+            _invalidate_review_and_ci(run, current_head)
 
 
 async def _request_owner_action(
@@ -2054,8 +2318,18 @@ async def _request_owner_action(
         return _action_error(
             "not_ready", "this run has no owner-controlled private PR", status_code=409
         )
+    takeover = _CorrectionTakeover()
+    if kind == "correction" and run.executor == "local":
+        takeover = await _plan_local_correction_takeover(session, run, action_id)
     current_head, is_open = await _current_pr_head(run)
-    if current_head != run.head_sha:
+    # A local run that is `correction_running` keeps its head until that
+    # correction reports (the new head is usually its own push); a stuck one
+    # is taken over below, once the request is known to be accepted. Runs that
+    # are not an open PR at all (merged, cancelled, ...) are never rewritten.
+    adopt_head = run.status in {"pr_opened", "pr_ready"} or (
+        run.status == "correction_running" and run.executor != "local"
+    )
+    if current_head != run.head_sha and adopt_head:
         _invalidate_review_and_ci(run, current_head)
         if retry_existing:
             assert action is not None
@@ -2097,7 +2371,15 @@ async def _request_owner_action(
             "CI and a clean review must pass on the current head",
             status_code=409,
         )
-    if kind == "correction" and run.status not in {"pr_opened", "pr_ready"}:
+    if takeover.live:
+        return _action_error(
+            "not_ready", "a correction is already running for this PR", status_code=409
+        )
+    if (
+        kind == "correction"
+        and run.status not in {"pr_opened", "pr_ready"}
+        and not (run.status == "correction_running" and takeover.expired_lease)
+    ):
         return _action_error("not_ready", "PR is not open for correction", status_code=409)
     target_token = (
         settings.github_public_agent_token
@@ -2133,6 +2415,7 @@ async def _request_owner_action(
         # otherwise the PR would sit "open" with a queued-but-invisible
         # correction, letting a concurrent merge, cancel, or second
         # correction request interfere before agent-svc ever picks it up.
+        _apply_correction_takeover(run, takeover, current_head)
         if run.lease_kind == "review" and run.lease_id is not None:
             # A live review lease never blocks run.status (it stays
             # pr_opened/pr_ready throughout), so a correction request can
@@ -2312,6 +2595,7 @@ async def agent_action_result(
         run.merged_sha = payload.merge_sha
         run.merged_at = run.merged_at or datetime.now(UTC)
         run.notified_at = None
+        await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
         if settings.agent_qa_enabled and run.repo_full_name == settings.agent_qa_repository:
             run.qa_deploy_dispatch_status = "pending"
             run.qa_deploy_dispatch_error = None
@@ -2337,11 +2621,11 @@ async def agent_action_result(
         pr_number = run.pr_url.rsplit("/", 1)[-1] if run.pr_url else ""
         if not pr_number.isdecimal():
             raise HTTPException(status_code=409, detail="invalid agent PR reference")
-        current_head, is_open = await _current_pr_head(run)
-        if not is_open or current_head != payload.head_sha:
-            raise HTTPException(
-                status_code=409, detail="correction PR head changed before recording"
-            )
+        current_head, is_open = await _settled_pr_head(run, payload.head_sha)
+        if not is_open:
+            raise HTTPException(status_code=409, detail=_CORRECTION_PR_CLOSED_DETAIL)
+        if current_head != payload.head_sha:
+            raise HTTPException(status_code=409, detail=_CORRECTION_HEAD_CHANGED_DETAIL)
         if payload.head_sha != run.head_sha:
             _invalidate_review_and_ci(run, payload.head_sha)
         else:
@@ -2668,6 +2952,7 @@ async def cancel_agent_run(run_id: str, session: DbSession, user: CurrentUser) -
         )
         .values(status="cancelled")
     )
+    await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
     _clear_lease(run)
     run.status = "cancelled"
     run.finished_at = datetime.now(UTC)
@@ -2698,6 +2983,7 @@ async def agent_run_merged(
     run.merged_at = run.merged_at or datetime.now(UTC)
     run.status = "merged"
     run.notified_at = None
+    await _retire_open_corrections(session, run, _CORRECTION_ORPHANED_ERROR)
     agent_events.record(session, run)
     await session.commit()
     return AgentRunOut.model_validate(run)

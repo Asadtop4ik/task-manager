@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from agent_svc.api import Work
+from agent_svc.api import HeadNotSettled, Work
 from agent_svc.codex import CodexResult
 from agent_svc.correction import handle_correction
 
@@ -115,6 +115,83 @@ class HandleCorrectionHappyPathTests(unittest.TestCase):
             new_tip = rev_parse_or_none(remote, BRANCH)
             self.assertEqual(result["head_sha"], new_tip)
             self.assertNotEqual(new_tip, base_sha)
+
+    def test_result_is_held_back_until_github_reports_the_pushed_head(self) -> None:
+        """Production 2026-09-30: the PR API kept the old head for a few
+        seconds after the push and the backend rejected the (correct) report."""
+        from agent_svc import publish as publish_module
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            push_new_branch(remote, base_sha, BRANCH)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
+            work = _work(expected_head_sha=base_sha)
+            patch_bytes = make_patch(remote, base_sha, {"FIX.md": "fixed\n"})
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["FIX.md"]}
+            )
+            state = {"reads_after_push": 0}
+            real_get_pull = ctx.github.get_pull  # type: ignore[attr-defined]
+            reads_at_report: list[int] = []
+
+            def lagging_get_pull(repo: str, number: int) -> dict:
+                pr = real_get_pull(repo, number)
+                tip = rev_parse_or_none(remote, BRANCH)
+                if tip == base_sha:
+                    return pr  # before the push: the normal stale-head check
+                state["reads_after_push"] += 1
+                if state["reads_after_push"] <= 3:
+                    return pr  # GitHub still shows the old head
+                return _open_pr(tip)  # type: ignore[arg-type]
+
+            ctx.github.get_pull = lagging_get_pull  # type: ignore[attr-defined,method-assign]
+            real_action_result = ctx.api.action_result  # type: ignore[attr-defined]
+
+            def recording_action_result(run_id: str, lease_id: str, payload: dict) -> None:
+                reads_at_report.append(state["reads_after_push"])
+                real_action_result(run_id, lease_id, payload)
+
+            ctx.api.action_result = recording_action_result  # type: ignore[attr-defined,method-assign]
+
+            with patch.object(publish_module, "PR_HEAD_WAIT_BACKOFF_S", (0.0,) * 10):
+                handle_correction(ctx, work, threading.Event())
+
+            result = ctx.api.action_results[0]  # type: ignore[attr-defined]
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["head_sha"], rev_parse_or_none(remote, BRANCH))
+            self.assertEqual(reads_at_report, [4])  # only after the 4th poll saw the new head
+
+    def test_head_not_settled_409_is_retried_not_dropped(self) -> None:
+        from agent_svc import runctx
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            base_sha = make_github_remote(remote)
+            push_new_branch(remote, base_sha, BRANCH)
+            ctx = build_test_context(root, github_remote=remote)
+            ctx.github.pulls[("Asadtop4ik/task-manager", 5)] = _open_pr(base_sha)  # type: ignore[attr-defined]
+            work = _work(expected_head_sha=base_sha)
+            patch_bytes = make_patch(remote, base_sha, {"FIX.md": "fixed\n"})
+            ctx.codex.queue_exec_result(_exec_result())  # type: ignore[attr-defined]
+            ctx.codex.queue_package_result(  # type: ignore[attr-defined]
+                {"patch_b64": _b64(patch_bytes), "changed_paths": ["FIX.md"]}
+            )
+            ctx.api.queue_action_result_effects(  # type: ignore[attr-defined]
+                HeadNotSettled("correction PR head changed before recording"),
+                HeadNotSettled("correction PR head changed before recording"),
+            )
+
+            with patch.object(runctx, "HEAD_LAG_RETRY_BACKOFF_S", (0.0, 0.0, 0.0)):
+                handle_correction(ctx, work, threading.Event())
+
+            self.assertEqual(len(ctx.api.action_results), 1)  # type: ignore[attr-defined]
+            self.assertEqual(ctx.api.action_results[0]["status"], "completed")  # type: ignore[attr-defined]
+            self.assertIsNone(ctx.journal.read(work.run_id))
 
     def test_empty_correction_patch_keeps_current_head(self) -> None:
         with TemporaryDirectory() as tmp:

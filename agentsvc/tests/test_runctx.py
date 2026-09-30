@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agent_svc.api import LeaseLost, Work
+from agent_svc.api import HeadNotSettled, LeaseLost, Work
 
 from .support import FakeApi, build_test_context
 
@@ -214,6 +214,85 @@ class RunScaffoldTests(unittest.TestCase):
             # LeaseLost is not a delivery failure -- the API already decided;
             # the journal is still removed normally.
             self.assertIsNone(ctx.journal.read(work.run_id))
+
+    def test_deliver_retries_head_not_settled_while_the_lease_is_live(self) -> None:
+        """A 409 "head changed before recording" is GitHub lag, not a lost
+        lease: the same report is retried and finally recorded."""
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            attempts = {"count": 0}
+
+            def lagging() -> None:
+                attempts["count"] += 1
+                if attempts["count"] <= 3:
+                    raise HeadNotSettled("correction PR head changed before recording")
+
+            with RunScaffold(
+                ctx,
+                work,
+                cancel,
+                heartbeat_interval_s=1000.0,
+                delivery_backoff_s=(0.01,),
+                head_lag_backoff_s=(0.01, 0.01, 0.01),
+            ) as run:
+                run.deliver(lagging)
+                self.assertFalse(cancel.is_set())
+            self.assertEqual(attempts["count"], 4)
+            self.assertIsNone(ctx.journal.read(work.run_id))  # delivered
+
+    def test_deliver_head_not_settled_is_bounded_and_keeps_the_journal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            attempts = {"count": 0}
+
+            def always_lagging() -> None:
+                attempts["count"] += 1
+                raise HeadNotSettled("correction PR head changed before recording")
+
+            with RunScaffold(
+                ctx,
+                work,
+                cancel,
+                heartbeat_interval_s=1000.0,
+                delivery_backoff_s=(0.01,),
+                head_lag_backoff_s=(0.01, 0.01),
+            ) as run:
+                run.deliver(always_lagging)
+            self.assertEqual(attempts["count"], 3)  # 1 initial + 2 head-lag retries
+            self.assertIsNotNone(ctx.journal.read(work.run_id))
+
+    def test_deliver_head_lag_then_lease_lost_stops_retrying(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from agent_svc.runctx import RunScaffold
+
+            ctx = build_test_context(Path(tmp), api=FakeApi())
+            work = _implement_work()
+            cancel = threading.Event()
+            effects: list[Exception] = [HeadNotSettled("lag"), LeaseLost("lease_mismatch")]
+            calls = {"count": 0}
+
+            def fn() -> None:
+                calls["count"] += 1
+                raise effects.pop(0)
+
+            with RunScaffold(
+                ctx,
+                work,
+                cancel,
+                heartbeat_interval_s=1000.0,
+                head_lag_backoff_s=(0.01, 0.01, 0.01),
+            ) as run:
+                run.deliver(fn)
+                self.assertTrue(cancel.is_set())
+            self.assertEqual(calls["count"], 2)
 
     def test_heartbeat_transient_failure_does_not_cancel(self) -> None:
         with TemporaryDirectory() as tmp:

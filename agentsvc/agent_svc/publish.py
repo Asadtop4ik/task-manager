@@ -59,6 +59,14 @@ _PREFLIGHT_TOOL_KEYS: dict[str, dict[str, str]] = {
 }
 
 
+# After pushing a correction, GitHub's PR API (`GET /pulls/N`) can keep
+# reporting the previous head for several seconds while the branch ref
+# already moved. The backend verifies the reported head against that same PR
+# view, so the result is held back until it shows the pushed head: up to
+# ~30s in total, polling every 1-5s.
+PR_HEAD_WAIT_BACKOFF_S: tuple[float, ...] = (1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0)
+
+
 class PublishError(Exception):
     """A publish step failed; `reason` is the trusted-script failure text."""
 
@@ -460,6 +468,33 @@ def publish_implement(
         shutil.rmtree(publish_dir, ignore_errors=True)
 
 
+def _wait_for_pr_head(
+    ctx: ServiceContext, work: Work, head_sha: str, cancel: threading.Event
+) -> bool:
+    """Poll the PR until GitHub reports `head_sha` as its head.
+
+    Returns whether it did. Never raises and never fails the correction: the
+    commit is already pushed, so a timeout only means the backend's own
+    bounded re-check and the delivery retry have to absorb the remaining lag.
+    """
+    if work.pr_number is None:
+        return False
+    for delay in (0.0, *PR_HEAD_WAIT_BACKOFF_S):
+        if delay and cancel.wait(delay):
+            return False
+        try:
+            pr = ctx.github.get_pull(work.repo_full_name, work.pr_number)
+        except Exception as exc:
+            ctx.logger.error(exc, event="pr_head_poll_failed", run_id=work.run_id)
+            continue
+        if (pr.get("head") or {}).get("sha") == head_sha:
+            return True
+    ctx.logger.event(
+        "pr_head_wait_timeout", level="warning", run_id=work.run_id, head_sha=head_sha
+    )
+    return False
+
+
 def publish_correction(
     ctx: ServiceContext,
     work: Work,
@@ -549,6 +584,7 @@ def publish_correction(
         if pushed_sha != new_head:
             raise PublishError("GitHub branch head differs from published correction")
 
+        _wait_for_pr_head(ctx, work, new_head, cancel)
         return PublishResult(head_sha=new_head)
     finally:
         shutil.rmtree(publish_dir, ignore_errors=True)

@@ -20,13 +20,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agent_svc import repos
+from agent_svc import publish, repos
 from agent_svc.codex import CodexResult
 from agent_svc.config import build_settings, load_config
 from agent_svc.context import ServiceContext
 from agent_svc.journal import Journal
 from agent_svc.log import Logger, Redactor
 from agent_svc.trusted import TrustedModules
+
+# `publish_correction` polls the PR until GitHub reports the pushed head (up to
+# ~30s). The fakes here register a static PR head, so without this every
+# correction test would sit out the whole wait; one immediate poll is enough,
+# and tests of the wait itself pass their own backoff.
+publish.PR_HEAD_WAIT_BACKOFF_S = ()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRUSTED_SOURCE_FILES: tuple[Path, ...] = (
@@ -184,6 +190,11 @@ class FakeApi:
         self.action_results: list[dict[str, Any]] = []
         self._heartbeat_effects: list[Any] = []
         self._callback_effects: list[Any] = []
+        self._action_result_effects: list[Any] = []
+
+    def queue_action_result_effects(self, *effects: Any) -> None:
+        """Exceptions raised, in order, by the NEXT `action_result(...)` calls."""
+        self._action_result_effects.extend(effects)
 
     def queue_heartbeat_effects(self, *effects: Any) -> None:
         self._heartbeat_effects.extend(effects)
@@ -216,6 +227,10 @@ class FakeApi:
         self.callbacks.append(dict(payload))
 
     def action_result(self, run_id: str, lease_id: str, payload: dict[str, Any]) -> None:
+        if self._action_result_effects:
+            effect = self._action_result_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
         self.action_results.append(dict(payload))
 
 

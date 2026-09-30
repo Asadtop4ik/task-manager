@@ -10,6 +10,7 @@ from typing import Any
 
 from agent_svc.api import (
     DiscussionLeaseInvalid,
+    HeadNotSettled,
     IntakeImage,
     IntakeLeaseInvalid,
     InvalidOpsWork,
@@ -92,9 +93,11 @@ class FakeOpener:
     def __init__(self, results: list[object]) -> None:
         self._results = list(results)
         self.requests: list[urllib.request.Request] = []
+        self.timeouts: list[float | None] = []
 
     def __call__(self, request: urllib.request.Request, timeout: float | None = None) -> Any:
         self.requests.append(request)
+        self.timeouts.append(timeout)
         result = self._results.pop(0)
         if isinstance(result, BaseException):
             raise result
@@ -242,6 +245,44 @@ class CallbackFamilyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             api.action_result("run-1", "not-a-uuid", {"action_id": "a1"})
         self.assertEqual(opener.requests, [])
+
+    def test_action_result_head_lag_409_is_not_a_lost_lease(self) -> None:
+        api, _opener = _api(
+            [_http_error(409, {"detail": "correction PR head changed before recording"})]
+        )
+        with self.assertRaises(HeadNotSettled):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
+
+    def test_action_result_pr_closed_409_is_terminal_not_retried(self) -> None:
+        """A closed/merged PR can never settle: distinct detail, LeaseLost
+        (terminal), never HeadNotSettled (which would retry ~60s for nothing)."""
+        api, _opener = _api([_http_error(409, {"detail": "correction PR is no longer open"})])
+        with self.assertRaises(LeaseLost):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
+
+    def test_action_result_uses_a_long_timeout_but_other_calls_keep_the_default(self) -> None:
+        api, opener = _api(
+            [
+                FakeResponse(json.dumps({"run_id": "run-1"}).encode(), status=200),
+                FakeResponse(b"", status=204),
+            ]
+        )
+        api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
+        api.callback("run-1", LEASE_ID, {"status": "running"})
+        self.assertEqual(opener.timeouts[0], 45.0)
+        self.assertEqual(opener.timeouts[1], 15.0)
+
+    def test_action_result_lease_mismatch_409_is_still_a_lost_lease(self) -> None:
+        api, _opener = _api([_http_error(409, {"detail": "lease_mismatch"})])
+        with self.assertRaises(LeaseLost):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
+
+    def test_action_result_other_409_stays_a_lost_lease(self) -> None:
+        api, _opener = _api(
+            [_http_error(409, {"detail": "correction action is no longer current"})]
+        )
+        with self.assertRaises(LeaseLost):
+            api.action_result("run-1", LEASE_ID, {"action_id": "a1", "status": "completed"})
 
     def test_action_result_returns_parsed_body(self) -> None:
         api, _opener = _api(
