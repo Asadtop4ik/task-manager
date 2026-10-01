@@ -181,6 +181,14 @@ class Work:
     # matter; best-effort, never validated as hard as the fields above).
     ci_status: str | None = None
     ci_url: str | None = None
+    # Review leases only (best-effort): completed corrections so far (0 = first
+    # review) and the newest one's owner instruction.
+    correction_count: int = 0
+    last_correction_instruction: str | None = None
+    # Review leases only: the head the newest completed correction was
+    # requested against (= the previously reviewed head). None for a first
+    # review or a same-head "reconsider" correction.
+    last_reviewed_sha: str | None = None
 
 
 def _bad_int(value: Any, *, minimum: int) -> bool:
@@ -338,6 +346,9 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     # Best-effort CI context: a malformed value is dropped, never a lease failure.
     ci_status = payload.get("ci_status")
     ci_url = payload.get("ci_url")
+    correction_count = payload.get("correction_count")
+    last_correction_instruction = payload.get("last_correction_instruction")
+    last_reviewed_sha = payload.get("last_reviewed_sha")
 
     return Work(
         run_id=run_id,
@@ -365,6 +376,23 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
         expected_head_sha=expected_head_sha,
         ci_status=ci_status if isinstance(ci_status, str) else None,
         ci_url=ci_url if isinstance(ci_url, str) else None,
+        correction_count=(
+            correction_count
+            if isinstance(correction_count, int)
+            and not isinstance(correction_count, bool)
+            and correction_count > 0
+            else 0
+        ),
+        last_correction_instruction=(
+            last_correction_instruction[:4000]
+            if isinstance(last_correction_instruction, str)
+            else None
+        ),
+        last_reviewed_sha=(
+            last_reviewed_sha
+            if isinstance(last_reviewed_sha, str) and _SHA_RE.fullmatch(last_reviewed_sha)
+            else None
+        ),
     )
 
 

@@ -171,6 +171,29 @@ class PullDiffTests(unittest.TestCase):
         self.assertEqual(len(client.pull_diff(DISPATCH_REPO, 7)), 250_000)
 
 
+class CompareDiffTests(unittest.TestCase):
+    BASE, HEAD = "a" * 40, "b" * 40
+
+    def test_requests_the_three_dot_diff_between_the_two_shas(self) -> None:
+        client, opener = _client([FakeResponse(b"diff --git a b\n")])
+        text = client.compare_diff(DISPATCH_REPO, self.BASE, self.HEAD, max_chars=100)
+        self.assertEqual(text, "diff --git a b\n")
+        request = opener.requests[0]
+        self.assertTrue(request.full_url.endswith(f"/compare/{self.BASE}...{self.HEAD}"))
+        self.assertEqual(request.get_header("Accept"), "application/vnd.github.diff")
+
+    def test_refuses_an_oversized_delta_instead_of_truncating(self) -> None:
+        client, _opener = _client([FakeResponse(b"x" * 101)])
+        with self.assertRaises(DiffTooLarge):
+            client.compare_diff(DISPATCH_REPO, self.BASE, self.HEAD, max_chars=100)
+
+    def test_rejects_non_sha_arguments_without_a_request(self) -> None:
+        client, opener = _client([])
+        with self.assertRaises(ValueError):
+            client.compare_diff(DISPATCH_REPO, "main", self.HEAD, max_chars=100)
+        self.assertEqual(opener.requests, [])
+
+
 class SetStatusTests(unittest.TestCase):
     def test_rejects_unknown_state(self) -> None:
         client, opener = _client([])

@@ -39,6 +39,7 @@ REVIEW_LANE = "code"
 REVIEW_MODEL_KEY = "review"
 STATUS_CONTEXT = "codex-review"
 MAX_DIFF_CHARS = 250_000
+MAX_DELTA_CHARS = 120_000
 DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 
 # The exact wording legacy's `fail()` uses for every failure it reports.
@@ -125,7 +126,18 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
             _post_error_review(api, github, work, logger)
             return
 
-        prompt = trusted.build_review_prompt(repo, work.pr_number, work.head_sha, diff)
+        delta_diff = _delta_diff(github, logger, work, repo)
+        prompt = trusted.build_review_prompt(
+            repo,
+            work.pr_number,
+            work.head_sha,
+            diff,
+            title=work.title,
+            description=work.description,
+            correction_count=work.correction_count,
+            correction_instruction=work.last_correction_instruction,
+            delta_diff=delta_diff,
+        )
 
         try:
             api.stage(work.run_id, work.lease_id, "review_started")
@@ -281,6 +293,29 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
         except Exception as exc:
             logger.error(exc, event="review_cleanup_failed", run_id=work.run_id)
         shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _delta_diff(
+    github: GitHubClient, logger: Logger, work: Work, repo: str
+) -> str | None:
+    """The changes since the previously reviewed head, or None (first review,
+    same-head correction, unavailable, empty or too large): the reviewer then
+    reviews exactly as for a first review."""
+    if (
+        work.correction_count <= 0
+        or work.last_reviewed_sha is None
+        or work.head_sha is None
+        or work.last_reviewed_sha == work.head_sha
+    ):
+        return None
+    try:
+        delta = github.compare_diff(
+            repo, work.last_reviewed_sha, work.head_sha, max_chars=MAX_DELTA_CHARS
+        )
+    except Exception as exc:
+        logger.error(exc, event="review_delta_unavailable", run_id=work.run_id)
+        return None
+    return delta if delta.strip() else None
 
 
 def _pr_is_current(trusted: Any, pr: dict[str, Any], work: Work) -> bool:

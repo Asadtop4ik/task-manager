@@ -24,6 +24,7 @@ _API_BASE = "https://api.github.com"
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _MAX_DIFF_FETCH_BYTES = 1024 * 1024
 _MAX_DIFF_CHARS = 250_000
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _STATUS_STATES = frozenset({"error", "failure", "pending", "success"})
 
 
@@ -190,6 +191,27 @@ class GitHubClient:
         # oversized one is refused outright (the caller posts an error review).
         if len(text) > _MAX_DIFF_CHARS:
             raise DiffTooLarge(f"diff has {len(text)} chars (limit {_MAX_DIFF_CHARS})")
+        return text
+
+    def compare_diff(
+        self, repo: str, base_sha: str, head_sha: str, *, max_chars: int
+    ) -> str:
+        """The unified diff of `head_sha` relative to `base_sha` (the changes
+        since an earlier head). Both must be full 40-hex SHAs. A diff over
+        `max_chars` raises `DiffTooLarge` rather than being truncated."""
+        for sha in (base_sha, head_sha):
+            if not _FULL_SHA.fullmatch(sha):
+                raise ValueError("compare needs full 40-hex commit SHAs")
+        response = self._call(
+            "GET",
+            f"/repos/{repo}/compare/{base_sha}...{head_sha}",
+            repo=repo,
+            accept="application/vnd.github.diff",
+            max_bytes=_MAX_DIFF_FETCH_BYTES,
+        )
+        text = response.body.decode("utf-8", "replace")
+        if len(text) > max_chars:
+            raise DiffTooLarge(f"compare diff has {len(text)} chars (limit {max_chars})")
         return text
 
     def set_status(
