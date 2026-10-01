@@ -79,7 +79,7 @@ UMask=0027
 
 # agent-svc must never be able to read Task Manager's own secrets, config or the
 # deploy account's home, even though ProtectHome=read-only would otherwise allow a read.
-# codex-runner is the live GitHub Actions self-hosted runner (its home holds runner
+# codex-runner is the legacy GitHub Actions runner account (service stopped; its home holds runner
 # credentials, checkout tokens and its own Codex auth) — never Codex's execution
 # account here (see agent-codex above) and never readable by this unit either. The
 # leading "-" tolerates codex-runner's home not existing on some other host.

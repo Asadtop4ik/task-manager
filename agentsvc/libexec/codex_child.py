@@ -18,7 +18,7 @@ can reach (see agent-svc-design.md security round 2, blocker 1).
 
 `agent-codex` is a dedicated system user for this sandbox only (design spec
 REVISION 2) — it is deliberately NOT `codex-runner`, which is also the live
-GitHub Actions self-hosted runner identity and whose home holds credentials
+legacy GitHub Actions runner identity (decommissioned, account kept) and whose home holds credentials
 and tokens that Codex's own sandbox (same uid) could otherwise read.
 
 Production invocation (pinned in sudoers): `/usr/bin/python3 -I

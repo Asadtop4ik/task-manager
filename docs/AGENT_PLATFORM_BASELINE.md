@@ -26,7 +26,7 @@ and merge, so it is not a valid measure of Codex execution time. Future
 measurement must record dispatch, runner start, PR ready, merge and deploy as
 separate events.
 
-The private `codex-agent` runner was online and idle. The server had 4 CPUs and
+The (since decommissioned) private GitHub Actions runner was online and idle. The server had 4 CPUs and
 8 GiB RAM, with about 3.7 GiB available at the time of inspection; the coding
 runner is capped at 1 CPU / 2 GiB and the intake service at 0.5 CPU / 768 MiB.
 The intake service and external deploy monitor timer were active. Public-agent

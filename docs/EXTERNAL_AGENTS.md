@@ -1,7 +1,8 @@
 # Qurbot, Kans Shop va Ketoshop agentlari
 
-Uch public repo Task Manager’ning **private** `agent-public-task.yml` workflow’i
-orqali ishlaydi. Public repolarga self-hosted runner qo‘shilmaydi. Codex
+Uch public repo agentlari lokal `agent-svc` xizmati (`docs/AGENT_SVC.md`) orqali
+ishlaydi; eski GitHub Actions workflow’lari (`agent-public-task.yml` va boshqalar)
+olib tashlangan. Public repolarga hech qanday runner qo‘shilmaydi. Codex
 implementatsiyani yozadi, lekin GitHub write tokenini olmaydi; alohida
 GitHub-hosted publisher tekshirilgan patchdan branch va PR yaratadi. Hozir bu
 loyihalarda faqat `@codex` → PR bor; `!fast` faqat Task Manager pilotida qoladi.
@@ -93,4 +94,4 @@ deploy deb atamaydi: image SHA yoki health mos kelmasa task `review` holatida
 qoladi.
 
 [GitHub xavfsizlik yo‘riqnomasi](https://docs.github.com/en/actions/reference/security/secure-use)
-self-hosted runnerni public repo PRlariga bevosita ulashdan qaytaradi.
+o‘z runnerini public repo PRlariga bevosita ulashdan qaytaradi.

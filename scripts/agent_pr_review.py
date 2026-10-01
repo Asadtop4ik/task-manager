@@ -161,9 +161,8 @@ def prepare() -> None:
         # published. Checked last -- after every other validation above has
         # already passed -- so a run can only be skipped once it is fully
         # confirmed to be this exact, currently active, correctly-branched
-        # pull request. agent-pr-review.yml gates the remaining steps on
-        # this "skip" output the same way agent-task.yml gates on
-        # `steps.start.outputs.cancelled`.
+        # pull request. Callers gate the remaining steps on this "skip"
+        # output.
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
             output.write(f"skip=true\npull_number={number}\nrun_id={run_id}\n")
         return
