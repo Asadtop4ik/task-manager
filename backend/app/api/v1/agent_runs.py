@@ -590,6 +590,15 @@ async def _issue_lease(
     # reports its own "leased" moment through POST /stage.
     complexity, relevant_files = await _intake_complexity(session, run.task_id)
     image_count = await _image_count(session, run.task_id)
+    correction_count = 0
+    last_correction_instruction: str | None = None
+    if kind == "review":
+        # Lets the independent reviewer know this is a re-review after a
+        # correction (the previous review's findings are wiped when the head
+        # moves, but the owner's correction instruction names what was fixed).
+        correction_count, last_correction_instruction = await _completed_corrections(
+            session, run
+        )
     await session.commit()
     return AgentWorkOut(
         run_id=run.run_id,
@@ -625,7 +634,40 @@ async def _issue_lease(
         ),
         ci_status=run.ci_status,
         ci_url=run.ci_url,
+        correction_count=correction_count,
+        last_correction_instruction=last_correction_instruction,
     )
+
+
+async def _completed_corrections(session: DbSession, run: AgentRun) -> tuple[int, str | None]:
+    """How many corrections this run has completed, and the newest one's
+    owner instruction (None when there is none or it carried no text)."""
+    count = (
+        await session.scalar(
+            select(func.count())
+            .select_from(AgentRunAction)
+            .where(
+                AgentRunAction.agent_run_id == run.id,
+                AgentRunAction.kind == "correction",
+                AgentRunAction.status == "completed",
+            )
+        )
+        or 0
+    )
+    if not count:
+        return 0, None
+    newest = await session.scalar(
+        select(AgentRunAction)
+        .where(
+            AgentRunAction.agent_run_id == run.id,
+            AgentRunAction.kind == "correction",
+            AgentRunAction.status == "completed",
+        )
+        .order_by(AgentRunAction.created_at.desc())
+        .limit(1)
+    )
+    instruction = newest.request_data.get("instruction") if newest is not None else None
+    return count, instruction if isinstance(instruction, str) and instruction else None
 
 
 # An accepted/in-progress merge that has not reported back for this long is a

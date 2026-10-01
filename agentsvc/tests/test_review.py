@@ -44,6 +44,10 @@ def _work(
     branch: str | None = "codex/task-1-11111111-1111-1111-1111-111111111111",
     head_sha: str = "a" * 40,
     pr_number: int | None = 7,
+    title: str = "t",
+    description: str = "d",
+    correction_count: int = 0,
+    last_correction_instruction: str | None = None,
 ) -> Work:
     return Work(
         run_id=run_id,
@@ -57,8 +61,8 @@ def _work(
         repo_full_name=repo,
         base_branch="main",
         mode="pr",
-        title="t",
-        description="d",
+        title=title,
+        description=description,
         image_count=0,
         complexity=None,
         relevant_files=(),
@@ -69,6 +73,8 @@ def _work(
         action_id=None,
         instruction=None,
         expected_head_sha=None,
+        correction_count=correction_count,
+        last_correction_instruction=last_correction_instruction,
     )
 
 
@@ -269,6 +275,37 @@ class HandleReviewTests(unittest.TestCase):
         self.assertEqual(request["effort"], "medium")
         # "review_started" was staged before the codex run
         self.assertIn((work.run_id, work.lease_id, "review_started", None), api.stage_calls)
+
+    def _review_prompt(self, work: Work) -> str:
+        api = FakeApi()
+        github = FakeGitHub(pulls=[_pr()])
+        codex = FakeCodexRunner(_ok_result())
+        ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
+        handle_review(ctx, work, Event())
+        return str(codex.requests[0]["prompt"])
+
+    def test_prompt_carries_task_text_as_untrusted_data_and_spec_rules(self) -> None:
+        prompt = self._review_prompt(
+            _work(
+                title="Add ETag",
+                description='ETag must be exactly "o1.1". Reads are public.',
+            )
+        )
+        self.assertIn("<untrusted-task>", prompt)
+        self.assertIn("Title: Add ETag", prompt)
+        self.assertIn('ETag must be exactly "o1.1". Reads are public.', prompt)
+        self.assertIn("Spec deviation", prompt)
+        self.assertIn("P2", prompt)
+        self.assertNotIn("RE-REVIEW", prompt)
+
+    def test_prompt_marks_re_review_with_the_correction_instruction(self) -> None:
+        prompt = self._review_prompt(
+            _work(correction_count=2, last_correction_instruction="Use role not body")
+        )
+        self.assertIn("RE-REVIEW", prompt)
+        self.assertIn("2 correction(s)", prompt)
+        self.assertIn("<untrusted-correction-instruction>", prompt)
+        self.assertIn("Use role not body", prompt)
 
     def test_happy_path_no_dispatch_for_non_dispatch_repo(self) -> None:
         work = _work(repo="muradjanov-dev/qurbot", branch=None)

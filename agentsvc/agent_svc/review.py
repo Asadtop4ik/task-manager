@@ -125,7 +125,16 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
             _post_error_review(api, github, work, logger)
             return
 
-        prompt = trusted.build_review_prompt(repo, work.pr_number, work.head_sha, diff)
+        prompt = trusted.build_review_prompt(
+            repo,
+            work.pr_number,
+            work.head_sha,
+            diff,
+            title=work.title,
+            description=work.description,
+            correction_count=work.correction_count,
+            correction_instruction=work.last_correction_instruction,
+        )
 
         try:
             api.stage(work.run_id, work.lease_id, "review_started")

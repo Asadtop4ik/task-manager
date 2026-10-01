@@ -448,6 +448,11 @@ class AgentWorkOut(BaseModel):
     # fetch the failed job log; always for the run's current head.
     ci_status: str | None = None
     ci_url: str | None = None
+    # Review leases only: how many corrections this run has completed (0 =
+    # first review) and the newest one's owner instruction, so the reviewer
+    # can focus a re-review on what was asked to change.
+    correction_count: int = 0
+    last_correction_instruction: str | None = None
 
 
 class AgentLeaseHeartbeat(BaseModel):

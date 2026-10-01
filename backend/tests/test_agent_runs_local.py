@@ -644,6 +644,43 @@ async def test_ci_result_on_local_run_skips_external_review_and_review_lease_fol
     assert body["head_sha"] == _SHA
     assert body["pr_url"] == _PR_URL
     assert body["action_id"] is None
+    assert body["correction_count"] == 0
+    assert body["last_correction_instruction"] is None
+
+
+async def test_review_lease_after_a_correction_carries_its_instruction(
+    client: AsyncClient, session: AsyncSession, manager: User, project: Project, monkeypatch
+) -> None:
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _mark_ci_green(client, monkeypatch, run_id)
+    row = await _run_row(session, run_id)
+    now = datetime.now(UTC)
+    for index, (status_, instruction) in enumerate(
+        [
+            ("completed", "older fix"),
+            ("completed", "newest fix"),
+            ("rejected", "never applied"),
+        ]
+    ):
+        session.add(
+            AgentRunAction(
+                action_id=str(uuid4()),
+                agent_run_id=row.id,
+                kind="correction",
+                request_hash=str(index) * 64,
+                request_data={"expected_head_sha": _SHA, "instruction": instruction},
+                status=status_,
+                created_at=now - timedelta(minutes=10 - index),
+            )
+        )
+    await session.commit()
+
+    leased = await client.post("/api/v1/agent-runs/lease", json={"lane": "code"}, headers=_SVC)
+    assert leased.status_code == 200
+    body = leased.json()
+    assert body["kind"] == "review"
+    assert body["correction_count"] == 2
+    assert body["last_correction_instruction"] == "newest fix"
 
 
 async def test_review_result_clears_lease_and_recomputes_pr_ready(
