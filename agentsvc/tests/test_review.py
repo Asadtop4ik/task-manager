@@ -48,6 +48,7 @@ def _work(
     description: str = "d",
     correction_count: int = 0,
     last_correction_instruction: str | None = None,
+    last_reviewed_sha: str | None = None,
 ) -> Work:
     return Work(
         run_id=run_id,
@@ -75,6 +76,7 @@ def _work(
         expected_head_sha=None,
         correction_count=correction_count,
         last_correction_instruction=last_correction_instruction,
+        last_reviewed_sha=last_reviewed_sha,
     )
 
 
@@ -136,6 +138,8 @@ class FakeGitHub:
     def __init__(self, *, pulls: list[dict[str, Any]], diff: str = "diff --git a b\n") -> None:
         self._pulls = list(pulls)
         self.diff = diff
+        self.compare_calls: list[tuple[str, str, str, int]] = []
+        self.compare_result: str | Exception = "diff --git delta\n+delta line\n"
         self.set_status_calls: list[tuple[Any, ...]] = []
         self.dispatch_calls: list[tuple[str, str, dict[str, Any]]] = []
 
@@ -146,6 +150,12 @@ class FakeGitHub:
 
     def pull_diff(self, _repo: str, _number: int) -> str:
         return self.diff
+
+    def compare_diff(self, repo: str, base: str, head: str, *, max_chars: int) -> str:
+        self.compare_calls.append((repo, base, head, max_chars))
+        if isinstance(self.compare_result, Exception):
+            raise self.compare_result
+        return self.compare_result
 
     def set_status(
         self,
@@ -276,9 +286,11 @@ class HandleReviewTests(unittest.TestCase):
         # "review_started" was staged before the codex run
         self.assertIn((work.run_id, work.lease_id, "review_started", None), api.stage_calls)
 
-    def _review_prompt(self, work: Work) -> str:
+    def _review_prompt(
+        self, work: Work, github: FakeGitHub | None = None
+    ) -> str:
         api = FakeApi()
-        github = FakeGitHub(pulls=[_pr()])
+        github = github or FakeGitHub(pulls=[_pr()])
         codex = FakeCodexRunner(_ok_result())
         ctx = _ctx(api=api, github=github, codex=codex, dispatch_repo="Owner/task-manager")
         handle_review(ctx, work, Event())
@@ -298,14 +310,47 @@ class HandleReviewTests(unittest.TestCase):
         self.assertIn("P2", prompt)
         self.assertNotIn("RE-REVIEW", prompt)
 
-    def test_prompt_marks_re_review_with_the_correction_instruction(self) -> None:
+    def test_re_review_gets_the_delta_diff_and_instruction(self) -> None:
+        github = FakeGitHub(pulls=[_pr()])
         prompt = self._review_prompt(
-            _work(correction_count=2, last_correction_instruction="Use role not body")
+            _work(
+                correction_count=2,
+                last_correction_instruction="Use role not body",
+                last_reviewed_sha="b" * 40,
+            ),
+            github,
+        )
+        self.assertEqual(
+            github.compare_calls, [("Owner/task-manager", "b" * 40, "a" * 40, 120_000)]
         )
         self.assertIn("RE-REVIEW", prompt)
         self.assertIn("2 correction(s)", prompt)
         self.assertIn("<untrusted-correction-instruction>", prompt)
         self.assertIn("Use role not body", prompt)
+        self.assertIn("<untrusted-delta-diff>", prompt)
+        self.assertIn("+delta line", prompt)
+
+    def test_re_review_without_a_usable_delta_reviews_like_a_first_review(self) -> None:
+        # unavailable delta
+        github = FakeGitHub(pulls=[_pr()])
+        github.compare_result = RuntimeError("boom")
+        prompt = self._review_prompt(
+            _work(correction_count=1, last_reviewed_sha="b" * 40), github
+        )
+        self.assertNotIn("RE-REVIEW", prompt)
+        self.assertNotIn("<untrusted-delta-diff>", prompt)
+        # same-head reconsider correction: no reviewed sha, no compare call
+        github = FakeGitHub(pulls=[_pr()])
+        prompt = self._review_prompt(_work(correction_count=1), github)
+        self.assertEqual(github.compare_calls, [])
+        self.assertNotIn("RE-REVIEW", prompt)
+        # reviewed sha equal to the head: nothing changed
+        github = FakeGitHub(pulls=[_pr()])
+        prompt = self._review_prompt(
+            _work(correction_count=1, last_reviewed_sha="a" * 40), github
+        )
+        self.assertEqual(github.compare_calls, [])
+        self.assertNotIn("RE-REVIEW", prompt)
 
     def test_happy_path_no_dispatch_for_non_dispatch_repo(self) -> None:
         work = _work(repo="muradjanov-dev/qurbot", branch=None)

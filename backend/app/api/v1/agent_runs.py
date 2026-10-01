@@ -592,13 +592,16 @@ async def _issue_lease(
     image_count = await _image_count(session, run.task_id)
     correction_count = 0
     last_correction_instruction: str | None = None
+    last_reviewed_sha: str | None = None
     if kind == "review":
         # Lets the independent reviewer know this is a re-review after a
         # correction (the previous review's findings are wiped when the head
         # moves, but the owner's correction instruction names what was fixed).
-        correction_count, last_correction_instruction = await _completed_corrections(
-            session, run
-        )
+        (
+            correction_count,
+            last_correction_instruction,
+            last_reviewed_sha,
+        ) = await _completed_corrections(session, run)
     await session.commit()
     return AgentWorkOut(
         run_id=run.run_id,
@@ -636,38 +639,39 @@ async def _issue_lease(
         ci_url=run.ci_url,
         correction_count=correction_count,
         last_correction_instruction=last_correction_instruction,
+        last_reviewed_sha=last_reviewed_sha,
     )
 
 
-async def _completed_corrections(session: DbSession, run: AgentRun) -> tuple[int, str | None]:
-    """How many corrections this run has completed, and the newest one's
-    owner instruction (None when there is none or it carried no text)."""
-    count = (
-        await session.scalar(
-            select(func.count())
-            .select_from(AgentRunAction)
+async def _completed_corrections(
+    session: DbSession, run: AgentRun
+) -> tuple[int, str | None, str | None]:
+    """(completed corrections, newest one's owner instruction, previously
+    reviewed head). The reviewed head is the newest correction's
+    `expected_head_sha` (the head the owner asked to fix; `review_sha` itself
+    is wiped when the head moves) and is None when it equals the current head
+    (a same-head "reconsider": there is no delta to review)."""
+    rows = (
+        await session.scalars(
+            select(AgentRunAction)
             .where(
                 AgentRunAction.agent_run_id == run.id,
                 AgentRunAction.kind == "correction",
                 AgentRunAction.status == "completed",
             )
+            .order_by(AgentRunAction.created_at.desc(), AgentRunAction.action_id.desc())
         )
-        or 0
+    ).all()
+    if not rows:
+        return 0, None, None
+    data = rows[0].request_data
+    instruction = data.get("instruction")
+    reviewed = data.get("expected_head_sha")
+    return (
+        len(rows),
+        instruction if isinstance(instruction, str) and instruction else None,
+        reviewed if isinstance(reviewed, str) and reviewed != run.head_sha else None,
     )
-    if not count:
-        return 0, None
-    newest = await session.scalar(
-        select(AgentRunAction)
-        .where(
-            AgentRunAction.agent_run_id == run.id,
-            AgentRunAction.kind == "correction",
-            AgentRunAction.status == "completed",
-        )
-        .order_by(AgentRunAction.created_at.desc())
-        .limit(1)
-    )
-    instruction = newest.request_data.get("instruction") if newest is not None else None
-    return count, instruction if isinstance(instruction, str) and instruction else None
 
 
 # An accepted/in-progress merge that has not reported back for this long is a

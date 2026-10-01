@@ -453,6 +453,10 @@ class AgentWorkOut(BaseModel):
     # can focus a re-review on what was asked to change.
     correction_count: int = 0
     last_correction_instruction: str | None = None
+    # Review leases only: the head the newest completed correction was
+    # requested against (the previously reviewed head); None for a first
+    # review or a same-head "reconsider" correction.
+    last_reviewed_sha: str | None = None
 
 
 class AgentLeaseHeartbeat(BaseModel):

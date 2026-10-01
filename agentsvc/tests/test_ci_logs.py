@@ -334,6 +334,14 @@ class ParseWorkTests(unittest.TestCase):
         )
         self.assertEqual(len(long_work.last_correction_instruction or ""), 4000)
 
+    def test_last_reviewed_sha_must_be_a_full_sha(self) -> None:
+        good = "b" * 40
+        work = parse_work(self._payload(last_reviewed_sha=good), {REPO: "main"})
+        self.assertEqual(work.last_reviewed_sha, good)
+        for bad in (None, "abc", "B" * 40, 5):
+            work = parse_work(self._payload(last_reviewed_sha=bad), {REPO: "main"})
+            self.assertIsNone(work.last_reviewed_sha)
+
 
 class PromptCompositionTests(unittest.TestCase):
     def test_block_is_inserted_between_base_and_efficiency_rules(self) -> None:

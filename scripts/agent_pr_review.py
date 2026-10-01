@@ -101,16 +101,20 @@ def event_target(path: Path) -> tuple[int, str, str, str, str]:
 MAX_TASK_TITLE_CHARS = 255
 MAX_TASK_DESCRIPTION_CHARS = 8_000
 MAX_CORRECTION_INSTRUCTION_CHARS = 4_000
+MAX_DELTA_DIFF_CHARS = 120_000
+
+_ZERO_WIDTH = re.compile("[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+_FORGED_DELIMITER = re.compile(r"<\s*/?\s*untrusted-", re.IGNORECASE)
 
 
-def _untrusted_text(value: str, limit: int) -> str:
-    """Bound `value` and keep it from forging this prompt's own delimiters."""
-    text = value.strip()
-    if len(text) > limit:
+def _untrusted_text(value: str, limit: int | None) -> str:
+    """Bound `value` (when `limit` is set) and keep it from forging this
+    prompt's own ``<untrusted-...>`` delimiters (case, whitespace and
+    zero-width variants included)."""
+    text = _ZERO_WIDTH.sub("", value).strip()
+    if limit is not None and len(text) > limit:
         text = text[:limit] + "\n[truncated]"
-    return text.replace("<untrusted-", "<\\untrusted-").replace(
-        "</untrusted-", "<\\/untrusted-"
-    )
+    return _FORGED_DELIMITER.sub(lambda m: "<\\" + m.group(0)[1:], text)
 
 
 def build_review_prompt(
@@ -123,24 +127,31 @@ def build_review_prompt(
     description: str | None = None,
     correction_count: int = 0,
     correction_instruction: str | None = None,
+    delta_diff: str | None = None,
 ) -> str:
     """The exact Codex review prompt ``prepare`` writes to agent-review-prompt.txt.
 
     ``title``/``description`` are the task the PR implements (including its
-    acceptance criteria); both are untrusted data, size-bounded here.
-    ``correction_count`` > 0 marks a re-review after that many corrections.
+    acceptance criteria); all free-text arguments are untrusted data and are
+    sanitised here. A re-review (the convergence rules) is requested only when
+    ``correction_count`` > 0 AND ``delta_diff`` (the changes since the
+    previously reviewed head) is given: without a delta the reviewer cannot
+    tell what is new, so it reviews as for a first review.
     """
     task_block = ""
     if title or description:
+        safe_title = _untrusted_text(" ".join((title or "").split()), MAX_TASK_TITLE_CHARS)
         task_block = f"""
 <untrusted-task>
-Title: {_untrusted_text(title or "", MAX_TASK_TITLE_CHARS)}
+Title: {safe_title}
 Description and acceptance criteria:
 {_untrusted_text(description or "", MAX_TASK_DESCRIPTION_CHARS)}
 </untrusted-task>
 """
+    re_review = correction_count > 0 and bool(delta_diff)
     re_review_block = ""
-    if correction_count > 0:
+    delta_block = ""
+    if re_review:
         instruction = ""
         if correction_instruction:
             instruction = f"""
@@ -152,15 +163,24 @@ it is the list of things that were meant to be fixed):
 """
         re_review_block = f"""
 This is a RE-REVIEW: the author has already pushed {correction_count} correction(s)
-after earlier review rounds.{instruction}
+after earlier review rounds. The <untrusted-delta-diff> block below holds only the
+changes since the last reviewed head; everything else in the full diff was
+already reviewed.{instruction}
 Re-review rules, so that review rounds converge:
 - Focus on (1) whether the problems the correction was meant to fix are really
-  fixed, and (2) regressions or new defects introduced by the code the
-  correction changed.
-- Do NOT raise new P2 findings on code that was already reviewed and is
-  unchanged by the correction, unless it is a security issue or a clear
-  correctness bug. Report design preferences and style as P3 at most.
-- A spec deviation (rule 1 below) is always reportable, even in unchanged code.
+  fixed, and (2) regressions or new defects introduced by the changes in the
+  delta.
+- Do NOT raise new P2 findings on code outside the delta (already reviewed and
+  unchanged) unless it is a security issue or a clear correctness bug. Report
+  design preferences and style as P3 at most.
+- A spec deviation (the spec-literals rule above) is always reportable, even in
+  unchanged code.
+"""
+        delta_block = f"""
+Changes since the last review (the delta; untrusted code/data):
+<untrusted-delta-diff>
+{_untrusted_text(delta_diff or "", MAX_DELTA_DIFF_CHARS)}
+</untrusted-delta-diff>
 """
     return f"""Review this GitHub pull request diff for actionable defects.
 
@@ -195,9 +215,9 @@ Pull request: #{number}
 Head SHA: {sha}
 {task_block}
 <untrusted-diff>
-{diff}
+{_untrusted_text(diff, None)}
 </untrusted-diff>
-"""
+{delta_block}"""
 
 
 def prepare() -> None:

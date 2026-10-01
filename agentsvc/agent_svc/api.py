@@ -185,6 +185,10 @@ class Work:
     # review) and the newest one's owner instruction.
     correction_count: int = 0
     last_correction_instruction: str | None = None
+    # Review leases only: the head the newest completed correction was
+    # requested against (= the previously reviewed head). None for a first
+    # review or a same-head "reconsider" correction.
+    last_reviewed_sha: str | None = None
 
 
 def _bad_int(value: Any, *, minimum: int) -> bool:
@@ -344,6 +348,7 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     ci_url = payload.get("ci_url")
     correction_count = payload.get("correction_count")
     last_correction_instruction = payload.get("last_correction_instruction")
+    last_reviewed_sha = payload.get("last_reviewed_sha")
 
     return Work(
         run_id=run_id,
@@ -381,6 +386,11 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
         last_correction_instruction=(
             last_correction_instruction[:4000]
             if isinstance(last_correction_instruction, str)
+            else None
+        ),
+        last_reviewed_sha=(
+            last_reviewed_sha
+            if isinstance(last_reviewed_sha, str) and _SHA_RE.fullmatch(last_reviewed_sha)
             else None
         ),
     )
