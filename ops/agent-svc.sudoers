@@ -5,7 +5,7 @@
 Defaults:agent-svc !requiretty
 
 # Run the sandboxed Codex child as the dedicated agent-codex account — NOT
-# codex-runner, which is the live GitHub Actions self-hosted runner and must never
+# codex-runner, which is the legacy GitHub Actions runner account and must never
 # share a uid with anything Codex's sandbox can reach (runner credentials, checkout
 # tokens, its own Codex auth). Only these five subcommands are allowed, each pinned
 # with `-I` (isolated mode: ignores PYTHONPATH/PYTHONSTARTUP/user site-packages, so

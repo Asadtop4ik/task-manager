@@ -78,15 +78,20 @@ yuboring. Bot shu taskni Codexga topshiradi. Codex PR yaratgach, uning havolasi
 veb boarddagi shu task sahifasida ko'rinadi.
 
 Agar `@codex` ishga tushmasa, loyiha repo va to‘g‘ri branchga ulanganini,
-public loyiha flagi yoqilganini va yopiq runner online ekanini tekshiring.
+public loyiha flagi yoqilganini va `agent-svc` xizmati ishlayotganini tekshiring
+(`docs/AGENT_SVC.md`).
 
 The project repository and default branch are manager-only settings. The backend
 also requires the repository in `GITHUB_AGENT_ALLOWED_REPOS` and checks its
 approved project key, branch and visibility before dispatch. Only the private
 `Asadtop4ik/task-manager` is allowlisted by default; the three approved public
-repos use the private Task Manager runner, not a runner registered to them.
-The worker uses a GitHub `repository_dispatch` event; its workflow runs on a
-private `codex-agent` self-hosted runner. The repository needs these credentials:
+repos are served by the same local `agent-svc`, not a runner registered to them.
+Implementation, review and correction run in the local `agent-svc` service, which
+leases work from the backend (`AGENT_LOCAL_EXECUTOR_PROJECTS`); the former GitHub
+Actions task, review and runner workflows were removed. Only GitHub-hosted
+workflows remain: CI, Deploy, the owner merge action
+(`agent-run-release.yml`, `repository_dispatch` `agent_run_merge`) and the
+small-change auto-merge. The repository needs these credentials:
 
 - Server env: `GITHUB_AGENT_TOKEN` for repository metadata, dispatch and PR
   verification and central workflow dispatch; `GITHUB_PUBLIC_AGENT_TOKEN` for
@@ -96,8 +101,9 @@ private `codex-agent` self-hosted runner. The repository needs these credentials
   publication, release and central review dispatch; `AGENT_PUBLIC_REPO_TOKEN`
   for release/correction pushes and review statuses on the three approved public
   repos; `AGENT_CALLBACK_TOKEN` matching the server value.
-- Runner: Codex CLI logged in under its dedicated account, plus `gh` and Python 3.
-  Do not expose the Codex auth cache to a public repository or a general runner.
+- agent-svc host: Codex CLI logged in under its dedicated `agent-codex` account
+  (see `docs/AGENT_SVC.md`). Do not expose the Codex auth cache to a public
+  repository or a general runner.
 - Intake host worker: a separate read-only Codex process and
   `INTAKE_WORKER_TOKEN` matching the API server environment. Leave
   `AGENT_INTAKE_ENABLED=false` until the host worker is installed. Intake
@@ -141,7 +147,7 @@ this event history. The existing GitHub patch artifacts expire after one day.
 For automatic review of human and agent PRs, connect this repository to Codex
 Cloud and enable Code review plus Automatic reviews in Codex settings. The
 repository's `AGENTS.md` includes the review rules. This is a separate, one-time
-account setting from the self-hosted task runner.
+account setting from agent-svc.
 
 ## The web app
 

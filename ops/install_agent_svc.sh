@@ -198,8 +198,8 @@ sudo usermod -aG agentwork agent-codex
 # path (still live until Phase 5) keeps working with no ordering dependency
 # on anything this installer does. Codex's app-server now connects to that
 # socket as `agent-codex`, but `agent-codex` itself is deliberately NOT made
-# a member of `codex-runner` (that account is the live GitHub Actions
-# self-hosted runner identity -- far broader than "may read one socket").
+# a member of `codex-runner` (that account is the legacy GitHub Actions
+# runner identity -- far broader than "may read one socket").
 # Instead: a dedicated group, `task-diag-client`, owns ONLY this one socket
 # (diagnostic_host.py chgrp's it there after bind, best-effort, if the group
 # exists); `codex-runner` joins it too (so the legacy client keeps working

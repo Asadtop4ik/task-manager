@@ -10,7 +10,7 @@ git mirror infratuzilmasini boshqaradi; u o'zi hech qanday model chaqirmaydi va
 hech qanday matnni "o'ylab" javob yozmaydi.
 
 Codex hech qachon `codex-runner` hisobida ishlamaydi: shu hisob bir vaqtning o'zida
-tirik GitHub Actions self-hosted runner ham bo'lgani uchun, uning uid'i bilan
+eski GitHub Actions runner hisobi (xizmat to'xtatilgan, hisob qolgan) bo'lgani uchun, uning uid'i bilan
 o'qiladigan har qanday fayl (runner credential'lari, checkout tokenlari, runnerning
 o'z Codex `auth.json`si) Codex sandboxi uchun ham ko'rinadi. Shu sabab Codex uchun
 alohida, faqat shu maqsad uchun yaratilgan `agent-codex` hisobi ishlatiladi. Xuddi
@@ -18,6 +18,16 @@ shu sabab bilan Node va Codex CLI ham `codex-runner`ning uyidan **nusxalanmaydi*
 (uni istalgan GitHub Actions job yozishi mumkin) — ular rasmiy manbadan yuklab
 olinib, o'rnatishdan oldin hash bo'yicha tekshiriladi (`ops/agent-svc-node.lock`,
 `ops/agent-svc-codex.lock`).
+
+## Qolgan GitHub Actions workflow'lari
+
+Eski runner-asosli workflow'lar (`agent-task`, `agent-public-task`, `agent-pr-review`
+va `agent-run-release`dagi `correction` joblari) olib tashlandi: implement, review
+va correction faqat agent-svc'da bajariladi. Faqat GitHub-hosted (`ubuntu-latest`)
+workflow'lar qoldi: `ci.yml`, `deploy.yml`, `agent-run-release.yml` (`agent_run_merge`
+— egasining Merge tugmasi local runlar uchun ham shu workflow'ni dispatch qiladi) va
+`agent-auto-merge.yml` (agent-svc review tugagach `agent_review_completed` yuboradi).
+`!fast` o'chirilgan; qayta yoqish uchun yangi publisher kerak bo'ladi.
 
 ## Arxitektura (matnli diagramma)
 
