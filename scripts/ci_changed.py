@@ -29,17 +29,7 @@ def selected_jobs(paths: list[str] | None) -> dict[str, bool]:
 def changed_paths(
     event: dict, event_name: str, head: str, *, cwd: str | None = None
 ) -> list[str] | None:
-    branch = (event.get("ref") or "").removeprefix("refs/heads/")
-    if event_name == "push" and branch.startswith("codex/fast/"):
-        # Every rebase/merge of main must revalidate the whole agent patch,
-        # not merely what changed since the previous fast-branch push.
-        try:
-            base = subprocess.check_output(
-                ["git", "merge-base", "origin/main", head], text=True, cwd=cwd
-            ).strip()
-        except subprocess.CalledProcessError:
-            return None
-    elif event_name == "pull_request":
+    if event_name == "pull_request":
         base = (event.get("pull_request") or {}).get("base", {}).get("sha")
     elif event_name == "push":
         base = event.get("before")

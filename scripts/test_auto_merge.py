@@ -1,5 +1,11 @@
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import auto_merge
 from auto_merge import (
     agent_ready,
     agent_run_id,
@@ -106,6 +112,55 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(
             agent_run_id({"head": {"ref": "codex/task-7-invalid"}}), "invalid"
         )
+
+
+class DispatchPathTests(unittest.TestCase):
+    def test_repository_dispatch_checks_the_dispatched_sha(self) -> None:
+        sha = "a" * 40
+        repo = "Asadtop4ik/task-manager"
+        calls: list[str] = []
+
+        def fake_github(path: str) -> object:
+            calls.append(path)
+            if path == f"repos/{repo}/pulls/5":
+                return {
+                    "state": "open",
+                    "draft": False,
+                    "mergeable_state": "clean",
+                    "base": {"ref": "main"},
+                    "head": {"sha": sha, "ref": "docs-fix", "repo": {"full_name": repo}},
+                }
+            if "/files" in path:
+                return [{"filename": "README.md"}]
+            if path.startswith(f"repos/{repo}/commits/{sha}/check-runs"):
+                return {
+                    "check_runs": [
+                        {"id": 1, "name": "gate", "conclusion": "success"},
+                        {"id": 2, "name": "agent-policy", "conclusion": "success"},
+                    ]
+                }
+            if path == f"repos/{repo}/commits/{sha}/statuses":
+                return [{"id": 1, "context": "codex-review", "state": "success"}]
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event = Path(tmp) / "event.json"
+            event.write_text(
+                json.dumps({"client_payload": {"pull_number": 5, "head_sha": sha}})
+            )
+            output = Path(tmp) / "output"
+            env = {
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_REPOSITORY": repo,
+                "GITHUB_OUTPUT": str(output),
+            }
+            with (
+                patch.dict(os.environ, env),
+                patch.object(auto_merge, "_github", fake_github),
+            ):
+                auto_merge.main()
+            self.assertIn(f"eligible=true\nnumber=5\nsha={sha}", output.read_text())
+        self.assertTrue(any("check-runs" in call for call in calls))
 
 
 if __name__ == "__main__":

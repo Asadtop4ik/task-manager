@@ -151,7 +151,7 @@ def main() -> None:
         return
     if not _agent_allows_merge(pr):
         return
-    checks = _github(f"repos/{repo}/commits/{run['head_sha']}/check-runs?per_page=100")
+    checks = _github(f"repos/{repo}/commits/{expected_sha}/check-runs?per_page=100")
     assert isinstance(checks, dict)
     if not latest_checks_pass(checks["check_runs"]):
         return
