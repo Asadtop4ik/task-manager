@@ -657,8 +657,8 @@ async def _issue_lease(
         correction_count=correction_count,
         last_correction_instruction=last_correction_instruction,
         last_reviewed_sha=last_reviewed_sha,
-        acceptance=acceptance if kind == "implement" else [],
-        owner_note=run.owner_note if kind == "implement" else None,
+        acceptance=acceptance if kind in {"implement", "correction"} else [],
+        owner_note=run.owner_note if kind in {"implement", "correction"} else None,
         check_gate=run.check_gate if kind == "review" else None,
     )
 
@@ -883,6 +883,10 @@ async def _task(session: DbSession, task_id: int, *, lock: bool = False) -> Task
     if task.deleted_at is not None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+# agent-svc marks a spec/acceptance contradiction with this error prefix.
+_SPEC_CONFLICT_RE = re.compile(r"SPEC_CONFLICT[ (:]")
 
 
 def _revision(task: Task, mode: str = "pr") -> str:
@@ -1780,6 +1784,7 @@ async def pending_notifications(
                 ),
                 actions=_run_detail(run).actions,
                 executor=run.executor,
+                attempt_index=run.attempt_index,
                 qa_ready_url=run.qa_ready_url,
                 qa_ready_sha=run.qa_ready_sha,
                 qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
@@ -2962,6 +2967,12 @@ async def start_agent_run(
         .where(AgentRun.task_id == task_id, AgentRun.task_revision == revision)
         .order_by(AgentRun.attempt_index.desc())
     )
+    if owner_note is not None and not (
+        run is not None and run.status == "failed" and _SPEC_CONFLICT_RE.match(run.error or "")
+    ):
+        # The note confirms one specific spec conflict for the task as it is
+        # now; never drop it on an existing run or apply it to an edited task.
+        raise HTTPException(status_code=409, detail="spec_conflict_not_pending")
     if run is not None and run.status in {"failed", "cancelled"}:
         if run.attempt_index >= 2:
             raise HTTPException(status_code=409, detail="agent run retry limit reached")

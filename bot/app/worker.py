@@ -22,6 +22,8 @@ from app.handlers.agent_ops import (
 )
 from app.handlers.agent_release import release_card, release_keyboard
 from app.handlers.agent_spec import (
+    LIMIT_REACHED_TEXT,
+    attempts_exhausted,
     is_spec_conflict,
     spec_conflict_keyboard,
     spec_conflict_text,
@@ -99,6 +101,8 @@ def agent_result_card(notice: dict[str, object]) -> str:
         lines.append(
             f"Ziddiyat: {_html_text(spec_conflict_text(notice.get('error')) or 'ko‘rsatilmagan', 1200)}"
         )
+        if attempts_exhausted(notice):
+            lines.append(LIMIT_REACHED_TEXT)
         if notice.get("github_run_url"):
             lines.append(f"Jarayon: {_html_text(notice['github_run_url'], 300)}")
     else:
@@ -253,7 +257,11 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                             )
                     elif notice.get("ops_controls_available"):
                         owner_markup = ops_keyboard(notice.get("ops_requests"))
-                    if len(owner_head_sha) != 40 and is_spec_conflict(notice):
+                    if (
+                        len(owner_head_sha) != 40
+                        and is_spec_conflict(notice)
+                        and not attempts_exhausted(notice)
+                    ):
                         task_id = notice.get("task_id")
                         if isinstance(task_id, int):
                             owner_markup = combine_keyboards(

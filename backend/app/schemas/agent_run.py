@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Same format as `scripts/agent_ops_policy.py` (WP-D0) and agent-svc's own
 # `ops_requests.py` — the backend never imports either, but the shapes must
@@ -75,7 +75,6 @@ class AgentRunOut(BaseModel):
     deployed_at: datetime | None
     executor: str
     check_gate: dict[str, object] | None = None
-    owner_note: str | None = None
 
 
 class AgentOpsProposal(BaseModel):
@@ -180,6 +179,14 @@ class AgentCheckGate(BaseModel):
     fixup_output_tokens: int | None = Field(default=None, ge=0, le=100_000_000)
     author_model: str | None = Field(default=None, max_length=32)
     fixup_model: str | None = Field(default=None, max_length=32)
+
+    @model_validator(mode="after")
+    def _counts_are_consistent(self) -> "AgentCheckGate":
+        if self.passed > self.total:
+            raise ValueError("passed cannot exceed total")
+        if len(self.failed) > self.total:
+            raise ValueError("failed cannot list more checks than total")
+        return self
 
 
 class AgentRunCallback(BaseModel):
@@ -416,6 +423,7 @@ class AgentNotificationOut(BaseModel):
     qa_deploy_dispatch_status: str | None = None
     qa_deploy_dispatch_error: str | None = None
     executor: str = "github"
+    attempt_index: int = 1
     # Owner card only — includes values. The legacy task-origin card (which
     # may be a group chat) must use `ops_pending_count` instead.
     ops_requests: list[AgentOpsRequestOut] = Field(default_factory=list)

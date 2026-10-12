@@ -134,6 +134,22 @@ async def test_worker_attaches_the_rerun_button_only_to_the_owner_card(monkeypat
     assert button.callback_data == SpecRerunAction(action="ask", task_id=41).pack()
 
 
+async def test_worker_final_attempt_has_no_button_and_says_why(monkeypatch) -> None:
+    _client, bot = _install_worker_fakes(monkeypatch, [_failed_notice(attempt_index=2)])
+    await worker.notify_agent_runs({})
+    owner = bot.send_message.await_args_list[1]
+    assert owner.kwargs["reply_markup"] is None
+    assert "Qayta urinish limiti tugadi. Vazifani tahrirlang." in owner.args[1]
+
+
+async def test_worker_first_attempt_keeps_the_button(monkeypatch) -> None:
+    _client, bot = _install_worker_fakes(monkeypatch, [_failed_notice(attempt_index=1)])
+    await worker.notify_agent_runs({})
+    owner = bot.send_message.await_args_list[1]
+    assert owner.kwargs["reply_markup"] is not None
+    assert "limiti" not in owner.args[1]
+
+
 async def test_worker_no_button_for_ordinary_failures(monkeypatch) -> None:
     _client, bot = _install_worker_fakes(
         monkeypatch, [_failed_notice(error="Codex timed out")]
@@ -212,15 +228,68 @@ async def test_group_chat_is_refused_before_any_api_call(monkeypatch) -> None:
     assert query.answer.await_args.kwargs["show_alert"] is True
 
 
-async def test_attempt_cap_409_is_shown_as_an_alert(monkeypatch) -> None:
+async def test_backend_409_maps_to_already_handled_and_removes_buttons(monkeypatch) -> None:
     api = _api(monkeypatch)
-    api.start_agent_run.side_effect = ApiError(409, "agent run retry limit reached")
+    api.start_agent_run.side_effect = ApiError(409, "spec_conflict_not_pending")
     query = _query()
     await agent_spec.spec_rerun_action(query, SpecRerunAction(action="yes", task_id=41))
-    text = query.answer.await_args.args[0]
-    assert "retry limit reached" in text
+    assert (
+        query.answer.await_args.args[0]
+        == "Allaqachon ishga tushirilgan yoki vazifa o'zgargan."
+    )
     assert query.answer.await_args.kwargs["show_alert"] is True
-    query.message.edit_reply_markup.assert_not_awaited()
+    assert query.message.edit_reply_markup.await_args.kwargs["reply_markup"] is None
+
+
+async def test_final_attempt_is_refused_early_in_uzbek(monkeypatch) -> None:
+    api = _api(
+        monkeypatch,
+        runs=[{"status": "failed", "error": _CONFLICT, "attempt_index": 2}],
+    )
+    query = _query()
+    await agent_spec.spec_rerun_action(query, SpecRerunAction(action="yes", task_id=41))
+    api.start_agent_run.assert_not_awaited()
+    assert (
+        query.answer.await_args.args[0] == "Qayta urinish limiti tugadi. Vazifani tahrirlang."
+    )
+    assert query.message.edit_reply_markup.await_args.kwargs["reply_markup"] is None
+
+
+async def test_markup_edit_failure_after_the_run_started_is_swallowed(monkeypatch) -> None:
+    from aiogram.exceptions import TelegramBadRequest
+
+    api = _api(monkeypatch)
+    query = _query()
+    query.message.edit_reply_markup.side_effect = TelegramBadRequest(
+        method=MagicMock(), message="message to edit not found"
+    )
+    await agent_spec.spec_rerun_action(query, SpecRerunAction(action="yes", task_id=41))
+    api.start_agent_run.assert_awaited_once()
+    assert query.answer.await_args.args[0] == "Agent qayta ishga tushirildi."
+
+
+async def test_inaccessible_message_gets_its_own_alert(monkeypatch) -> None:
+    api = _api(monkeypatch)
+    query = _query()
+    query.message = None
+    await agent_spec.spec_rerun_action(query, SpecRerunAction(action="yes", task_id=41))
+    api.start_agent_run.assert_not_awaited()
+    assert "eskirgan" in query.answer.await_args.args[0]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("SPEC_CONFLICT: x", True),
+        ("SPEC_CONFLICT (x)", True),
+        ("SPEC_CONFLICT x", True),
+        ("SPEC_CONFLICTING", False),
+        ("SPEC_CONFLICT", False),
+        ("see SPEC_CONFLICT: x", False),
+    ],
+)
+def test_spec_conflict_prefix_is_tight(error: str, expected: bool) -> None:
+    assert agent_spec.is_spec_conflict({"status": "failed", "error": error}) is expected
 
 
 def test_api_client_sends_owner_note_only_when_given() -> None:

@@ -277,6 +277,8 @@ def _gate(**overrides: object) -> dict[str, object]:
         _gate(failed=["x"] * 51),
         _gate(failed=["x" * 201]),
         _gate(failed="check two"),
+        _gate(passed=4),
+        _gate(total=1, passed=1, failed=["a", "b"]),
         _gate(acceptance_modified="maybe"),
         _gate(author_model="m" * 33),
         _gate(fixup_output_tokens=-5),
@@ -368,7 +370,7 @@ async def test_owner_note_round_trips_on_a_new_attempt(
     assert resp.status_code == 201
     body = resp.json()
     assert body["attempt_index"] == 2
-    assert body["owner_note"] == "Follow the spec as written."
+    assert "owner_note" not in body  # never on the public AgentRunOut
     row = await session.scalar(select(AgentRun).where(AgentRun.run_id == body["run_id"]))
     assert row is not None and row.owner_note == "Follow the spec as written."
 
@@ -419,7 +421,131 @@ async def test_owner_note_is_owner_only(
     # A plain retry without a note is still allowed for that user.
     plain = await client.post(f"/api/v1/agent-runs/tasks/{task_id}", headers=auth(manager))
     assert plain.status_code == 201
-    assert plain.json()["owner_note"] is None
+    assert (await _run_row(session, plain.json()["run_id"])).owner_note is None
+
+
+async def test_owner_note_rejected_while_the_new_attempt_is_active(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: ProjectModel,
+    monkeypatch,
+) -> None:
+    task_id, _ = await _spec_conflict_attempt(client, session, manager, project, monkeypatch)
+    first = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}",
+        json={"owner_note": "one"},
+        headers=auth(manager),
+    )
+    assert first.status_code == 201
+    second = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}",
+        json={"owner_note": "two"},
+        headers=auth(manager),
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == "spec_conflict_not_pending"
+    row = await _run_row(session, first.json()["run_id"])
+    await session.refresh(row)
+    assert row.owner_note == "one"
+
+
+async def test_owner_note_rejected_after_the_task_was_edited(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: ProjectModel,
+    monkeypatch,
+) -> None:
+    task_id, _ = await _spec_conflict_attempt(client, session, manager, project, monkeypatch)
+    edited = await client.patch(
+        f"/api/v1/tasks/{task_id}",
+        json={"description": "the spec changed"},
+        headers=auth(manager),
+    )
+    assert edited.status_code == 200
+    resp = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", json={"owner_note": "go"}, headers=auth(manager)
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "spec_conflict_not_pending"
+    runs = (await session.scalars(select(AgentRun).where(AgentRun.task_id == task_id))).all()
+    assert len(runs) == 1
+
+
+@pytest.mark.parametrize(
+    "error", ["Codex timed out", "SPEC_CONFLICTING input", "SPEC_CONFLICT", "spec_conflict: x"]
+)
+async def test_owner_note_requires_a_spec_conflict_failure(
+    error: str,
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: ProjectModel,
+    monkeypatch,
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    lease_id = (await _lease(client))["lease_id"]
+    await _fail_run(client, run_id, lease_id, error)
+    task_id = (await _run_row(session, run_id)).task_id
+    resp = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", json={"owner_note": "go"}, headers=auth(manager)
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "spec_conflict_not_pending"
+
+
+@pytest.mark.parametrize("error", ["SPEC_CONFLICT: x", "SPEC_CONFLICT (brief vs acceptance)"])
+async def test_owner_note_accepts_the_tight_spec_conflict_prefixes(
+    error: str,
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: ProjectModel,
+    monkeypatch,
+) -> None:
+    run_id = await _local_run(client, session, manager, project, monkeypatch)
+    lease_id = (await _lease(client))["lease_id"]
+    await _fail_run(client, run_id, lease_id, error)
+    task_id = (await _run_row(session, run_id)).task_id
+    resp = await client.post(
+        f"/api/v1/agent-runs/tasks/{task_id}", json={"owner_note": "go"}, headers=auth(manager)
+    )
+    assert resp.status_code == 201
+
+
+async def test_correction_lease_carries_acceptance_and_owner_note(
+    client: AsyncClient,
+    session: AsyncSession,
+    manager: User,
+    project: ProjectModel,
+    monkeypatch,
+) -> None:
+    from uuid import uuid4
+
+    from app.api.v1 import agent_runs
+
+    run_id, _ = await _open_local_pr(client, session, manager, project, monkeypatch)
+    await _add_intake(session, run_id, manager, {"acceptance": ["a one"]})
+    row = await _run_row(session, run_id)
+    row.owner_note = "Follow the spec."
+    await session.commit()
+
+    async def fake_current_head(run) -> tuple[str, bool]:
+        return _SHA, True
+
+    monkeypatch.setattr(agent_runs, "_current_pr_head", fake_current_head)
+    req = await client.post(
+        f"/api/v1/agent-runs/{run_id}/corrections",
+        json={"expected_head_sha": _SHA, "action_id": str(uuid4()), "instruction": "fix it"},
+        headers=auth(manager),
+    )
+    assert req.status_code == 200
+    body = await _lease(client)
+    assert body["kind"] == "correction"
+    assert body["acceptance"] == ["a one"]
+    assert body["owner_note"] == "Follow the spec."
+    assert body["check_gate"] is None
 
 
 @pytest.mark.parametrize("note", ["", "   ", "x" * 501])

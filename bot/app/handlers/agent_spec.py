@@ -9,6 +9,7 @@ written; that starts the next attempt with a fixed `owner_note` (the backend acc
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from aiogram import Router
@@ -19,10 +20,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.api import ApiError
 from app.callbacks import SpecRerunAction
 from app.handlers.helpers import api_for, editable
+from app.logging import get_logger
 
 router = Router(name="agent_spec")
+log = get_logger(__name__)
 
 SPEC_CONFLICT_PREFIX = "SPEC_CONFLICT"
+# Same rule as the backend's `start_agent_run` guard: the marker, then a space, "(" or ":".
+_SPEC_CONFLICT_RE = re.compile(r"SPEC_CONFLICT[ (:]")
+# The backend allows two attempts per task revision (attempt_index 1 and 2).
+MAX_ATTEMPTS = 2
+LIMIT_REACHED_TEXT = "Qayta urinish limiti tugadi. Vazifani tahrirlang."
+ALREADY_HANDLED_TEXT = "Allaqachon ishga tushirilgan yoki vazifa o'zgargan."
 SPEC_CONFIRMED_NOTE = (
     "Owner spec'ni tasdiqladi: brief va acceptance mezonlarini so'zma-so'z bajar; "
     "spec'ni o'zgartirma."
@@ -30,9 +39,14 @@ SPEC_CONFIRMED_NOTE = (
 
 
 def is_spec_conflict(run: dict[str, Any]) -> bool:
-    return run.get("status") == "failed" and str(run.get("error") or "").startswith(
-        SPEC_CONFLICT_PREFIX
+    return run.get("status") == "failed" and bool(
+        _SPEC_CONFLICT_RE.match(str(run.get("error") or ""))
     )
+
+
+def attempts_exhausted(run: dict[str, Any]) -> bool:
+    attempt = run.get("attempt_index")
+    return isinstance(attempt, int) and attempt >= MAX_ATTEMPTS
 
 
 def spec_conflict_text(error: Any) -> str:
@@ -61,6 +75,7 @@ def spec_conflict_keyboard(task_id: int, *, confirming: bool = False) -> InlineK
 
 
 async def _set_markup(query: CallbackQuery, markup: InlineKeyboardMarkup | None) -> None:
+    """Best effort: a failed cosmetic edit must never look like a failed action."""
     message = editable(query)
     if message is None:
         return
@@ -68,13 +83,19 @@ async def _set_markup(query: CallbackQuery, markup: InlineKeyboardMarkup | None)
         await message.edit_reply_markup(reply_markup=markup)
     except TelegramBadRequest as error:
         if "message is not modified" not in str(error).lower():
-            raise
+            log.warning("spec_rerun_markup_edit_failed", error=str(error)[:200])
 
 
 @router.callback_query(SpecRerunAction.filter())
 async def spec_rerun_action(query: CallbackQuery, callback_data: SpecRerunAction) -> None:
     message = editable(query)
-    if message is None or message.chat.type != "private":
+    if message is None:
+        await query.answer(
+            "Bu karta eskirgan. Yangi kartani kuting yoki vazifani qayta oching.",
+            show_alert=True,
+        )
+        return
+    if message.chat.type != "private":
         await query.answer(
             "Bu amal faqat egasining shaxsiy chatida ishlaydi.", show_alert=True
         )
@@ -102,17 +123,20 @@ async def spec_rerun_action(query: CallbackQuery, callback_data: SpecRerunAction
         runs = await api.agent_runs(task_id)
         latest = runs[0] if runs else None
         if latest is None or not is_spec_conflict(latest):
-            await query.answer(
-                "Holat o‘zgargan: bu vazifa uchun qayta ishga tushirish kerak emas.",
-                show_alert=True,
-            )
+            await query.answer(ALREADY_HANDLED_TEXT, show_alert=True)
+            await _set_markup(query, None)
+            return
+        if attempts_exhausted(latest):
+            await query.answer(LIMIT_REACHED_TEXT, show_alert=True)
             await _set_markup(query, None)
             return
         await api.start_agent_run(task_id, owner_note=SPEC_CONFIRMED_NOTE)
     except ApiError as error:
         if error.status == 409:
-            text = f"Qayta ishga tushirib bo‘lmaydi: {error.detail}"
-        elif error.status == 403:
+            await query.answer(ALREADY_HANDLED_TEXT, show_alert=True)
+            await _set_markup(query, None)
+            return
+        if error.status == 403:
             text = "Bu amal faqat egasi uchun."
         else:
             text = "Qayta ishga tushirib bo‘lmadi. Birozdan so‘ng qayta urinib ko‘ring."
