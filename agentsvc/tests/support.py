@@ -321,6 +321,9 @@ class FakeCodexRunner:
         self.package_calls: list[dict[str, Any]] = []
         self.preflight_calls: list[dict[str, Any]] = []
         self.cleanup_calls: list[dict[str, Any]] = []
+        self.check_calls: list[dict[str, Any]] = []
+        self.check_kwargs: list[dict[str, Any]] = []
+        self._check_results: list[dict[str, Any] | Exception] = []
         self._exec_results: list[CodexResult] = []
         self._package_results: list[dict[str, Any]] = []
         self._preflight_results: list[dict[str, Any] | Exception] = []
@@ -343,6 +346,11 @@ class FakeCodexRunner:
         if isinstance(result, Exception):
             raise result
         return result
+
+    def queue_check_result(self, result: dict[str, Any] | Exception) -> None:
+        """Scripted `check` replies, consumed in order; once exhausted the
+        default reply is a pass of `expected_tests` tests."""
+        self._check_results.append(result)
 
     def queue_package_result(self, result: dict[str, Any]) -> None:
         self._package_results.append(result)
@@ -407,6 +415,30 @@ class FakeCodexRunner:
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         self.cleanup_calls.append(request)
         return {"ok": True}
+
+    def check(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout_s: float = 240.0,
+        cancel: Any = None,
+    ) -> dict[str, Any]:
+        self.check_calls.append(request)
+        self.check_kwargs.append({"timeout_s": timeout_s, "cancel": cancel})
+        if self._check_results:
+            result = self._check_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        expected = int(request.get("expected_tests", 0))
+        return {
+            "status": "passed",
+            "total": expected,
+            "passed": expected,
+            "failed": [],
+            "output_tail": "",
+            "detail": "",
+        }
 
 
 class FakeChatApi:

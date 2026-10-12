@@ -24,6 +24,12 @@ _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 _KINDS = frozenset({"implement", "review", "correction"})
 _COMPLEXITIES = frozenset({"simple", "complex"})
 _MAX_RELEVANT_FILES = 12
+# Factory acceptance checks (lease fields, parsed leniently: a malformed value
+# is dropped, never a lease failure).
+_MAX_ACCEPTANCE_ITEMS = 5
+_MAX_ACCEPTANCE_ITEM_CHARS = 250
+_MAX_OWNER_NOTE_CHARS = 500
+_MAX_DESCRIPTION_CHARS = 12000
 
 # Chat lane (intake / discussion) constants. These endpoints (`/agent-intakes`,
 # `/project-discussions`) are a separate contract from `/agent-runs`: a
@@ -72,6 +78,9 @@ STAGES = frozenset(
         "codex_finished",
         "patch_validated",
         "preflight_passed",
+        "acceptance_authored",
+        "check_gate_passed",
+        "check_gate_failed",
         "branch_pushed",
         "review_started",
         "correction_pushed",
@@ -189,6 +198,47 @@ class Work:
     # requested against (= the previously reviewed head). None for a first
     # review or a same-head "reconsider" correction.
     last_reviewed_sha: str | None = None
+    # Implement leases only (best-effort): the intake brief's acceptance
+    # criteria (<=5 items of <=250 chars) and an owner instruction attached to
+    # a spec-conflict restart (<=500 chars).
+    acceptance: tuple[str, ...] = ()
+    owner_note: str | None = None
+    # Review leases only (best-effort): the Check Gate summary recorded for
+    # the PR's run (status/total/passed/...), or None.
+    check_gate: dict[str, Any] | None = None
+
+
+def _parse_acceptance(value: Any) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or len(value) > _MAX_ACCEPTANCE_ITEMS
+        or not all(
+            isinstance(item, str) and item.strip() and len(item) <= _MAX_ACCEPTANCE_ITEM_CHARS
+            for item in value
+        )
+    ):
+        return ()
+    return tuple(value)
+
+
+def _parse_owner_note(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip() and len(value) <= _MAX_OWNER_NOTE_CHARS:
+        return value
+    return None
+
+
+def _parse_check_gate(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    gate: dict[str, Any] = {}
+    status = value.get("status")
+    if isinstance(status, str) and len(status) <= 32:
+        gate["status"] = status
+    for key in ("total", "passed"):
+        number = value.get(key)
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+            gate[key] = number
+    return gate or None
 
 
 def _bad_int(value: Any, *, minimum: int) -> bool:
@@ -287,7 +337,7 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
     if not isinstance(title, str) or not title.strip() or len(title) > 255:
         fail("lease response has an invalid title")
     description = payload.get("description")
-    if not isinstance(description, str) or len(description) > 8000:
+    if not isinstance(description, str) or len(description) > _MAX_DESCRIPTION_CHARS:
         fail("lease response has an invalid description")
     image_count = payload.get("image_count")
     if _bad_int(image_count, minimum=0):
@@ -393,6 +443,9 @@ def parse_work(payload: Any, catalog: Mapping[str, str]) -> Work:
             if isinstance(last_reviewed_sha, str) and _SHA_RE.fullmatch(last_reviewed_sha)
             else None
         ),
+        acceptance=_parse_acceptance(payload.get("acceptance")),
+        owner_note=_parse_owner_note(payload.get("owner_note")),
+        check_gate=_parse_check_gate(payload.get("check_gate")),
     )
 
 

@@ -105,6 +105,9 @@ ENGINEERING_CHECKLIST = (
     "README).\n"
     "- Fix the root cause instead of adapting code to fit brittle tests; do not reorder or "
     "rename things just to make tautological tests pass.\n"
+    "- Copy every literal the request spells out (anything in backticks, and exact "
+    "formats, status codes, header names, message texts, routes, field names) "
+    "verbatim; never \"improve\", rename or reformat them.\n"
     "- In your final message, list what you verified and what you could not run.\n"
 )
 

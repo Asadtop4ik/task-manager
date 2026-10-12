@@ -72,6 +72,21 @@ DEFAULT_MODEL_MATRIX: dict[str, dict[str, Any]] = {
         "multi_agent": False,
         "sandbox": "read-only",
     },
+    # Factory acceptance checks (dark-shipped behind `acceptance_checks_enabled`):
+    # the test-author station writes the locked acceptance tests, a fix-up
+    # re-runs the builder in the same workspace after a failed Check Gate.
+    "test_author": {
+        "model": "gpt-6-luna",
+        "effort": "high",
+        "multi_agent": False,
+        "sandbox": "workspace-write",
+    },
+    "fixup": {
+        "model": "gpt-6-luna",
+        "effort": "high",
+        "multi_agent": False,
+        "sandbox": "workspace-write",
+    },
 }
 
 # Seconds. "idle" is a single global idle-timeout applied to every exec call.
@@ -82,7 +97,12 @@ DEFAULT_TIMEOUTS: dict[str, int] = {
     "implement_complex": 2100,
     "correction": 1200,
     "review": 480,
+    "test_author": 300,
+    "fixup": 900,
+    "check": 240,
 }
+DEFAULT_MAX_FIXUPS = 2
+MAX_FIXUPS_LIMIT = 3
 DEFAULT_IDLE_TIMEOUT_S = 480
 
 # Absolute, pinned preflight tool executables (never resolved from PATH inside
@@ -125,6 +145,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # ops lane applies owner-approved env changes through a root oneshot
     # unit and must be explicitly turned on per deployment.
     "ops_lane_enabled": False,
+    # Off by default (kill switch): the test-author station + Check Gate run
+    # only when this is on AND the repository has a check profile (see
+    # `agent_svc.acceptance`). Enabled after a server smoke test.
+    "acceptance_checks_enabled": False,
+    "max_fixups": DEFAULT_MAX_FIXUPS,
     "ops_allowlist_path": "/etc/agent-svc/ops-allowlist.json",
     "ops_request_dir": "/run/agent-svc/ops",
     "ops_results_dir": "/var/lib/agent-ops/results",
@@ -137,7 +162,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "preflight_tool_paths": DEFAULT_PREFLIGHT_TOOL_PATHS,
 }
 
-_BOOL_KEYS = ("code_lane_enabled", "chat_lane_enabled", "watch_enabled", "ops_lane_enabled")
+_BOOL_KEYS = (
+    "code_lane_enabled",
+    "chat_lane_enabled",
+    "watch_enabled",
+    "ops_lane_enabled",
+    "acceptance_checks_enabled",
+)
 _FLOAT_KEYS = ("poll_interval_s", "watch_poll_interval_s", "sd_watchdog_interval_s")
 _STR_KEYS = (
     "api_base_url",
@@ -188,6 +219,8 @@ class Settings:
     chat_lane_enabled: bool
     watch_enabled: bool
     ops_lane_enabled: bool
+    acceptance_checks_enabled: bool
+    max_fixups: int
     ops_allowlist_path: str
     ops_request_dir: str
     ops_results_dir: str
@@ -333,6 +366,15 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     for key in _STR_KEYS:
         if not isinstance(merged[key], str) or not merged[key].strip():
             raise ConfigError(f"config key {key!r} must be a non-empty string")
+    max_fixups = merged["max_fixups"]
+    if (
+        isinstance(max_fixups, bool)
+        or not isinstance(max_fixups, int)
+        or not 0 <= max_fixups <= MAX_FIXUPS_LIMIT
+    ):
+        raise ConfigError(
+            f"config key 'max_fixups' must be an integer from 0 to {MAX_FIXUPS_LIMIT}"
+        )
     if (
         not isinstance(merged["idle_timeout_s"], int)
         or isinstance(merged["idle_timeout_s"], bool)
@@ -460,6 +502,8 @@ def build_settings(config: Mapping[str, Any], secrets: Mapping[str, str]) -> Set
         chat_lane_enabled=config["chat_lane_enabled"],
         watch_enabled=config["watch_enabled"],
         ops_lane_enabled=config["ops_lane_enabled"],
+        acceptance_checks_enabled=config["acceptance_checks_enabled"],
+        max_fixups=config["max_fixups"],
         ops_allowlist_path=config["ops_allowlist_path"],
         ops_request_dir=config["ops_request_dir"],
         ops_results_dir=config["ops_results_dir"],

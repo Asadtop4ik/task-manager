@@ -128,6 +128,58 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(work.relevant_files, ("backend/app/main.py",))
         self.assertEqual(work.repo_full_name, "Asadtop4ik/task-manager")
 
+    def test_acceptance_fields_default_to_empty(self) -> None:
+        api, _opener = _api([FakeResponse(json.dumps(_work_payload()).encode(), status=200)])
+        work = api.lease("code")
+        assert work is not None
+        self.assertEqual(work.acceptance, ())
+        self.assertIsNone(work.owner_note)
+        self.assertIsNone(work.check_gate)
+
+    def test_acceptance_owner_note_and_check_gate_parse(self) -> None:
+        payload = _work_payload(
+            acceptance=["`GET /x` returns 200", "header `X-A: 1`"],
+            owner_note="Owner approved the spec: follow it literally",
+            check_gate={"status": "failed", "total": 5, "passed": 3, "failed": ["a"]},
+        )
+        api, _opener = _api([FakeResponse(json.dumps(payload).encode(), status=200)])
+        work = api.lease("code")
+        assert work is not None
+        self.assertEqual(work.acceptance, ("`GET /x` returns 200", "header `X-A: 1`"))
+        self.assertEqual(work.owner_note, "Owner approved the spec: follow it literally")
+        self.assertEqual(work.check_gate, {"status": "failed", "total": 5, "passed": 3})
+
+    def test_malformed_acceptance_owner_note_check_gate_are_dropped_not_fatal(self) -> None:
+        for overrides in (
+            {"acceptance": "not a list"},
+            {"acceptance": ["ok"] * 6},
+            {"acceptance": ["x" * 251]},
+            {"acceptance": [1]},
+            {"acceptance": [""]},
+            {"owner_note": "n" * 501},
+            {"owner_note": 5},
+            {"check_gate": "nope"},
+            {"check_gate": {"total": True}},
+        ):
+            payload = _work_payload(**overrides)
+            api, _opener = _api([FakeResponse(json.dumps(payload).encode(), status=200)])
+            work = api.lease("code")
+            assert work is not None, overrides
+            self.assertEqual(work.acceptance, ())
+            self.assertIsNone(work.owner_note)
+            self.assertIsNone(work.check_gate)
+
+    def test_description_limit_is_12000(self) -> None:
+        ok = _work_payload(description="d" * 12000)
+        api, _opener = _api([FakeResponse(json.dumps(ok).encode(), status=200)])
+        work = api.lease("code")
+        assert work is not None
+        self.assertEqual(len(work.description), 12000)
+        bad = _work_payload(description="d" * 12001)
+        api, _opener = _api([FakeResponse(json.dumps(bad).encode(), status=200)])
+        with self.assertRaises(InvalidWork):
+            api.lease("code")
+
     def test_unknown_repository_raises_invalid_work_with_run_id(self) -> None:
         bad = _work_payload(repo_full_name="someone-else/repo")
         api, _opener = _api([FakeResponse(json.dumps(bad).encode(), status=200)])

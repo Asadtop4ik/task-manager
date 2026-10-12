@@ -137,6 +137,7 @@ def handle_review(ctx: Any, work: Work, cancel: threading.Event) -> None:
             correction_count=work.correction_count,
             correction_instruction=work.last_correction_instruction,
             delta_diff=delta_diff,
+            check_gate=work.check_gate,
         )
 
         try:
