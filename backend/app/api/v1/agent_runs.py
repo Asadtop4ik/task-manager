@@ -207,6 +207,8 @@ def _run_detail(run: AgentRun) -> AgentRunDetailOut:
             ),
         },
         ops_note=run.ops_note,
+        check_gate=run.check_gate,
+        owner_note=run.owner_note,
     )
 
 
@@ -548,10 +550,15 @@ def _pr_number(pr_url: str | None) -> int | None:
 
 async def _intake_complexity(
     session: DbSession, task_id: int
-) -> tuple[Literal["simple", "complex"] | None, list[str]]:
+) -> tuple[Literal["simple", "complex"] | None, list[str], list[str]]:
+    """(complexity, relevant_files, acceptance) from the task's intake brief.
+
+    Everything is re-validated on the way out of storage rather than trusted:
+    a missing intake, a malformed brief or a bad entry degrades to None/[].
+    """
     intake = await session.scalar(select(AgentIntake).where(AgentIntake.task_id == task_id))
     if intake is None:
-        return None, []
+        return None, [], []
     brief = intake.brief or {}
     complexity = brief.get("complexity")
     if complexity not in {"simple", "complex"}:
@@ -562,7 +569,17 @@ async def _intake_complexity(
         if isinstance(relevant_files_raw, list)
         else []
     )
-    return cast(Literal["simple", "complex"] | None, complexity), relevant_files
+    acceptance_raw = brief.get("acceptance")
+    acceptance = (
+        [
+            item.strip()
+            for item in acceptance_raw
+            if isinstance(item, str) and item.strip() and len(item) <= 250
+        ][:5]
+        if isinstance(acceptance_raw, list)
+        else []
+    )
+    return cast(Literal["simple", "complex"] | None, complexity), relevant_files, acceptance
 
 
 async def _image_count(session: DbSession, task_id: int) -> int:
@@ -588,7 +605,7 @@ async def _issue_lease(
     # No event recorded here: `_mark_running`/the correction dispatch mirror
     # already record the GitHub-parity event for this pickup, and agent-svc
     # reports its own "leased" moment through POST /stage.
-    complexity, relevant_files = await _intake_complexity(session, run.task_id)
+    complexity, relevant_files, acceptance = await _intake_complexity(session, run.task_id)
     image_count = await _image_count(session, run.task_id)
     correction_count = 0
     last_correction_instruction: str | None = None
@@ -640,6 +657,9 @@ async def _issue_lease(
         correction_count=correction_count,
         last_correction_instruction=last_correction_instruction,
         last_reviewed_sha=last_reviewed_sha,
+        acceptance=acceptance if kind in {"implement", "correction"} else [],
+        owner_note=run.owner_note if kind in {"implement", "correction"} else None,
+        check_gate=run.check_gate if kind == "review" else None,
     )
 
 
@@ -863,6 +883,10 @@ async def _task(session: DbSession, task_id: int, *, lock: bool = False) -> Task
     if task.deleted_at is not None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+# agent-svc marks a spec/acceptance contradiction with this error prefix.
+_SPEC_CONFLICT_RE = re.compile(r"SPEC_CONFLICT[ (:]")
 
 
 def _revision(task: Task, mode: str = "pr") -> str:
@@ -1760,6 +1784,7 @@ async def pending_notifications(
                 ),
                 actions=_run_detail(run).actions,
                 executor=run.executor,
+                attempt_index=run.attempt_index,
                 qa_ready_url=run.qa_ready_url,
                 qa_ready_sha=run.qa_ready_sha,
                 qa_deploy_dispatch_status=run.qa_deploy_dispatch_status,
@@ -1776,6 +1801,8 @@ async def pending_notifications(
                 ),
                 ops_pending_count=sum(1 for row in ops_rows if row.status == "proposed"),
                 ops_note=run.ops_note,
+                check_gate=run.check_gate,
+                owner_note=run.owner_note,
             )
         )
     return notifications
@@ -2878,6 +2905,9 @@ async def start_agent_run(
 ) -> AgentRunOut:
     task = await _task(session, task_id, lock=True)
     mode = payload.mode if payload else "pr"
+    owner_note = payload.owner_note if payload else None
+    if owner_note is not None and user.telegram_id != settings.owner_telegram_id:
+        raise HTTPException(status_code=403, detail="owner_note is owner-only")
     if mode == "fast" and not settings.agent_fast_enabled:
         raise HTTPException(status_code=503, detail="fast mode is not enabled")
     if mode == "fast" and user.telegram_id != settings.owner_telegram_id:
@@ -2937,6 +2967,12 @@ async def start_agent_run(
         .where(AgentRun.task_id == task_id, AgentRun.task_revision == revision)
         .order_by(AgentRun.attempt_index.desc())
     )
+    if owner_note is not None and not (
+        run is not None and run.status == "failed" and _SPEC_CONFLICT_RE.match(run.error or "")
+    ):
+        # The note confirms one specific spec conflict for the task as it is
+        # now; never drop it on an existing run or apply it to an edited task.
+        raise HTTPException(status_code=409, detail="spec_conflict_not_pending")
     if run is not None and run.status in {"failed", "cancelled"}:
         if run.attempt_index >= 2:
             raise HTTPException(status_code=409, detail="agent run retry limit reached")
@@ -2958,6 +2994,7 @@ async def start_agent_run(
             mode=mode,
             status="pending",
             attempts=0,
+            owner_note=owner_note,
         )
         session.add(run)
         try:
@@ -3669,6 +3706,12 @@ async def agent_run_callback(
         )
     if run.executor == "local" and payload.ops_note is not None:
         run.ops_note = payload.ops_note
+    if (
+        run.executor == "local"
+        and payload.check_gate is not None
+        and payload.status in {"pr_opened", "failed"}
+    ):
+        run.check_gate = payload.check_gate.model_dump()
 
     changed = run.status != payload.status or (
         payload.status == "failed" and run.error != payload.error

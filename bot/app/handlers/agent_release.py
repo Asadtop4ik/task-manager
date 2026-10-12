@@ -81,6 +81,23 @@ def _full_sha(value: Any) -> str | None:
     return sha
 
 
+def _check_gate_line(run: dict[str, Any]) -> str | None:
+    """One "Qabul tekshiruvi" line from the run's acceptance-check gate, or None."""
+    gate = run.get("check_gate")
+    if not isinstance(gate, dict):
+        return None
+    status = gate.get("status")
+    if status in {"error", "unavailable"}:
+        return "Qabul tekshiruvi: o'tkazilmadi"
+    total, passed = gate.get("total"), gate.get("passed")
+    if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
+        return None
+    if isinstance(passed, bool) or not isinstance(passed, int):
+        return None
+    mark = "✅" if status == "passed" and passed >= total else "❌"
+    return f"Qabul tekshiruvi: {passed}/{total} {mark}"
+
+
 def _evidence_lines(run: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     ci = run.get("ci_evidence") or run.get("ci") or {}
@@ -214,6 +231,9 @@ def release_card(run: dict[str, Any], *, detailed: bool = False) -> str:
             workflow_link = _link("QA Actions natijasini ochish", run["github_run_url"])
             if workflow_link:
                 lines.append(workflow_link)
+    gate_line = _check_gate_line(run)
+    if gate_line:
+        lines.append(gate_line)
     evidence = _evidence_lines(run)
     if evidence:
         lines.extend(["", "<b>CI va review dalillari:</b>", *evidence])
