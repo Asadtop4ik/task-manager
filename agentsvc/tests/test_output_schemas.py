@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
+from agent_svc.acceptance import TEST_AUTHOR_SCHEMA
 from agent_svc.intake import OUTPUT_SCHEMA as INTAKE_SCHEMA
 from agent_svc.review import REVIEW_OUTPUT_SCHEMA
 
@@ -37,6 +38,15 @@ class StrictSchemaTests(unittest.TestCase):
 
     def test_intake_schema_is_strict(self) -> None:
         self.assertEqual(_violations(INTAKE_SCHEMA), [])
+
+    def test_test_author_schema_is_strict(self) -> None:
+        self.assertEqual(_violations(TEST_AUTHOR_SCHEMA), [])
+        self.assertEqual(
+            TEST_AUTHOR_SCHEMA["properties"]["status"]["enum"], ["ok", "cannot_check"]
+        )
+        self.assertEqual(
+            sorted(TEST_AUTHOR_SCHEMA["required"]), ["checks", "status", "unchecked"]
+        )
 
     def test_checker_catches_the_production_bug(self) -> None:
         loose = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}

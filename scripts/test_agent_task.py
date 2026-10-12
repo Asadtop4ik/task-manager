@@ -727,6 +727,9 @@ class BranchNameAndPromptTests(unittest.TestCase):
             "what you verified and what you could not run",
             "never full suites or dependency installs",
             "worker sub-agent",
+            "verbatim",
+            "AGENT_SPEC_CONFLICT",
+            '"criterion": <n or null>',
         ):
             self.assertIn(needle, ENGINEERING_CHECKLIST)
         # Stays concise and ahead of the task text.

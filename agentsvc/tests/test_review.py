@@ -49,6 +49,7 @@ def _work(
     correction_count: int = 0,
     last_correction_instruction: str | None = None,
     last_reviewed_sha: str | None = None,
+    check_gate: dict | None = None,
 ) -> Work:
     return Work(
         run_id=run_id,
@@ -77,6 +78,7 @@ def _work(
         correction_count=correction_count,
         last_correction_instruction=last_correction_instruction,
         last_reviewed_sha=last_reviewed_sha,
+        check_gate=check_gate,
     )
 
 
@@ -309,6 +311,18 @@ class HandleReviewTests(unittest.TestCase):
         self.assertIn("Spec deviation", prompt)
         self.assertIn("P2", prompt)
         self.assertNotIn("RE-REVIEW", prompt)
+
+    def test_check_gate_adds_the_locked_acceptance_line_and_rule(self) -> None:
+        prompt = self._review_prompt(
+            _work(check_gate={"status": "failed", "total": 5, "passed": 3})
+        )
+        self.assertIn("Factory acceptance checks (locked, run before PR): 3/5 passed.", prompt)
+        self.assertIn("any change to files under tests/acceptance/ as a P2 finding", prompt)
+
+    def test_no_check_gate_leaves_the_prompt_without_acceptance_text(self) -> None:
+        prompt = self._review_prompt(_work())
+        self.assertNotIn("Factory acceptance checks", prompt)
+        self.assertNotIn("tests/acceptance", prompt)
 
     def test_re_review_gets_the_delta_diff_and_instruction(self) -> None:
         github = FakeGitHub(pulls=[_pr()])

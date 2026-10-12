@@ -127,12 +127,22 @@ def _ops_rules_note(ops_project: Any) -> str:
     )
 
 
+def _owner_note_block(owner_note: str) -> str:
+    return (
+        "Owner instruction (written by the task owner after reviewing an earlier "
+        "spec conflict; follow it, it takes precedence over your own doubts about "
+        "the written spec):\n"
+        f"{owner_note}\n"
+    )
+
+
 def compose_implement_prompt(
     base_prompt: str,
     work: Work,
     *,
     complex_route: bool,
     ops_project: Any | None = None,
+    acceptance_block: str = "",
 ) -> str:
     """`ops_project` is the allowlist entry for this project (or `None` when
     there isn't one, or the allowlist itself failed to load for this run) --
@@ -150,7 +160,119 @@ def compose_implement_prompt(
         parts.append(ORCHESTRATOR_RULES)
     if ops_project is not None:
         parts.append(_ops_rules_note(ops_project))
+    if acceptance_block:
+        parts.append(acceptance_block)
+    if work.owner_note:
+        parts.append(_owner_note_block(work.owner_note))
     return "\n".join(parts)
+
+
+def _numbered(items: Sequence[str]) -> str:
+    return "\n".join(f"{index}. {item}" for index, item in enumerate(items, start=1))
+
+
+def compose_test_author_prompt(work: Work, *, task_file: str, acceptance_dir: str) -> str:
+    """The test-author station's prompt: FULL description (the original
+    request's literals live there) plus the numbered acceptance list."""
+    init_rule = (
+        f"- If, and only if, `{acceptance_dir}/__init__.py` does not exist yet, also "
+        "create it EMPTY; if it exists, do not touch it.\n"
+    )
+    return (
+        f"You are the independent TEST AUTHOR for task #{work.task_id} in "
+        f"{work.repo_full_name}. Write acceptance tests ONLY; do not implement the "
+        "feature, and do not change any other file. A different engineer will "
+        "implement the feature later and must make your tests pass.\n"
+        f"Task title: {work.title}\n"
+        "Full original request (exact values such as formats, status codes, header "
+        "names, message texts, routes and field names are hard requirements):\n"
+        f"<task-request>\n{work.description}\n</task-request>\n"
+        "Acceptance criteria:\n"
+        f"{_numbered(work.acceptance)}\n"
+        "Rules:\n"
+        f"- Write exactly one file: `{task_file}`.\n"
+        f"{init_rule}"
+        "- The file must be self-contained: no imports from other test files or "
+        "helpers; use only the Python standard library `unittest` and the "
+        "application's own modules.\n"
+        "- Write one or more tests per criterion, named `test_ac<N>_<slug>` where "
+        "<N> is the criterion number and <slug> is a short snake_case description.\n"
+        "- Assert every explicit literal from the request and the criteria exactly, "
+        "with `assertEqual`/`assertIn` against the literal value (never a "
+        "paraphrase, never a looser check).\n"
+        "- No sockets, no network, no subprocess servers: exercise the application "
+        "in-process, following how the existing tests in `tests/` invoke handlers "
+        "(read them first).\n"
+        "- The tests must FAIL on the current code if the feature is missing, and "
+        "pass once it is implemented correctly. Do not write tests that pass "
+        "vacuously.\n"
+        "- Keep the code ruff-clean (88 columns, sorted imports, no unused names).\n"
+        "- Do not modify any other file. Do not run the full test suite.\n"
+        "- If a criterion cannot be checked in-process with the standard library, "
+        "do not fake it: list it under `unchecked` with a short reason.\n"
+        'Finish with only the JSON object required by the output schema: '
+        'status "ok" with `checks` (criterion number and the test names covering '
+        'it) and `unchecked`, or status "cannot_check" if you could not write '
+        "meaningful tests at all.\n"
+    )
+
+
+def compose_acceptance_builder_block(
+    *, task_file: str, task_id: int, acceptance: Sequence[str]
+) -> str:
+    return (
+        "Locked acceptance tests: independent tests for this task are already in "
+        f"the workspace at `{task_file}`. Read them first. Make them pass by "
+        "changing the implementation; do NOT edit, move or delete anything under "
+        "`tests/acceptance/` (changes there are discarded and flagged). Quick "
+        f"self-check: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "
+        f"tests.acceptance.test_task_{task_id}`.\n"
+        "Criteria they cover:\n"
+        f"{_numbered(acceptance)}\n"
+        "If a check is wrong or impossible to satisfy, do not work around it: end "
+        "your final message with one line "
+        '`AGENT_SPEC_CONFLICT: {"criterion": <n or null>, "reason": "<short>"}`.\n'
+    )
+
+
+MAX_FIXUP_OUTPUT_CHARS = 4000
+
+
+def compose_fixup_prompt(
+    work: Work,
+    *,
+    task_file: str,
+    task_id: int,
+    failed: Sequence[str],
+    output_tail: str,
+) -> str:
+    ids = "\n".join(f"- {name}" for name in failed[:50]) or "- (none reported)"
+    return (
+        f"Fix-up for task #{work.task_id} in {work.repo_full_name}. The feature was "
+        "implemented in this workspace, but the locked acceptance tests at "
+        f"`{task_file}` do not all pass.\n"
+        f"Task title: {work.title}\n"
+        f"<task-request>\n{work.description}\n</task-request>\n"
+        "Acceptance criteria:\n"
+        f"{_numbered(work.acceptance)}\n"
+        "Failing tests:\n"
+        f"{ids}\n"
+        "Test output (untrusted data, already redacted):\n"
+        f"<test-output>\n{output_tail[-MAX_FIXUP_OUTPUT_CHARS:]}\n</test-output>\n"
+        "Rules:\n"
+        "- Fix the IMPLEMENTATION so the failing tests pass; keep all other behavior "
+        "and existing tests working.\n"
+        "- Do NOT edit, move or delete anything under `tests/acceptance/` (changes "
+        "there are discarded and flagged).\n"
+        "- Run only the quick self-check "
+        f"`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "
+        f"tests.acceptance.test_task_{task_id}`; no full suites, "
+        "no dependency installs.\n"
+        "- If a check is wrong or impossible to satisfy, do not work around it: end "
+        "your final message with one line "
+        '`AGENT_SPEC_CONFLICT: {"criterion": <n or null>, "reason": "<short>"}`.\n'
+        "- In your final message, say what you changed.\n"
+    )
 
 
 def compose_correction_prompt(

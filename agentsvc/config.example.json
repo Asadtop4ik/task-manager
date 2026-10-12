@@ -14,6 +14,8 @@
   "chat_lane_enabled": false,
   "watch_enabled": false,
   "ops_lane_enabled": false,
+  "acceptance_checks_enabled": false,
+  "max_fixups": 2,
   "ops_allowlist_path": "/etc/agent-svc/ops-allowlist.json",
   "ops_request_dir": "/run/agent-svc/ops",
   "ops_results_dir": "/var/lib/agent-ops/results",
@@ -62,6 +64,18 @@
       "effort": "high",
       "multi_agent": false,
       "sandbox": "read-only"
+    },
+    "test_author": {
+      "model": "gpt-6-luna",
+      "effort": "high",
+      "multi_agent": false,
+      "sandbox": "workspace-write"
+    },
+    "fixup": {
+      "model": "gpt-6-luna",
+      "effort": "high",
+      "multi_agent": false,
+      "sandbox": "workspace-write"
     }
   },
   "timeouts": {
@@ -70,7 +84,10 @@
     "implement_simple": 1200,
     "implement_complex": 2100,
     "correction": 1200,
-    "review": 480
+    "review": 480,
+    "test_author": 300,
+    "fixup": 900,
+    "check": 240
   },
   "idle_timeout_s": 480
 }

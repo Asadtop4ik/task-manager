@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import types
 import unittest
 from datetime import UTC, datetime
@@ -14,8 +15,11 @@ from agent_svc.config import (
 from agent_svc.prompts import (
     OPS_TRAILER_EXAMPLE,
     ORCHESTRATOR_RULES,
+    compose_acceptance_builder_block,
     compose_correction_prompt,
+    compose_fixup_prompt,
     compose_implement_prompt,
+    compose_test_author_prompt,
     is_complex,
     route_correction,
     route_implement,
@@ -245,3 +249,77 @@ class ComposeCorrectionPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FactoryPromptTests(unittest.TestCase):
+    def _acceptance_work(self, **overrides):
+        return dataclasses.replace(
+            _work(),
+            description="Full request: header `X-Total: 5` and message `Topilmadi`.",
+            acceptance=("returns `X-Total: 5`", "404 body `Topilmadi`"),
+            **overrides,
+        )
+
+    def test_owner_note_is_appended_to_the_implement_prompt(self) -> None:
+        work = self._acceptance_work(owner_note="Owner approved the spec: literal.")
+        prompt = compose_implement_prompt("BASE", work, complex_route=False)
+        self.assertIn("Owner instruction", prompt)
+        self.assertIn("Owner approved the spec: literal.", prompt)
+        plain = compose_implement_prompt("BASE", _work(), complex_route=False)
+        self.assertNotIn("Owner instruction", plain)
+
+    def test_acceptance_block_is_appended_only_when_given(self) -> None:
+        work = self._acceptance_work()
+        self.assertNotIn(
+            "Locked acceptance", compose_implement_prompt("BASE", work, complex_route=False)
+        )
+        block = compose_acceptance_builder_block(
+            task_file="tests/acceptance/test_task_7.py", task_id=7, acceptance=work.acceptance
+        )
+        prompt = compose_implement_prompt(
+            "BASE", work, complex_route=False, acceptance_block=block
+        )
+        self.assertIn("tests/acceptance/test_task_7.py", prompt)
+        self.assertIn("python3 -m unittest tests.acceptance.test_task_7", prompt)
+        self.assertIn("1. returns `X-Total: 5`", prompt)
+        self.assertIn("AGENT_SPEC_CONFLICT:", prompt)
+        self.assertIn("do NOT edit", prompt)
+
+    def test_test_author_prompt_has_full_description_and_rules(self) -> None:
+        work = self._acceptance_work()
+        prompt = compose_test_author_prompt(
+            work, task_file="tests/acceptance/test_task_7.py", acceptance_dir="tests/acceptance"
+        )
+        self.assertIn(work.description, prompt)
+        self.assertIn("1. returns `X-Total: 5`", prompt)
+        self.assertIn("2. 404 body `Topilmadi`", prompt)
+        for needle in (
+            "`tests/acceptance/test_task_7.py`",
+            "`tests/acceptance/__init__.py`",
+            "test_ac<N>_<slug>",
+            "assertEqual",
+            "No sockets",
+            "unittest",
+            "ruff-clean",
+            "unchecked",
+            "FAIL on the current code",
+            "self-contained",
+        ):
+            self.assertIn(needle, prompt)
+
+    def test_fixup_prompt_has_failing_tests_output_and_rules(self) -> None:
+        work = self._acceptance_work()
+        prompt = compose_fixup_prompt(
+            work,
+            task_file="tests/acceptance/test_task_7.py",
+            task_id=7,
+            failed=["test_ac1_x", "test_ac2_y"],
+            output_tail="E" * 5000 + "TAIL",
+        )
+        self.assertIn("- test_ac1_x", prompt)
+        self.assertIn("- test_ac2_y", prompt)
+        self.assertIn("TAIL", prompt)
+        self.assertNotIn("E" * 4500, prompt)  # capped at 4000
+        self.assertIn(work.description, prompt)
+        self.assertIn("Do NOT edit", prompt)
+        self.assertIn("AGENT_SPEC_CONFLICT:", prompt)

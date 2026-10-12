@@ -252,6 +252,28 @@ class ReviewPromptContentTests(unittest.TestCase):
         self.assertNotIn("rule 1", prompt.lower())
         self.assertLess(prompt.index("</untrusted-diff>"), prompt.index("\n<untrusted-delta-diff>\n"))
 
+    def test_check_gate_line_and_locked_acceptance_rule(self) -> None:
+        prompt = self._prompt(check_gate={"status": "passed", "total": 5, "passed": 5})
+        self.assertIn("Factory acceptance checks (locked, run before PR): 5/5 passed.", prompt)
+        self.assertIn(
+            "Treat\n   any change to files under tests/acceptance/ as a P2 finding", prompt
+        )
+        self.assertIn("4. Factory acceptance checks", prompt)
+        self.assertTrue(prompt.rstrip().endswith("</untrusted-diff>"))
+
+    def test_check_gate_without_counts_says_not_run(self) -> None:
+        prompt = self._prompt(check_gate={"status": "unavailable"})
+        self.assertIn("not run (unavailable).", prompt)
+        prompt = self._prompt(check_gate={"status": "Evil\nstatus", "total": 0, "passed": 0})
+        self.assertIn("not run (unknown).", prompt)
+        self.assertNotIn("Evil", prompt)
+
+    def test_no_check_gate_means_no_acceptance_text(self) -> None:
+        for gate in (None, {}, "nope"):
+            prompt = self._prompt(check_gate=gate)
+            self.assertNotIn("Factory acceptance", prompt)
+            self.assertNotIn("tests/acceptance", prompt)
+
     def test_re_review_needs_a_delta_otherwise_it_is_a_first_review(self) -> None:
         for kwargs in (
             {"correction_count": 1},

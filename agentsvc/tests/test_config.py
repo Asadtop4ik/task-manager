@@ -174,6 +174,72 @@ class LoadConfigTests(unittest.TestCase):
             config = load_config(path)
             self.assertTrue(config["ops_lane_enabled"])
 
+    def test_acceptance_checks_defaults(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp) / "absent.json")
+            self.assertFalse(config["acceptance_checks_enabled"])
+            self.assertEqual(config["max_fixups"], 2)
+            for key in ("test_author", "fixup"):
+                self.assertEqual(
+                    config["model_matrix"][key],
+                    {
+                        "model": "gpt-6-luna",
+                        "effort": "high",
+                        "multi_agent": False,
+                        "sandbox": "workspace-write",
+                    },
+                )
+            self.assertEqual(config["timeouts"]["test_author"], 300)
+            self.assertEqual(config["timeouts"]["fixup"], 900)
+            self.assertEqual(config["timeouts"]["check"], 240)
+
+    def test_acceptance_checks_overrides_and_validation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"acceptance_checks_enabled": True, "max_fixups": 0}))
+            config = load_config(path)
+            self.assertTrue(config["acceptance_checks_enabled"])
+            self.assertEqual(config["max_fixups"], 0)
+            for bad in (
+                {"acceptance_checks_enabled": "yes"},
+                {"max_fixups": 4},
+                {"max_fixups": -1},
+                {"max_fixups": True},
+                {"max_fixups": 1.5},
+                {"max_fixups": "2"},
+            ):
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(ConfigError, msg=str(bad)):
+                    load_config(path)
+
+    def test_acceptance_model_matrix_and_timeouts_are_deep_merged(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "model_matrix": {"fixup": {"effort": "medium"}},
+                        "timeouts": {"check": 120},
+                    }
+                )
+            )
+            config = load_config(path)
+            self.assertEqual(config["model_matrix"]["fixup"]["effort"], "medium")
+            self.assertEqual(config["model_matrix"]["fixup"]["model"], "gpt-6-luna")
+            self.assertEqual(config["timeouts"]["check"], 120)
+            self.assertEqual(config["timeouts"]["fixup"], 900)
+            self.assertIn("test_author", config["model_matrix"])
+            path.write_text(json.dumps({"model_matrix": {"test_author": {"model": "nope"}}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_example_config_loads_and_matches_defaults(self) -> None:
+        example = Path(__file__).resolve().parents[1] / "config.example.json"
+        config = load_config(example)
+        self.assertEqual(config["model_matrix"], DEFAULT_MODEL_MATRIX)
+        self.assertEqual(config["timeouts"], DEFAULT_TIMEOUTS)
+        self.assertFalse(config["acceptance_checks_enabled"])
+
 
 class ModelMatrixTimeoutsDeepMergeTests(unittest.TestCase):
     """The production bug this fixes: a config written before a lane
