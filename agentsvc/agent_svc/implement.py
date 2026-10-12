@@ -56,7 +56,6 @@ FIXUP_MIN_REMAINING_S = 600.0
 _MIN_EXEC_TIMEOUT_S = 30.0
 _MIN_AUTHOR_REMAINING_S = 900.0
 _CHECK_GRACE_S = 60.0
-_CHECK_RESERVE_S = 120.0
 _CHECK_STATUSES = frozenset({"passed", "failed", "error", "unavailable"})
 _MAX_OUTPUT_TAIL = 4000
 
@@ -195,6 +194,7 @@ def _run_implement(ctx: ServiceContext, work: Work, run: RunScaffold) -> None:
         work,
         complex_route=route.complex,
         ops_project=ops_project,
+        spec_conflict_rules=ctx.settings.acceptance_checks_enabled,
         acceptance_block=(
             compose_acceptance_builder_block(
                 task_file=station.task_file,
@@ -278,8 +278,12 @@ def _run_builder_and_publish(
     # before anything else reads Codex's text), so the marker line can never
     # leak into a PR body or a failure reason. When present the run stops here:
     # no package, no publish.
+    # The trailer is only trusted (and the rule only put in the prompt) when
+    # the acceptance switch is on; switched off, marker-shaped lines are still
+    # scrubbed from the text but the run continues exactly as it always did.
     message, conflict = split_spec_conflict(result.final_message)
-    if conflict is not None:
+    _log_ignored_marker(ctx, work, result.final_message, message, conflict)
+    if conflict is not None and ctx.settings.acceptance_checks_enabled:
         _fail_spec_conflict(ctx, work, run, state, conflict)
         raise _RunEnded
 
@@ -588,6 +592,30 @@ class _Station:
     task_file: str
     pinned: bytes
     test_count: int
+    # The author's own (artefact-free) patch, which is what the workspace
+    # holds; equals `pinned` unless preflight reformatted it.
+    raw: bytes = b""
+
+
+def _log_ignored_marker(
+    ctx: ServiceContext,
+    work: Work,
+    raw: str | None,
+    stripped: str,
+    conflict: Any,
+) -> None:
+    """Marker-shaped lines were scrubbed but no conflict will be acted on."""
+    if stripped == (raw or "") and conflict is None:
+        return
+    if conflict is not None and ctx.settings.acceptance_checks_enabled:
+        return
+    ctx.logger.event(
+        "spec_conflict_marker_ignored",
+        level="warning",
+        run_id=work.run_id,
+        trusted_marker=conflict is not None,
+        switch_on=ctx.settings.acceptance_checks_enabled,
+    )
 
 
 def _fail_spec_conflict(
@@ -652,7 +680,7 @@ def _run_author_station(
     will use. Returns the pinned station, or `None` after restoring a clean
     workspace (any skip/failure: the normal flow then continues without
     acceptance checks). Raises `_WorkspaceRestoreError` if the restore fails."""
-    station, reason = _author_attempt(
+    station, reason, touched = _author_attempt(
         ctx, work, run, state, profile=profile, base_sha=base_sha, deadline=deadline
     )
     if station is not None:
@@ -666,7 +694,8 @@ def _run_author_station(
         reason=ctx.redactor.redact(reason)[:300],
     )
     state.status = "skipped"
-    _restore_workspace(ctx, work, prepare_request)
+    if touched:
+        _restore_workspace(ctx, work, prepare_request)
     return None
 
 
@@ -679,10 +708,16 @@ def _author_attempt(
     profile: dict[str, str],
     base_sha: str,
     deadline: float,
-) -> tuple[_Station | None, str]:
+) -> tuple[_Station | None, str, bool]:
+    """`(station, skip_reason, workspace_touched)`: `workspace_touched` is True
+    once the author exec ran, i.e. the workspace needs restoring on a skip."""
+    # Before any author cost: without a `check` method on the Codex runner (an
+    # older runner) the gate could never run, so do not write tests for it.
+    if not callable(getattr(ctx.codex, "check", None)):
+        return None, "the Codex runner has no check support", False
     remaining = deadline - _monotonic()
     if remaining < _MIN_AUTHOR_REMAINING_S:
-        return None, "not enough run budget left for the test author"
+        return None, "not enough run budget left for the test author", False
     matrix = ctx.settings.model_matrix["test_author"]
     task_file = acceptance.task_file_path(profile, work.task_id)
     state.author_model = str(matrix["model"])
@@ -712,48 +747,66 @@ def _author_attempt(
         )
     except Exception as exc:
         ctx.logger.error(exc, event="acceptance_author_exec_failed", run_id=work.run_id)
-        return None, f"test author exec failed: {type(exc).__name__}"
+        return None, f"test author exec failed: {type(exc).__name__}", True
     state.add_author(result.usage)
     if run.cancel.is_set() or result.cancelled:
-        return None, "cancelled"
+        return None, "cancelled", True
     if result.timed_out or result.idle_killed or result.exit_code != 0:
-        return None, "test author exec did not finish"
+        return None, "test author exec did not finish", True
 
     reply = _parse_author_reply(result.final_message)
     if reply is None or reply.get("status") != "ok":
         status = reply.get("status") if reply is not None else "unparseable"
-        return None, f"test author reported {status!s}"[:200]
+        return None, f"test author reported {status!s}"[:200], True
 
     try:
         package = ctx.codex.package({"run_id": work.run_id})
-        author_patch = base64.b64decode(package.get("patch_b64") or "", validate=True)
-        task_path, test_count = acceptance.validate_author_patch(
-            author_patch, profile=profile, task_id=work.task_id
+        # Bytecode caches the author left behind are artefacts, not violations.
+        raw = acceptance.drop_artifacts(
+            base64.b64decode(package.get("patch_b64") or "", validate=True)
         )
-        _text, preflighted = _run_preflight(ctx, work, patch=author_patch, base_sha=base_sha)
+        acceptance.validate_author_patch(raw, profile=profile, task_id=work.task_id)
+        _text, pinned = _run_preflight(ctx, work, patch=raw, base_sha=base_sha)
+        if pinned != raw:
+            # Preflight reformatted the tests: what it returns is the pin (and
+            # must itself be a valid author patch).
+            task_path, test_count = acceptance.validate_author_patch(
+                pinned, profile=profile, task_id=work.task_id
+            )
+        else:
+            task_path, test_count = acceptance.validate_author_patch(
+                raw, profile=profile, task_id=work.task_id
+            )
     except acceptance.AcceptanceError as exc:
-        return None, str(exc)
+        return None, str(exc), True
     except PublishError as exc:
-        return None, f"author patch failed preflight: {exc.reason}"
+        return None, f"author patch failed preflight: {exc.reason}", True
     except Exception as exc:
         ctx.logger.error(exc, event="acceptance_author_package_failed", run_id=work.run_id)
-        return None, f"author patch handling failed: {type(exc).__name__}"
-    if preflighted != author_patch:
-        return None, "preflight changed the author patch"
+        return None, f"author patch handling failed: {type(exc).__name__}", True
 
     ctx.logger.event(
         "acceptance_authored",
         run_id=work.run_id,
         task_id=work.task_id,
-        sha256=acceptance.sha256_hex(author_patch),
+        sha256=acceptance.sha256_hex(pinned),
+        raw_sha256=acceptance.sha256_hex(raw),
+        preflight_reformatted=pinned != raw,
         paths=[task_path],
         tests=test_count,
         unchecked=len(reply.get("unchecked") or []),
     )
     run.stage("acceptance_authored", base_sha=base_sha)
     return (
-        _Station(profile=profile, task_file=task_path, pinned=author_patch, test_count=test_count),
+        _Station(
+            profile=profile,
+            task_file=task_path,
+            pinned=pinned,
+            test_count=test_count,
+            raw=raw,
+        ),
         "",
+        True,
     )
 
 
@@ -773,7 +826,9 @@ def _splice_and_gate(
     Returns the final spliced patch to publish -- the PR is opened whether or
     not the gate passed. Raises `_RunEnded` on cancel or a spec conflict."""
     acceptance_dir = station.profile["dir"]
-    patch, modified = acceptance.splice(patch, station.pinned, acceptance_dir)
+    patch, modified = acceptance.splice(
+        patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
+    )
     state.acceptance_modified = state.acceptance_modified or modified
     if modified:
         ctx.logger.event(
@@ -826,8 +881,10 @@ def _check_once(
     deadline: float,
 ) -> dict[str, Any]:
     acceptance_dir = station.profile["dir"]
+    # The whole call (timeout + grace) must still leave the exec reserve.
     timeout_s = min(
-        float(ctx.settings.timeouts["check"]), deadline - _monotonic() - _CHECK_RESERVE_S
+        float(ctx.settings.timeouts["check"]),
+        deadline - _monotonic() - EXEC_RESERVE_S - _CHECK_GRACE_S,
     )
     if timeout_s < _MIN_EXEC_TIMEOUT_S:
         return _check_outcome("skipped", detail="not enough run budget left for the check")
@@ -904,10 +961,15 @@ def _check_outcome_from_reply(reply: Any) -> dict[str, Any]:
     )
     tail = reply.get("output_tail")
     detail = reply.get("detail")
+    # Same normalisation the reported `check_gate` gets, so a bogus "failed"
+    # (zero tests) is an error here too and never triggers a fix-up.
+    status, total, passed, failed = acceptance.normalise_result(
+        str(status), _nonneg_int(reply.get("total")), _nonneg_int(reply.get("passed")), failed
+    )
     return _check_outcome(
-        str(status),
-        total=_nonneg_int(reply.get("total")),
-        passed=_nonneg_int(reply.get("passed")),
+        status,
+        total=total,
+        passed=passed,
         failed=failed,
         output_tail=tail[-_MAX_OUTPUT_TAIL:] if isinstance(tail, str) else "",
         detail=detail[:300] if isinstance(detail, str) else "",
@@ -944,8 +1006,10 @@ def _run_fixup(
                     work,
                     task_file=station.task_file,
                     task_id=work.task_id,
-                    failed=outcome["failed"],
-                    output_tail=outcome["output_tail"],
+                    # Test output comes from running repository code: redact
+                    # it here, whatever the child already did.
+                    failed=[ctx.redactor.redact(name) for name in outcome["failed"]],
+                    output_tail=ctx.redactor.redact(outcome["output_tail"]),
                 ),
                 "images": [],
                 "output_schema": None,
@@ -962,7 +1026,8 @@ def _run_fixup(
     state.add_fixup(result.usage)
     if run.cancel.is_set() or result.cancelled:
         raise _RunEnded
-    _text, conflict = split_spec_conflict(result.final_message)
+    stripped, conflict = split_spec_conflict(result.final_message)
+    _log_ignored_marker(ctx, work, result.final_message, stripped, conflict)
     if conflict is not None:
         _fail_spec_conflict(ctx, work, run, state, conflict)
         raise _RunEnded
@@ -985,7 +1050,9 @@ def _run_fixup(
     acceptance_dir = station.profile["dir"]
     if not acceptance.strip_acceptance(patch, acceptance_dir).strip():
         return None
-    patch, modified = acceptance.splice(patch, station.pinned, acceptance_dir)
+    patch, modified = acceptance.splice(
+        patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
+    )
     state.acceptance_modified = state.acceptance_modified or modified
     return patch
 

@@ -167,6 +167,47 @@ class StripAndSpliceTests(unittest.TestCase):
         self.assertEqual(spliced[: -len(self.pinned)], broken + b"\n")
 
 
+class ArtifactAndLineBreakTests(unittest.TestCase):
+    def test_drop_artifacts_removes_pycache_and_pyc_only(self) -> None:
+        keep = _new_file(TASK, TEST_BODY)
+        patch = (
+            keep
+            + _binary(f"{DIR}/__pycache__/test_task_7.cpython-312.pyc")
+            + _new_file(f"{DIR}/__pycache__/x.py", "a = 1\n")
+            + _binary(f"{DIR}/stray.pyc")
+            + _new_file("pycache_notes.md", "x\n")
+        )
+        self.assertEqual(
+            acceptance.drop_artifacts(patch), keep + _new_file("pycache_notes.md", "x\n")
+        )
+
+    def test_splice_ignores_bytecode_and_accepts_the_raw_author_patch(self) -> None:
+        pinned = _new_file(TASK, TEST_BODY.replace("(1, 1)", "(1, 1)  # reformatted"))
+        raw = _new_file(TASK, TEST_BODY)
+        code = _new_file("app/x.py", "y = 1\n")
+        pyc = _binary(f"{DIR}/__pycache__/t.pyc")
+        spliced, modified = splice(code + raw + pyc, pinned, DIR, unmodified=(raw,))
+        self.assertFalse(modified)
+        self.assertEqual(spliced, code + pinned)
+        _, modified = splice(code + raw + pyc, pinned, DIR)
+        self.assertTrue(modified)
+
+    def test_carriage_return_does_not_fake_a_section_header(self) -> None:
+        patch = _new_file("a.py", "x = 1\n")
+        patch = patch.replace(b"+x = 1\n", b"+x = 1\rdiff --git a/tests/acceptance/y.py b/x\n")
+        sections = split_sections(patch)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0].paths, ("a.py",))
+        self.assertEqual(strip_acceptance(patch, DIR), patch)
+        # a header after a real newline still splits
+        self.assertEqual(len(split_sections(patch + _new_file("b.py", "y\n"))), 2)
+
+    def test_added_test_counting_ignores_carriage_returns(self) -> None:
+        body = b"+x = 1\r+    def test_fake(self):\n+    def test_real(self):\n"
+        patch = f"diff --git a/{TASK} b/{TASK}\nnew file mode 100644\n@@ -0,0 +1 @@\n".encode() + body
+        self.assertEqual(count_added_tests(patch, TASK), 1)
+
+
 class CountAndValidateTests(unittest.TestCase):
     def test_count_added_tests_only_counts_added_def_test(self) -> None:
         patch = _new_file(TASK, TEST_BODY) + _new_file("other.py", "def test_nope(): pass\n")
@@ -201,6 +242,16 @@ class CountAndValidateTests(unittest.TestCase):
             "no tests": _new_file(TASK, "import unittest\n"),
             "unparseable": b"diff --git nonsense\nnew file mode 100644\n",
             "deleted": _delete(TASK),
+            "rename": (
+                _new_file(TASK, TEST_BODY)
+                + f"diff --git a/{INIT} b/{INIT}\nsimilarity index 100%\n"
+                f"rename from {INIT}\nrename to {INIT}\n".encode()
+            ),
+            "copy": (
+                _new_file(TASK, TEST_BODY).replace(
+                    b"new file mode 100644\n", b"new file mode 100644\ncopy from x.py\n"
+                )
+            ),
         }
         for name, patch in cases.items():
             with self.assertRaises(AcceptanceError, msg=name):
@@ -216,7 +267,7 @@ class GateReportTests(unittest.TestCase):
     def test_shape_and_caps(self) -> None:
         report = gate_report(
             status="failed",
-            total=5,
+            total=100,
             passed=3,
             failed=[f"t{i}" for i in range(80)],
             fixups=2,
@@ -237,6 +288,25 @@ class GateReportTests(unittest.TestCase):
         self.assertEqual(len(report["failed"]), 50)
         self.assertEqual(report["author_input_tokens"], 10)
         self.assertEqual(report["fixup_output_tokens"], 1)
+
+    def test_invariants_are_enforced_whatever_the_child_said(self) -> None:
+        report = gate_report(
+            status="failed",
+            total=500,
+            passed=900,
+            failed=["a", "a", "b\nc\x00d", "", "x" * 500, *[f"t{i}" for i in range(200)]],
+        )
+        self.assertEqual(report["total"], 100)
+        self.assertEqual(report["passed"], 100)
+        self.assertEqual(len(report["failed"]), 50)
+        self.assertEqual(report["failed"][:2], ["a", "bcd"])
+        self.assertEqual(len(set(report["failed"])), 50)
+        self.assertTrue(all(len(item) <= 200 for item in report["failed"]))
+        small = gate_report(status="failed", total=2, passed=0, failed=["a", "b", "c", "d"])
+        self.assertEqual(small["failed"], ["a", "b"])  # never more ids than tests
+        self.assertEqual(gate_report(status="failed", total=0, failed=["a"])["status"], "error")
+        self.assertEqual(gate_report(status="failed", total=0)["failed"], [])
+        self.assertEqual(gate_report(status="passed", total=3, passed=-4)["passed"], 0)
 
     def test_profile_table(self) -> None:
         self.assertEqual(

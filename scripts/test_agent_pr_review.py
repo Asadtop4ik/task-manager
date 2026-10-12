@@ -254,7 +254,7 @@ class ReviewPromptContentTests(unittest.TestCase):
 
     def test_check_gate_line_and_locked_acceptance_rule(self) -> None:
         prompt = self._prompt(check_gate={"status": "passed", "total": 5, "passed": 5})
-        self.assertIn("Factory acceptance checks (locked, run before PR): 5/5 passed.", prompt)
+        self.assertIn("Factory acceptance checks (locked, run before PR): status passed, 5/5 passed.", prompt)
         self.assertIn(
             "Treat\n   any change to files under tests/acceptance/ as a P2 finding", prompt
         )
@@ -263,10 +263,20 @@ class ReviewPromptContentTests(unittest.TestCase):
 
     def test_check_gate_without_counts_says_not_run(self) -> None:
         prompt = self._prompt(check_gate={"status": "unavailable"})
-        self.assertIn("not run (unavailable).", prompt)
+        self.assertIn("status unavailable, not run.", prompt)
         prompt = self._prompt(check_gate={"status": "Evil\nstatus", "total": 0, "passed": 0})
-        self.assertIn("not run (unknown).", prompt)
+        self.assertIn("status unknown, not run.", prompt)
         self.assertNotIn("Evil", prompt)
+
+    def test_failed_gate_shows_status_and_counts(self) -> None:
+        prompt = self._prompt(check_gate={"status": "failed", "total": 5, "passed": 3})
+        self.assertIn("status failed, 3/5 passed.", prompt)
+
+    def test_description_literal_near_the_backend_limit_reaches_the_reviewer(self) -> None:
+        description = "x" * 11_900 + "\nETag must be exactly `o1.1`"
+        prompt = self._prompt(title="t", description=description)
+        self.assertIn("ETag must be exactly `o1.1`", prompt)
+        self.assertNotIn("[truncated]", prompt)
 
     def test_no_check_gate_means_no_acceptance_text(self) -> None:
         for gate in (None, {}, "nope"):

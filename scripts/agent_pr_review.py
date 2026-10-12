@@ -100,7 +100,7 @@ def event_target(path: Path) -> tuple[int, str, str, str, str]:
 
 
 MAX_TASK_TITLE_CHARS = 255
-MAX_TASK_DESCRIPTION_CHARS = 8_000
+MAX_TASK_DESCRIPTION_CHARS = 12_000
 MAX_CORRECTION_INSTRUCTION_CHARS = 4_000
 MAX_DELTA_DIFF_CHARS = 120_000
 
@@ -125,6 +125,8 @@ def _check_gate_block(check_gate: Mapping[str, object] | None) -> str:
     total = check_gate.get("total")
     passed = check_gate.get("passed")
     status = check_gate.get("status")
+    valid = isinstance(status, str) and re.fullmatch(r"[a-z_]{1,32}", status)
+    label = status if valid else "unknown"
     if (
         isinstance(total, int)
         and isinstance(passed, int)
@@ -132,11 +134,9 @@ def _check_gate_block(check_gate: Mapping[str, object] | None) -> str:
         and not isinstance(passed, bool)
         and total > 0
     ):
-        line = f"{passed}/{total} passed."
+        line = f"status {label}, {passed}/{total} passed."
     else:
-        valid = isinstance(status, str) and re.fullmatch(r"[a-z_]{1,32}", status)
-        label = status if valid else "unknown"
-        line = f"not run ({label})."
+        line = f"status {label}, not run."
     return f"""4. Factory acceptance checks (locked, run before PR): {line} Files under
    tests/acceptance/ are locked tests written before the implementation. Treat
    any change to files under tests/acceptance/ as a P2 finding titled "Locked

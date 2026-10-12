@@ -11,8 +11,8 @@ BEFORE it, on the raw final message:
 
 * a STRICT marker line (exact literal prefix at column 0, a JSON object with
   exactly the keys `criterion` (int or null) and `reason` (non-empty str, at
-  most 800 chars), located in the last 5 non-empty lines of the message) is the
-  only thing ever trusted as a conflict. More than one strict marker line is
+  most 800 chars, longer is truncated), located in the last 5 non-empty lines
+  of the message) is the only thing ever trusted as a conflict. More than one strict marker line is
   ambiguous and never trusted;
 * every line that merely LOOKS like the marker (Unicode-normalised, casefolded
   substring match, plus an immediately following JSON-looking line) is removed
@@ -57,9 +57,10 @@ def _parse(raw: str) -> SpecConflict | None:
         or not 0 < criterion <= MAX_CRITERION
     ):
         return None
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON_CHARS:
+    if not isinstance(reason, str) or not reason.strip():
         return None
-    return SpecConflict(criterion=criterion, reason=" ".join(reason.split()))
+    # An over-long reason is truncated, not rejected: the conflict is real.
+    return SpecConflict(criterion=criterion, reason=" ".join(reason.split())[:MAX_REASON_CHARS])
 
 
 def split_spec_conflict(final_message: str | None) -> tuple[str, SpecConflict | None]:

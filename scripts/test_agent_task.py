@@ -728,10 +728,11 @@ class BranchNameAndPromptTests(unittest.TestCase):
             "never full suites or dependency installs",
             "worker sub-agent",
             "verbatim",
-            "AGENT_SPEC_CONFLICT",
-            '"criterion": <n or null>',
         ):
             self.assertIn(needle, ENGINEERING_CHECKLIST)
+        # The spec-conflict trailer rule is agent-svc's, added only when its
+        # acceptance switch is on; the shared checklist must not carry it.
+        self.assertNotIn("AGENT_SPEC_CONFLICT", ENGINEERING_CHECKLIST)
         # Stays concise and ahead of the task text.
         self.assertLessEqual(len(ENGINEERING_CHECKLIST.splitlines()), 25)
         self.assertLess(prompt.index(ENGINEERING_CHECKLIST), prompt.index("Task #9"))

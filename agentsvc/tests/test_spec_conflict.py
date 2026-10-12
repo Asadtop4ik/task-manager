@@ -42,7 +42,6 @@ class SplitSpecConflictTests(unittest.TestCase):
             '{"criterion": "1", "reason": "r"}',
             '{"criterion": true, "reason": "r"}',
             '{"criterion": 0, "reason": "r"}',
-            '{"criterion": 1, "reason": "' + "x" * 801 + '"}',
             "[1]",
             "not json",
             "",
@@ -59,6 +58,11 @@ class SplitSpecConflictTests(unittest.TestCase):
         _, conflict = split_spec_conflict(f'{MARK} {{"criterion": 1, "reason": "a\\n  b"}}')
         assert conflict is not None
         self.assertEqual(conflict.reason, "a b")
+
+    def test_over_long_reason_is_truncated_not_rejected(self) -> None:
+        _, conflict = split_spec_conflict(f'{MARK} {{"criterion": 1, "reason": "{"y" * 5000}"}}')
+        assert conflict is not None
+        self.assertEqual(conflict.reason, "y" * 800)
 
     def test_two_strict_markers_are_ambiguous(self) -> None:
         line = f'{MARK} {{"criterion": 1, "reason": "r"}}'

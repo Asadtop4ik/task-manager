@@ -26,6 +26,8 @@ PROFILES: dict[str, dict[str, str]] = {
 
 MAX_AUTHOR_PATCH_BYTES = 200_000
 MAX_FAILED_IDS = 50
+MAX_GATE_TOTAL = 100
+MAX_ID_CHARS = 200
 
 # Strict structured output (`codex exec --output-schema`): every object needs
 # `additionalProperties: false` and every property listed in `required`.
@@ -127,12 +129,10 @@ def _header_paths(line: bytes) -> tuple[str, ...]:
 def split_sections(patch: bytes) -> list[Section]:
     """Split `patch` on `diff --git ` header lines. `b"".join(s.data)` always
     reproduces `patch` exactly."""
-    starts: list[int] = []
-    position = 0
-    for line in patch.splitlines(keepends=True):
-        if line.startswith(_HEADER):
-            starts.append(position)
-        position += len(line)
+    # `^` with re.MULTILINE matches only after b"\n" -- never after a lone b"\r"
+    # (which `bytes.splitlines` would treat as a line break), so a carriage
+    # return inside a patch line can never fake a section header.
+    starts = [m.start() for m in re.finditer(rb"^diff --git ", patch, re.MULTILINE)]
     if not starts:
         return [Section((), patch)] if patch else []
     sections: list[Section] = []
@@ -168,12 +168,37 @@ def acceptance_sections(patch: bytes, acceptance_dir: str) -> bytes:
     )
 
 
-def splice(builder_patch: bytes, pinned: bytes, acceptance_dir: str) -> tuple[bytes, bool]:
+def _is_artifact(section: Section) -> bool:
+    """Bytecode caches are build artefacts, not part of the tests."""
+    return bool(section.paths) and all(
+        "__pycache__" in path.split("/") or path.endswith((".pyc", ".pyo"))
+        for path in section.paths
+    )
+
+
+def drop_artifacts(patch: bytes) -> bytes:
+    """`patch` without `__pycache__/` and `*.pyc` sections."""
+    return b"".join(
+        section.data for section in split_sections(patch) if not _is_artifact(section)
+    )
+
+
+def splice(
+    builder_patch: bytes,
+    pinned: bytes,
+    acceptance_dir: str,
+    *,
+    unmodified: tuple[bytes, ...] = (),
+) -> tuple[bytes, bool]:
     """Drop every acceptance section from the builder's (cumulative) patch and
     append the pinned author sections. Returns `(patch, acceptance_modified)`:
-    modified is True when the builder's acceptance sections differ byte-for-byte
-    from the pinned ones (edited, deleted or extra files)."""
-    modified = acceptance_sections(builder_patch, acceptance_dir) != pinned
+    modified is True when the builder's acceptance sections (bytecode caches
+    ignored) differ byte-for-byte from the pinned ones or from any of
+    `unmodified` -- the other byte strings that mean "the builder left the
+    locked tests alone" (the raw author patch, when preflight reformatted it
+    into the pin) -- i.e. edited, deleted or extra files."""
+    found = drop_artifacts(acceptance_sections(builder_patch, acceptance_dir))
+    modified = found != pinned and found not in unmodified
     kept = strip_acceptance(builder_patch, acceptance_dir)
     if kept and not kept.endswith(b"\n"):
         kept += b"\n"
@@ -186,7 +211,7 @@ def count_added_tests(patch: bytes, path: str) -> int:
     for section in split_sections(patch):
         if path not in section.paths:
             continue
-        for line in section.data.splitlines():
+        for line in section.data.split(b"\n"):
             if re.match(rb"\+\s*(?:async\s+)?def\s+test_\w*\s*\(", line):
                 total += 1
     return total
@@ -219,6 +244,15 @@ def validate_author_patch(
         seen.add(path)
         if b"\nGIT binary patch" in section.data or b"\nBinary files " in section.data:
             raise AcceptanceError(f"{path} is a binary change")
+        # `package` runs `git diff --no-renames`, so a genuine author patch can
+        # never carry these; refuse a hand-made one rather than reason about it.
+        if (
+            b"\nrename from " in section.data
+            or b"\ncopy from " in section.data
+            or b"\nrename to " in section.data
+            or b"\ncopy to " in section.data
+        ):
+            raise AcceptanceError(f"{path} is a rename or copy")
         if b"\nnew file mode 100644\n" not in section.data:
             raise AcceptanceError(f"{path} is not a new regular file")
         if path == init_path and b"\n@@" in section.data:
@@ -229,6 +263,35 @@ def validate_author_patch(
     if count < 1:
         raise AcceptanceError("test author wrote no tests")
     return task_path, count
+
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def clean_test_id(value: object) -> str:
+    """A test id/name as safe single-line text: control characters (newlines
+    included) removed, at most `MAX_ID_CHARS` characters."""
+    return _CONTROL_RE.sub("", str(value)).strip()[:MAX_ID_CHARS]
+
+
+def normalise_result(
+    status: str, total: int, passed: int, failed: list[str] | None
+) -> tuple[str, int, int, list[str]]:
+    """The one place the backend's `check_gate` invariants are enforced:
+    total <= 100, passed <= total, failed = distinct clean ids, at most
+    min(50, total) of them, and a `failed` status without a single test is an
+    `error`."""
+    total = max(0, min(int(total), MAX_GATE_TOTAL))
+    passed = max(0, min(int(passed), total))
+    ids: list[str] = []
+    for item in failed or []:
+        name = clean_test_id(item)
+        if name and name not in ids:
+            ids.append(name)
+    ids = ids[: min(MAX_FAILED_IDS, total)]
+    if status == "failed" and total == 0:
+        status = "error"
+    return status, total, passed, ids
 
 
 def gate_report(
@@ -244,14 +307,16 @@ def gate_report(
     author_model: str | None = None,
     fixup_model: str | None = None,
 ) -> dict[str, Any]:
-    """The `check_gate` object sent in the run callback (and review lease)."""
+    """The `check_gate` object sent in the run callback; the counters are
+    normalised here (see `normalise_result`), whatever the child reported."""
     author_usage = author_usage or {}
     fixup_usage = fixup_usage or {}
+    status, total, passed, ids = normalise_result(status, total, passed, failed)
     return {
         "status": status,
         "total": total,
         "passed": passed,
-        "failed": [str(name)[:200] for name in (failed or [])][:MAX_FAILED_IDS],
+        "failed": ids,
         "fixups": fixups,
         "acceptance_modified": acceptance_modified,
         "author_input_tokens": author_usage.get("input_tokens", 0),
