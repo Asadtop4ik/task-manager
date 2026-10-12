@@ -103,6 +103,13 @@ class AgentRun(Base, TimestampMixin):
     # of the trailer line by agent-svc before it ever reaches here. Display
     # only, never parsed. See `app.schemas.agent_run.AgentRunCallback.ops_note`.
     ops_note: Mapped[str | None] = mapped_column(Text)
+    # Acceptance-check gate result reported by agent-svc with the terminal
+    # implement callback (`AgentRunCallback.check_gate`); display and review
+    # context only, never a merge gate.
+    check_gate: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    # Owner's instruction for this attempt (e.g. "follow the spec as written"
+    # after a SPEC_CONFLICT); set only when the attempt is created.
+    owner_note: Mapped[str | None] = mapped_column(Text)
 
     task: Mapped["Task"] = relationship()
 

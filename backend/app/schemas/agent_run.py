@@ -1,6 +1,6 @@
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -74,6 +74,8 @@ class AgentRunOut(BaseModel):
     merged_at: datetime | None
     deployed_at: datetime | None
     executor: str
+    check_gate: dict[str, object] | None = None
+    owner_note: str | None = None
 
 
 class AgentOpsProposal(BaseModel):
@@ -157,6 +159,29 @@ class AgentOpsRequestOut(BaseModel):
     updated_at: datetime
 
 
+class AgentCheckGate(BaseModel):
+    """Acceptance-check gate result agent-svc reports with a terminal implement
+    callback. Strict: an unknown key inside it is a 422, since it is stored
+    verbatim and later shown to the owner and the reviewer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["passed", "failed", "error", "unavailable", "skipped"]
+    total: int = Field(ge=0, le=100)
+    passed: int = Field(ge=0, le=100)
+    fixups: int = Field(ge=0, le=20)
+    failed: list[Annotated[str, Field(max_length=200)]] = Field(
+        default_factory=list, max_length=50
+    )
+    acceptance_modified: bool = False
+    author_input_tokens: int | None = Field(default=None, ge=0, le=100_000_000)
+    author_output_tokens: int | None = Field(default=None, ge=0, le=100_000_000)
+    fixup_input_tokens: int | None = Field(default=None, ge=0, le=100_000_000)
+    fixup_output_tokens: int | None = Field(default=None, ge=0, le=100_000_000)
+    author_model: str | None = Field(default=None, max_length=32)
+    fixup_model: str | None = Field(default=None, max_length=32)
+
+
 class AgentRunCallback(BaseModel):
     run_id: str
     status: str = Field(
@@ -172,6 +197,7 @@ class AgentRunCallback(BaseModel):
     output_tokens: int | None = Field(default=None, ge=0)
     ops_requests: list[AgentOpsProposal] = Field(default_factory=list, max_length=3)
     ops_note: str | None = Field(default=None, max_length=200)
+    check_gate: AgentCheckGate | None = None
 
 
 class AgentDeployment(BaseModel):
@@ -283,6 +309,8 @@ class AgentRunDetailOut(BaseModel):
     actions: dict[str, AgentActionAvailability]
     ops_requests: list[AgentOpsRequestOut] = Field(default_factory=list)
     ops_note: str | None = None
+    check_gate: dict[str, object] | None = None
+    owner_note: str | None = None
 
 
 class AgentActionOut(BaseModel):
@@ -341,6 +369,14 @@ class ExternalAgentPending(BaseModel):
 
 class AgentRunStart(BaseModel):
     mode: Literal["pr", "fast"] = "pr"
+    # Owner-only instruction for the attempt this request creates (checked in
+    # `start_agent_run`); handed to the implementing agent on its lease.
+    owner_note: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("owner_note", mode="before")
+    @classmethod
+    def _strip_owner_note(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
 
 
 class AgentImageOut(BaseModel):
@@ -386,6 +422,8 @@ class AgentNotificationOut(BaseModel):
     ops_controls_available: bool = False
     ops_pending_count: int = 0
     ops_note: str | None = None
+    check_gate: dict[str, object] | None = None
+    owner_note: str | None = None
 
 
 class AgentNoticeAck(BaseModel):
@@ -457,6 +495,12 @@ class AgentWorkOut(BaseModel):
     # requested against (the previously reviewed head); None for a first
     # review or a same-head "reconsider" correction.
     last_reviewed_sha: str | None = None
+    # Implement leases only: the task's intake-brief acceptance criteria (empty
+    # without an intake/brief) and the owner's note for this attempt.
+    acceptance: list[str] = Field(default_factory=list)
+    owner_note: str | None = None
+    # Review leases only: the stored acceptance-check gate result, or None.
+    check_gate: dict[str, object] | None = None
 
 
 class AgentLeaseHeartbeat(BaseModel):
@@ -478,6 +522,9 @@ AgentStage = Literal[
     "review_started",
     "correction_pushed",
     "retrying",
+    "acceptance_authored",
+    "check_gate_passed",
+    "check_gate_failed",
 ]
 
 

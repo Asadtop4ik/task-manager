@@ -21,6 +21,11 @@ from app.handlers.agent_ops import (
     ops_lines,
 )
 from app.handlers.agent_release import release_card, release_keyboard
+from app.handlers.agent_spec import (
+    is_spec_conflict,
+    spec_conflict_keyboard,
+    spec_conflict_text,
+)
 from app.handlers.project_discussion import discussion_keyboard
 from app.loader import create_bot
 from app.logging import configure_logging, get_logger
@@ -89,6 +94,13 @@ def agent_result_card(notice: dict[str, object]) -> str:
         )
     elif status == "ops_applied":
         lines.append("Holat: ✅ Muhit sozlamalari qo‘llandi.")
+    elif is_spec_conflict(notice):
+        lines.append("Holat: ⚠️ Spec ziddiyati: agent to‘xtadi, egasi qarori kerak.")
+        lines.append(
+            f"Ziddiyat: {_html_text(spec_conflict_text(notice.get('error')) or 'ko‘rsatilmagan', 1200)}"
+        )
+        if notice.get("github_run_url"):
+            lines.append(f"Jarayon: {_html_text(notice['github_run_url'], 300)}")
     else:
         lines.append("Holat: ⚠️ Agent ishi to‘xtadi.")
         lines.append(f"Sabab: {_html_text(notice.get('error') or 'noma’lum', 1200)}")
@@ -241,6 +253,12 @@ async def notify_agent_runs(ctx: dict[str, object]) -> None:
                             )
                     elif notice.get("ops_controls_available"):
                         owner_markup = ops_keyboard(notice.get("ops_requests"))
+                    if len(owner_head_sha) != 40 and is_spec_conflict(notice):
+                        task_id = notice.get("task_id")
+                        if isinstance(task_id, int):
+                            owner_markup = combine_keyboards(
+                                owner_markup, spec_conflict_keyboard(task_id)
+                            )
                     # An ID is reusable only alongside the same owner chat ID.
                     reusable_id = (
                         owner_message_id if owner_notice_chat_id == owner_chat_id else None

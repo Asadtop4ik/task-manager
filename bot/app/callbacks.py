@@ -58,3 +58,14 @@ class AgentOpsAction(CallbackData, prefix="ao"):
     action: str  # ask | yes | no | back
     ops_id: int
     h: str
+
+
+class SpecRerunAction(CallbackData, prefix="sr"):
+    """Owner re-run after a SPEC_CONFLICT failure; `sr:confirm:<task_id>` is far under 64 bytes.
+
+    There is no run id: the handler re-reads the task's newest run and only acts when
+    it is still a SPEC_CONFLICT failure, so a stale card can never start a second run.
+    """
+
+    action: str  # ask | yes | back
+    task_id: int
