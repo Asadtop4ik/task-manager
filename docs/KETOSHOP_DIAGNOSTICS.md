@@ -112,8 +112,9 @@ sudo stat -c '%a %U %G' /run/task-manager-diagnostics/diagnostics.sock
 ```
 
 Then verify the owner can see the Ketoshop tools and a non-owner cannot.
-The broker audit file should show only metadata after a tool call; it must not
-contain the submitted SQL or any returned order field. Keep the feature flag
+The broker audit file records call metadata (and, for the full-access tools in
+`docs/AGENT_DIAGNOSTICS.md`, the SQL text); it must not contain any returned
+order field. Keep the feature flag
 off if the role/view, socket, or API authorization check fails.
 
 ## Synthetic QA database

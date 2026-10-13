@@ -289,16 +289,37 @@ async def lease_discussion(
         base_branch=repository.branch,
         project_key=project_key,
         diagnostics_enabled=bool(
-            settings.ketoshop_diagnostics_enabled
-            and project_key == "ketoshop"
-            and actor is not None
-            and actor.telegram_id == settings.owner_telegram_id
-            and settings.owner_telegram_id > 0
+            actor is not None
+            and project is not None
+            and _diagnostics_access(project, actor) is not None
         ),
         thread_id=row.thread_id,
         text=row.pending_text or "",
         images=row.pending_images,
     )
+
+
+def _diagnostics_access(project: Project, actor: User) -> str | None:
+    """ "full" (AGENT_DIAGNOSTICS_*), "legacy" (Ketoshop views) or None.
+
+    Every level is owner-only and needs the project row to be the catalog's
+    repository for its key. Full access additionally needs the project's database
+    id to equal the fixed id configured for that key, so a project row someone
+    created, renamed or re-pointed can never reach another project's database.
+    """
+    if settings.owner_telegram_id <= 0 or actor.telegram_id != settings.owner_telegram_id:
+        return None
+    if repository_for(project.key, project.repo_full_name, project.default_branch) is None:
+        return None
+    if (
+        settings.agent_diagnostics_enabled
+        and project.key in settings.agent_diagnostics_projects
+        and settings.agent_diagnostics_project_ids.get(project.key) == project.id
+    ):
+        return "full"
+    if settings.ketoshop_diagnostics_enabled and project.key == "ketoshop":
+        return "legacy"
+    return None
 
 
 @router.get("/{discussion_id:int}/diagnostic-context")
@@ -326,18 +347,16 @@ async def diagnostic_context(
     actor = await session.get(User, row.user_id)
     if actor is None or project is None:
         raise HTTPException(status_code=404, detail="diagnostics are not available")
-    allowed = bool(
-        settings.ketoshop_diagnostics_enabled
-        and settings.owner_telegram_id > 0
-        and project.key == "ketoshop"
-        and actor.is_active
-        and actor.telegram_id == settings.owner_telegram_id
-    )
-    if not allowed or not await can_see_project(session, actor, row.project_id):
+    access = _diagnostics_access(project, actor) if actor.is_active else None
+    if access is None or not await can_see_project(session, actor, row.project_id):
         raise HTTPException(status_code=404, detail="diagnostics are not available")
     return {
         "authorized": True,
-        "project_key": "ketoshop",
+        # The broker only serves sessions the owner started themselves.
+        "owner_initiated": True,
+        # False for the legacy Ketoshop-only flag: db_sql/logs/containers stay off.
+        "full_access": access == "full",
+        "project_key": project.key,
         "project_id": project.id,
         "actor_id": actor.id,
         "active": True,

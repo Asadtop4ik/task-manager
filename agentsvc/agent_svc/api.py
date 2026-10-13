@@ -45,11 +45,15 @@ _MAX_IMAGE_BYTES = 20 * 1024 * 1024
 # response is a small JSON object, never anything close to the 4 MiB
 # default `JsonHttp` allows for a generic response.
 _MAX_LEASE_RESPONSE_BYTES = 64 * 1024
-# Ported verbatim from `ops/intake_worker.py poll_discussion_once`: diagnostics
-# may only be enabled for this one fixed repository/branch, regardless of what
-# `project_key` a lease response claims.
-_KETOSHOP_REPO = "muradjanov-dev/ketoshop"
-_KETOSHOP_BRANCH = "master"
+# Diagnostics may only be enabled for these fixed project key -> repository/
+# branch pairs, regardless of what `project_key` a lease response claims (the
+# backend's AGENT_DIAGNOSTICS_PROJECTS decides which of them are actually on).
+_DIAGNOSTICS_PROJECTS = {
+    "ketoshop": ("muradjanov-dev/ketoshop", "master"),
+    "qurbot": ("muradjanov-dev/qurbot", "master"),
+    "kans-shop": ("muradjanov-dev/kans-shop", "main"),
+    "task-manager": ("Asadtop4ik/task-manager", "main"),
+}
 
 # Ops lane (agent-svc-notes/ops-requests-spec.md section 5/6, WP-C): a
 # separate contract again, `/agent-ops` (not `/agent-runs`), always the
@@ -713,8 +717,9 @@ def parse_discussion_lease(payload: Any, catalog: Mapping[str, str]) -> Discussi
     """Validate one `DiscussionWork` lease response (project-discussions contract).
 
     Ports the inline validation in `ops/intake_worker.py`'s
-    `poll_discussion_once` exactly, including the hardcoded ketoshop-only
-    diagnostics restriction (never derived from `project_key` alone).
+    `poll_discussion_once`, except that the diagnostics restriction is now the
+    fixed project -> repository/branch table above (never derived from
+    `project_key` alone).
 
     Identity (id/revision/lease_id) is validated FIRST: once those three
     parse, every later failure raises `DiscussionLeaseInvalid` (carrying
@@ -755,10 +760,9 @@ def parse_discussion_lease(payload: Any, catalog: Mapping[str, str]) -> Discussi
     diagnostics_enabled = payload.get("diagnostics_enabled", False)
     if not isinstance(diagnostics_enabled, bool):
         fail("has an invalid diagnostics_enabled")
-    if diagnostics_enabled and (
-        project_key != "ketoshop"
-        or repo_full_name != _KETOSHOP_REPO
-        or base_branch != _KETOSHOP_BRANCH
+    if diagnostics_enabled and _DIAGNOSTICS_PROJECTS.get(project_key) != (
+        repo_full_name,
+        base_branch,
     ):
         fail("has diagnostics enabled for an unapproved project")
     thread_id = payload.get("thread_id")

@@ -24,7 +24,12 @@ from agent_svc.api import (
 )
 from agent_svc.http import JsonHttp
 
-CATALOG = {"Asadtop4ik/task-manager": "main", "muradjanov-dev/ketoshop": "master"}
+CATALOG = {
+    "Asadtop4ik/task-manager": "main",
+    "muradjanov-dev/ketoshop": "master",
+    "muradjanov-dev/qurbot": "master",
+    "muradjanov-dev/kans-shop": "main",
+}
 BASE_URL = "https://tasks.example.test/api/v1"
 # The contract sets lease_id via uuid4(); every method now validates it as one.
 LEASE_ID = "22222222-2222-2222-2222-222222222222"
@@ -478,7 +483,7 @@ class DiscussionLeaseParsingTests(unittest.TestCase):
         self.assertEqual(lease.discussion_id, 5)
         self.assertFalse(lease.diagnostics_enabled)
 
-    def test_diagnostics_only_allowed_for_ketoshop_project_key(self) -> None:
+    def test_diagnostics_only_allowed_for_a_matching_project_key(self) -> None:
         payload = _discussion_payload(
             repo_full_name="muradjanov-dev/ketoshop",
             base_branch="master",
@@ -490,7 +495,7 @@ class DiscussionLeaseParsingTests(unittest.TestCase):
         self.assertEqual(ctx.exception.discussion_id, 5)
         self.assertEqual(ctx.exception.lease_id, LEASE_ID)
 
-    def test_diagnostics_only_allowed_for_the_ketoshop_repository(self) -> None:
+    def test_diagnostics_only_allowed_for_the_projects_own_repository(self) -> None:
         payload = _discussion_payload(
             repo_full_name="Asadtop4ik/task-manager",
             base_branch="main",
@@ -514,6 +519,43 @@ class DiscussionLeaseParsingTests(unittest.TestCase):
         )
         lease = parse_discussion_lease(payload, CATALOG)
         self.assertTrue(lease.diagnostics_enabled)
+
+    def test_diagnostics_enabled_for_every_approved_project_parses(self) -> None:
+        for key, repo, branch in (
+            ("qurbot", "muradjanov-dev/qurbot", "master"),
+            ("kans-shop", "muradjanov-dev/kans-shop", "main"),
+            ("task-manager", "Asadtop4ik/task-manager", "main"),
+        ):
+            with self.subTest(project=key):
+                lease = parse_discussion_lease(
+                    _discussion_payload(
+                        repo_full_name=repo,
+                        base_branch=branch,
+                        project_key=key,
+                        diagnostics_enabled=True,
+                    ),
+                    CATALOG,
+                )
+                self.assertTrue(lease.diagnostics_enabled)
+
+    def test_diagnostics_rejected_for_an_unknown_project_key_or_mixed_pair(self) -> None:
+        for key, repo, branch in (
+            ("somebody-else", "muradjanov-dev/qurbot", "master"),
+            ("qurbot", "muradjanov-dev/kans-shop", "main"),
+            ("kans-shop", "muradjanov-dev/kans-shop", "master"),
+        ):
+            with self.subTest(project=key, repo=repo, branch=branch):
+                catalog = {**CATALOG, repo: branch}
+                with self.assertRaises(DiscussionLeaseInvalid):
+                    parse_discussion_lease(
+                        _discussion_payload(
+                            repo_full_name=repo,
+                            base_branch=branch,
+                            project_key=key,
+                            diagnostics_enabled=True,
+                        ),
+                        catalog,
+                    )
 
     def test_invalid_thread_id_rejected(self) -> None:
         with self.assertRaises(InvalidResponse):

@@ -2776,8 +2776,8 @@ def base_discussion_request(run_id: str, **overrides: object) -> dict:
 
 
 class AppServerArgvTests(unittest.TestCase):
-    """In-process: the exact ketoshop-only diagnostics MCP wiring, ported
-    from `ops/discussion_appserver.py`'s own `_app_server_command` test."""
+    """In-process: the project-diagnostics MCP wiring, kept identical to
+    `ops/discussion_appserver.py`'s own `_app_server_command`."""
 
     def test_plain_command_has_no_diagnostics_config(self) -> None:
         plain = codex_child._app_server_argv(None, None)
@@ -2790,14 +2790,30 @@ class AppServerArgvTests(unittest.TestCase):
             for index, value in enumerate(configured)
             if value == "--config"
         ]
-        self.assertEqual(len(overrides), 2)
+        self.assertEqual(len(overrides), 5)
         joined = "\n".join(overrides)
-        self.assertIn("mcp_servers.ketoshop_diagnostics.command", joined)
+        self.assertIn("mcp_servers.project_diagnostics.command", joined)
+        self.assertIn(
+            'mcp_servers.project_diagnostics.default_tools_approval_mode="approve"', joined
+        )
+        self.assertNotIn("ketoshop_diagnostics", joined)
         self.assertIn("--discussion-id", joined)
         self.assertIn("83", joined)
-        self.assertIn("--lease-id", joined)
-        self.assertIn("unpredictable-active-lease", joined)
+        # The lease is a capability: it travels in the environment, not argv.
+        self.assertNotIn("--lease-id", joined)
+        self.assertNotIn("unpredictable-active-lease", "\n".join(configured))
+        self.assertIn('env_vars=["DIAGNOSTIC_LEASE_ID"]', joined)
+        # ... and is hidden from the model's own shell environment.
+        self.assertIn('shell_environment_policy.exclude=["DIAGNOSTIC_LEASE_ID"]', joined)
         self.assertNotIn("TOKEN", "\n".join(configured))
+
+    def test_the_lease_reaches_the_proxy_only_through_the_environment(self) -> None:
+        run_dir = Path("/tmp/run")
+        env = codex_child._discussion_env(run_dir, Path("/tmp/codex"), "lease-secret-1")
+        self.assertEqual(env["DIAGNOSTIC_LEASE_ID"], "lease-secret-1")
+        self.assertNotIn(
+            "DIAGNOSTIC_LEASE_ID", codex_child._discussion_env(run_dir, Path("/tmp/codex"))
+        )
 
     def test_a_discussion_id_without_a_lease_id_is_refused(self) -> None:
         with self.assertRaises(codex_child.ChildRefusal):
@@ -2924,7 +2940,7 @@ class DiscussionIntegrationTests(ChildProcessTestCase):
         )
         self.assertEqual(completed.returncode, 3)
 
-    def test_diagnostics_config_reaches_the_ketoshop_proxy_args(self) -> None:
+    def test_diagnostics_config_reaches_the_project_proxy_args(self) -> None:
         run_id = new_run_id()
         wt = self._prepare_wt(run_id)
         self._write_control(wt, {"final_message": "OK"})

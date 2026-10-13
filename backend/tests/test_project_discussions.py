@@ -368,6 +368,8 @@ async def test_ketoshop_diagnostic_context_is_owner_project_and_active_turn_only
     assert context.status_code == 200
     assert context.json() == {
         "authorized": True,
+        "owner_initiated": True,
+        "full_access": False,
         "project_key": "ketoshop",
         "project_id": project.id,
         "actor_id": manager.id,
@@ -464,6 +466,207 @@ async def test_other_project_discussion_does_not_get_diagnostics(
     denied = await client.get(
         f"/api/v1/project-discussions/{discussion_id}/diagnostic-context",
         headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert denied.status_code == 404
+
+
+async def _lease_for_project(
+    client: AsyncClient, project: Project, manager: User, key: str, repo: str, branch: str
+) -> dict:
+    project.key = key
+    project.repo_full_name = repo
+    project.default_branch = branch
+    created = await client.post(
+        "/api/v1/project-discussions",
+        json={"project_id": project.id, "chat_id": manager.telegram_id},
+        headers=bot_headers(manager),
+    )
+    discussion_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/project-discussions/{discussion_id}/messages",
+        json={"text": "Bazani tekshiring"},
+        headers=bot_headers(manager),
+    )
+    work = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert work["project_key"] == key
+    return work
+
+
+async def test_owner_gets_full_diagnostics_for_every_listed_project(
+    client: AsyncClient,
+    session: AsyncSession,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "ketoshop_diagnostics_enabled", False)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id)
+    monkeypatch.setattr(settings, "agent_diagnostics_enabled", True)
+    monkeypatch.setattr(settings, "agent_diagnostics_projects", frozenset({"qurbot"}))
+    monkeypatch.setattr(settings, "agent_diagnostics_project_ids", {"qurbot": project.id})
+    work = await _lease_for_project(
+        client, project, manager, "qurbot", "muradjanov-dev/qurbot", "master"
+    )
+    assert work["diagnostics_enabled"] is True
+    context = await client.get(
+        f"/api/v1/project-discussions/{work['id']}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert context.status_code == 200
+    assert context.json() == {
+        "authorized": True,
+        "owner_initiated": True,
+        "full_access": True,
+        "project_key": "qurbot",
+        "project_id": project.id,
+        "actor_id": manager.id,
+        "active": True,
+        "revision": work["revision"],
+    }
+
+
+async def test_full_diagnostics_need_the_fixed_project_id_and_catalog_repository(
+    client: AsyncClient,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "ketoshop_diagnostics_enabled", False)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id)
+    monkeypatch.setattr(settings, "agent_diagnostics_enabled", True)
+    monkeypatch.setattr(settings, "agent_diagnostics_projects", frozenset({"qurbot"}))
+
+    # No fixed id configured for the key: no full access.
+    monkeypatch.setattr(settings, "agent_diagnostics_project_ids", {})
+    missing = await _lease_for_project(
+        client, project, manager, "qurbot", "muradjanov-dev/qurbot", "master"
+    )
+    assert missing["diagnostics_enabled"] is False
+
+    # An id that belongs to some other project row.
+    monkeypatch.setattr(
+        settings, "agent_diagnostics_project_ids", {"qurbot": project.id + 1000}
+    )
+    await client.post(
+        f"/api/v1/project-discussions/{missing['id']}/result",
+        json={
+            "revision": missing["revision"],
+            "lease_id": missing["lease_id"],
+            "thread_id": "thr_a",
+            "response": "Tayyor.",
+        },
+        headers=worker_headers(),
+    )
+    await client.post(
+        f"/api/v1/project-discussions/{missing['id']}/messages",
+        json={"text": "Yana"},
+        headers=bot_headers(manager),
+    )
+    other = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert other["diagnostics_enabled"] is False
+    denied = await client.get(
+        f"/api/v1/project-discussions/{other['id']}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": other["lease_id"]},
+    )
+    assert denied.status_code == 404
+
+    # Right id, but the project row was re-pointed away from the catalog repo.
+    monkeypatch.setattr(settings, "agent_diagnostics_project_ids", {"qurbot": project.id})
+    project.default_branch = "attacker-branch"
+    repointed = await client.get(
+        f"/api/v1/project-discussions/{other['id']}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": other["lease_id"]},
+    )
+    assert repointed.status_code == 404
+    project.default_branch = "master"
+    allowed = await client.get(
+        f"/api/v1/project-discussions/{other['id']}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": other["lease_id"]},
+    )
+    assert allowed.status_code == 200 and allowed.json()["full_access"] is True
+
+
+def test_project_ids_setting_parses_a_comma_list_and_ignores_bad_entries() -> None:
+    from app.core.config import Settings
+
+    parsed = Settings._parse_project_ids("ketoshop:3, qurbot:5,bad,x:0,y:abc")
+    assert parsed == {"ketoshop": 3, "qurbot": 5}
+    assert Settings._parse_project_ids("") == {}
+
+
+async def test_full_diagnostics_need_the_flag_the_listing_and_the_owner(
+    client: AsyncClient,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "ketoshop_diagnostics_enabled", False)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id)
+    monkeypatch.setattr(settings, "agent_diagnostics_enabled", True)
+    monkeypatch.setattr(settings, "agent_diagnostics_projects", frozenset({"kans-shop"}))
+    monkeypatch.setattr(settings, "agent_diagnostics_project_ids", {"qurbot": project.id})
+    # Not in AGENT_DIAGNOSTICS_PROJECTS.
+    work = await _lease_for_project(
+        client, project, manager, "qurbot", "muradjanov-dev/qurbot", "master"
+    )
+    assert work["diagnostics_enabled"] is False
+    denied = await client.get(
+        f"/api/v1/project-discussions/{work['id']}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": work["lease_id"]},
+    )
+    assert denied.status_code == 404
+
+
+async def test_full_diagnostics_switch_off_and_non_owner_are_denied(
+    client: AsyncClient,
+    project: Project,
+    manager: User,
+    monkeypatch,
+) -> None:
+    await ready_project_flags(monkeypatch)
+    monkeypatch.setattr(settings, "ketoshop_diagnostics_enabled", False)
+    monkeypatch.setattr(settings, "agent_diagnostics_projects", frozenset({"qurbot"}))
+    monkeypatch.setattr(settings, "agent_diagnostics_project_ids", {"qurbot": project.id})
+    # Listed, but the master switch is off.
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id)
+    monkeypatch.setattr(settings, "agent_diagnostics_enabled", False)
+    work = await _lease_for_project(
+        client, project, manager, "qurbot", "muradjanov-dev/qurbot", "master"
+    )
+    assert work["diagnostics_enabled"] is False
+
+    # Switch on, listed, but the actor is not the owner.
+    monkeypatch.setattr(settings, "agent_diagnostics_enabled", True)
+    monkeypatch.setattr(settings, "owner_telegram_id", manager.telegram_id + 1)
+    await client.post(
+        f"/api/v1/project-discussions/{work['id']}/result",
+        json={
+            "revision": work["revision"],
+            "lease_id": work["lease_id"],
+            "thread_id": "thr_x",
+            "response": "Tayyor.",
+        },
+        headers=worker_headers(),
+    )
+    await client.post(
+        f"/api/v1/project-discussions/{work['id']}/messages",
+        json={"text": "Yana"},
+        headers=bot_headers(manager),
+    )
+    again = (
+        await client.post("/api/v1/project-discussions/lease", headers=worker_headers())
+    ).json()
+    assert again["diagnostics_enabled"] is False
+    denied = await client.get(
+        f"/api/v1/project-discussions/{again['id']}/diagnostic-context",
+        headers=worker_headers() | {"X-Intake-Lease-ID": again["lease_id"]},
     )
     assert denied.status_code == 404
 
