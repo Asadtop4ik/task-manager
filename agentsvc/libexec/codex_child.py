@@ -1836,13 +1836,13 @@ def _app_server_argv(
             # defense-in-depth check against a future internal caller that
             # skips that validation.
             raise ChildRefusal("diagnostic lease capability is required")
+        # The lease capability travels in the proxy's environment
+        # (DIAGNOSTIC_LEASE_ID, see `_discussion_env`), never in argv.
         proxy_args = json.dumps(
             [
                 DIAGNOSTIC_PROXY,
                 "--discussion-id",
                 str(diagnostics_discussion_id),
-                "--lease-id",
-                diagnostics_lease_id,
                 "--socket",
                 DIAGNOSTIC_SOCKET,
             ],
@@ -1854,6 +1854,8 @@ def _app_server_argv(
                 'mcp_servers.project_diagnostics.command="/usr/bin/python3"',
                 "--config",
                 f"mcp_servers.project_diagnostics.args={proxy_args}",
+                "--config",
+                'mcp_servers.project_diagnostics.env_vars=["DIAGNOSTIC_LEASE_ID"]',
                 # approval_policy is "never" and every approval ask fails the
                 # turn, so the broker's own owner/lease checks are the gate.
                 "--config",
@@ -1863,8 +1865,10 @@ def _app_server_argv(
     return command
 
 
-def _discussion_env(run_dir: Path, codex_home: Path) -> dict[str, str]:
-    return {
+def _discussion_env(
+    run_dir: Path, codex_home: Path, diagnostics_lease_id: str | None = None
+) -> dict[str, str]:
+    env = {
         "HOME": HOME_DIR,
         "CODEX_HOME": str(codex_home),
         "PATH": PATH_VALUE,
@@ -1876,6 +1880,9 @@ def _discussion_env(run_dir: Path, codex_home: Path) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
+    if diagnostics_lease_id:
+        env["DIAGNOSTIC_LEASE_ID"] = diagnostics_lease_id
+    return env
 
 
 def _thread_start_params(params: DiscussionParams) -> dict[str, Any]:
@@ -1895,7 +1902,9 @@ def _run_app_server_turn(
         process = subprocess.Popen(
             _app_server_argv(params.diagnostics_discussion_id, params.diagnostics_lease_id),
             cwd=str(params.cwd_path),
-            env=_discussion_env(params.run_dir, params.codex_home),
+            env=_discussion_env(
+                params.run_dir, params.codex_home, params.diagnostics_lease_id
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

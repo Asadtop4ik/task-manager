@@ -36,6 +36,8 @@ from diagnostic_security import (
     pack_rows,
     parse_select,
     redact_credentials,
+    scrub_error_values,
+    statement_first_word,
     structured_log_metadata,
     validate_single_statement,
 )
@@ -78,10 +80,58 @@ LEGACY_TOOLS = frozenset(
 FULL_ACCESS_TOOLS = frozenset({"db_sql", "logs", "containers"})
 ALLOWED_TOOLS = LEGACY_TOOLS | FULL_ACCESS_TOOLS
 
+# Writes are a smaller slice of the per-turn call budget.
+MAX_WRITES_PER_REVISION = 10
+MAX_CONCURRENT_CLIENTS = 8
+DB_WORK_MEM = "16MB"
 DB_STATEMENT_TIMEOUT = "15000ms"
 DB_LOCK_TIMEOUT = "5000ms"
 DB_IDLE_TX_TIMEOUT = "20000ms"
 DOCKER_BINARY = "/usr/bin/docker"
+# Attributes and memberships that turn an "agent" role into a way around every
+# other control here (file/program access, signalling backends, bypassing RLS or
+# reading all data). The role must be the dedicated `<project>_agent` role from
+# ops/provision_agent_diagnostics_roles.sql, never an application role.
+DANGEROUS_ROLES = (
+    "pg_execute_server_program",
+    "pg_read_server_files",
+    "pg_write_server_files",
+    "pg_signal_backend",
+    "pg_read_all_data",
+    "pg_write_all_data",
+    "pg_monitor",
+)
+DANGEROUS_EXTENSIONS = ("dblink", "postgres_fdw")
+ROLE_GUARD_SQL = """
+SELECT reason FROM (
+    SELECT 'role attribute ' || v.name AS reason
+    FROM pg_roles AS r
+    CROSS JOIN LATERAL (VALUES
+        ('rolsuper', r.rolsuper),
+        ('rolcreaterole', r.rolcreaterole),
+        ('rolcreatedb', r.rolcreatedb),
+        ('rolreplication', r.rolreplication),
+        ('rolbypassrls', r.rolbypassrls)
+    ) AS v(name, flag)
+    WHERE r.rolname = current_user AND v.flag
+    UNION ALL
+    SELECT 'member of ' || rolname
+    FROM pg_roles
+    WHERE rolname = ANY(%s) AND pg_has_role(current_user, oid, 'MEMBER')
+    UNION ALL
+    SELECT 'extension ' || extname FROM pg_extension WHERE extname = ANY(%s)
+    UNION ALL
+    SELECT 'untrusted language ' || lanname
+    FROM pg_language
+    WHERE NOT lanpltrusted AND lanname NOT IN ('internal', 'c')
+    UNION ALL
+    SELECT 'standard_conforming_strings is off'
+    WHERE current_setting('standard_conforming_strings') <> 'on'
+) AS problems
+"""
+# Row-returning statements of these kinds stream through a server-side cursor so
+# a huge result never sits in the broker's memory.
+_CURSOR_WORDS = frozenset({"select", "values", "table"})
 LOG_DEADLINE_SECONDS = 10
 LOG_MAX_SINCE_MINUTES = 1440
 LOG_MAX_TAIL = 2000
@@ -334,6 +384,7 @@ class DiagnosticHost:
         intake_token: str,
         database_url: str = "",
         project_dsns: Mapping[str, str] | None = None,
+        project_ids: Mapping[str, int] | None = None,
         api_base_url: str = API_BASE_URL,
         audit: AuditLog | None = None,
         command_runner: Any = subprocess.run,
@@ -350,6 +401,10 @@ class DiagnosticHost:
             for key, dsn in (project_dsns or {}).items()
             if key in PROJECTS and dsn and dsn.strip()
         }
+        # Static project key -> database id of the Task Manager project row. The
+        # backend's answer must agree, so a renamed or re-pointed project row
+        # cannot redirect the agent to another project's database.
+        self._project_ids = dict(project_ids or {})
         self._secrets = _known_secrets(
             intake_token, database_url, *self._project_dsns.values()
         )
@@ -359,7 +414,11 @@ class DiagnosticHost:
         self._popen_factory = popen_factory
         self._opener = opener
         self._counter_lock = threading.Lock()
-        self._calls: dict[int, tuple[int, int, float]] = {}
+        self._calls: dict[int, tuple[int, int, float, int]] = {}
+
+    @property
+    def has_full_access_databases(self) -> bool:
+        return bool(self._project_dsns)
 
     def _context(self, discussion_id: int, lease_id: str) -> Context:
         if (
@@ -415,22 +474,27 @@ class DiagnosticHost:
             context.get("full_access") is True,
         )
 
-    def _consume_call(self, discussion_id: int, revision: int) -> None:
+    def _consume_call(self, discussion_id: int, revision: int, write: bool = False) -> None:
         now = time.monotonic()
         with self._counter_lock:
-            for key, (saved_revision, _count, last_call) in list(self._calls.items()):
+            for key, (saved_revision, _count, last_call, _writes) in list(self._calls.items()):
                 if key == discussion_id and (
                     saved_revision != revision or now - last_call > 300
                 ):
                     self._calls.pop(key, None)
             saved = self._calls.get(discussion_id)
             count = saved[1] if saved and saved[0] == revision else 0
+            writes = saved[3] if saved and saved[0] == revision else 0
             if count >= MAX_CALLS_PER_REVISION:
                 raise DiagnosticsError(
                     f"{MAX_CALLS_PER_REVISION} diagnostic calls per discussion turn "
                     "are allowed"
                 )
-            self._calls[discussion_id] = (revision, count + 1, now)
+            if write and writes >= MAX_WRITES_PER_REVISION:
+                raise DiagnosticsError(
+                    f"{MAX_WRITES_PER_REVISION} write calls per discussion turn are allowed"
+                )
+            self._calls[discussion_id] = (revision, count + 1, now, writes + int(write))
 
     def _select(self, query: str) -> tuple[list[dict[str, Any]], str, bool]:
         parsed: ParsedQuery = parse_select(query)
@@ -722,6 +786,15 @@ class DiagnosticHost:
             :500
         ]
 
+    def _check_session(self, cursor: Any) -> None:
+        """Refuse to run agent SQL under a role that could escape the guards."""
+        cursor.execute(ROLE_GUARD_SQL, (list(DANGEROUS_ROLES), list(DANGEROUS_EXTENSIONS)))
+        reasons = [str(row[0]) for row in cursor.fetchall()]
+        if reasons:
+            raise DiagnosticsError(
+                "role guard: refusing to run SQL because " + "; ".join(reasons[:6])
+            )
+
     def _db_sql(
         self, project: str, arguments: dict[str, Any]
     ) -> tuple[dict[str, Any], str, int]:
@@ -730,6 +803,7 @@ class DiagnosticHost:
             raise DiagnosticsError("write must be true or false")
         try:
             sql = validate_single_statement(arguments.get("sql"))
+            first_word = statement_first_word(sql)
         except QueryError as exc:
             raise DiagnosticsError(str(exc)) from None
         dsn = self._project_dsns.get(project)
@@ -741,46 +815,70 @@ class DiagnosticHost:
             raise DiagnosticsError(
                 "diagnostics database driver is unavailable"
             ) from None
+        options = "-c standard_conforming_strings=on"
+        if not write:
+            options += " -c default_transaction_read_only=on"
+        # WITH may hide a data-modifying CTE, which a cursor cannot declare.
+        streamed = first_word in _CURSOR_WORDS or (not write and first_word == "with")
+
+        def redact(text: str) -> str:
+            return redact_credentials(text, self._secrets)
+
         try:
-            with (
-                psycopg.connect(
-                    dsn,
-                    connect_timeout=3,
-                    application_name="task-manager-diagnostics",
-                ) as connection,
-                connection.cursor() as cursor,
-            ):
-                if not write:
-                    # Must be the first statement of the transaction.
-                    cursor.execute("SET TRANSACTION READ ONLY")
-                cursor.execute(f"SET LOCAL statement_timeout = '{DB_STATEMENT_TIMEOUT}'")
-                cursor.execute(f"SET LOCAL lock_timeout = '{DB_LOCK_TIMEOUT}'")
-                cursor.execute(
-                    f"SET LOCAL idle_in_transaction_session_timeout = '{DB_IDLE_TX_TIMEOUT}'"
-                )
-                if not write:
-                    # Takes the transaction's first snapshot; after that
-                    # Postgres refuses SET TRANSACTION READ WRITE, so the one
-                    # statement below cannot lift the read-only guard.
-                    cursor.execute("SELECT 1")
-                cursor.execute(sql)
-                body: dict[str, Any] = {
-                    "project": project,
-                    "write": write,
-                    "status": cursor.statusmessage,
-                    "rowcount": cursor.rowcount,
-                }
-                if cursor.description is not None:
-                    columns = [column.name for column in cursor.description]
-                    fetched = cursor.fetchmany(MAX_ROWS + 1)
-                    packed, truncated, masked = pack_rows(columns, fetched)
-                    body.update(
-                        columns=columns,
-                        rows=packed,
-                        returned_rows=len(packed),
-                        truncated=truncated,
-                        masked_columns=masked,
+            with psycopg.connect(
+                dsn,
+                connect_timeout=3,
+                application_name="task-manager-diagnostics",
+                options=options,
+            ) as connection:
+                with connection.cursor() as setup:
+                    if not write:
+                        # Must be the first statement of the transaction.
+                        setup.execute("SET TRANSACTION READ ONLY")
+                    setup.execute(f"SET LOCAL statement_timeout = '{DB_STATEMENT_TIMEOUT}'")
+                    setup.execute(f"SET LOCAL lock_timeout = '{DB_LOCK_TIMEOUT}'")
+                    setup.execute(
+                        f"SET LOCAL idle_in_transaction_session_timeout = '{DB_IDLE_TX_TIMEOUT}'"
                     )
+                    setup.execute(f"SET LOCAL work_mem = '{DB_WORK_MEM}'")
+                    setup.execute("SET LOCAL row_security = on")
+                    # This query also takes the transaction's first snapshot;
+                    # after that Postgres refuses SET TRANSACTION READ WRITE, so
+                    # the one statement below cannot lift the read-only guard.
+                    self._check_session(setup)
+                cursor = (
+                    connection.cursor(name="diagnostics_cursor")
+                    if streamed
+                    else connection.cursor()
+                )
+                with cursor:
+                    if streamed:
+                        cursor.execute(sql)
+                    else:
+                        # prepare=True sends Parse/Bind/Execute, so the server
+                        # itself rejects a second statement.
+                        cursor.execute(sql, prepare=True)
+                    body: dict[str, Any] = {
+                        "project": project,
+                        "write": write,
+                        "status": cursor.statusmessage,
+                        "rowcount": cursor.rowcount,
+                    }
+                    if cursor.description is not None:
+                        columns = [column.name for column in cursor.description]
+                        fetched = cursor.fetchmany(MAX_ROWS + 1)
+                        packed, truncated, masked = pack_rows(columns, fetched, redact=redact)
+                        body.update(
+                            columns=columns,
+                            rows=packed,
+                            returned_rows=len(packed),
+                            truncated=truncated,
+                            masked_columns=masked,
+                        )
+                        if streamed:
+                            # A server-side cursor does not know the total.
+                            body["status"] = "SELECT"
+                            body["rowcount"] = len(fetched)
                 if write:
                     connection.commit()
                 else:
@@ -909,6 +1007,7 @@ class DiagnosticHost:
             f"{since}m",
             "--tail",
             str(LOG_GREP_SCAN_LINES if grep else tail),
+            "--",
             container,
         ]
         lines, scanned, matched, scan_limit = self._read_docker_logs(command, tail, grep)
@@ -1020,7 +1119,9 @@ class DiagnosticHost:
                 context.project_id,
             )
             project_key = context.project_key
-            self._consume_call(discussion_id, revision)
+            self._consume_call(
+                discussion_id, revision, write=tool == "db_sql" and write
+            )
             outcome = "error"
             if tool in LEGACY_TOOLS:
                 if project_key != "ketoshop":
@@ -1043,6 +1144,11 @@ class DiagnosticHost:
                     )
                 if raw_arguments is not None and not isinstance(raw_arguments, dict):
                     raise DiagnosticsError("invalid arguments")
+                expected_id = self._project_ids.get(project_key)
+                if expected_id is None or expected_id != context.project_id:
+                    raise DiagnosticsError(
+                        "project identity does not match the broker's configuration"
+                    )
                 project = self._project_arg(arguments, project_key)
                 if tool == "db_sql":
                     body, digest, rows = self._db_sql(project, arguments)
@@ -1089,42 +1195,56 @@ class DiagnosticHost:
                     "result_bytes": result_bytes,
                     "duration_ms": round((time.monotonic() - started) * 1000),
                     "outcome": outcome,
-                    "error": error_text,
+                    "error": scrub_error_values(error_text),
                 }
             )
         return response
 
 
+_CLIENT_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
+
+
 def _handle_client(connection: socket.socket, host: DiagnosticHost) -> None:
     with connection:
         connection.settimeout(40)
-        data = bytearray()
-        while len(data) <= MAX_REQUEST_BYTES:
-            chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 1 - len(data)))
-            if not chunk or b"\n" in chunk:
-                if chunk:
-                    data.extend(chunk.split(b"\n", 1)[0])
-                break
-            data.extend(chunk)
-        if len(data) > MAX_REQUEST_BYTES:
-            response = {"ok": False, "error": "diagnostic request is too large"}
-        else:
-            try:
-                request = json.loads(data)
-                if not isinstance(request, dict):
-                    raise TypeError("request must be a JSON object")
-                response = host.handle(request)
-            except (ValueError, TypeError):
-                response = {"ok": False, "error": "invalid diagnostic request"}
-        encoded = json.dumps(
-            response, ensure_ascii=False, separators=(",", ":")
-        ).encode()
-        if len(encoded) > MAX_RESULT_BYTES:
-            encoded = b'{"ok":false,"error":"diagnostic result exceeds 64 KB"}'
-        connection.sendall(encoded + b"\n")
+        # Bound concurrent database/docker work; callers beyond it wait briefly.
+        if not _CLIENT_SLOTS.acquire(timeout=5):
+            connection.sendall(b'{"ok":false,"error":"diagnostics broker is busy"}\n')
+            return
+        try:
+            _serve_request(connection, host)
+        finally:
+            _CLIENT_SLOTS.release()
 
 
-def _narrow_socket_group(socket_path: Path, group_name: str) -> None:
+def _serve_request(connection: socket.socket, host: DiagnosticHost) -> None:
+    data = bytearray()
+    while len(data) <= MAX_REQUEST_BYTES:
+        chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 1 - len(data)))
+        if not chunk or b"\n" in chunk:
+            if chunk:
+                data.extend(chunk.split(b"\n", 1)[0])
+            break
+        data.extend(chunk)
+    if len(data) > MAX_REQUEST_BYTES:
+        response = {"ok": False, "error": "diagnostic request is too large"}
+    else:
+        try:
+            request = json.loads(data)
+            if not isinstance(request, dict):
+                raise TypeError("request must be a JSON object")
+            response = host.handle(request)
+        except (ValueError, TypeError):
+            response = {"ok": False, "error": "invalid diagnostic request"}
+    encoded = json.dumps(
+        response, ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    if len(encoded) > MAX_RESULT_BYTES:
+        encoded = b'{"ok":false,"error":"diagnostic result exceeds 64 KB"}'
+    connection.sendall(encoded + b"\n")
+
+
+def _narrow_socket_group(socket_path: Path, group_name: str, *, required: bool = False) -> None:
     """Best-effort: chgrp the socket to `group_name` if that group exists on
     this host; otherwise leave its group exactly as it is today (the
     process's own primary/effective group, `codex-runner` per the systemd
@@ -1132,14 +1252,27 @@ def _narrow_socket_group(socket_path: Path, group_name: str) -> None:
     itself break the still-live legacy consumer (`ops/discussion_appserver.py`,
     running as `codex-runner`) regardless of whether the group-creation step
     of the installer has run yet on this host.
+
+    `required=True` (full-access tools enabled) fails closed instead: with a
+    database DSN loaded, a socket left in the wider legacy group is not acceptable.
     """
     try:
         gid = grp.getgrnam(group_name).gr_gid
     except KeyError:
+        if required:
+            raise RuntimeError(
+                f"diagnostics: group {group_name} is required when full-access "
+                "tools are configured"
+            ) from None
         return
     try:
         os.chown(socket_path, -1, gid)
     except OSError as error:
+        if required:
+            raise RuntimeError(
+                f"diagnostics: cannot chgrp the socket to {group_name} "
+                f"({type(error).__name__}); the service user must be a member"
+            ) from None
         # The service user must be a member of the group to chgrp (no
         # CAP_CHOWN). Never let this take the broker down: keep today's group.
         print(
@@ -1156,9 +1289,16 @@ def serve(host: DiagnosticHost, socket_path: Path = SOCKET_PATH) -> None:
         socket_path.unlink()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_path))
-    socket_path.chmod(0o660)
-    _narrow_socket_group(socket_path, SOCKET_GROUP)
-    server.listen(16)
+    try:
+        socket_path.chmod(0o660)
+        _narrow_socket_group(
+            socket_path, SOCKET_GROUP, required=host.has_full_access_databases
+        )
+        server.listen(16)
+    except BaseException:
+        server.close()
+        socket_path.unlink(missing_ok=True)
+        raise
     try:
         while True:
             connection, _ = server.accept()
@@ -1170,6 +1310,16 @@ def serve(host: DiagnosticHost, socket_path: Path = SOCKET_PATH) -> None:
         socket_path.unlink(missing_ok=True)
 
 
+def _parse_project_ids(raw: str) -> dict[str, int]:
+    """`ketoshop:3,qurbot:5` -> {"ketoshop": 3, "qurbot": 5}; bad entries are skipped."""
+    found: dict[str, int] = {}
+    for part in raw.split(","):
+        key, _, value = part.strip().partition(":")
+        if key.strip() in PROJECTS and value.strip().isdigit() and int(value) > 0:
+            found[key.strip()] = int(value)
+    return found
+
+
 def main() -> None:
     host = DiagnosticHost(
         intake_token=os.environ["INTAKE_WORKER_TOKEN"],
@@ -1178,6 +1328,7 @@ def main() -> None:
         project_dsns={
             key: os.environ.get(access.dsn_env, "") for key, access in PROJECTS.items()
         },
+        project_ids=_parse_project_ids(os.environ.get("DIAG_PROJECT_IDS", "")),
     )
     serve(host)
 

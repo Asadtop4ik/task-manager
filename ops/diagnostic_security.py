@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 MAX_QUERY_CHARS = 2_000
@@ -336,13 +337,43 @@ MAX_CELL_CHARS = 2_000
 # Rows are packed into the 64 KB result with headroom for the JSON envelope.
 RESULT_BODY_BUDGET = 60 * 1024
 
-_TRANSACTION_CONTROL = frozenset(
-    {"begin", "start", "commit", "end", "rollback", "abort", "savepoint", "release"}
+# Statement types that are refused in both modes: transaction control (it would
+# end the READ ONLY guard or detach work from the audited call), cross-session
+# effects (NOTIFY, PREPARE TRANSACTION), server-level commands, COPY/DO/LOAD, and
+# SET/RESET (which would undo the per-call timeouts). `commit prepared` and
+# `rollback prepared` start with commit/rollback; `alter system|role|database`
+# are covered by the ALTER rule below.
+_DENIED_FIRST_WORDS = frozenset(
+    {
+        "begin",
+        "start",
+        "commit",
+        "end",
+        "rollback",
+        "abort",
+        "savepoint",
+        "release",
+        "prepare",
+        "listen",
+        "notify",
+        "unlisten",
+        "discard",
+        "checkpoint",
+        "vacuum",
+        "reindex",
+        "cluster",
+        "load",
+        "copy",
+        "do",
+        "set",
+        "reset",
+    }
 )
+_DENIED_ALTER_TARGETS = frozenset({"system", "role", "user", "group", "database"})
 _LEADING_WORD = re.compile(r"[A-Za-z_]+")
 _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 _MASKED_NAME = re.compile(
-    r"password|passwd|secret|token|api_?key|private_?key|hash",
+    r"password|passwd|secret|token|api_?key|private_?key|hash|lease",
     re.IGNORECASE,
 )
 # Short words need a boundary so "footprint" or "salted_at" style names are not
@@ -350,15 +381,8 @@ _MASKED_NAME = re.compile(
 _MASKED_SHORT_NAME = re.compile(r"(?:^|[^a-z])(?:otp|salt)(?:[^a-z]|$)", re.IGNORECASE)
 
 
-def validate_single_statement(sql: object) -> str:
-    """Return `sql` stripped of one trailing semicolon, or raise QueryError.
-
-    Walks the text the way the server lexes it (comments, quoted strings and
-    identifiers, dollar quoting) so a `;` inside them is not a separator. The
-    check exists because psycopg runs a parameterless query as a simple query,
-    which would otherwise accept `SELECT 1; COMMIT; ...` and escape the
-    READ ONLY transaction.
-    """
+def _scan_statement(sql: object) -> tuple[str, list[str]]:
+    """Validate shape and return (stripped sql, leading lowercase words)."""
     if not isinstance(sql, str) or not sql.strip():
         raise QueryError("sql must be a non-empty string")
     if len(sql) > MAX_SQL_CHARS:
@@ -369,7 +393,7 @@ def validate_single_statement(sql: object) -> str:
     index = 0
     statements = 0
     has_content = False
-    first_word = ""
+    words: list[str] = []
     while index < length:
         char = sql[index]
         if char == "-" and sql.startswith("--", index):
@@ -413,8 +437,8 @@ def validate_single_statement(sql: object) -> str:
                     break
                 index += 1
             has_content = True
-            if not first_word:
-                first_word = "?"
+            if not words:
+                words.append("?")
             continue
         if char == "$":
             tag = _DOLLAR_TAG.match(sql, index)
@@ -424,8 +448,8 @@ def validate_single_statement(sql: object) -> str:
                     raise QueryError("unterminated dollar-quoted string")
                 index = end + len(tag.group(0))
                 has_content = True
-                if not first_word:
-                    first_word = "?"
+                if not words:
+                    words.append("?")
                 continue
         if char == ";":
             if has_content:
@@ -436,18 +460,46 @@ def validate_single_statement(sql: object) -> str:
         if not char.isspace():
             if statements and not has_content:
                 raise QueryError("only one SQL statement is allowed per call")
-            if not first_word:
-                match = _LEADING_WORD.match(sql, index)
-                first_word = match.group(0).lower() if match else "?"
             has_content = True
+            match = _LEADING_WORD.match(sql, index)
+            starts_word = match is not None and (
+                index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == "_")
+            )
+            if starts_word and match is not None:
+                if len(words) < 2 and statements == 0:
+                    words.append(match.group(0).lower())
+                index = match.end()
+                continue
+            if not words:
+                words.append("?")
         index += 1
     if has_content:
         statements += 1
     if statements != 1:
         raise QueryError("exactly one SQL statement is required")
-    if first_word in _TRANSACTION_CONTROL:
-        raise QueryError("transaction control statements are not allowed")
-    return sql.strip()
+    first = words[0] if words else ""
+    second = words[1] if len(words) > 1 else ""
+    if first in _DENIED_FIRST_WORDS or (first == "alter" and second in _DENIED_ALTER_TARGETS):
+        label = f"ALTER {second.upper()}" if first == "alter" else first.upper()
+        raise QueryError(f"{label} statements are not allowed")
+    return sql.strip(), words
+
+
+def validate_single_statement(sql: object) -> str:
+    """Return `sql` stripped, or raise QueryError.
+
+    Walks the text the way the server lexes it (comments, quoted strings and
+    identifiers, dollar quoting) so a `;` inside them is not a separator. This is
+    the secondary check: the broker also executes through the extended protocol,
+    where the server itself refuses multiple statements.
+    """
+    return _scan_statement(sql)[0]
+
+
+def statement_first_word(sql: str) -> str:
+    """Lowercase first keyword of an already validated statement ('' if none)."""
+    words = _scan_statement(sql)[1]
+    return words[0] if words else ""
 
 
 def is_masked_column(name: object) -> bool:
@@ -455,8 +507,11 @@ def is_masked_column(name: object) -> bool:
     return bool(_MASKED_NAME.search(text) or _MASKED_SHORT_NAME.search(text))
 
 
-def clean_cell(value: Any) -> Any:
-    """JSON-safe cell, with long text clipped to MAX_CELL_CHARS."""
+def clean_cell(value: Any, redact: Callable[[str], str] | None = None) -> Any:
+    """JSON-safe cell; text is credential-redacted, then clipped to MAX_CELL_CHARS.
+
+    Dicts and lists are serialized first, so redaction also covers nested JSON.
+    """
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -469,21 +524,30 @@ def clean_cell(value: Any) -> Any:
         text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
     else:
         text = str(value)
+    if redact is not None:
+        text = redact(text)
     if len(text) > MAX_CELL_CHARS:
         return text[:MAX_CELL_CHARS] + "...[truncated]"
     return text
 
 
 def pack_rows(
-    columns: list[str], rows: list[tuple[Any, ...]], limit: int = MAX_ROWS
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    limit: int = MAX_ROWS,
+    redact: Callable[[str], str] | None = None,
 ) -> tuple[list[list[Any]], bool, list[str]]:
-    """Mask, clip and size-cap rows. Returns (rows, truncated, masked columns)."""
+    """Mask, redact, clip and size-cap rows. Returns (rows, truncated, masked columns).
+
+    Column-name masking is advisory: it catches conventional names only. The
+    `redact` hook is what strips known credentials from any other text cell.
+    """
     masked_indexes = [i for i, name in enumerate(columns) if is_masked_column(name)]
     packed: list[list[Any]] = []
     used = len(json.dumps(columns, ensure_ascii=False, separators=(",", ":")).encode())
     truncated = len(rows) > limit
     for row in rows[:limit]:
-        cells = [clean_cell(cell) for cell in row]
+        cells = [clean_cell(cell, redact) for cell in row]
         for i in masked_indexes:
             if cells[i] is not None:
                 cells[i] = "[masked]"
@@ -508,3 +572,19 @@ def redact_credentials(text: str, secrets: tuple[str, ...] = ()) -> str:
     text = _DSN_PASSWORD.sub(r"\1[redacted]\2", text)
     text = _BEARER.sub("Bearer [redacted]", text)
     return _LOG_BOT_TOKEN.sub("[redacted-token]", text)
+
+
+_ERROR_KEY_VALUES = re.compile(r"\([^()]*\)=\([^()]*\)")
+_ERROR_FAILING_ROW = re.compile(r"(?i)(failing row contains )\(.*\)")
+_ERROR_QUOTED_INPUT = re.compile(r'(?i)(invalid input[^:"]*: )"[^"]*"')
+
+
+def scrub_error_values(text: str) -> str:
+    """Drop data values from a Postgres error but keep names (constraint, column).
+
+    `Key (email)=(a@b.uz) already exists` becomes `Key (...)=(...) already exists`.
+    Used for the audit trail, which must not accumulate row contents.
+    """
+    text = _ERROR_KEY_VALUES.sub("(...)=(...)", text)
+    text = _ERROR_FAILING_ROW.sub(r"\1(...)", text)
+    return _ERROR_QUOTED_INPUT.sub(r'\1"..."', text)

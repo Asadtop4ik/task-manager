@@ -72,8 +72,6 @@ def _app_server_command(
             DIAGNOSTIC_PROXY,
             "--discussion-id",
             str(diagnostics_discussion_id),
-            "--lease-id",
-            diagnostics_lease_id,
             "--socket",
             DIAGNOSTIC_SOCKET,
         ], separators=(",", ":"))
@@ -81,6 +79,8 @@ def _app_server_command(
             "--config", 'mcp_servers.project_diagnostics.command="/usr/bin/python3"',
             "--config",
             f"mcp_servers.project_diagnostics.args={proxy_args}",
+            "--config",
+            'mcp_servers.project_diagnostics.env_vars=["DIAGNOSTIC_LEASE_ID"]',
             "--config",
             'mcp_servers.project_diagnostics.default_tools_approval_mode="approve"',
         ])
@@ -125,6 +125,9 @@ def run_turn(
         "PATH": CODEX_PATH,
         "LANG": "C.UTF-8",
     }
+    if diagnostics_lease_id:
+        # Read by diagnostic_proxy.py; kept out of argv (world-readable in ps).
+        env["DIAGNOSTIC_LEASE_ID"] = diagnostics_lease_id
     if (diagnostics_discussion_id is None) != (diagnostics_lease_id is None):
         raise DiscussionError("diagnostic discussion and lease must be paired")
     process = subprocess.Popen(

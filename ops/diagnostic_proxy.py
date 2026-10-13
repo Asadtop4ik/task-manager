@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 from typing import Any
@@ -14,6 +15,7 @@ MAX_REQUEST_BYTES = 32 * 1024
 HOST_CALL_TIMEOUT_SECONDS = 35
 MAX_SQL_CHARS = 16_000
 DEFAULT_SOCKET = "/run/task-manager-diagnostics/diagnostics.sock"
+LEASE_ENV = "DIAGNOSTIC_LEASE_ID"
 
 TOOLS = [
     {
@@ -95,7 +97,8 @@ TOOLS = [
             "owner request after a SELECT preview. 15 s statement timeout. Returns column "
             "names and at most 200 rows (cells clipped to 2000 chars); columns named like "
             "password/token/secret/hash/otp are returned as [masked]. Add LIMIT to large "
-            "selects. Discover tables through information_schema or pg_catalog."
+            "selects. Transaction control, SET/RESET, DO, COPY, VACUUM and ALTER ROLE/DATABASE "
+            "are refused. Discover tables through information_schema or pg_catalog."
         ),
         "inputSchema": {
             "type": "object",
@@ -330,12 +333,16 @@ def serve(socket_path: str, discussion_id: int, lease_id: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--discussion-id", type=int, required=True)
-    parser.add_argument("--lease-id", required=True)
+    # The lease is a capability. It is passed through the environment so it does
+    # not show up in the world-readable process list; `--lease-id` remains only
+    # as a fallback for callers that cannot set the variable.
+    parser.add_argument("--lease-id")
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     args = parser.parse_args()
-    if args.discussion_id < 1 or not args.lease_id or len(args.lease_id) > 100:
+    lease_id = os.environ.get(LEASE_ENV) or args.lease_id or ""
+    if args.discussion_id < 1 or not lease_id or len(lease_id) > 100:
         raise SystemExit(2)
-    serve(args.socket, args.discussion_id, args.lease_id)
+    serve(args.socket, args.discussion_id, lease_id)
 
 
 if __name__ == "__main__":

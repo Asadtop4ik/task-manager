@@ -7,8 +7,24 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from diagnostic_host import AuditLog, Context, DiagnosticHost, DiagnosticsError
-from diagnostic_security import QueryError, redact_credentials, validate_single_statement
+import diagnostic_host
+from diagnostic_host import (
+    DANGEROUS_EXTENSIONS,
+    DANGEROUS_ROLES,
+    ROLE_GUARD_SQL,
+    AuditLog,
+    Context,
+    DiagnosticHost,
+    DiagnosticsError,
+    _narrow_socket_group,
+)
+from diagnostic_security import (
+    QueryError,
+    clean_cell,
+    redact_credentials,
+    scrub_error_values,
+    validate_single_statement,
+)
 
 DSN_PASSWORD = "s3cretPassw0rd"
 QURBOT_DSN = f"postgresql://qurbot:{DSN_PASSWORD}@127.0.0.1:5432/qurbot"
@@ -20,14 +36,19 @@ class FakePsycopg:
     class Error(Exception):
         pass
 
-    def __init__(self, columns=None, rows=None, status="SELECT", fail=None):
+    def __init__(self, columns=None, rows=None, status="SELECT", fail=None, guard=()):
         self.statements: list[str] = []
+        self.params: list[object] = []
+        self.prepared: list[bool] = []
         self.events: list[str] = []
         self.dsns: list[str] = []
+        self.connect_kwargs: list[dict] = []
+        self.cursor_names: list[object] = []
         self.columns = columns
         self.rows = rows or []
         self.status = status
         self.fail = fail
+        self.guard = list(guard)
         outer = self
 
         class Cursor:
@@ -43,8 +64,14 @@ class FakePsycopg:
             def __exit__(self, *_args):
                 return False
 
-            def execute(self, query):
+            def execute(self, query, params=None, prepare=None):
                 outer.statements.append(query)
+                outer.params.append(params)
+                outer.prepared.append(bool(prepare))
+                if query is ROLE_GUARD_SQL:
+                    self.description = [SimpleNamespace(name="reason")]
+                    self._rows = [(reason,) for reason in outer.guard]
+                    return
                 if query.startswith("SET "):
                     self.statusmessage = "SET"
                     return
@@ -60,6 +87,10 @@ class FakePsycopg:
                 taken, self._rows = self._rows[:size], self._rows[size:]
                 return taken
 
+            def fetchall(self):
+                taken, self._rows = self._rows, []
+                return taken
+
         class Connection:
             def __enter__(self):
                 return self
@@ -67,7 +98,8 @@ class FakePsycopg:
             def __exit__(self, *_args):
                 return False
 
-            def cursor(self):
+            def cursor(self, name=None):
+                outer.cursor_names.append(name)
                 return Cursor()
 
             def commit(self):
@@ -78,8 +110,9 @@ class FakePsycopg:
 
         self.Connection = Connection
 
-    def connect(self, dsn, **_kwargs):
+    def connect(self, dsn, **kwargs):
         self.dsns.append(dsn)
+        self.connect_kwargs.append(kwargs)
         return self.Connection()
 
     def module(self):
@@ -88,12 +121,16 @@ class FakePsycopg:
         module.connect = self.connect
         return module
 
+    def user_statements(self):
+        return [q for q in self.statements if not q.startswith("SET ") and q is not ROLE_GUARD_SQL]
+
 
 def make_host(**overrides):
     values = dict(
         intake_token="worker-token-value",
         database_url="postgresql://legacy-view-role",
         project_dsns={"qurbot": QURBOT_DSN},
+        project_ids={"qurbot": 9},
         audit=AuditLog(Path(tempfile.mkdtemp()) / "audit.jsonl"),
     )
     values.update(overrides)
@@ -196,13 +233,20 @@ class DbSqlTests(unittest.TestCase):
         response = run_with(fake, make_host(), db_request("SELECT id FROM users"))
         self.assertTrue(response["ok"])
         self.assertEqual(fake.statements[0], "SET TRANSACTION READ ONLY")
+        self.assertIn("-c default_transaction_read_only=on", fake.connect_kwargs[0]["options"])
+        self.assertIn("-c standard_conforming_strings=on", fake.connect_kwargs[0]["options"])
         self.assertIn("SET LOCAL statement_timeout = '15000ms'", fake.statements)
         self.assertIn("SET LOCAL lock_timeout = '5000ms'", fake.statements)
         self.assertTrue(
             any(s.startswith("SET LOCAL idle_in_transaction_session_timeout") for s in fake.statements)
         )
-        # SELECT 1 takes the snapshot that makes READ WRITE impossible to restore.
-        self.assertEqual(fake.statements[-2:], ["SELECT 1", "SELECT id FROM users"])
+        self.assertIn("SET LOCAL row_security = on", fake.statements)
+        self.assertIn("SET LOCAL work_mem = '16MB'", fake.statements)
+        # The guard query takes the snapshot that makes READ WRITE impossible to
+        # restore; it runs after the read-only/timeouts setup and before agent SQL.
+        self.assertEqual(fake.statements[-2:], [ROLE_GUARD_SQL, "SELECT id FROM users"])
+        # A SELECT streams through a named server-side cursor, not a buffer.
+        self.assertEqual(fake.cursor_names, [None, "diagnostics_cursor"])
         self.assertEqual(fake.events, ["rollback"])
         self.assertEqual(response["result"]["columns"], ["id"])
         self.assertEqual(response["result"]["rows"], [[1], [2]])
@@ -216,7 +260,12 @@ class DbSqlTests(unittest.TestCase):
         )
         self.assertTrue(response["ok"], response)
         self.assertNotIn("SET TRANSACTION READ ONLY", fake.statements)
+        self.assertNotIn("default_transaction_read_only", fake.connect_kwargs[0]["options"])
+        self.assertIn("standard_conforming_strings=on", fake.connect_kwargs[0]["options"])
         self.assertEqual(fake.events, ["commit"])
+        # DML goes through the extended protocol (the server rejects a 2nd statement).
+        self.assertTrue(fake.prepared[-1])
+        self.assertEqual(fake.cursor_names, [None, None])
         self.assertEqual(response["result"]["status"], "UPDATE 1")
         self.assertEqual(response["result"]["rowcount"], 1)
         self.assertTrue(response["result"]["write"])
@@ -366,6 +415,252 @@ class DbSqlTests(unittest.TestCase):
         self.assertNotIn("worker-token-value", text)
 
 
+class RoleGuardTests(unittest.TestCase):
+    def test_guard_query_checks_every_privilege_the_review_named(self):
+        for attribute in (
+            "rolsuper",
+            "rolcreaterole",
+            "rolcreatedb",
+            "rolreplication",
+            "rolbypassrls",
+        ):
+            self.assertIn(attribute, ROLE_GUARD_SQL)
+        for needle in ("pg_has_role", "pg_extension", "pg_language", "lanpltrusted"):
+            self.assertIn(needle, ROLE_GUARD_SQL)
+        self.assertEqual(
+            DANGEROUS_ROLES,
+            (
+                "pg_execute_server_program",
+                "pg_read_server_files",
+                "pg_write_server_files",
+                "pg_signal_backend",
+                "pg_read_all_data",
+                "pg_write_all_data",
+                "pg_monitor",
+            ),
+        )
+        self.assertEqual(DANGEROUS_EXTENSIONS, ("dblink", "postgres_fdw"))
+
+    def test_clean_role_runs_the_guard_before_the_agent_sql(self):
+        fake = FakePsycopg(columns=["x"], rows=[(1,)])
+        response = run_with(fake, make_host(), db_request("SELECT 1"))
+        self.assertTrue(response["ok"], response)
+        index = fake.statements.index(ROLE_GUARD_SQL)
+        self.assertEqual(fake.params[index], (list(DANGEROUS_ROLES), list(DANGEROUS_EXTENSIONS)))
+        self.assertLess(index, fake.statements.index("SELECT 1"))
+
+    def test_a_flagged_role_is_refused_audited_and_never_runs_agent_sql(self):
+        for reasons in (
+            ["role attribute rolsuper"],
+            ["role attribute rolbypassrls"],
+            ["member of pg_read_server_files"],
+            ["member of pg_write_all_data", "member of pg_monitor"],
+            ["extension dblink"],
+            ["extension postgres_fdw"],
+            ["untrusted language plpython3u"],
+        ):
+            with self.subTest(reasons=reasons):
+                fake = FakePsycopg(columns=["x"], rows=[(1,)], guard=reasons)
+                host = make_host()
+                response = run_with(fake, host, db_request("DELETE FROM users", write=True))
+                self.assertFalse(response["ok"])
+                self.assertIn("role guard", response["error"])
+                self.assertIn(reasons[0], response["error"])
+                self.assertEqual(fake.user_statements(), [])
+                self.assertEqual(fake.events, [])
+                record = json.loads(host._audit.path.read_text().splitlines()[-1])
+                self.assertEqual(record["outcome"], "error")
+                self.assertIn("role guard", record["error"])
+                self.assertEqual(record["sql"], "DELETE FROM users")
+
+
+class StatementDenylistTests(unittest.TestCase):
+    def test_denied_statement_types_never_reach_the_database(self):
+        fake = FakePsycopg()
+        for sql in (
+            "PREPARE TRANSACTION 'x'",
+            "COMMIT PREPARED 'x'",
+            "ROLLBACK PREPARED 'x'",
+            "LISTEN chan",
+            "NOTIFY chan",
+            "UNLISTEN *",
+            "DISCARD ALL",
+            "CHECKPOINT",
+            "VACUUM users",
+            "REINDEX TABLE users",
+            "CLUSTER users",
+            "LOAD 'x'",
+            "COPY users TO STDOUT",
+            "ALTER SYSTEM SET work_mem = '1GB'",
+            "ALTER ROLE app SET statement_timeout = 0",
+            "ALTER DATABASE app SET search_path = x",
+            "DO $$ BEGIN NULL; END $$",
+            "SET statement_timeout = 0",
+            "RESET ALL",
+            "  /* c */ set role postgres",
+        ):
+            for write in (False, True):
+                with self.subTest(sql=sql, write=write):
+                    response = run_with(fake, make_host(), db_request(sql, write=write))
+                    self.assertFalse(response["ok"])
+                    self.assertIn("not allowed", response["error"])
+        self.assertEqual(fake.dsns, [])
+
+    def test_ordinary_statements_that_merely_contain_those_words_still_run(self):
+        for sql in (
+            "SELECT 'commit; do it' AS note",
+            "SELECT copy, set FROM t",
+            "UPDATE users SET name = 'x' WHERE id = 1",
+            "ALTER TABLE users ADD COLUMN note text",
+            "WITH a AS (SELECT 1) SELECT * FROM a",
+            "EXPLAIN SELECT 1",
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(validate_single_statement(sql), sql)
+
+
+class ProjectIdentityTests(unittest.TestCase):
+    def test_backend_project_id_must_match_the_brokers_static_map(self):
+        fake = FakePsycopg(columns=["x"], rows=[(1,)])
+        for project_ids in ({"qurbot": 10}, {}, {"ketoshop": 9}):
+            with self.subTest(project_ids=project_ids):
+                host = make_host(project_ids=project_ids)
+                for tool, arguments in (
+                    ("db_sql", {"sql": "SELECT 1"}),
+                    ("logs", {}),
+                    ("containers", {}),
+                ):
+                    response = run_with(
+                        fake,
+                        host,
+                        {
+                            "discussion_id": 7,
+                            "lease_id": "lease",
+                            "tool": tool,
+                            "arguments": arguments,
+                        },
+                    )
+                    self.assertFalse(response["ok"], tool)
+                    self.assertIn("project identity", response["error"])
+        self.assertEqual(fake.dsns, [])
+
+    def test_project_ids_env_parsing_skips_bad_entries(self):
+        self.assertEqual(
+            diagnostic_host._parse_project_ids("ketoshop:3, qurbot:5,nope:1,kans-shop:x,task-manager:0"),
+            {"ketoshop": 3, "qurbot": 5},
+        )
+
+
+class BudgetTests(unittest.TestCase):
+    def test_writes_have_a_smaller_per_turn_budget_than_reads(self):
+        fake = FakePsycopg(status="UPDATE 1")
+        host = make_host()
+        for _ in range(10):
+            self.assertTrue(
+                run_with(fake, host, db_request("UPDATE t SET a = 1", write=True))["ok"]
+            )
+        refused = run_with(fake, host, db_request("UPDATE t SET a = 1", write=True))
+        self.assertFalse(refused["ok"])
+        self.assertIn("10 write calls", refused["error"])
+        # Reads continue up to the overall 30.
+        fake_read = FakePsycopg(columns=["x"], rows=[(1,)])
+        for _ in range(20):
+            self.assertTrue(run_with(fake_read, host, db_request("SELECT 1"))["ok"])
+        self.assertIn(
+            "30 diagnostic calls", run_with(fake_read, host, db_request("SELECT 1"))["error"]
+        )
+
+
+class RedactionAndAuditScrubTests(unittest.TestCase):
+    def test_known_credentials_are_redacted_in_every_text_cell_including_nested_json(self):
+        columns = ["note", "payload", "n"]
+        rows = [
+            (
+                f"conn {QURBOT_DSN}",
+                {"a": [{"pw": DSN_PASSWORD}], "b": "Bearer abc.def-ghi"},
+                7,
+            )
+        ]
+        fake = FakePsycopg(columns=columns, rows=rows)
+        result = run_with(fake, make_host(), db_request("SELECT * FROM t"))["result"]
+        text = json.dumps(result)
+        self.assertNotIn(DSN_PASSWORD, text)
+        self.assertNotIn("abc.def-ghi", text)
+        self.assertEqual(result["rows"][0][2], 7)
+
+    def test_redaction_happens_before_clipping(self):
+        secret = "S" * 40
+        cell = ("x" * 1990) + secret
+        self.assertNotIn("S", clean_cell(cell, lambda t: t.replace(secret, "[redacted]"))[1990:])
+
+    def test_audit_error_keeps_constraint_names_but_drops_data_values(self):
+        raw = (
+            'duplicate key value violates unique constraint "users_email_key" '
+            "Key (email)=(zarina@example.uz) already exists. "
+            "Failing row contains (1, Zarina, +998901234567)."
+        )
+        scrubbed = scrub_error_values(raw)
+        self.assertIn("users_email_key", scrubbed)
+        self.assertNotIn("zarina@example.uz", scrubbed)
+        self.assertNotIn("+998901234567", scrubbed)
+        self.assertIn("Key (...)=(...)", scrubbed)
+        self.assertNotIn(
+            "abc", scrub_error_values('invalid input syntax for type integer: "abc"')
+        )
+
+        fake = FakePsycopg(
+            columns=["x"],
+            fail=FakePsycopg.Error('duplicate key value violates "users_email_key" Key (email)=(a@b.uz) exists'),
+        )
+        host = make_host()
+        run_with(fake, host, db_request("INSERT INTO users VALUES (1)", write=True))
+        text = host._audit.path.read_text()
+        self.assertIn("users_email_key", text)
+        self.assertNotIn("a@b.uz", text)
+
+
+class SocketGroupFailClosedTests(unittest.TestCase):
+    def test_required_group_missing_or_unchangeable_refuses_to_start(self):
+        with patch.object(diagnostic_host.grp, "getgrnam", side_effect=KeyError("x")):
+            with self.assertRaises(RuntimeError):
+                _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client", required=True)
+        with (
+            patch.object(
+                diagnostic_host.grp, "getgrnam", return_value=SimpleNamespace(gr_gid=7)
+            ),
+            patch.object(diagnostic_host.os, "chown", side_effect=PermissionError("no")),
+        ):
+            with self.assertRaises(RuntimeError):
+                _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client", required=True)
+            _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")  # best effort
+
+    def test_serve_refuses_and_removes_the_socket_when_full_access_is_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "d.sock"
+            host = make_host()
+            self.assertTrue(host.has_full_access_databases)
+            with patch.object(diagnostic_host.grp, "getgrnam", side_effect=KeyError("x")):
+                with self.assertRaises(RuntimeError):
+                    diagnostic_host.serve(host, path)
+            self.assertFalse(path.exists())
+
+
+class ConcurrencyTests(unittest.TestCase):
+    def test_clients_beyond_the_slot_limit_are_told_the_broker_is_busy(self):
+        import socket
+
+        slots = diagnostic_host.threading.BoundedSemaphore(1)
+        slots.acquire()
+        left, right = socket.socketpair()
+        with patch.object(diagnostic_host, "_CLIENT_SLOTS", slots):
+            original = slots.acquire
+            slots.acquire = lambda timeout=None: original(timeout=0.05)  # type: ignore[method-assign]
+            diagnostic_host._handle_client(left, make_host())
+        self.assertIn(b"busy", right.recv(200))
+        right.close()
+        self.assertEqual(diagnostic_host.MAX_CONCURRENT_CLIENTS, 8)
+
+
 class LogsTests(unittest.TestCase):
     def _host(self, body: bytes, status: int = 0):
         captured = {}
@@ -395,7 +690,16 @@ class LogsTests(unittest.TestCase):
         self.assertTrue(response["ok"], response)
         self.assertEqual(
             captured["command"],
-            ["/usr/bin/docker", "logs", "--since", "60m", "--tail", "300", "qurbot-web"],
+            [
+                "/usr/bin/docker",
+                "logs",
+                "--since",
+                "60m",
+                "--tail",
+                "300",
+                "--",
+                "qurbot-web",
+            ],
         )
         text = response["result"]["text"]
         self.assertIn("plain text line without json", text)
@@ -431,7 +735,7 @@ class LogsTests(unittest.TestCase):
         ok = self._logs(host, container="qurbot-worker", since_minutes=5, tail=7)
         self.assertTrue(ok["ok"])
         self.assertEqual(captured["command"][-1], "qurbot-worker")
-        self.assertEqual(captured["command"][3:], ["5m", "--tail", "7", "qurbot-worker"])
+        self.assertEqual(captured["command"][3:], ["5m", "--tail", "7", "--", "qurbot-worker"])
 
     def test_argument_bounds(self):
         host, _captured = self._host(b"x\n")
@@ -455,6 +759,7 @@ class LogsTests(unittest.TestCase):
         self.assertEqual(result["matched_lines"], 2)
         self.assertTrue(result["truncated"])
         self.assertIn("20000", captured["command"])
+        self.assertEqual(captured["command"][-2:], ["--", "qurbot-web"])
         self.assertEqual(self._logs(host, grep="a.b")["result"]["returned_lines"], 1)
         self.assertEqual(self._logs(host, grep=DSN_PASSWORD)["result"]["returned_lines"], 0)
 

@@ -289,7 +289,9 @@ async def lease_discussion(
         base_branch=repository.branch,
         project_key=project_key,
         diagnostics_enabled=bool(
-            actor is not None and _diagnostics_access(project_key, actor) is not None
+            actor is not None
+            and project is not None
+            and _diagnostics_access(project, actor) is not None
         ),
         thread_id=row.thread_id,
         text=row.pending_text or "",
@@ -297,20 +299,25 @@ async def lease_discussion(
     )
 
 
-def _diagnostics_access(project_key: str, actor: User) -> str | None:
+def _diagnostics_access(project: Project, actor: User) -> str | None:
     """ "full" (AGENT_DIAGNOSTICS_*), "legacy" (Ketoshop views) or None.
 
-    Every level is owner-only; nobody else gets a diagnostics session, whatever
-    the project.
+    Every level is owner-only and needs the project row to be the catalog's
+    repository for its key. Full access additionally needs the project's database
+    id to equal the fixed id configured for that key, so a project row someone
+    created, renamed or re-pointed can never reach another project's database.
     """
     if settings.owner_telegram_id <= 0 or actor.telegram_id != settings.owner_telegram_id:
         return None
+    if repository_for(project.key, project.repo_full_name, project.default_branch) is None:
+        return None
     if (
         settings.agent_diagnostics_enabled
-        and project_key in settings.agent_diagnostics_projects
+        and project.key in settings.agent_diagnostics_projects
+        and settings.agent_diagnostics_project_ids.get(project.key) == project.id
     ):
         return "full"
-    if settings.ketoshop_diagnostics_enabled and project_key == "ketoshop":
+    if settings.ketoshop_diagnostics_enabled and project.key == "ketoshop":
         return "legacy"
     return None
 
@@ -340,7 +347,7 @@ async def diagnostic_context(
     actor = await session.get(User, row.user_id)
     if actor is None or project is None:
         raise HTTPException(status_code=404, detail="diagnostics are not available")
-    access = _diagnostics_access(project.key, actor) if actor.is_active else None
+    access = _diagnostics_access(project, actor) if actor.is_active else None
     if access is None or not await can_see_project(session, actor, row.project_id):
         raise HTTPException(status_code=404, detail="diagnostics are not available")
     return {

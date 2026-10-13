@@ -105,6 +105,12 @@ class Settings(BaseSettings):
     agent_diagnostics_projects: Annotated[frozenset[str], NoDecode] = Field(
         default_factory=frozenset, alias="AGENT_DIAGNOSTICS_PROJECTS"
     )
+    # Fixed Task Manager project row id per diagnostics project, "ketoshop:3,qurbot:5".
+    # A project without an id here never gets full access, so renaming or
+    # re-pointing a project row cannot grant it database access.
+    agent_diagnostics_project_ids: Annotated[dict[str, int], NoDecode] = Field(
+        default_factory=dict, alias="AGENT_DIAGNOSTICS_PROJECT_IDS"
+    )
     # Local agent-svc executor: a systemd service that leases coding work instead
     # of GitHub Actions running it. Empty project list keeps every project on the
     # existing GitHub dispatch path, byte-for-byte.
@@ -127,6 +133,19 @@ class Settings(BaseSettings):
         if isinstance(value, (list, tuple, set, frozenset)):
             return frozenset(str(part).strip() for part in value if str(part).strip())
         return frozenset()
+
+    @field_validator("agent_diagnostics_project_ids", mode="before")
+    @classmethod
+    def _parse_project_ids(cls, value: object) -> dict[str, int]:
+        if isinstance(value, dict):
+            return {str(k).strip(): int(v) for k, v in value.items()}
+        found: dict[str, int] = {}
+        if isinstance(value, str):
+            for part in value.split(","):
+                key, _, raw_id = part.strip().partition(":")
+                if key.strip() and raw_id.strip().isdigit() and int(raw_id) > 0:
+                    found[key.strip()] = int(raw_id)
+        return found
 
     # --- Web ---
     public_url: str = Field(default="http://localhost:5173", alias="PUBLIC_URL")
