@@ -2150,8 +2150,9 @@ _CONFINING_SANDBOX = """\
 import json, os, sys
 command = sys.argv[sys.argv.index("--") + 1:]
 if "agent-svc-canary" in command:
-    keys = ("net_public", "net_loopback", "write_outside", "write_tmp", "write_inside")
-    print("AGENT_SVC_CANARY:" + json.dumps({key: True for key in keys}), flush=True)
+    nonce = command[command.index("agent-svc-canary") + 1]
+    keys = %r
+    print("AGENT_SVC_CANARY:" + nonce + ":" + json.dumps({key: True for key in keys}))
     raise SystemExit(0)
 os.execv(command[0], command)
 """
@@ -2181,7 +2182,9 @@ class CheckIntegrationTests(ChildProcessTestCase):
         super().setUp()
         self.wrappers = self.root / "wrappers"
         self.wrappers.mkdir()
-        self.confining = self._wrapper("confining", _CONFINING_SANDBOX)
+        self.confining = self._wrapper(
+            "confining", _CONFINING_SANDBOX % (codex_child.CANARY_CHECKS,)
+        )
         self.leaky = self._wrapper("leaky", _LEAKY_SANDBOX)
         base = {
             "app.py": 'def greeting():\n    return "hi"\n\n\ndef etag():\n    return "v0"\n',
@@ -2409,10 +2412,87 @@ class CheckIntegrationTests(ChildProcessTestCase):
         self.assertIn("timed out", body["detail"])
         self.assertLess(time.monotonic() - started, 30)
 
+    def test_symlink_in_builder_patch_is_refused_in_any_spelling(self) -> None:
+        outside = self.root / "outside-dir"
+        (outside / "acceptance").mkdir(parents=True)
+        (outside / "acceptance" / "keep.txt").write_text("keep", encoding="utf-8")
+        for mode in ("120000", "0120000", " 120000", "120000 "):
+            with self.subTest(mode=repr(mode)):
+                link = (
+                    "diff --git a/tests b/tests\n"
+                    f"new file mode{' ' if not mode.startswith(' ') else ''}{mode}\n"
+                    "--- /dev/null\n"
+                    "+++ b/tests\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{outside}\n"
+                    "\\ No newline at end of file\n"
+                ).encode()
+                completed = self.run_check(
+                    self.request(patch_b64=base64.b64encode(link).decode("ascii"))
+                )
+                if completed.returncode == 0:
+                    body = json.loads(completed.stdout)
+                    self.assertEqual(body["status"], "error", body)
+                else:
+                    self.assertEqual(completed.returncode, 3, completed.stdout)
+                self.assertTrue((outside / "acceptance" / "keep.txt").exists())
+
+    def test_staged_symlink_is_refused_even_if_the_text_scan_misses_it(self) -> None:
+        with patch.object(codex_child, "_run_git") as run_git:
+            run_git.return_value = subprocess.CompletedProcess(
+                [], 0, stdout=b":000000 120000 0000000 1111111 A\x00tests\x00", stderr=b""
+            )
+            with self.assertRaises(codex_child.ChildRefusal):
+                codex_child._refuse_bad_staged_modes(
+                    Path("/x"), cwd=Path("/"), env={}
+                )
+
+    def test_canary_must_prove_every_probe(self) -> None:
+        for index in range(len(codex_child.CANARY_CHECKS)):
+            keys = codex_child.CANARY_CHECKS[:index] + codex_child.CANARY_CHECKS[index + 1 :]
+            partial = self._wrapper(f"partial-{index}", _CONFINING_SANDBOX % (keys,))
+            with self.subTest(missing=codex_child.CANARY_CHECKS[index]):
+                body = self.check_body(self.request(), wrapper=partial)
+                self.assertEqual(body["status"], "unavailable", body)
+
+    def test_two_result_lines_or_a_killed_runner_are_errors(self) -> None:
+        nonce = "n" * 32
+        line = (
+            f'AGENT_SVC_CHECK_RESULT:{nonce}:{{"status": "passed", "total": 2, '
+            '"passed": 2, "failed": []}'
+        )
+        self.assertIsNotNone(
+            codex_child._single_tagged_json(line.encode(), f"AGENT_SVC_CHECK_RESULT:{nonce}:")
+        )
+        self.assertIsNone(
+            codex_child._single_tagged_json(
+                f"{line}\n{line}\n".encode(), f"AGENT_SVC_CHECK_RESULT:{nonce}:"
+            )
+        )
+        suicidal = _ACCEPTANCE_TESTS + (
+            "\n\ndef tearDownModule():\n"
+            "    import os, signal\n"
+            "    os.kill(os.getpid(), signal.SIGKILL)\n"
+        )
+        pinned = self.patch_for(
+            {"tests/acceptance/__init__.py": "", "tests/acceptance/test_task_7.py": suicidal}
+        )
+        body = self.check_body(self.request(pinned_b64=base64.b64encode(pinned).decode("ascii")))
+        self.assertEqual(body["status"], "error", body)
+
+    def test_agent_config_in_builder_patch_is_an_error(self) -> None:
+        codex_cfg = self.patch_for({".codex/config.toml": 'sandbox_mode = "danger-full-access"\n'})
+        body = self.check_body(
+            self.request(patch_b64=base64.b64encode(codex_cfg).decode("ascii"))
+        )
+        self.assertEqual(body["status"], "error", body)
+
     def test_production_sandbox_argv_is_pinned(self) -> None:
         with patch.object(codex_child, "CHECK_SANDBOX_WRAPPER", None):
             argv = codex_child._check_sandbox_argv(Path("/w/r/ck"), ["python3", "-c", "x"])
-        self.assertEqual(argv[:4], [codex_child.CODEX_BINARY, "sandbox", "-C", "/w/r/ck"])
+        self.assertEqual(argv[:2], [codex_child.CODEX_BINARY, "sandbox"])
+        # `-C` needs `--permission-profile` in codex-cli 0.159; cwd is used.
+        self.assertNotIn("-C", argv)
         self.assertIn("sandbox_workspace_write.network_access=false", argv)
         self.assertIn("sandbox_workspace_write.exclude_slash_tmp=true", argv)
         self.assertIn('sandbox_mode="workspace-write"', argv)

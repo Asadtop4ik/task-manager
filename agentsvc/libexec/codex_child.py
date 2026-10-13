@@ -361,7 +361,9 @@ def _refuse_if_agent_config_present(root: Path) -> None:
             raise ChildRefusal("repository contains .codex, .agents, or .git")
 
 
-def _clone_mirror(mirror: Path, wt: Path, *, run_dir: Path, env: dict[str, str]) -> None:
+def _clone_mirror(
+    mirror: Path, wt: Path, *, run_dir: Path, env: dict[str, str], timeout: float = 120.0
+) -> None:
     """Clone the agent-svc-owned mirror as agent-codex across the ownership boundary.
 
     git only honors `safe.directory` from system/global config on older
@@ -385,6 +387,7 @@ def _clone_mirror(mirror: Path, wt: Path, *, run_dir: Path, env: dict[str, str])
             ),
             cwd=run_dir,
             env={**env, "GIT_CONFIG_GLOBAL": config_path},
+            timeout=timeout,
         )
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -473,22 +476,23 @@ _DIFF_GIT_HEADER_RE = re.compile(
     r'^diff --git (?:"a/(?:[^"\\]|\\.)*"|a/.*) '
     r'(?:"b/(?P<quoted>(?:[^"\\]|\\.)*)"|b/(?P<plain>.*))$'
 )
-_MODE_LINE_PATTERNS = (
-    re.compile(r"^new file mode (\d+)$"),
-    re.compile(r"^old mode (\d+)$"),
-    re.compile(r"^new mode (\d+)$"),
-    re.compile(r"^deleted file mode (\d+)$"),
-)
-_INDEX_LINE_RE = re.compile(r"^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+(?: (\d+))?$")
+# Header lines that carry a file mode. git parses the mode with
+# `strtoul(..., 8)`, so `0120000`, `+120000`, two spaces or a trailing space
+# all still mean a symlink: anything but the exact spellings of a regular file
+# is refused instead of trying to out-parse git.
+_MODE_LINE_PREFIXES = ("new file mode", "old mode", "new mode", "deleted file mode")
+_ALLOWED_PATCH_MODES = frozenset({"100644", "100755"})
+_INDEX_LINE_RE = re.compile(r"^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+(?: (\S+))?$")
 
 
 def _scan_patch_for_bad_modes(patch_text: str) -> str | None:
     """Parse the patch's own text headers (`new file mode`, `old mode`, `new
-    mode`, `deleted file mode`, `index <a>..<b> <mode>`) for a symlink
-    (120000) or submodule (160000) entry. Reading this off the one patch we
-    actually return -- instead of a second, separate `--raw` call against the
-    same index -- means the mode check can never disagree with what's in the
-    patch."""
+    mode`, `deleted file mode`, `index <a>..<b> <mode>`) for any mode other
+    than a plain or executable file -- a symlink (120000), a submodule
+    (160000), or a spelling git would still read as one. Reading this off the
+    one patch we actually return -- instead of a second, separate `--raw`
+    call against the same index -- means the mode check can never disagree
+    with what's in the patch. Returns the offending path, else `None`."""
     current_path = "<unknown>"
     for line in patch_text.splitlines():
         header = _DIFF_GIT_HEADER_RE.match(line)
@@ -496,14 +500,37 @@ def _scan_patch_for_bad_modes(patch_text: str) -> str | None:
             quoted = header.group("quoted")
             current_path = quoted if quoted is not None else header.group("plain")
             continue
-        for pattern in _MODE_LINE_PATTERNS:
-            match = pattern.match(line)
-            if match and match.group(1) in BAD_GIT_MODES:
+        for prefix in _MODE_LINE_PREFIXES:
+            if line.startswith(prefix):
+                rest = line[len(prefix) :]
+                if not (rest.startswith(" ") and rest[1:] in _ALLOWED_PATCH_MODES):
+                    return current_path
+        if line.startswith("index "):
+            match = _INDEX_LINE_RE.match(line)
+            if match is None or (
+                match.group(1) is not None and match.group(1) not in _ALLOWED_PATCH_MODES
+            ):
                 return current_path
-        match = _INDEX_LINE_RE.match(line)
-        if match and match.group(1) in BAD_GIT_MODES:
-            return current_path
     return None
+
+
+def _refuse_bad_staged_modes(directory: Path, *, cwd: Path, env: dict[str, str]) -> None:
+    """Ask git itself, after `git apply --index`, whether anything staged
+    against HEAD is a symlink or submodule -- the authoritative check behind
+    `_scan_patch_for_bad_modes`, which only reads patch text."""
+    raw = _run_git(
+        _git_argv(
+            "-C", str(directory), "diff", "--cached", "--raw", "-z", "--no-renames", "HEAD", "--"
+        ),
+        cwd=cwd,
+        env=env,
+    )
+    for meta in raw.stdout.split(b"\x00"):
+        if not meta.startswith(b":"):
+            continue
+        fields = meta[1:].split()
+        if len(fields) >= 2 and fields[1].decode("ascii", "replace") in BAD_GIT_MODES:
+            raise ChildRefusal("unsupported change (symlink or submodule) after apply")
 
 
 def _package_worktree(
@@ -794,6 +821,7 @@ def cmd_preflight(request: dict[str, Any]) -> int:
             env=env,
             input_bytes=patch_bytes,
         )
+        _refuse_bad_staged_modes(pf_dir, cwd=run_dir, env=env)
         _refuse_if_agent_config_present(pf_dir)
 
         if not isinstance(repo, str):
@@ -2140,7 +2168,12 @@ def cmd_discussion(request: dict[str, Any]) -> int:
 # Residual risk (accepted, see docs/adr/0001): repository code runs in the
 # same interpreter as the runner, so a deliberately hostile patch could forge
 # a result; CI re-runs the same checks independently as regression. As with
-# `exec` (workspace-write), sandboxed code can READ what agent-codex can read.
+# `exec` (workspace-write), sandboxed code can READ what agent-codex can read,
+# and `output_tail` (stderr the tests control) carries text back to agent-svc,
+# so `_redact` is best effort, not a boundary. The sandbox does not scope
+# signals or /proc between same-uid processes, there is no per-check cgroup
+# (pids/memory/disk), and a process that detaches AND kills this child can
+# outlive the check; per-check uids or cgroups are milestone-2 work.
 # --------------------------------------------------------------------------
 
 CHECK_PROFILES: dict[str, dict[str, Any]] = {
@@ -2158,9 +2191,13 @@ CHECK_MAX_FAILED_IDS = 50
 CHECK_MAX_TEST_ID_CHARS = 200
 CHECK_FSIZE_BYTES = 64 * 1024 * 1024
 CHECK_CANARY_TIMEOUT_S = 30.0
-# Slack inside the parent's own `timeout_s + 60s` grace for clone, canary
-# and cleanup, so the child's reasoned reply wins the race against SIGTERM.
-CHECK_OVERHEAD_S = 40.0
+# Work (clone, canary, tests) may use `timeout_s` plus this much; cleanup is
+# SIGKILL-only and bounded, so the reply still lands well inside the parent's
+# own `timeout_s + 60s` before it SIGTERMs us.
+CHECK_OVERHEAD_S = 20.0
+CHECK_GIT_TIMEOUT_S = 60.0
+CHECK_RUNNER_NPROC = 512
+CHECK_RUNNER_AS_BYTES = 4 * 1024 * 1024 * 1024
 CHECK_RESULT_PREFIX = "AGENT_SVC_CHECK_RESULT:"
 CANARY_RESULT_PREFIX = "AGENT_SVC_CANARY:"
 CANARY_MARKER = "agent-svc-canary"
@@ -2187,16 +2224,21 @@ import errno, json, os, socket, sys
 BLOCKED = (errno.EPERM, errno.EACCES)
 
 
-def net_blocked(host, port):
+def net_blocked(family, kind, address, also=()):
+    # Loopback and UDP probes keep a host firewall (which can also answer
+    # EPERM, for public TCP) from passing for the sandbox.
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.socket(family, kind)
     except OSError as exc:
-        return exc.errno in BLOCKED
+        return exc.errno in BLOCKED + also
     try:
         sock.settimeout(3)
-        sock.connect((host, port))
+        if kind == socket.SOCK_DGRAM:
+            sock.sendto(b"x", address)
+        else:
+            sock.connect(address)
     except OSError as exc:
-        return exc.errno in BLOCKED
+        return exc.errno in BLOCKED + also
     finally:
         sock.close()
     return False
@@ -2211,26 +2253,52 @@ def try_create(path):
     return 0
 
 
-outside, tmp, inside = sys.argv[2:5]
+nonce, outside, tmp, inside = sys.argv[2:6]
 inside_errno = try_create(inside)
 if inside_errno == 0:
     os.unlink(inside)
+no_v6 = (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL)
 result = {
-    "net_public": net_blocked("1.1.1.1", 443),
-    "net_loopback": net_blocked("127.0.0.1", 9),
+    "net_public": net_blocked(socket.AF_INET, socket.SOCK_STREAM, ("1.1.1.1", 443)),
+    "net_loopback": net_blocked(socket.AF_INET, socket.SOCK_STREAM, ("127.0.0.1", 9)),
+    "net_loopback_udp": net_blocked(socket.AF_INET, socket.SOCK_DGRAM, ("127.0.0.1", 9)),
+    "net_loopback6": net_blocked(socket.AF_INET6, socket.SOCK_STREAM, ("::1", 9), no_v6),
     "write_outside": try_create(outside) in BLOCKED + (errno.EROFS,),
     "write_tmp": try_create(tmp) in BLOCKED + (errno.EROFS,),
     "write_inside": inside_errno == 0,
 }
-print("AGENT_SVC_CANARY:" + json.dumps(result), flush=True)
+print("AGENT_SVC_CANARY:" + nonce + ":" + json.dumps(result), flush=True)
 """
+CANARY_CHECKS = (
+    "net_public",
+    "net_loopback",
+    "net_loopback_udp",
+    "net_loopback6",
+    "write_outside",
+    "write_tmp",
+    "write_inside",
+)
 
 _RUNNER_SRC = r"""
-import importlib, json, os, sys, unittest
+import importlib, json, os, resource, sys, unittest
+
+
+def limit(which, value):
+    try:
+        _soft, hard = resource.getrlimit(which)
+        if hard != resource.RLIM_INFINITY:
+            value = min(value, hard)
+        resource.setrlimit(which, (value, value))
+    except (ValueError, OSError):
+        pass
 
 
 def main():
-    nonce_path, module_name, expected_file = sys.argv[2:5]
+    nonce_path, module_name, expected_file, nproc, address_space = sys.argv[2:7]
+    # Python-only caps (the node launcher of `codex sandbox` cannot take
+    # them): fork bombs and runaway memory in the repository's tests.
+    limit(resource.RLIMIT_NPROC, int(nproc))
+    limit(resource.RLIMIT_AS, int(address_space))
     with open(nonce_path, encoding="ascii") as handle:
         nonce = handle.read().strip()
     os.unlink(nonce_path)
@@ -2375,7 +2443,9 @@ def _validate_check_request(request: dict[str, Any]) -> CheckParams:
     )
 
 
-def _pinned_paths(params: CheckParams, ck: Path, env: dict[str, str]) -> list[str]:
+def _pinned_paths(
+    params: CheckParams, ck: Path, env: dict[str, str], *, timeout: float
+) -> list[str]:
     """Every path the pinned patch touches, as git itself parses it; refuse
     anything outside the acceptance directory, renames/copies, and a pinned
     patch that does not carry this task's own test file."""
@@ -2383,7 +2453,11 @@ def _pinned_paths(params: CheckParams, ck: Path, env: dict[str, str]) -> list[st
         if line.startswith((b"rename from ", b"rename to ", b"copy from ", b"copy to ")):
             raise ChildRefusal("pinned patch must not rename or copy files")
     numstat = _run_git(
-        _git_argv("apply", "--numstat", "-z"), cwd=ck, env=env, input_bytes=params.pinned
+        _git_argv("apply", "--numstat", "-z"),
+        cwd=ck,
+        env=env,
+        input_bytes=params.pinned,
+        timeout=timeout,
     )
     paths: list[str] = []
     for field in numstat.stdout.split(b"\0"):
@@ -2418,11 +2492,11 @@ def _redact(text: str) -> str:
 def _check_sandbox_argv(ck: Path, command: list[str]) -> list[str]:
     if CHECK_SANDBOX_WRAPPER is not None:
         return [CHECK_SANDBOX_WRAPPER, str(ck), "--", *command]
+    # No `-C`: in codex-cli 0.159 it requires `--permission-profile`; the
+    # workspace root is the process cwd (`ck`), set by `_run_sandboxed`.
     return [
         CODEX_BINARY,
         "sandbox",
-        "-C",
-        str(ck),
         "-c",
         'sandbox_mode="workspace-write"',
         "-c",
@@ -2512,17 +2586,19 @@ def _run_sandboxed(
     try:
         returncode = process.wait(timeout=max(timeout_s, 0.1))
     except subprocess.TimeoutExpired:
-        kill_tree(process.pid)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=5)
+        pass
     finally:
+        # Straight SIGKILL: nothing sandboxed needs a graceful exit, and the
+        # cleanup must fit the time budget (see CHECK_OVERHEAD_S).
         if process.poll() is None:
-            kill_tree(process.pid)
+            kill_tree(process.pid, grace_s=0)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
         # Anything that detached from the sandboxed tree (and so may hold the
         # pipes open) dies here: we are a subreaper, so it is ours to find.
-        _reap_all_descendants()
+        _reap_all_descendants(grace_s=0.5)
         for reader in readers:
-            reader.join(timeout=5)
+            reader.join(timeout=2)
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 with contextlib.suppress(OSError):
@@ -2530,15 +2606,22 @@ def _run_sandboxed(
     return returncode, b"".join(out_sink), b"".join(err_sink)
 
 
-def _last_tagged_json(stdout: bytes, prefix: str) -> dict[str, Any] | None:
-    for line in reversed(stdout.decode("utf-8", "replace").splitlines()):
-        if line.startswith(prefix):
-            try:
-                body = json.loads(line[len(prefix) :])
-            except json.JSONDecodeError:
-                return None
-            return body if isinstance(body, dict) else None
-    return None
+def _single_tagged_json(stdout: bytes, prefix: str) -> dict[str, Any] | None:
+    """The JSON object on the ONE stdout line tagged `prefix` (which carries
+    a per-call nonce); `None` if there is no such line or more than one --
+    a second writer means someone else had the descriptor or the nonce."""
+    tagged = [
+        line
+        for line in stdout.decode("utf-8", "replace").splitlines()
+        if line.startswith(prefix)
+    ]
+    if len(tagged) != 1:
+        return None
+    try:
+        body = json.loads(tagged[0][len(prefix) :])
+    except json.JSONDecodeError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 def _canary_failure(
@@ -2547,6 +2630,7 @@ def _canary_failure(
     """Prove the sandbox actually confines before any repository code runs.
     Returns `None` when it does, else why the gate is unavailable."""
     suffix = secrets.token_hex(8)
+    nonce = secrets.token_hex(16)
     outside = params.run_dir / f"ck-canary-outside-{suffix}"
     tmp_probe = Path("/tmp") / f"agent-svc-check-canary-{params.run_id}-{suffix}"
     inside = ck / CHECK_TMP_NAME / f"canary-{suffix}"
@@ -2562,6 +2646,7 @@ def _canary_failure(
                 "-c",
                 _CANARY_SRC,
                 CANARY_MARKER,
+                nonce,
                 str(outside),
                 str(tmp_probe),
                 str(inside),
@@ -2580,42 +2665,72 @@ def _canary_failure(
                 probe.unlink()
     if returncode != 0:
         return f"sandbox canary exited with {returncode}"
-    body = _last_tagged_json(stdout, CANARY_RESULT_PREFIX)
-    expected = ("net_public", "net_loopback", "write_outside", "write_tmp", "write_inside")
-    if body is None or leaked or any(body.get(key) is not True for key in expected):
+    body = _single_tagged_json(stdout, f"{CANARY_RESULT_PREFIX}{nonce}:")
+    if body is None or leaked or any(body.get(key) is not True for key in CANARY_CHECKS):
         return "sandbox canary: confinement not proven"
     return None
 
 
-def _prepare_check_tree(params: CheckParams, ck: Path, env: dict[str, str]) -> None:
+def _refuse_symlinked_components(root: Path, relative: str) -> None:
+    """Every existing component of `root/relative` must be a real directory
+    or file, never a symlink: the unconfined steps below delete there."""
+    current = root
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ChildRefusal(f"refuses a symlink at {current.relative_to(root)}")
+        if not current.exists():
+            return
+    _ensure_within(current, root)
+
+
+def _prepare_check_tree(
+    params: CheckParams, ck: Path, env: dict[str, str], deadline: float
+) -> None:
     """Fresh clone at base + builder patch, with the acceptance directory
-    reset to base and the pinned checks applied on top."""
+    reset to base and the pinned checks applied on top. Runs unconfined (as
+    agent-codex, no repository code executes), so every step refuses
+    symlinks, submodules and agent config the patches could introduce."""
     acceptance = params.acceptance_dir
+
+    def remaining() -> float:
+        left = min(CHECK_GIT_TIMEOUT_S, deadline - time.monotonic())
+        if left <= 0:
+            raise ChildRefusal("no time left to assemble the checks")
+        return left
 
     def git(*args: str, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
         return _run_git(
-            _git_argv("-C", str(ck), *args), cwd=params.run_dir, env=env, input_bytes=input_bytes
+            _git_argv("-C", str(ck), *args),
+            cwd=params.run_dir,
+            env=env,
+            input_bytes=input_bytes,
+            timeout=remaining(),
         )
 
-    _clone_mirror(params.mirror, ck, run_dir=params.run_dir, env=env)
+    _clone_mirror(params.mirror, ck, run_dir=params.run_dir, env=env, timeout=remaining())
     git("checkout", "--detach", params.base_sha)
     _refuse_if_agent_config_present(ck)
-    _pinned_paths(params, ck, env)
+    _pinned_paths(params, ck, env, timeout=remaining())
     if params.patch:
         git("apply", "--index", input_bytes=params.patch)
+        _refuse_bad_staged_modes(ck, cwd=params.run_dir, env=env)
         _refuse_if_agent_config_present(ck)
+    _refuse_symlinked_components(ck, acceptance)
     git("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", acceptance)
     target = ck / acceptance
-    if target.is_symlink() or (target.exists() and not target.is_dir()):
+    if target.exists() and not target.is_dir():
         target.unlink()
     elif target.exists():
         shutil.rmtree(target)
     if git("ls-tree", "--name-only", params.base_sha, "--", acceptance).stdout.strip():
         git("checkout", params.base_sha, "--", acceptance)
     git("apply", "--index", input_bytes=params.pinned)
+    _refuse_bad_staged_modes(ck, cwd=params.run_dir, env=env)
+    _refuse_if_agent_config_present(ck)
     for relative in (f"{acceptance}/__init__.py", params.task_file):
-        path = ck / relative
-        if path.is_symlink() or not path.is_file():
+        _refuse_symlinked_components(ck, relative)
+        if not (ck / relative).is_file():
             raise ChildRefusal(f"missing {relative} after applying the checks")
 
 
@@ -2668,6 +2783,8 @@ def _run_checks(
             str(nonce_path),
             params.module_name,
             str(ck / params.task_file),
+            str(CHECK_RUNNER_NPROC),
+            str(CHECK_RUNNER_AS_BYTES),
         ],
         ck=ck,
         env=env,
@@ -2676,10 +2793,14 @@ def _run_checks(
     output = stderr.decode("utf-8", "replace")
     if returncode is None:
         return _check_reply("error", output=output, detail="acceptance checks timed out")
-    body = _last_tagged_json(stdout, f"{CHECK_RESULT_PREFIX}{nonce}:")
+    body = _single_tagged_json(stdout, f"{CHECK_RESULT_PREFIX}{nonce}:")
     if body is None:
         return _check_reply("error", output=output, detail=f"no check result (exit {returncode})")
     status = body.get("status")
+    if status != "error" and returncode != 0:
+        # The runner itself always exits 0 after reporting a verdict; a
+        # killed or crashed runner's verdict line is not trusted.
+        return _check_reply("error", output=output, detail=f"check runner exited {returncode}")
     if status == "error":
         detail = body.get("detail")
         return _check_reply(
@@ -2725,7 +2846,7 @@ def cmd_check(request: dict[str, Any]) -> int:
         ck.rmdir()  # `git clone` wants to create it itself.
         _fresh_dir(run_dir / "ck-home", mode=0o700)
         try:
-            _prepare_check_tree(params, ck, _git_env())
+            _prepare_check_tree(params, ck, _git_env(), deadline)
         except ChildRefusal as exc:
             reply = _check_reply("error", detail=f"could not assemble the checks: {exc}")
         else:
