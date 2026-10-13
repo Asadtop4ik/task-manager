@@ -317,7 +317,7 @@ class HandleReviewTests(unittest.TestCase):
             _work(check_gate={"status": "failed", "total": 5, "passed": 3})
         )
         self.assertIn("Factory acceptance checks (locked, run before PR): status failed, 3/5 passed.", prompt)
-        self.assertIn("any change to files under tests/acceptance/ as a P2 finding", prompt)
+        self.assertIn('P2 finding titled "Locked\n   acceptance test changed"', prompt)
 
     def test_no_check_gate_leaves_the_prompt_without_acceptance_text(self) -> None:
         prompt = self._review_prompt(_work())

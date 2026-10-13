@@ -572,7 +572,8 @@ class CorrectionPromptTests(unittest.TestCase):
         self.assertIn(f"Current PR head: {expected_head_sha}", prompt)
         self.assertIn("Owner correction:\nRename the button to Submit.", prompt)
         self.assertIn("Do not push, open a PR, merge, deploy", prompt)
-        self.assertIn("Do not edit files under tests/acceptance/", prompt)
+        self.assertIn("Do not edit\ntests/acceptance/test_task_12.py", prompt)
+        self.assertIn("earlier tasks' regression tests", prompt)
 
     def test_verify_correction_writes_exactly_what_correction_prompt_builds(self) -> None:
         run_id = "00000000-0000-0000-0000-000000000012"

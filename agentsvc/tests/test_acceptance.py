@@ -62,6 +62,7 @@ TEST_BODY = (
 )
 TASK = f"{DIR}/test_task_7.py"
 INIT = f"{DIR}/__init__.py"
+LOCKED = (TASK, INIT)
 
 
 class SplitSectionsTests(unittest.TestCase):
@@ -127,42 +128,47 @@ class StripAndSpliceTests(unittest.TestCase):
 
     def test_splice_identical_builder_sections_is_unmodified(self) -> None:
         builder = self.code + self.pinned
-        spliced, modified = splice(builder, self.pinned, DIR)
+        spliced, modified = splice(builder, self.pinned, LOCKED)
         self.assertFalse(modified)
         self.assertEqual(spliced, self.code + self.pinned)
 
     def test_splice_when_builder_edited_the_task_file(self) -> None:
         edited = _new_file(TASK, TEST_BODY + "    def test_ac3_cheat(self):\n        pass\n")
         builder = self.code + _new_file(INIT, "") + edited
-        spliced, modified = splice(builder, self.pinned, DIR)
+        spliced, modified = splice(builder, self.pinned, LOCKED)
         self.assertTrue(modified)
         self.assertEqual(spliced, self.code + self.pinned)
         self.assertNotIn(b"cheat", spliced)
 
     def test_splice_when_builder_deleted_or_added_acceptance_files(self) -> None:
-        spliced, modified = splice(self.code, self.pinned, DIR)  # builder patch lacks them
+        spliced, modified = splice(self.code, self.pinned, LOCKED)  # builder patch lacks them
         self.assertTrue(modified)
         self.assertEqual(spliced, self.code + self.pinned)
-        extra = _new_file(f"{DIR}/helpers.py", "z = 1\n") + _binary(f"{DIR}/c.pyc")
-        spliced, modified = splice(self.code + self.pinned + extra, self.pinned, DIR)
-        self.assertTrue(modified)
+        spliced, modified = splice(self.code + _new_file(INIT, ""), self.pinned, LOCKED)
+        self.assertTrue(modified)  # the task file is missing
         self.assertEqual(spliced, self.code + self.pinned)
 
+    def test_splice_keeps_edits_to_earlier_tasks_regression_tests(self) -> None:
+        earlier = _modify(f"{DIR}/test_task_3.py", "old", "new")
+        spliced, modified = splice(self.code + earlier + self.pinned, self.pinned, LOCKED)
+        self.assertFalse(modified)
+        self.assertEqual(spliced, self.code + earlier + self.pinned)
+
     def test_splice_with_only_acceptance_in_builder_patch(self) -> None:
-        spliced, modified = splice(self.pinned, self.pinned, DIR)
+        spliced, modified = splice(self.pinned, self.pinned, LOCKED)
         self.assertFalse(modified)
         self.assertEqual(spliced, self.pinned)
 
     def test_splice_keeps_non_acceptance_binary_sections_intact(self) -> None:
         binary = _binary("assets/logo.png")
-        spliced, modified = splice(binary + self.pinned, self.pinned, DIR)
+        spliced, modified = splice(binary + self.pinned, self.pinned, LOCKED)
         self.assertFalse(modified)
         self.assertEqual(spliced, binary + self.pinned)
 
     def test_splice_adds_missing_trailing_newline_before_pinned(self) -> None:
         # The appended sections must still start on a fresh line.
         broken = self.code.rstrip(b"\n")
-        spliced, _ = splice(broken, self.pinned, DIR)
+        spliced, _ = splice(broken, self.pinned, LOCKED)
         self.assertTrue(spliced.endswith(self.pinned))
         self.assertEqual(spliced[: -len(self.pinned)], broken + b"\n")
 
@@ -186,10 +192,10 @@ class ArtifactAndLineBreakTests(unittest.TestCase):
         raw = _new_file(TASK, TEST_BODY)
         code = _new_file("app/x.py", "y = 1\n")
         pyc = _binary(f"{DIR}/__pycache__/t.pyc")
-        spliced, modified = splice(code + raw + pyc, pinned, DIR, unmodified=(raw,))
+        spliced, modified = splice(code + raw + pyc, pinned, LOCKED, unmodified=(raw,))
         self.assertFalse(modified)
         self.assertEqual(spliced, code + pinned)
-        _, modified = splice(code + raw + pyc, pinned, DIR)
+        _, modified = splice(code + raw + pyc, pinned, LOCKED)
         self.assertTrue(modified)
 
     def test_carriage_return_does_not_fake_a_section_header(self) -> None:

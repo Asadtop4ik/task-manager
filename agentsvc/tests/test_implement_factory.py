@@ -571,15 +571,25 @@ class SpliceTests(unittest.TestCase):
             self.assertTrue(payload["check_gate"]["acceptance_modified"])
             self.assertEqual(env.pushed(TASK_PATH), TEST_SRC)
 
-    def test_builder_adding_extra_acceptance_files_drops_them(self) -> None:
+    def test_builder_edits_to_other_acceptance_files_are_kept_as_regression_edits(
+        self,
+    ) -> None:
         with TemporaryDirectory() as tmp:
             env = _Env(Path(tmp))
             env.queue_author()
             env.queue_builder(
-                env.patch({"app.py": "TOTAL = 5\n", "tests/acceptance/helper.py": "x = 1\n"})
+                env.patch(
+                    {"app.py": "TOTAL = 5\n", "tests/acceptance/test_task_3.py": "x = 1\n"}
+                )
             )
             payload = env.run()
-            self.assertTrue(payload["check_gate"]["acceptance_modified"])
+            self.assertFalse(payload["check_gate"]["acceptance_modified"])
+            self.assertEqual(env.pushed("tests/acceptance/test_task_3.py"), "x = 1\n")
+            self.assertEqual(env.pushed(TASK_PATH), TEST_SRC)
+            # The gate only ever sees the code: the child resets the acceptance
+            # directory and applies the pin.
+            check_patch = base64.b64decode(env.codex.check_calls[0]["patch_b64"])
+            self.assertNotIn(b"test_task_3.py", check_patch)
             result = run_git(
                 [
                     "git",
@@ -591,8 +601,19 @@ class SpliceTests(unittest.TestCase):
                     f"refs/heads/{BRANCH}",
                 ]
             ).stdout
-            self.assertNotIn("helper.py", result)
+            self.assertIn("test_task_3.py", result)
             self.assertIn("test_task_7.py", result)
+
+    def test_builder_edit_of_this_tasks_init_is_discarded_and_flagged(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.queue_builder(
+                env.patch({"app.py": "TOTAL = 5\n", INIT_PATH: "import os\n"})
+            )
+            payload = env.run()
+            self.assertTrue(payload["check_gate"]["acceptance_modified"])
+            self.assertEqual(env.pushed(INIT_PATH), "")
 
 
 class PinTests(unittest.TestCase):
@@ -1157,7 +1178,8 @@ class TestDisputeTests(unittest.TestCase):
             _queue_dispute(env, env.patch({}), after)
             payload = env.run()
             self.assertEqual(payload["status"], "failed")
-            self.assertIn('"outcome": "invalid_revision"', _log(env))
+            # A file outside the locked pair is a code change for the review.
+            self.assertIn('"outcome": "author_touched_code"', _log(env))
 
     def test_author_not_ok_keeps_the_conflict(self) -> None:
         with TemporaryDirectory() as tmp:

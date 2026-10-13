@@ -138,11 +138,15 @@ def _check_gate_block(check_gate: Mapping[str, object] | None) -> str:
     else:
         line = f"status {label}, not run."
     return f"""4. Factory acceptance checks (locked, run before PR): {line} Files under
-   tests/acceptance/ are locked tests written before the implementation. Treat
-   any change to files under tests/acceptance/ as a P2 finding titled "Locked
-   acceptance test changed" -- except the original addition of the task's own
-   tests/acceptance/test_task_<id>.py (and an empty tests/acceptance/__init__.py)
-   in the first commit.
+   tests/acceptance/ are acceptance tests written before an implementation. This
+   task's own tests/acceptance/test_task_<id>.py (and an empty
+   tests/acceptance/__init__.py) are locked: treat any change to them other than
+   their original addition in the first commit as a P2 finding titled "Locked
+   acceptance test changed". Other tests/acceptance/test_task_*.py files are
+   earlier tasks' regression tests: a change there is fine only where this
+   request deliberately changes the behavior that test checks; treat any other
+   weakening or deletion as a P2 finding titled "Regression acceptance test
+   weakened".
 """
 
 
