@@ -26,9 +26,11 @@ from .ops_requests import build_ops_note, split_trailer
 from .ops_requests import validate as validate_ops_requests
 from .prompts import (
     compose_acceptance_builder_block,
+    compose_dispute_resume_block,
     compose_fixup_prompt,
     compose_implement_prompt,
     compose_test_author_prompt,
+    compose_test_dispute_prompt,
     route_implement,
 )
 from .publish import (
@@ -38,7 +40,7 @@ from .publish import (
     publish_implement,
 )
 from .runctx import RunScaffold
-from .spec_conflict import conflict_error, split_spec_conflict
+from .spec_conflict import SpecConflict, conflict_error, split_spec_conflict
 
 _NO_CHANGES_MESSAGE = "agent produced no file changes"
 _OPS_UNAVAILABLE_NOTE = "ops_unavailable"
@@ -55,6 +57,15 @@ EXEC_RESERVE_S = 240.0
 FIXUP_MIN_REMAINING_S = 600.0
 _MIN_EXEC_TIMEOUT_S = 30.0
 _MIN_AUTHOR_REMAINING_S = 900.0
+# A spec conflict raised while locked acceptance tests exist first goes back to
+# the test author this many times per run (the author either revises the
+# disputed tests or upholds them); only an upheld or repeated conflict fails
+# the run with SPEC_CONFLICT for the owner.
+MAX_TEST_DISPUTES = 1
+# The review (author exec + package/preflight) plus a useful builder re-run and
+# the gate must still fit; after a revision at least FIXUP_MIN_REMAINING_S must
+# be left, or the conflict stands (never an ungated PR with rewritten tests).
+_MIN_DISPUTE_REMAINING_S = 1500.0
 _CHECK_GRACE_S = 60.0
 _CHECK_STATUSES = frozenset({"passed", "failed", "error", "unavailable"})
 _MAX_OUTPUT_TAIL = 4000
@@ -249,43 +260,69 @@ def _run_builder_and_publish(
     allowlist: Any,
 ) -> None:
     run.stage("codex_started")
-    result = ctx.codex.run_exec(
-        {
-            "run_id": work.run_id,
-            "lane": "code",
-            "cwd": "wt",
-            "model": route.model,
-            "effort": route.effort,
-            "sandbox": route.sandbox,
-            "multi_agent": route.multi_agent,
-            "prompt": prompt,
-            "images": [str(path) for path in image_paths],
-            "output_schema": None,
-            "timeout_s": _exec_timeout(route.timeout_s, deadline),
-            "idle_timeout_s": ctx.settings.idle_timeout_s,
-        },
-        on_event=lambda _event: None,
-        heartbeat=None,
-        cancel=run.cancel,
-    )
-    state.add_total(result.usage)
-    run.stage("codex_finished")
+    builder_prompt = prompt
+    while True:
+        result = ctx.codex.run_exec(
+            {
+                "run_id": work.run_id,
+                "lane": "code",
+                "cwd": "wt",
+                "model": route.model,
+                "effort": route.effort,
+                "sandbox": route.sandbox,
+                "multi_agent": route.multi_agent,
+                "prompt": builder_prompt,
+                "images": [str(path) for path in image_paths],
+                "output_schema": None,
+                "timeout_s": _exec_timeout(route.timeout_s, deadline),
+                "idle_timeout_s": ctx.settings.idle_timeout_s,
+            },
+            on_event=lambda _event: None,
+            heartbeat=None,
+            cancel=run.cancel,
+        )
+        state.add_total(result.usage)
+        run.stage("codex_finished")
 
-    if run.cancel.is_set() or result.cancelled:
-        raise _RunEnded
+        if run.cancel.is_set() or result.cancelled:
+            raise _RunEnded
 
-    # A spec-conflict trailer is stripped BEFORE the ops trailer is split (and
-    # before anything else reads Codex's text), so the marker line can never
-    # leak into a PR body or a failure reason. When present the run stops here:
-    # no package, no publish.
-    # The trailer is only trusted (and the rule only put in the prompt) when
-    # the acceptance switch is on; switched off, marker-shaped lines are still
-    # scrubbed from the text but the run continues exactly as it always did.
-    message, conflict = split_spec_conflict(result.final_message)
-    _log_ignored_marker(ctx, work, result.final_message, message, conflict)
-    if conflict is not None and ctx.settings.acceptance_checks_enabled:
-        _fail_spec_conflict(ctx, work, run, state, conflict)
-        raise _RunEnded
+        # A spec-conflict trailer is stripped BEFORE the ops trailer is split
+        # (and before anything else reads Codex's text), so the marker line can
+        # never leak into a PR body or a failure reason. When present the run
+        # stops here (no package, no publish) unless the test author revises
+        # the disputed locked tests: then the builder runs once more.
+        # The trailer is only trusted (and the rule only put in the prompt) when
+        # the acceptance switch is on; switched off, marker-shaped lines are
+        # still scrubbed from the text but the run continues exactly as it
+        # always did.
+        message, conflict = split_spec_conflict(result.final_message)
+        _log_ignored_marker(ctx, work, result.final_message, message, conflict)
+        if conflict is None or not ctx.settings.acceptance_checks_enabled:
+            break
+        resolved = (
+            _resolve_test_dispute(
+                ctx,
+                work,
+                run,
+                state,
+                station=station,
+                conflict=conflict,
+                base_sha=base_sha,
+                deadline=deadline,
+            )
+            if station is not None
+            else None
+        )
+        if resolved is None:
+            _fail_spec_conflict(ctx, work, run, state, conflict)
+            raise _RunEnded
+        station = resolved[0]
+        builder_prompt = (
+            prompt
+            + "\n"
+            + compose_dispute_resume_block(task_file=station.task_file, task_id=work.task_id)
+        )
 
     # Every downstream use of Codex's own text -- a failure reason, the "no
     # changes" note, or the eventual PR body -- must never carry the ops
@@ -509,6 +546,14 @@ class _WorkspaceRestoreError(Exception):
     """`cleanup` + `prepare` could not restore a clean workspace."""
 
 
+class _TestDispute(Exception):
+    """A fix-up reported a spec conflict while a test dispute is still allowed."""
+
+    def __init__(self, conflict: SpecConflict) -> None:
+        super().__init__(conflict.reason)
+        self.conflict = conflict
+
+
 def _exec_timeout(configured: float, deadline: float) -> float:
     """`min(configured, time left before the run deadline - reserve)`, never
     below a small floor. Returns `configured` itself when it fits, so a run
@@ -537,6 +582,7 @@ class _RunState:
     passed: int = 0
     failed: list[str] = field(default_factory=list)
     fixups: int = 0
+    disputes: int = 0
     acceptance_modified: bool = False
     author_model: str | None = None
     fixup_model: str | None = None
@@ -810,6 +856,166 @@ def _author_attempt(
     )
 
 
+def _resolve_test_dispute(
+    ctx: ServiceContext,
+    work: Work,
+    run: RunScaffold,
+    state: _RunState,
+    *,
+    station: _Station,
+    conflict: SpecConflict,
+    base_sha: str,
+    deadline: float,
+) -> tuple[_Station, bytes] | None:
+    """Send a spec conflict raised against the locked tests back to the test
+    author once. Returns `(revised station, workspace patch)` when the author
+    revised the tests into a valid acceptance patch, else `None` (the conflict
+    stands: upheld tests, no dispute left, no budget, or an unusable
+    revision). Raises `_RunEnded` on cancel."""
+    if state.disputes >= MAX_TEST_DISPUTES:
+        return None
+    if deadline - _monotonic() < _MIN_DISPUTE_REMAINING_S:
+        _log_dispute(ctx, work, conflict, "no_budget")
+        return None
+    state.disputes += 1
+    profile = station.profile
+    acceptance_dir = profile["dir"]
+    try:
+        before = base64.b64decode(
+            ctx.codex.package({"run_id": work.run_id}).get("patch_b64") or "", validate=True
+        )
+    except Exception as exc:
+        ctx.logger.error(exc, event="acceptance_dispute_package_failed", run_id=work.run_id)
+        return None
+    if acceptance.drop_artifacts(
+        acceptance.acceptance_sections(before, acceptance_dir)
+    ) not in (
+        station.raw,
+        station.pinned,
+    ):
+        # The disputing side already edited the locked tests: never let the
+        # author build on that.
+        _log_dispute(ctx, work, conflict, "tests_already_modified")
+        return None
+    matrix = ctx.settings.model_matrix["test_author"]
+    try:
+        result = ctx.codex.run_exec(
+            {
+                "run_id": work.run_id,
+                "lane": "code",
+                "cwd": "wt",
+                "model": matrix["model"],
+                "effort": matrix["effort"],
+                "sandbox": matrix["sandbox"],
+                "multi_agent": bool(matrix["multi_agent"]),
+                "prompt": compose_test_dispute_prompt(
+                    work,
+                    task_file=station.task_file,
+                    acceptance_dir=acceptance_dir,
+                    criterion=conflict.criterion,
+                    reason=ctx.redactor.redact(conflict.reason),
+                ),
+                "images": [],
+                "output_schema": acceptance.TEST_AUTHOR_SCHEMA,
+                "timeout_s": _exec_timeout(
+                    float(ctx.settings.timeouts["test_author"]), deadline
+                ),
+                "idle_timeout_s": ctx.settings.idle_timeout_s,
+            },
+            on_event=lambda _event: None,
+            heartbeat=None,
+            cancel=run.cancel,
+        )
+    except Exception as exc:
+        ctx.logger.error(exc, event="acceptance_dispute_exec_failed", run_id=work.run_id)
+        return None
+    state.add_author(result.usage)
+    if run.cancel.is_set() or result.cancelled:
+        raise _RunEnded
+    if result.timed_out or result.idle_killed or result.exit_code != 0:
+        _log_dispute(ctx, work, conflict, "author_exec_failed")
+        return None
+    reply = _parse_author_reply(result.final_message)
+    if reply is None or reply.get("status") != "ok":
+        _log_dispute(ctx, work, conflict, "author_not_ok")
+        return None
+    try:
+        after = base64.b64decode(
+            ctx.codex.package({"run_id": work.run_id}).get("patch_b64") or "", validate=True
+        )
+    except Exception as exc:
+        ctx.logger.error(exc, event="acceptance_dispute_package_failed", run_id=work.run_id)
+        return None
+    # The author may only touch its own test file: the implementation must be
+    # byte-for-byte what the builder left.
+    code_before = acceptance.drop_artifacts(
+        acceptance.strip_acceptance(before, acceptance_dir)
+    )
+    code_after = acceptance.drop_artifacts(acceptance.strip_acceptance(after, acceptance_dir))
+    if code_before != code_after:
+        _log_dispute(ctx, work, conflict, "author_touched_code")
+        return None
+    raw = acceptance.drop_artifacts(acceptance.acceptance_sections(after, acceptance_dir))
+    if raw == acceptance.drop_artifacts(
+        acceptance.acceptance_sections(before, acceptance_dir)
+    ):
+        _log_dispute(ctx, work, conflict, "upheld")
+        return None
+    try:
+        acceptance.validate_author_patch(raw, profile=profile, task_id=work.task_id)
+        _text, pinned = _run_preflight(ctx, work, patch=raw, base_sha=base_sha)
+        task_path, test_count = acceptance.validate_author_patch(
+            pinned, profile=profile, task_id=work.task_id
+        )
+    except acceptance.AcceptanceError as exc:
+        _log_dispute(ctx, work, conflict, "invalid_revision", detail=str(exc))
+        return None
+    except PublishError as exc:
+        _log_dispute(ctx, work, conflict, "revision_failed_preflight", detail=exc.reason)
+        return None
+    except Exception as exc:
+        ctx.logger.error(exc, event="acceptance_dispute_package_failed", run_id=work.run_id)
+        return None
+    if deadline - _monotonic() < FIXUP_MIN_REMAINING_S:
+        _log_dispute(ctx, work, conflict, "no_budget_after_review")
+        return None
+    _log_dispute(
+        ctx,
+        work,
+        conflict,
+        "revised",
+        sha256=acceptance.sha256_hex(pinned),
+        tests_before=station.test_count,
+        tests=test_count,
+    )
+    run.stage("acceptance_authored", base_sha=base_sha)
+    return (
+        _Station(
+            profile=profile,
+            task_file=task_path,
+            pinned=pinned,
+            test_count=test_count,
+            raw=raw,
+        ),
+        after,
+    )
+
+
+def _log_dispute(
+    ctx: ServiceContext, work: Work, conflict: SpecConflict, outcome: str, **fields: Any
+) -> None:
+    if "detail" in fields:
+        fields["detail"] = ctx.redactor.redact(str(fields["detail"]))[:300]
+    ctx.logger.event(
+        "acceptance_dispute",
+        level="info" if outcome == "revised" else "warning",
+        run_id=work.run_id,
+        criterion=conflict.criterion,
+        outcome=outcome,
+        **fields,
+    )
+
+
 def _splice_and_gate(
     ctx: ServiceContext,
     work: Work,
@@ -824,7 +1030,8 @@ def _splice_and_gate(
     """Splice the pinned acceptance sections into the builder's patch, run the
     Check Gate and (on failure, budget permitting) up to `max_fixups` fix-ups.
     Returns the final spliced patch to publish -- the PR is opened whether or
-    not the gate passed. Raises `_RunEnded` on cancel or a spec conflict."""
+    not the gate passed. Raises `_RunEnded` on cancel or a spec conflict that
+    the test author upheld (a revised dispute re-runs the gate instead)."""
     acceptance_dir = station.profile["dir"]
     patch, modified = acceptance.splice(
         patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
@@ -855,15 +1062,38 @@ def _splice_and_gate(
             run.stage("check_gate_failed", base_sha=base_sha)
             return patch
         state.fixups += 1
-        new_patch = _run_fixup(
-            ctx,
-            work,
-            run,
-            state,
-            station=station,
-            outcome=outcome,
-            deadline=deadline,
-        )
+        try:
+            new_patch = _run_fixup(
+                ctx,
+                work,
+                run,
+                state,
+                station=station,
+                outcome=outcome,
+                deadline=deadline,
+            )
+        except _TestDispute as dispute:
+            resolved = _resolve_test_dispute(
+                ctx,
+                work,
+                run,
+                state,
+                station=station,
+                conflict=dispute.conflict,
+                base_sha=base_sha,
+                deadline=deadline,
+            )
+            if resolved is None:
+                _fail_spec_conflict(ctx, work, run, state, dispute.conflict)
+                raise _RunEnded from None
+            station, workspace_patch = resolved
+            # The fix-up's code plus the revised tests, gated again; the
+            # disputing fix-up does not use up a slot (disputes are capped).
+            state.fixups -= 1
+            new_patch, modified = acceptance.splice(
+                workspace_patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
+            )
+            state.acceptance_modified = state.acceptance_modified or modified
         if new_patch is None:
             run.stage("check_gate_failed", base_sha=base_sha)
             return patch
@@ -988,8 +1218,9 @@ def _run_fixup(
 ) -> bytes | None:
     """One fix-up exec in the same workspace, then re-package and re-splice.
     Returns the new spliced patch, or `None` if the fix-up produced nothing
-    usable (the caller keeps the previous patch). Raises `_RunEnded` on
-    cancel or a spec conflict."""
+    usable (the caller keeps the previous patch). Raises `_TestDispute` on a
+    spec conflict while a test dispute is still allowed, `_RunEnded` on cancel
+    or any other spec conflict."""
     matrix = ctx.settings.model_matrix["fixup"]
     state.fixup_model = str(matrix["model"])
     try:
@@ -1029,6 +1260,8 @@ def _run_fixup(
     stripped, conflict = split_spec_conflict(result.final_message)
     _log_ignored_marker(ctx, work, result.final_message, stripped, conflict)
     if conflict is not None:
+        if state.disputes < MAX_TEST_DISPUTES:
+            raise _TestDispute(conflict)
         _fail_spec_conflict(ctx, work, run, state, conflict)
         raise _RunEnded
     if result.timed_out or result.idle_killed or result.exit_code != 0:
