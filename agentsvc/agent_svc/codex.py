@@ -361,6 +361,18 @@ class CodexRunner:
     def cleanup(self, request: dict[str, Any], *, timeout_s: float = 60.0) -> dict[str, Any]:
         return self._simple_call("cleanup", request, timeout_s)
 
+    def check(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout_s: float,
+        cancel: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """One Check Gate run (`codex_child.py check`). `timeout_s` is the
+        outer wall clock; callers pass a margin over `request["timeout_s"]`
+        so the child's own reasoned timeout wins, as with `run_discussion`."""
+        return self._call_with_grace("check", request, timeout_s, cancel=cancel)
+
     def run_discussion(
         self,
         request: dict[str, Any],

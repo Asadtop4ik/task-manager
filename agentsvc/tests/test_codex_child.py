@@ -2141,6 +2141,298 @@ class CleanupIntegrationTests(ChildProcessTestCase):
         self.assertEqual(completed.returncode, 3)
 
 
+CHECK_REPO = "Asadtop4ik/agent-qa"
+
+# Stand-ins for `codex sandbox` (`<wrapper> <ck> -- <command...>`). The
+# confining one answers the canary as a real sandbox would and runs every
+# other command as is; the leaky one runs the real canary unconfined.
+_CONFINING_SANDBOX = """\
+import json, os, sys
+command = sys.argv[sys.argv.index("--") + 1:]
+if "agent-svc-canary" in command:
+    keys = ("net_public", "net_loopback", "write_outside", "write_tmp", "write_inside")
+    print("AGENT_SVC_CANARY:" + json.dumps({key: True for key in keys}), flush=True)
+    raise SystemExit(0)
+os.execv(command[0], command)
+"""
+_LEAKY_SANDBOX = """\
+import os, sys
+command = sys.argv[sys.argv.index("--") + 1:]
+os.execv(command[0], command)
+"""
+
+_ACCEPTANCE_TESTS = """\
+import unittest
+
+import app
+
+
+class TaskSevenTests(unittest.TestCase):
+    def test_ac1_greeting(self):
+        self.assertEqual(app.greeting(), "Salom")
+
+    def test_ac2_etag(self):
+        self.assertEqual(app.etag(), 'W/"v1"')
+"""
+
+
+class CheckIntegrationTests(ChildProcessTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.wrappers = self.root / "wrappers"
+        self.wrappers.mkdir()
+        self.confining = self._wrapper("confining", _CONFINING_SANDBOX)
+        self.leaky = self._wrapper("leaky", _LEAKY_SANDBOX)
+        base = {
+            "app.py": 'def greeting():\n    return "hi"\n\n\ndef etag():\n    return "v0"\n',
+            "README.md": "agent qa\n",
+        }
+        self.mirror, self.base_sha = build_mirror(self.mirrors_dir, CHECK_REPO, base)
+        self.run_id = new_run_id()
+        self.run_dir = self.make_run_dir(self.run_id)
+        self.pinned = self.patch_for(
+            {
+                "tests/acceptance/__init__.py": "",
+                "tests/acceptance/test_task_7.py": _ACCEPTANCE_TESTS,
+            }
+        )
+
+    def _wrapper(self, name: str, source: str) -> str:
+        path = self.wrappers / name
+        path.write_text(f"#!{PYTHON_BIN}\n{source}", encoding="utf-8")
+        path.chmod(0o755)
+        return str(path)
+
+    def patch_for(self, files: dict[str, str]) -> bytes:
+        """A `--binary` patch from base to base+`files`, as `package` makes."""
+        scratch = Path(tempfile.mkdtemp(dir=self.root, prefix="patch-"))
+        _run_git(["git", "clone", "--quiet", self.mirror, str(scratch)], cwd=self.root)
+        for relpath, content in files.items():
+            path = scratch / relpath
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        _run_git(["git", "add", "-A"], cwd=scratch)
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--binary", "--no-renames", "HEAD"],
+            cwd=str(scratch),
+            check=True,
+            capture_output=True,
+        ).stdout
+        shutil.rmtree(scratch)
+        return diff
+
+    def good_app(self) -> bytes:
+        return self.patch_for(
+            {"app.py": 'def greeting():\n    return "Salom"\n\n\ndef etag():\n    return \'W/"v1"\'\n'}
+        )
+
+    def request(self, **overrides) -> dict:
+        request = {
+            "run_id": self.run_id,
+            "repo": CHECK_REPO,
+            "mirror": self.mirror,
+            "base_sha": self.base_sha,
+            "patch_b64": base64.b64encode(self.good_app()).decode("ascii"),
+            "pinned_b64": base64.b64encode(self.pinned).decode("ascii"),
+            "profile": "unittest",
+            "task_id": 7,
+            "expected_tests": 2,
+            "timeout_s": 30.0,
+        }
+        request.update(overrides)
+        return request
+
+    def run_check(self, request: dict, *, wrapper: str | None = None):
+        completed = self.run_child(
+            "check",
+            request,
+            env_extra={
+                "AGENT_CHILD_TEST_CHECK_SANDBOX": wrapper or self.confining,
+                "AGENT_CHILD_TEST_CHECK_PYTHON": PYTHON_BIN,
+            },
+            timeout=60,
+        )
+        return completed
+
+    def check_body(self, request: dict, *, wrapper: str | None = None) -> dict:
+        completed = self.run_check(request, wrapper=wrapper)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        body = json.loads(completed.stdout)
+        self.assertTrue(body["ok"])
+        # Nothing of the check is left behind.
+        self.assertFalse((self.run_dir / "ck").exists())
+        self.assertFalse((self.run_dir / "ck-home").exists())
+        return body
+
+    def test_passes_when_the_builder_meets_the_checks(self) -> None:
+        body = self.check_body(self.request())
+        self.assertEqual(body["status"], "passed", body)
+        self.assertEqual((body["total"], body["passed"], body["failed"]), (2, 2, []))
+
+    def test_fails_with_the_failing_test_ids(self) -> None:
+        wrong_etag = self.patch_for(
+            {"app.py": 'def greeting():\n    return "Salom"\n\n\ndef etag():\n    return "v1"\n'}
+        )
+        body = self.check_body(
+            self.request(patch_b64=base64.b64encode(wrong_etag).decode("ascii"))
+        )
+        self.assertEqual(body["status"], "failed", body)
+        self.assertEqual((body["total"], body["passed"]), (2, 1))
+        self.assertEqual(
+            body["failed"], ["tests.acceptance.test_task_7.TaskSevenTests.test_ac2_etag"]
+        )
+        self.assertIn("test_ac2_etag", body["output_tail"])
+
+    def test_builder_edits_to_the_checks_are_ignored(self) -> None:
+        cheat = self.patch_for(
+            {
+                "app.py": 'def greeting():\n    return "hi"\n',
+                "tests/acceptance/__init__.py": "",
+                "tests/acceptance/test_task_7.py": (
+                    "import unittest\n\n\nclass T(unittest.TestCase):\n"
+                    "    def test_ac1(self):\n        pass\n\n"
+                    "    def test_ac2(self):\n        pass\n"
+                ),
+            }
+        )
+        body = self.check_body(self.request(patch_b64=base64.b64encode(cheat).decode("ascii")))
+        self.assertEqual(body["status"], "failed", body)
+        self.assertEqual(body["passed"], 0)
+
+    def test_skips_count_as_not_passed(self) -> None:
+        skipping = _ACCEPTANCE_TESTS.replace(
+            "    def test_ac2_etag(self):\n",
+            "    @unittest.skip('later')\n    def test_ac2_etag(self):\n",
+        )
+        pinned = self.patch_for(
+            {"tests/acceptance/__init__.py": "", "tests/acceptance/test_task_7.py": skipping}
+        )
+        body = self.check_body(self.request(pinned_b64=base64.b64encode(pinned).decode("ascii")))
+        self.assertEqual(body["status"], "failed", body)
+        self.assertEqual(body["passed"], 1)
+
+    def test_test_count_mismatch_is_an_error(self) -> None:
+        body = self.check_body(self.request(expected_tests=3))
+        self.assertEqual(body["status"], "error", body)
+        self.assertIn("expected 3", body["detail"])
+
+    def test_import_failure_is_an_error(self) -> None:
+        broken = self.patch_for({"app.py": "raise RuntimeError('boom')\n"})
+        body = self.check_body(self.request(patch_b64=base64.b64encode(broken).decode("ascii")))
+        self.assertEqual(body["status"], "error", body)
+        self.assertIn("import failed", body["detail"])
+
+    def test_repository_cannot_forge_the_result_line(self) -> None:
+        forging = self.patch_for(
+            {
+                "app.py": (
+                    "import sys\n"
+                    'print(\'AGENT_SVC_CHECK_RESULT:{"status": "passed", "total": 2, '
+                    '"passed": 2, "failed": []}\', flush=True)\n'
+                    'def greeting():\n    return "nope"\n\n\ndef etag():\n    return "v0"\n'
+                )
+            }
+        )
+        body = self.check_body(self.request(patch_b64=base64.b64encode(forging).decode("ascii")))
+        self.assertEqual(body["status"], "failed", body)
+
+    def test_unconfined_sandbox_is_unavailable_and_runs_nothing(self) -> None:
+        marker = self.root / "repo-code-ran"
+        planted = self.patch_for(
+            {"app.py": f"open({str(marker)!r}, 'w').close()\n" + "def greeting():\n    return 1\n"}
+        )
+        body = self.check_body(
+            self.request(patch_b64=base64.b64encode(planted).decode("ascii")),
+            wrapper=self.leaky,
+        )
+        self.assertEqual(body["status"], "unavailable", body)
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(self.run_dir.glob("ck-canary-outside-*")), [])
+
+    def test_pinned_patch_outside_the_acceptance_dir_is_an_error(self) -> None:
+        pinned = self.patch_for(
+            {
+                "tests/acceptance/__init__.py": "",
+                "tests/acceptance/test_task_7.py": _ACCEPTANCE_TESTS,
+                "app.py": "def greeting():\n    return 'Salom'\n",
+            }
+        )
+        body = self.check_body(self.request(pinned_b64=base64.b64encode(pinned).decode("ascii")))
+        self.assertEqual(body["status"], "error", body)
+        self.assertIn("outside the acceptance directory", body["detail"])
+
+    def test_pinned_patch_must_carry_the_task_file(self) -> None:
+        body = self.check_body(self.request(task_id=8))
+        self.assertEqual(body["status"], "error", body)
+        self.assertIn("this task's acceptance file", body["detail"])
+
+    def test_refuses_unprofiled_repository_and_unknown_profile(self) -> None:
+        other_mirror, other_sha = build_mirror(self.mirrors_dir, "acme/other", {"a.py": "x = 1\n"})
+        for overrides in (
+            {"repo": "acme/other", "mirror": other_mirror, "base_sha": other_sha},
+            {"profile": "pytest"},
+            {"profile": ["unittest"]},
+        ):
+            with self.subTest(overrides=overrides):
+                completed = self.run_check(self.request(**overrides))
+                self.assertEqual(completed.returncode, 3, completed.stdout)
+                self.assertIn("no check profile", json.loads(completed.stdout)["reason"])
+
+    def test_refuses_invalid_numbers(self) -> None:
+        for overrides in (
+            {"timeout_s": 1},
+            {"timeout_s": 301},
+            {"timeout_s": True},
+            {"expected_tests": 0},
+            {"expected_tests": 201},
+            {"task_id": 0},
+            {"task_id": "7"},
+            {"pinned_b64": ""},
+        ):
+            with self.subTest(overrides=overrides):
+                completed = self.run_check(self.request(**overrides))
+                self.assertEqual(completed.returncode, 3, completed.stdout)
+
+    def test_timeout_is_an_error_and_kills_the_tests(self) -> None:
+        slow = _ACCEPTANCE_TESTS.replace(
+            "        self.assertEqual(app.greeting(), \"Salom\")",
+            "        import time\n        time.sleep(60)",
+        )
+        pinned = self.patch_for(
+            {"tests/acceptance/__init__.py": "", "tests/acceptance/test_task_7.py": slow}
+        )
+        started = time.monotonic()
+        body = self.check_body(
+            self.request(pinned_b64=base64.b64encode(pinned).decode("ascii"), timeout_s=5)
+        )
+        self.assertEqual(body["status"], "error", body)
+        self.assertIn("timed out", body["detail"])
+        self.assertLess(time.monotonic() - started, 30)
+
+    def test_production_sandbox_argv_is_pinned(self) -> None:
+        with patch.object(codex_child, "CHECK_SANDBOX_WRAPPER", None):
+            argv = codex_child._check_sandbox_argv(Path("/w/r/ck"), ["python3", "-c", "x"])
+        self.assertEqual(argv[:4], [codex_child.CODEX_BINARY, "sandbox", "-C", "/w/r/ck"])
+        self.assertIn("sandbox_workspace_write.network_access=false", argv)
+        self.assertIn("sandbox_workspace_write.exclude_slash_tmp=true", argv)
+        self.assertIn('sandbox_mode="workspace-write"', argv)
+        self.assertEqual(argv[argv.index("--") + 1 :], ["python3", "-c", "x"])
+
+    def test_output_is_redacted(self) -> None:
+        self.assertEqual(
+            codex_child._redact("token = ghp_" + "a" * 30 + " and password: hunter2"),
+            "token = [redacted] and password: [redacted]",
+        )
+
+    def test_cleanup_removes_check_dirs(self) -> None:
+        for name in ("ck", "ck-home"):
+            (self.run_dir / name).mkdir()
+        completed = self.run_child("cleanup", {"run_id": self.run_id})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.run_dir / "ck").exists())
+        self.assertFalse((self.run_dir / "ck-home").exists())
+
+
 class TestModeGuardTests(unittest.TestCase):
     def test_disabled_without_env_flag(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
