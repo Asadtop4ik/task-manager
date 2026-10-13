@@ -7,7 +7,7 @@ Defaults:agent-svc !requiretty
 # Run the sandboxed Codex child as the dedicated agent-codex account — NOT
 # codex-runner, which is the legacy GitHub Actions runner account and must never
 # share a uid with anything Codex's sandbox can reach (runner credentials, checkout
-# tokens, its own Codex auth). Only these five subcommands are allowed, each pinned
+# tokens, its own Codex auth). Only these six subcommands are allowed, each pinned
 # with `-I` (isolated mode: ignores PYTHONPATH/PYTHONSTARTUP/user site-packages, so
 # agent-svc's own environment can't smuggle an import override into the child);
 # codex_child.py itself validates every argument it receives on stdin (run_id, lane,
@@ -15,13 +15,17 @@ Defaults:agent-svc !requiretty
 # (ruff/black/compileall) as agent-codex, never as agent-svc: those tools execute
 # inside a directory whose content is entirely attacker-controlled (the agent's own
 # patch), so running them as agent-svc would let a malicious patch read every
-# credential agent-svc can reach (security round 2, blocker 1). The paths below are
+# credential agent-svc can reach (security round 2, blocker 1). `check` (the factory
+# Check Gate) runs one task's locked acceptance checks as agent-codex inside
+# `codex sandbox` (network off, writes confined to a fresh clone, fail-closed
+# canary first); the command itself is an allowlisted profile inside
+# codex_child.py, never taken from the request. The paths below are
 # the stable, root-owned symlinks into the active release (see
 # ops/install_agent_svc.sh); the sudoers rule is pinned to these stable paths, never
 # to a release-specific one. There is no `--version` entry: agent_svc's self-check
 # verifies this rule is reachable with `sudo -n -l`, which does not require running
 # the target command at all.
-agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py preflight, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py cleanup
+agent-svc ALL=(agent-codex) NOPASSWD: /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py prepare, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py exec, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py package, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py preflight, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py cleanup, /usr/bin/python3 -I /opt/agent-svc/libexec/codex_child.py check
 
 # `discussion` (Phase 3, chat lane): one read-only `/suhbat` app-server turn, same
 # agent-codex trust boundary as the five above, PLUS the `task-diag-client` group —

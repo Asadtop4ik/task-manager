@@ -40,7 +40,7 @@ class ProductionArgvTests(unittest.TestCase):
 
     def test_each_subcommand_argv_matches_a_sudoers_rule_exactly(self) -> None:
         allowed = _allowed_commands()
-        for sub in ("prepare", "exec", "package", "preflight", "cleanup"):
+        for sub in ("prepare", "exec", "package", "preflight", "cleanup", "check"):
             argv = self.runner._argv(sub)
             self.assertEqual(
                 argv[:6],
