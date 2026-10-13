@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -665,14 +666,20 @@ class LogsTests(unittest.TestCase):
     def _host(self, body: bytes, status: int = 0):
         captured = {}
 
+        # The body goes through a file: Linux caps one argv string at 128 KiB.
+        body_file = tempfile.NamedTemporaryFile(delete=False)
+        body_file.write(body)
+        body_file.close()
+        self.addCleanup(os.unlink, body_file.name)
+
         def spawn(command, **kwargs):
             captured["command"] = command
             code = (
-                "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); "
+                "import sys; sys.stdout.buffer.write(open(sys.argv[1], 'rb').read()); "
                 "sys.exit(int(sys.argv[2]))"
             )
             return subprocess.Popen(
-                [sys.executable, "-c", code, body.hex(), str(status)], **kwargs
+                [sys.executable, "-c", code, body_file.name, str(status)], **kwargs
             )
 
         host = make_host(popen_factory=spawn)
