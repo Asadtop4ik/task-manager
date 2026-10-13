@@ -57,7 +57,8 @@ them and runs the SQL and `docker` commands.
 Every call carries the discussion id and the unguessable lease id of the running
 turn. The lease id reaches the MCP proxy through the `DIAGNOSTIC_LEASE_ID`
 environment variable (forwarded by Codex's `env_vars`), not argv, so it is not
-visible in the process list. The broker asks the backend
+visible in the process list; `shell_environment_policy.exclude` also keeps it out
+of the model's own shell tool. The broker asks the backend
 (`GET /project-discussions/{id}/diagnostic-context`) and proceeds only if:
 
 - the session is active and was started by the owner (`OWNER_TELEGRAM_ID`);
@@ -87,21 +88,37 @@ session.
 application's own DSN. `ops/provision_agent_diagnostics_roles.sql` creates
 `<project>_agent`: `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
 NOBYPASSRLS`, no built-in role membership, `CONNECT` on its own database only,
-`SELECT/INSERT/UPDATE/DELETE` on the application schema's tables and
-`USAGE/SELECT/UPDATE` on its sequences (plus default privileges for tables the
-application creates later), no `CREATE`. The script also sets role-level
+`SELECT/INSERT/UPDATE/DELETE` on the application schema's tables, `USAGE/SELECT`
+on its sequences (plus `UPDATE` only on sequences owned by a writable table), no
+`CREATE` anywhere. The script also runs `REVOKE CREATE ON SCHEMA <schema> FROM
+PUBLIC` and grants `USAGE, CREATE` on it explicitly to `table_owner`; this only
+affects roles that relied on PUBLIC for `CREATE` (the application role keeps
+working through its explicit grant or ownership of the schema; check any other
+role that creates objects there). Future tables get default privileges (full DML)
+unless a read-only list is given, see below. The script also sets role-level
 `temp_file_limit=256MB` and `statement_timeout=15s` (settings only a superuser
 may apply, which the broker is not).
 
 On every `db_sql` connection the broker checks the connected role and refuses to
-run the agent's SQL (and audits the refusal) if it has `rolsuper`,
-`rolcreaterole`, `rolcreatedb`, `rolreplication` or `rolbypassrls`, is a member of
-`pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files`,
-`pg_signal_backend`, `pg_read_all_data`, `pg_write_all_data` or `pg_monitor`, or
-the database has `dblink`, `postgres_fdw` or any untrusted procedural language
-installed. Use of an application role (usually the table owner, often with
-`CREATE`) is thereby caught for the privilege cases above, but the script is
-what narrows it properly.
+run the agent's SQL (and audits the refusal) if any of these holds:
+
+- the role name does not end in `_agent`;
+- it has `rolsuper`, `rolcreaterole`, `rolcreatedb`, `rolreplication` or
+  `rolbypassrls`;
+- it is a member of **any** role (so also `pg_execute_server_program`,
+  `pg_read_server_files`, `pg_write_server_files`, `pg_signal_backend`,
+  `pg_read_all_data`, `pg_write_all_data`, `pg_monitor`);
+- it has `CREATE` on the database or on any non-system schema (a schema where
+  PUBLIC still has `CREATE`, the default `public` before PostgreSQL 15, also
+  trips this: revoke it);
+- it owns the database, or owns any relation or function outside the system
+  schemas (an application/table-owner role);
+- it can execute `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
+  `pg_stat_file`, `lo_import` or `lo_export`;
+- the database has `dblink`, `postgres_fdw` or an untrusted procedural language
+  installed, or `standard_conforming_strings` is off.
+
+Pointing a `DIAG_DSN_*` at an application role is therefore refused outright.
 
 Task Manager's own database is the sensitive one: the agent could otherwise grant
 itself more access (`users`, project membership) or tamper with agent leases. Run
@@ -115,9 +132,18 @@ attachments, activity, reminders):
 ```
 
 (`alembic_version` is always read-only. `hidden_columns` are not readable at all:
-lease ids and invite token hashes are capabilities.) After a migration that adds
-a table, the new table is `SELECT`-only for this role until you re-run the script
-with the same full lists, which then grants DML to any table not listed.
+lease ids and invite token hashes are capabilities.) With a read-only list the
+role is fail-closed for the future: tables and sequences created by a later
+migration get **no** grants at all, so the agent cannot see them until you re-run
+the script (with the same full lists) after each migration; that then grants DML
+to any table not listed, so add any new sensitive table to the read-only list
+first.
+
+The agent can delete rows in `tasks` (and `comments`, `attachments`, ...). Foreign
+key `ON DELETE CASCADE`/`SET NULL` actions run with the table owner's privileges,
+not the agent's, so deleting a task also deletes its dependent rows, including
+`agent_runs` history that the agent has no direct write access to. Treat
+`DELETE FROM tasks` as destructive to that history.
 
 Stop the roles reaching other projects' databases (once per database):
 `REVOKE CONNECT ON DATABASE <db> FROM PUBLIC;` then
@@ -159,8 +185,8 @@ while constraint names are kept. To see what the agent changed:
    unit file (now `MemoryMax=512M`) to `/opt/task-manager/ops` and runs
    `daemon-reload`. It does not restart the broker. `ops/install_agent_svc.sh`
    must already have run (it creates `task-diag-client` and adds
-   `task-diagnostics` to it): with a DSN loaded the broker now **refuses to
-   start** if it cannot `chgrp` its socket to that group.
+   `task-diagnostics` to it): with any `DIAG_DSN_*` or `DIAG_PROJECT_IDS` set the
+   broker **refuses to start** if it cannot `chgrp` its socket to that group.
 3. Add these to `/etc/task-manager/diagnostics.env` (never print the file or put
    values on a command line). Each DSN uses the **agent** role from step 1, host
    `127.0.0.1`, port `5432`, no `+asyncpg` suffix (the broker also strips it) and
@@ -213,10 +239,10 @@ lose the tools immediately.
   showing a SELECT of the affected rows, but that is instruction, not a
   technical barrier. The agent role can do what its grants allow (DML on
   everything but the Task Manager tables listed above; no DDL).
-- The per-call timeouts and READ ONLY mode are guard rails against accidents, not
-  a security boundary against a determined statement (for example
-  `set_config('statement_timeout', '0', true)` inside a SELECT); the role
-  privileges are the boundary.
+- The per-call timeouts, READ ONLY mode and the `SET`/`RESET` denylist are guard
+  rails against accidents, not a security boundary against a determined statement
+  (for example `set_config('statement_timeout', '0', true)` inside a SELECT); the
+  role privileges and the role guard are the boundary.
 - Rows and log lines come from users and may contain prompt-injection text; the
   agent is told to treat them as data.
 - Take a backup before bulk changes. Postgres backups are in

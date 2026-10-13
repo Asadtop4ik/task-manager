@@ -1856,6 +1856,9 @@ def _app_server_argv(
                 f"mcp_servers.project_diagnostics.args={proxy_args}",
                 "--config",
                 'mcp_servers.project_diagnostics.env_vars=["DIAGNOSTIC_LEASE_ID"]',
+                # Keep the capability out of the model's own shell tool.
+                "--config",
+                'shell_environment_policy.exclude=["DIAGNOSTIC_LEASE_ID"]',
                 # approval_policy is "never" and every approval ask fails the
                 # turn, so the broker's own owner/lease checks are the gate.
                 "--config",

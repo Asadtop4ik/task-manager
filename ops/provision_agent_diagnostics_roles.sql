@@ -13,9 +13,10 @@
 -- app_schema      schema of the application tables (default public)
 -- readonly_tables comma list: SELECT only for these tables (alembic_version is
 --                 always read-only); every other existing table gets full DML.
---                 Giving a list also makes FUTURE tables SELECT-only until the
---                 script is re-run (with the same full list) after a migration,
---                 which then grants DML to any table not named here.
+--                 Giving a list also makes FUTURE tables and sequences get NO
+--                 grants until the script is re-run (with the same full list)
+--                 after each migration, which then grants DML to any table not
+--                 named here.
 -- hidden_columns  comma list of table.column: not readable at all (capabilities
 --                 such as lease ids and invite token hashes)
 --
@@ -90,7 +91,10 @@ BEGIN
     EXECUTE format(
         'ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION '
         'NOBYPASSRLS NOINHERIT CONNECTION LIMIT 8', agent);
-    -- Limits only a superuser can set (the broker, not being one, cannot).
+    -- temp_file_limit can only be set by a superuser, so it is set here, not by the
+    -- broker; the role cannot raise it. statement_timeout is merely a default:
+    -- any role may change it for itself (set_config), so it is a guard rail
+    -- against accidents, not a boundary (the broker also sets it per call).
     EXECUTE format('ALTER ROLE %I SET temp_file_limit = ''256MB''', agent);
     EXECUTE format('ALTER ROLE %I SET statement_timeout = ''15s''', agent);
 
@@ -106,7 +110,14 @@ BEGIN
 
     EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', database, agent);
     EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', app_schema, agent);
+    -- The agent must not be able to create objects anywhere (the broker's role
+    -- guard refuses a role with CREATE on the database or any schema). Revoking
+    -- CREATE from PUBLIC only affects roles that relied on PUBLIC for it, so give
+    -- the application role an explicit grant: its migrations keep working.
+    EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC', app_schema);
+    EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', app_schema, owner_role);
     EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I', app_schema, agent);
+    EXECUTE format('REVOKE CREATE ON DATABASE %I FROM %I', database, agent);
     EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM %I', app_schema, agent);
     EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM %I', app_schema, agent);
 
@@ -129,23 +140,42 @@ BEGIN
                            app_schema, rel.relname, agent);
         END IF;
     END LOOP;
-    EXECUTE format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I',
-                   app_schema, agent);
+    -- Sequences: UPDATE (setval) only for sequences owned by a writable table;
+    -- USAGE/SELECT on the rest (and on those of read-only tables).
+    FOR rel IN
+        SELECT c.relname AS seq, owner_table.relname AS owner_table
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid
+            AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
+        LEFT JOIN pg_class owner_table ON owner_table.oid = d.refobjid
+        WHERE n.nspname = app_schema AND c.relkind = 'S'
+    LOOP
+        IF rel.owner_table IS NOT NULL AND NOT rel.owner_table = ANY (readonly) THEN
+            EXECUTE format('GRANT USAGE, SELECT, UPDATE ON SEQUENCE %I.%I TO %I',
+                           app_schema, rel.seq, agent);
+        ELSE
+            EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %I.%I TO %I',
+                           app_schema, rel.seq, agent);
+        END IF;
+    END LOOP;
 
-    -- Future tables created by the application role.
+    -- Future objects created by the application role. Restrictive mode (a
+    -- readonly list was given) grants NOTHING on them: a new table, possibly a
+    -- sensitive one, stays invisible until this script is re-run after the
+    -- migration. Otherwise new tables get DML like the existing ones.
     EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
                    'REVOKE ALL ON TABLES FROM %I', owner_role, app_schema, agent);
-    IF restrictive THEN
-        EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
-                       'GRANT SELECT ON TABLES TO %I', owner_role, app_schema, agent);
-    ELSE
+    EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
+                   'REVOKE ALL ON SEQUENCES FROM %I', owner_role, app_schema, agent);
+    IF NOT restrictive THEN
         EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
                        'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I',
                        owner_role, app_schema, agent);
+        EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
+                       'GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I',
+                       owner_role, app_schema, agent);
     END IF;
-    EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
-                   'GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I',
-                   owner_role, app_schema, agent);
 
     -- The role must not reach any other database.
     FOR other IN

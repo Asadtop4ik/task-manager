@@ -38,7 +38,7 @@ class AppServerTests(unittest.TestCase):
             for index, value in enumerate(configured)
             if value == "--config"
         ]
-        self.assertEqual(len(overrides), 4)
+        self.assertEqual(len(overrides), 5)
         settings = {}
         for override in overrides:
             key, value = override.split("=", 1)
@@ -49,6 +49,9 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(
             settings["mcp_servers.project_diagnostics.default_tools_approval_mode"],
             "approve",
+        )
+        self.assertEqual(
+            settings["shell_environment_policy.exclude"], ["DIAGNOSTIC_LEASE_ID"]
         )
         args = settings["mcp_servers.project_diagnostics.args"]
         self.assertEqual(args[1:3], ["--discussion-id", "83"])

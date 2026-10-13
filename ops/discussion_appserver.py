@@ -82,6 +82,8 @@ def _app_server_command(
             "--config",
             'mcp_servers.project_diagnostics.env_vars=["DIAGNOSTIC_LEASE_ID"]',
             "--config",
+            'shell_environment_policy.exclude=["DIAGNOSTIC_LEASE_ID"]',
+            "--config",
             'mcp_servers.project_diagnostics.default_tools_approval_mode="approve"',
         ])
     return command

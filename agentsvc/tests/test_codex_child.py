@@ -2790,7 +2790,7 @@ class AppServerArgvTests(unittest.TestCase):
             for index, value in enumerate(configured)
             if value == "--config"
         ]
-        self.assertEqual(len(overrides), 4)
+        self.assertEqual(len(overrides), 5)
         joined = "\n".join(overrides)
         self.assertIn("mcp_servers.project_diagnostics.command", joined)
         self.assertIn(
@@ -2803,6 +2803,8 @@ class AppServerArgvTests(unittest.TestCase):
         self.assertNotIn("--lease-id", joined)
         self.assertNotIn("unpredictable-active-lease", "\n".join(configured))
         self.assertIn('env_vars=["DIAGNOSTIC_LEASE_ID"]', joined)
+        # ... and is hidden from the model's own shell environment.
+        self.assertIn('shell_environment_policy.exclude=["DIAGNOSTIC_LEASE_ID"]', joined)
         self.assertNotIn("TOKEN", "\n".join(configured))
 
     def test_the_lease_reaches_the_proxy_only_through_the_environment(self) -> None:

@@ -102,6 +102,15 @@ DANGEROUS_ROLES = (
     "pg_monitor",
 )
 DANGEROUS_EXTENSIONS = ("dblink", "postgres_fdw")
+# File and large-object functions that a plain GRANT could hand to the role.
+DANGEROUS_FUNCTIONS = (
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+    "lo_import",
+    "lo_export",
+)
 ROLE_GUARD_SQL = """
 SELECT reason FROM (
     SELECT 'role attribute ' || v.name AS reason
@@ -127,6 +136,46 @@ SELECT reason FROM (
     UNION ALL
     SELECT 'standard_conforming_strings is off'
     WHERE current_setting('standard_conforming_strings') <> 'on'
+    UNION ALL
+    -- Must be the dedicated, creation-incapable agent role.
+    SELECT 'role name does not end in _agent' WHERE current_user !~ '_agent$'
+    UNION ALL
+    SELECT 'can create objects in the database'
+    WHERE has_database_privilege(current_user, current_database(), 'CREATE')
+    UNION ALL
+    SELECT 'can create objects in schema ' || n.nspname
+    FROM pg_namespace AS n
+    WHERE n.nspname NOT LIKE 'pg\\_%%' AND n.nspname <> 'information_schema'
+      AND has_schema_privilege(current_user, n.oid, 'CREATE')
+    UNION ALL
+    SELECT 'is a member of ' || g.rolname
+    FROM pg_auth_members AS m
+    JOIN pg_roles AS g ON g.oid = m.roleid
+    JOIN pg_roles AS me ON me.oid = m.member
+    WHERE me.rolname = current_user
+    UNION ALL
+    SELECT 'owns the database' FROM pg_database AS d
+    JOIN pg_roles AS me ON me.oid = d.datdba
+    WHERE d.datname = current_database() AND me.rolname = current_user
+    UNION ALL
+    SELECT 'owns relation ' || c.relname
+    FROM pg_class AS c
+    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    JOIN pg_roles AS me ON me.oid = c.relowner
+    WHERE me.rolname = current_user
+      AND n.nspname NOT LIKE 'pg\\_%%' AND n.nspname <> 'information_schema'
+    UNION ALL
+    SELECT 'owns function ' || p.proname
+    FROM pg_proc AS p
+    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    JOIN pg_roles AS me ON me.oid = p.proowner
+    WHERE me.rolname = current_user
+      AND n.nspname NOT LIKE 'pg\\_%%' AND n.nspname <> 'information_schema'
+    UNION ALL
+    SELECT 'can execute ' || p.proname
+    FROM pg_proc AS p
+    WHERE p.pronamespace = 'pg_catalog'::regnamespace AND p.proname = ANY(%s)
+      AND has_function_privilege(current_user, p.oid, 'EXECUTE')
 ) AS problems
 """
 # Row-returning statements of these kinds stream through a server-side cursor so
@@ -418,7 +467,9 @@ class DiagnosticHost:
 
     @property
     def has_full_access_databases(self) -> bool:
-        return bool(self._project_dsns)
+        # Any sign that full-access tools are configured: a DSN, or the static
+        # project-id map that only exists to authorize them.
+        return bool(self._project_dsns or self._project_ids)
 
     def _context(self, discussion_id: int, lease_id: str) -> Context:
         if (
@@ -788,7 +839,14 @@ class DiagnosticHost:
 
     def _check_session(self, cursor: Any) -> None:
         """Refuse to run agent SQL under a role that could escape the guards."""
-        cursor.execute(ROLE_GUARD_SQL, (list(DANGEROUS_ROLES), list(DANGEROUS_EXTENSIONS)))
+        cursor.execute(
+            ROLE_GUARD_SQL,
+            (
+                list(DANGEROUS_ROLES),
+                list(DANGEROUS_EXTENSIONS),
+                list(DANGEROUS_FUNCTIONS),
+            ),
+        )
         reasons = [str(row[0]) for row in cursor.fetchall()]
         if reasons:
             raise DiagnosticsError(

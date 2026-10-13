@@ -441,13 +441,42 @@ class RoleGuardTests(unittest.TestCase):
             ),
         )
         self.assertEqual(DANGEROUS_EXTENSIONS, ("dblink", "postgres_fdw"))
+        self.assertEqual(
+            diagnostic_host.DANGEROUS_FUNCTIONS,
+            (
+                "pg_read_file",
+                "pg_read_binary_file",
+                "pg_ls_dir",
+                "pg_stat_file",
+                "lo_import",
+                "lo_export",
+            ),
+        )
+        for needle in (
+            "has_database_privilege",
+            "has_schema_privilege",
+            "pg_auth_members",
+            "datdba",
+            "relowner",
+            "proowner",
+            "has_function_privilege",
+            "_agent$",
+        ):
+            self.assertIn(needle, ROLE_GUARD_SQL)
 
     def test_clean_role_runs_the_guard_before_the_agent_sql(self):
         fake = FakePsycopg(columns=["x"], rows=[(1,)])
         response = run_with(fake, make_host(), db_request("SELECT 1"))
         self.assertTrue(response["ok"], response)
         index = fake.statements.index(ROLE_GUARD_SQL)
-        self.assertEqual(fake.params[index], (list(DANGEROUS_ROLES), list(DANGEROUS_EXTENSIONS)))
+        self.assertEqual(
+            fake.params[index],
+            (
+                list(DANGEROUS_ROLES),
+                list(DANGEROUS_EXTENSIONS),
+                list(diagnostic_host.DANGEROUS_FUNCTIONS),
+            ),
+        )
         self.assertLess(index, fake.statements.index("SELECT 1"))
 
     def test_a_flagged_role_is_refused_audited_and_never_runs_agent_sql(self):
@@ -459,6 +488,15 @@ class RoleGuardTests(unittest.TestCase):
             ["extension dblink"],
             ["extension postgres_fdw"],
             ["untrusted language plpython3u"],
+            ["role name does not end in _agent"],
+            ["can create objects in the database"],
+            ["can create objects in schema public"],
+            ["is a member of some_role"],
+            ["owns the database"],
+            ["owns relation orders"],
+            ["owns function helper"],
+            ["can execute pg_read_file"],
+            ["can execute lo_export"],
         ):
             with self.subTest(reasons=reasons):
                 fake = FakePsycopg(columns=["x"], rows=[(1,)], guard=reasons)
@@ -634,6 +672,19 @@ class SocketGroupFailClosedTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client", required=True)
             _narrow_socket_group(Path("/tmp/x.sock"), "task-diag-client")  # best effort
+
+    def test_a_project_id_map_alone_also_makes_the_group_required(self):
+        host = make_host(project_dsns={}, project_ids={"qurbot": 9})
+        self.assertTrue(host.has_full_access_databases)
+        self.assertFalse(
+            make_host(project_dsns={}, project_ids={}).has_full_access_databases
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "d.sock"
+            with patch.object(diagnostic_host.grp, "getgrnam", side_effect=KeyError("x")):
+                with self.assertRaises(RuntimeError):
+                    diagnostic_host.serve(host, path)
+            self.assertFalse(path.exists())
 
     def test_serve_refuses_and_removes_the_socket_when_full_access_is_configured(self):
         with tempfile.TemporaryDirectory() as directory:
