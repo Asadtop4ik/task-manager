@@ -581,7 +581,15 @@ class SpliceTests(unittest.TestCase):
             payload = env.run()
             self.assertTrue(payload["check_gate"]["acceptance_modified"])
             result = run_git(
-                ["git", "-C", str(env.remote), "ls-tree", "-r", "--name-only", f"refs/heads/{BRANCH}"]
+                [
+                    "git",
+                    "-C",
+                    str(env.remote),
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    f"refs/heads/{BRANCH}",
+                ]
             ).stdout
             self.assertNotIn("helper.py", result)
             self.assertIn("test_task_7.py", result)
@@ -770,7 +778,16 @@ class GateOutcomeTests(unittest.TestCase):
 
     def test_gate_error_means_no_fixups(self) -> None:
         for name, reply in (
-            ("error", {"status": "error", "total": 0, "passed": 0, "failed": [], "detail": "0 tests"}),
+            (
+                "error",
+                {
+                    "status": "error",
+                    "total": 0,
+                    "passed": 0,
+                    "failed": [],
+                    "detail": "0 tests",
+                },
+            ),
             ("unavailable", {"status": "unavailable", "detail": "canary"}),
             ("raises", CodexChildError(3, "refused")),
             ("raises-other", RuntimeError("boom")),
@@ -901,22 +918,24 @@ class GateOutcomeTests(unittest.TestCase):
 class SpecConflictTests(unittest.TestCase):
     CONFLICT = 'AGENT_SPEC_CONFLICT: {"criterion": 2, "reason": "404 text conflicts with API"}'
 
-    def test_builder_conflict_fails_without_publishing(self) -> None:
+    def test_builder_conflict_upheld_by_the_author_fails_without_publishing(self) -> None:
         with TemporaryDirectory() as tmp:
             env = _Env(Path(tmp))
             env.queue_author()
             env.codex.queue_exec_result(
                 _exec_result(final_message=f"I stopped.\n{self.CONFLICT}")
             )
+            _queue_dispute(env, env.patch({}), env.patch({}))  # tests upheld
             payload = env.run()
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["failure_phase"], "implement")
             self.assertEqual(
                 payload["error"], "SPEC_CONFLICT (mezon 2): 404 text conflicts with API"
             )
-            self.assertEqual(payload["input_tokens"], 200)
-            self.assertEqual(payload["check_gate"]["author_input_tokens"], 100)
-            self.assertEqual(len(env.codex.package_calls), 1)  # only the author's
+            self.assertEqual(payload["input_tokens"], 300)  # author + builder + review
+            self.assertEqual(payload["check_gate"]["author_input_tokens"], 200)
+            self.assertEqual(len(env.codex.package_calls), 3)  # author + dispute x2
+            self.assertIn('"outcome": "upheld"', _log(env))
             self.assertEqual(env.codex.check_calls, [])
             self.assertEqual(env.ctx.github.created_pulls, [])  # type: ignore[attr-defined]
             self.assertIsNone(
@@ -976,12 +995,14 @@ class SpecConflictTests(unittest.TestCase):
             env.queue_builder(env.patch({"app.py": "TOTAL = 4\n"}))
             env.codex.queue_check_result(_failed(["test_ac1_header"]))
             env.queue_fixup(None, message=self.CONFLICT)
+            workspace = env.patch({"app.py": "TOTAL = 4\n"})
+            _queue_dispute(env, workspace, workspace)  # tests upheld
             payload = env.run()
             self.assertEqual(payload["status"], "failed")
             self.assertTrue(payload["error"].startswith("SPEC_CONFLICT (mezon 2)"))
             self.assertEqual(payload["check_gate"]["fixups"], 1)
             self.assertEqual(payload["check_gate"]["status"], "failed")
-            self.assertEqual(payload["input_tokens"], 300)
+            self.assertEqual(payload["input_tokens"], 400)
             self.assertEqual(env.ctx.github.created_pulls, [])  # type: ignore[attr-defined]
 
     def test_lookalike_marker_never_reaches_the_pr_body(self) -> None:
@@ -1012,6 +1033,197 @@ class SpecConflictTests(unittest.TestCase):
             payload = env.run(_work())
             self.assertEqual(payload["status"], "failed")
             self.assertNotIn("AGENT_OPS_REQUESTS", payload["error"])
+
+
+REVISED_SRC = TEST_SRC.replace(
+    "'Topilmadi', 'Topilmadi'", "'Topilmadi', 'Topilmadi'  # ok"
+) + ("\n    def test_ac2_body(self):\n        self.assertEqual(1, 1)\n")
+
+
+def _queue_dispute(
+    env: _Env, before: bytes, after: bytes, *, message: str = AUTHOR_OK
+) -> None:
+    """The test author's dispute review: package before, author exec, package after."""
+    env.codex.queue_package_result({"patch_b64": _b64(before)})
+    env.codex.queue_exec_result(_exec_result(final_message=message))
+    env.codex.queue_package_result({"patch_b64": _b64(after)})
+
+
+def _log(env: _Env) -> str:
+    return env.ctx.logger._stream.getvalue()  # type: ignore[attr-defined]
+
+
+class TestDisputeTests(unittest.TestCase):
+    CONFLICT = (
+        'AGENT_SPEC_CONFLICT: {"criterion": 2, "reason": "test_ac2 expects 401 and 400"}'
+    )
+
+    def _revised(self, env: _Env, files: dict[str, str]) -> bytes:
+        return make_patch(
+            env.remote, env.base_sha, {INIT_PATH: "", TASK_PATH: REVISED_SRC, **files}
+        )
+
+    def test_revised_tests_rerun_the_builder_and_gate_the_revision(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(
+                _exec_result(final_message=f"Partial.\n{self.CONFLICT}")
+            )
+            partial = env.patch({"app.py": "TOTAL = 4\n"})
+            _queue_dispute(env, partial, self._revised(env, {"app.py": "TOTAL = 4\n"}))
+            env.queue_builder(self._revised(env, {"app.py": "TOTAL = 5\n"}))
+            payload = env.run()
+
+            self.assertEqual(payload["status"], "pr_opened")
+            gate = payload["check_gate"]
+            self.assertEqual(gate["status"], "passed")
+            self.assertEqual((gate["total"], gate["passed"]), (3, 3))
+            self.assertFalse(gate["acceptance_modified"])
+            self.assertEqual(gate["author_input_tokens"], 200)
+            self.assertEqual(payload["input_tokens"], 400)  # author, builder, review, builder
+            self.assertEqual(env.pushed(TASK_PATH), REVISED_SRC)
+            self.assertEqual(env.pushed("app.py"), "TOTAL = 5\n")
+
+            review = env.codex.run_exec_calls[2]
+            self.assertEqual(review["model"], "gpt-6-luna")
+            self.assertEqual(review["output_schema"], acceptance.TEST_AUTHOR_SCHEMA)
+            self.assertIn(
+                "<test-dispute>\ntest_ac2 expects 401 and 400\n</test-dispute>",
+                review["prompt"],
+            )
+            self.assertIn("criterion 2", review["prompt"])
+            self.assertIn("do not adapt the tests to it", review["prompt"])
+            resumed = env.codex.run_exec_calls[3]
+            self.assertIn("Dispute resolved", resumed["prompt"])
+            self.assertTrue(
+                resumed["prompt"].startswith(env.codex.run_exec_calls[1]["prompt"])
+            )
+            check = env.codex.check_calls[0]
+            self.assertEqual(check["expected_tests"], 3)
+            self.assertIn(b"test_ac2_body", base64.b64decode(check["pinned_b64"]))
+            self.assertEqual(env.stages().count("acceptance_authored"), 2)
+            self.assertIn('"outcome": "revised"', _log(env))
+
+    def test_a_second_conflict_after_a_revision_fails_the_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            _queue_dispute(env, env.patch({}), self._revised(env, {}))
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertTrue(payload["error"].startswith("SPEC_CONFLICT (mezon 2)"))
+            self.assertEqual(len(env.codex.run_exec_calls), 4)  # one review only
+            self.assertEqual(env.codex.check_calls, [])
+
+    def test_author_touching_the_implementation_keeps_the_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            _queue_dispute(
+                env,
+                env.patch({"app.py": "TOTAL = 4\n"}),
+                self._revised(env, {"app.py": "X\n"}),
+            )
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn('"outcome": "author_touched_code"', _log(env))
+            self.assertEqual(len(env.codex.run_exec_calls), 3)
+
+    def test_builder_edited_tests_are_never_reviewed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            env.codex.queue_package_result({"patch_b64": _b64(self._revised(env, {}))})
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn('"outcome": "tests_already_modified"', _log(env))
+            self.assertEqual(len(env.codex.run_exec_calls), 2)  # no review exec
+
+    def test_invalid_revision_keeps_the_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            after = make_patch(
+                env.remote,
+                env.base_sha,
+                {**env.author_files, "tests/acceptance/helpers.py": "X = 1\n"},
+            )
+            _queue_dispute(env, env.patch({}), after)
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn('"outcome": "invalid_revision"', _log(env))
+
+    def test_author_not_ok_keeps_the_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            env.codex.queue_package_result({"patch_b64": _b64(env.patch({}))})
+            env.codex.queue_exec_result(
+                _exec_result(
+                    final_message='{"status": "cannot_check", "checks": [], "unchecked": []}'
+                )
+            )
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn('"outcome": "author_not_ok"', _log(env))
+
+    def test_no_budget_left_skips_the_review(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            clock = _Clock()
+            original = env.codex.run_exec
+
+            def run_exec(request: dict[str, Any], **kwargs: Any) -> Any:
+                if len(env.codex.run_exec_calls) == 1:  # the builder
+                    clock.t = implement.RUN_BUDGET_S - 600
+                return original(request, **kwargs)
+
+            env.codex.run_exec = run_exec  # type: ignore[method-assign]
+            with clock.patched():
+                payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn('"outcome": "no_budget"', _log(env))
+            self.assertEqual(len(env.codex.run_exec_calls), 2)
+
+    def test_fixup_conflict_revised_reruns_the_gate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.queue_builder(env.patch({"app.py": "TOTAL = 4\n"}))
+            env.codex.queue_check_result(_failed(["test_ac2_message"]))
+            env.queue_fixup(None, message=self.CONFLICT)
+            workspace = env.patch({"app.py": "TOTAL = 5\n"})
+            _queue_dispute(env, workspace, self._revised(env, {"app.py": "TOTAL = 5\n"}))
+            payload = env.run()
+            self.assertEqual(payload["status"], "pr_opened")
+            gate = payload["check_gate"]
+            self.assertEqual(gate["status"], "passed")
+            self.assertEqual(gate["fixups"], 1)
+            self.assertEqual(gate["total"], 3)
+            self.assertEqual(len(env.codex.check_calls), 2)
+            self.assertEqual(env.codex.check_calls[1]["expected_tests"], 3)
+            self.assertEqual(env.pushed(TASK_PATH), REVISED_SRC)
+            self.assertEqual(env.pushed("app.py"), "TOTAL = 5\n")
+
+    def test_switch_off_never_disputes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp), acceptance_checks_enabled=False)
+            env.queue_builder(
+                env.patch({"NOTES.md": "hi\n"}, with_acceptance=False),
+                message=f"Done.\n{self.CONFLICT}",
+            )
+            payload = env.run(_work())
+            self.assertEqual(payload["status"], "pr_opened")
+            self.assertNotIn("acceptance_dispute", _log(env))
 
 
 class OwnerNoteTests(unittest.TestCase):
