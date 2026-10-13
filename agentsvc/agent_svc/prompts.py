@@ -205,7 +205,8 @@ def compose_test_author_prompt(work: Work, *, task_file: str, acceptance_dir: st
     request's literals live there) plus the numbered acceptance list."""
     init_rule = (
         f"- If, and only if, `{acceptance_dir}/__init__.py` does not exist yet, also "
-        "create it EMPTY; if it exists, do not touch it.\n"
+        "create it EMPTY (zero bytes: no docstring, no comment, no blank line -- "
+        "any content makes the whole station fail); if it exists, do not touch it.\n"
     )
     return (
         f"You are the independent TEST AUTHOR for task #{work.task_id} in "
