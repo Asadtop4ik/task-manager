@@ -429,7 +429,7 @@ def _run_builder_and_publish(
     # always contains it; "no changes" then means no changes OUTSIDE the
     # acceptance directory.
     if station is not None:
-        no_changes = not acceptance.strip_acceptance(patch, station.profile["dir"]).strip()
+        no_changes = not acceptance.strip_locked(patch, station.locked).strip()
     else:
         no_changes = not patch_b64
     if no_changes:
@@ -474,7 +474,7 @@ def _run_builder_and_publish(
             patch=patch,
             deadline=deadline,
         )
-        if not acceptance.strip_acceptance(patch, station.profile["dir"]).strip():
+        if not acceptance.strip_locked(patch, station.locked).strip():
             # A fix-up reverted every non-test change.
             _fail(
                 ctx,
@@ -641,6 +641,11 @@ class _Station:
     # The author's own (artefact-free) patch, which is what the workspace
     # holds; equals `pinned` unless preflight reformatted it.
     raw: bytes = b""
+
+    @property
+    def locked(self) -> tuple[str, str]:
+        """This run's locked paths: its task test file and the package init."""
+        return (self.task_file, acceptance.init_file_path(self.profile))
 
 
 def _log_ignored_marker(
@@ -888,7 +893,7 @@ def _resolve_test_dispute(
         ctx.logger.error(exc, event="acceptance_dispute_package_failed", run_id=work.run_id)
         return None
     if acceptance.drop_artifacts(
-        acceptance.acceptance_sections(before, acceptance_dir)
+        acceptance.locked_sections(before, station.locked)
     ) not in (
         station.raw,
         station.pinned,
@@ -949,15 +954,15 @@ def _resolve_test_dispute(
     # The author may only touch its own test file: the implementation must be
     # byte-for-byte what the builder left.
     code_before = acceptance.drop_artifacts(
-        acceptance.strip_acceptance(before, acceptance_dir)
+        acceptance.strip_locked(before, station.locked)
     )
-    code_after = acceptance.drop_artifacts(acceptance.strip_acceptance(after, acceptance_dir))
+    code_after = acceptance.drop_artifacts(acceptance.strip_locked(after, station.locked))
     if code_before != code_after:
         _log_dispute(ctx, work, conflict, "author_touched_code")
         return None
-    raw = acceptance.drop_artifacts(acceptance.acceptance_sections(after, acceptance_dir))
+    raw = acceptance.drop_artifacts(acceptance.locked_sections(after, station.locked))
     if raw == acceptance.drop_artifacts(
-        acceptance.acceptance_sections(before, acceptance_dir)
+        acceptance.locked_sections(before, station.locked)
     ):
         _log_dispute(ctx, work, conflict, "upheld")
         return None
@@ -1032,9 +1037,8 @@ def _splice_and_gate(
     Returns the final spliced patch to publish -- the PR is opened whether or
     not the gate passed. Raises `_RunEnded` on cancel or a spec conflict that
     the test author upheld (a revised dispute re-runs the gate instead)."""
-    acceptance_dir = station.profile["dir"]
     patch, modified = acceptance.splice(
-        patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
+        patch, station.pinned, station.locked, unmodified=(station.raw,)
     )
     state.acceptance_modified = state.acceptance_modified or modified
     if modified:
@@ -1091,7 +1095,7 @@ def _splice_and_gate(
             # disputing fix-up does not use up a slot (disputes are capped).
             state.fixups -= 1
             new_patch, modified = acceptance.splice(
-                workspace_patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
+                workspace_patch, station.pinned, station.locked, unmodified=(station.raw,)
             )
             state.acceptance_modified = state.acceptance_modified or modified
         if new_patch is None:
@@ -1280,11 +1284,10 @@ def _run_fixup(
     except Exception as exc:
         ctx.logger.error(exc, event="fixup_package_failed", run_id=work.run_id)
         return None
-    acceptance_dir = station.profile["dir"]
-    if not acceptance.strip_acceptance(patch, acceptance_dir).strip():
+    if not acceptance.strip_locked(patch, station.locked).strip():
         return None
     patch, modified = acceptance.splice(
-        patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
+        patch, station.pinned, station.locked, unmodified=(station.raw,)
     )
     state.acceptance_modified = state.acceptance_modified or modified
     return patch

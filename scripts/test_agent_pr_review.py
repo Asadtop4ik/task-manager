@@ -255,9 +255,8 @@ class ReviewPromptContentTests(unittest.TestCase):
     def test_check_gate_line_and_locked_acceptance_rule(self) -> None:
         prompt = self._prompt(check_gate={"status": "passed", "total": 5, "passed": 5})
         self.assertIn("Factory acceptance checks (locked, run before PR): status passed, 5/5 passed.", prompt)
-        self.assertIn(
-            "Treat\n   any change to files under tests/acceptance/ as a P2 finding", prompt
-        )
+        self.assertIn('as a P2 finding titled "Locked\n   acceptance test changed"', prompt)
+        self.assertIn('"Regression acceptance test\n   weakened"', prompt)
         self.assertIn("4. Factory acceptance checks", prompt)
         self.assertTrue(prompt.rstrip().endswith("</untrusted-diff>"))
 

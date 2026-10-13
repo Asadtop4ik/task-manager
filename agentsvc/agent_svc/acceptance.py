@@ -151,6 +151,30 @@ def _is_acceptance(section: Section, acceptance_dir: str) -> bool:
     return bool(section.paths) and any(path.startswith(prefix) for path in section.paths)
 
 
+def locked_paths(profile: dict[str, str], task_id: int) -> tuple[str, str]:
+    """The paths this run locks: its own task test file and the package
+    `__init__.py`. Earlier tasks' files in the acceptance directory are
+    regression tests the builder may update like any other test."""
+    return (task_file_path(profile, task_id), init_file_path(profile))
+
+
+def _is_locked(section: Section, locked: tuple[str, ...]) -> bool:
+    return bool(section.paths) and any(path in locked for path in section.paths)
+
+
+def strip_locked(patch: bytes, locked: tuple[str, ...]) -> bytes:
+    """`patch` without any section touching one of the `locked` paths."""
+    return b"".join(
+        section.data for section in split_sections(patch) if not _is_locked(section, locked)
+    )
+
+
+def locked_sections(patch: bytes, locked: tuple[str, ...]) -> bytes:
+    return b"".join(
+        section.data for section in split_sections(patch) if _is_locked(section, locked)
+    )
+
+
 def strip_acceptance(patch: bytes, acceptance_dir: str) -> bytes:
     """`patch` without any section touching `acceptance_dir/**`."""
     return b"".join(
@@ -186,20 +210,27 @@ def drop_artifacts(patch: bytes) -> bytes:
 def splice(
     builder_patch: bytes,
     pinned: bytes,
-    acceptance_dir: str,
+    locked: tuple[str, ...],
     *,
     unmodified: tuple[bytes, ...] = (),
 ) -> tuple[bytes, bool]:
-    """Drop every acceptance section from the builder's (cumulative) patch and
-    append the pinned author sections. Returns `(patch, acceptance_modified)`:
-    modified is True when the builder's acceptance sections (bytecode caches
-    ignored) differ byte-for-byte from the pinned ones or from any of
-    `unmodified` -- the other byte strings that mean "the builder left the
-    locked tests alone" (the raw author patch, when preflight reformatted it
-    into the pin) -- i.e. edited, deleted or extra files."""
-    found = drop_artifacts(acceptance_sections(builder_patch, acceptance_dir))
+    """Drop every section touching a `locked` path from the builder's
+    (cumulative) patch and append the pinned author sections; the builder's
+    changes to other acceptance files (earlier tasks' regression tests) are
+    kept. Returns `(patch, acceptance_modified)`: modified is True when the
+    builder's locked sections (bytecode caches ignored) differ byte-for-byte
+    from the pinned ones or from any of `unmodified` -- the other byte strings
+    that mean "the builder left the locked tests alone" (the raw author patch,
+    when preflight reformatted it into the pin) -- i.e. edited or deleted."""
+    found = drop_artifacts(locked_sections(builder_patch, locked))
     modified = found != pinned and found not in unmodified
-    kept = strip_acceptance(builder_patch, acceptance_dir)
+    # Bytecode caches the builder left in the acceptance directory never ship.
+    acceptance_dir = locked[-1].rsplit("/", 1)[0]
+    kept = b"".join(
+        section.data
+        for section in split_sections(strip_locked(builder_patch, locked))
+        if not (_is_artifact(section) and _is_acceptance(section, acceptance_dir))
+    )
     if kept and not kept.endswith(b"\n"):
         kept += b"\n"
     return kept + pinned, modified
