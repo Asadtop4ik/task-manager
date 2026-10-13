@@ -2190,13 +2190,15 @@ CHECK_DETAIL_CHARS = 300
 CHECK_MAX_FAILED_IDS = 50
 CHECK_MAX_TEST_ID_CHARS = 200
 CHECK_FSIZE_BYTES = 64 * 1024 * 1024
-CHECK_CANARY_TIMEOUT_S = 30.0
-# Work (clone, canary, tests) may use `timeout_s` plus this much; cleanup is
+CHECK_CANARY_TIMEOUT_S = 15.0
+# Work (clone, canary <= 15s, tests) may use `timeout_s` plus this much, so
+# the tests themselves still get their full `timeout_s`; cleanup is
 # SIGKILL-only and bounded, so the reply still lands well inside the parent's
 # own `timeout_s + 60s` before it SIGTERMs us.
-CHECK_OVERHEAD_S = 20.0
+CHECK_OVERHEAD_S = 35.0
 CHECK_GIT_TIMEOUT_S = 60.0
-CHECK_RUNNER_NPROC = 512
+# Per-uid (all agent-codex tasks, threads included): only a fork-bomb cap.
+CHECK_RUNNER_NPROC = 4096
 CHECK_RUNNER_AS_BYTES = 4 * 1024 * 1024 * 1024
 CHECK_RESULT_PREFIX = "AGENT_SVC_CHECK_RESULT:"
 CANARY_RESULT_PREFIX = "AGENT_SVC_CANARY:"
@@ -2834,6 +2836,7 @@ def cmd_check(request: dict[str, Any]) -> int:
         raise _CheckTerminated
 
     previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    reply: dict[str, Any] | None = None
     try:
         params = _validate_check_request(request)
         run_dir = params.run_dir
@@ -2858,23 +2861,29 @@ def cmd_check(request: dict[str, Any]) -> int:
             else:
                 reply = _run_checks(params, ck, sandbox_env, deadline)
     except _CheckTerminated:
+        reply = None
         _emit_error("check terminated")
         return 3
     except ChildRefusal as exc:
+        reply = None
         _emit_error(str(exc))
         return 3
     except OSError as exc:
+        reply = None
         _emit_error(f"check failed: {exc}")
         return 3
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         with contextlib.suppress(Exception):
-            _reap_all_descendants()
+            _reap_all_descendants(grace_s=0.5)
+        # Reply first: removing a tree the tests filled with many files can
+        # take long, and the parent's own `cleanup` call removes it anyway.
+        if reply is not None:
+            print(json.dumps(reply), flush=True)
         if run_dir is not None:
             for name in ("ck", "ck-home"):
                 shutil.rmtree(run_dir / name, ignore_errors=True)
         signal.signal(signal.SIGTERM, previous)
-    print(json.dumps(reply), flush=True)
     return 0
 
 
