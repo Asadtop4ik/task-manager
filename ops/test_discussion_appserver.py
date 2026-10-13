@@ -38,15 +38,19 @@ class AppServerTests(unittest.TestCase):
             for index, value in enumerate(configured)
             if value == "--config"
         ]
-        self.assertEqual(len(overrides), 2)
+        self.assertEqual(len(overrides), 3)
         settings = {}
         for override in overrides:
             key, value = override.split("=", 1)
             settings[key] = tomllib.loads(f"value={value}")["value"]
         self.assertEqual(
-            settings["mcp_servers.ketoshop_diagnostics.command"], "/usr/bin/python3"
+            settings["mcp_servers.project_diagnostics.command"], "/usr/bin/python3"
         )
-        args = settings["mcp_servers.ketoshop_diagnostics.args"]
+        self.assertEqual(
+            settings["mcp_servers.project_diagnostics.default_tools_approval_mode"],
+            "approve",
+        )
+        args = settings["mcp_servers.project_diagnostics.args"]
         self.assertEqual(args[1:3], ["--discussion-id", "83"])
         self.assertEqual(args[3:5], ["--lease-id", "unpredictable-active-lease"])
         self.assertNotIn("TOKEN", str(configured))

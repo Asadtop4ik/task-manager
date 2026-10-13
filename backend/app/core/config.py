@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     ketoshop_diagnostics_enabled: bool = Field(
         default=False, alias="KETOSHOP_DIAGNOSTICS_ENABLED"
     )
+    # Owner-only live database/log access for the agent in discussion chats.
+    # Both must be set; the project list is comma-separated project keys. The
+    # host-side broker additionally needs a DSN for each listed project.
+    agent_diagnostics_enabled: bool = Field(default=False, alias="AGENT_DIAGNOSTICS_ENABLED")
+    agent_diagnostics_projects: Annotated[frozenset[str], NoDecode] = Field(
+        default_factory=frozenset, alias="AGENT_DIAGNOSTICS_PROJECTS"
+    )
     # Local agent-svc executor: a systemd service that leases coding work instead
     # of GitHub Actions running it. Empty project list keeps every project on the
     # existing GitHub dispatch path, byte-for-byte.
@@ -110,9 +117,11 @@ class Settings(BaseSettings):
         default_factory=frozenset, alias="AGENT_LOCAL_EXECUTOR_PROJECTS"
     )
 
-    @field_validator("agent_local_executor_projects", mode="before")
+    @field_validator(
+        "agent_local_executor_projects", "agent_diagnostics_projects", mode="before"
+    )
     @classmethod
-    def _parse_local_executor_projects(cls, value: object) -> frozenset[str]:
+    def _parse_project_key_set(cls, value: object) -> frozenset[str]:
         if isinstance(value, str):
             return frozenset(part.strip() for part in value.split(",") if part.strip())
         if isinstance(value, (list, tuple, set, frozenset)):

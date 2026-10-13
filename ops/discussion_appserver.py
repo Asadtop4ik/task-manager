@@ -78,9 +78,11 @@ def _app_server_command(
             DIAGNOSTIC_SOCKET,
         ], separators=(",", ":"))
         command.extend([
-            "--config", 'mcp_servers.ketoshop_diagnostics.command="/usr/bin/python3"',
+            "--config", 'mcp_servers.project_diagnostics.command="/usr/bin/python3"',
             "--config",
-            f"mcp_servers.ketoshop_diagnostics.args={proxy_args}",
+            f"mcp_servers.project_diagnostics.args={proxy_args}",
+            "--config",
+            'mcp_servers.project_diagnostics.default_tools_approval_mode="approve"',
         ])
     return command
 

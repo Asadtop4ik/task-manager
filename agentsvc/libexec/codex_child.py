@@ -1851,9 +1851,13 @@ def _app_server_argv(
         command.extend(
             [
                 "--config",
-                'mcp_servers.ketoshop_diagnostics.command="/usr/bin/python3"',
+                'mcp_servers.project_diagnostics.command="/usr/bin/python3"',
                 "--config",
-                f"mcp_servers.ketoshop_diagnostics.args={proxy_args}",
+                f"mcp_servers.project_diagnostics.args={proxy_args}",
+                # approval_policy is "never" and every approval ask fails the
+                # turn, so the broker's own owner/lease checks are the gate.
+                "--config",
+                'mcp_servers.project_diagnostics.default_tools_approval_mode="approve"',
             ]
         )
     return command

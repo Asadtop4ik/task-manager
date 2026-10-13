@@ -322,3 +322,189 @@ def structured_log_metadata(line: str) -> dict[str, Any] | None:
     ):
         safe["status_code"] = status
     return safe or None
+
+
+# --------------------------------------------------------------------------
+# Full-access tools (db_sql / logs / containers). The owner chose full database
+# and log access for the agent; the controls kept here are that the agent never
+# holds a DSN, that exactly one statement runs per call, and that credentials do
+# not leak back through result cells or log lines.
+# --------------------------------------------------------------------------
+
+MAX_SQL_CHARS = 16_000
+MAX_CELL_CHARS = 2_000
+# Rows are packed into the 64 KB result with headroom for the JSON envelope.
+RESULT_BODY_BUDGET = 60 * 1024
+
+_TRANSACTION_CONTROL = frozenset(
+    {"begin", "start", "commit", "end", "rollback", "abort", "savepoint", "release"}
+)
+_LEADING_WORD = re.compile(r"[A-Za-z_]+")
+_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_MASKED_NAME = re.compile(
+    r"password|passwd|secret|token|api_?key|private_?key|hash",
+    re.IGNORECASE,
+)
+# Short words need a boundary so "footprint" or "salted_at" style names are not
+# masked by accident; "otp_code", "user_otp" and "salt" are.
+_MASKED_SHORT_NAME = re.compile(r"(?:^|[^a-z])(?:otp|salt)(?:[^a-z]|$)", re.IGNORECASE)
+
+
+def validate_single_statement(sql: object) -> str:
+    """Return `sql` stripped of one trailing semicolon, or raise QueryError.
+
+    Walks the text the way the server lexes it (comments, quoted strings and
+    identifiers, dollar quoting) so a `;` inside them is not a separator. The
+    check exists because psycopg runs a parameterless query as a simple query,
+    which would otherwise accept `SELECT 1; COMMIT; ...` and escape the
+    READ ONLY transaction.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        raise QueryError("sql must be a non-empty string")
+    if len(sql) > MAX_SQL_CHARS:
+        raise QueryError(f"sql must be at most {MAX_SQL_CHARS} characters")
+    if "\x00" in sql:
+        raise QueryError("sql must not contain NUL characters")
+    length = len(sql)
+    index = 0
+    statements = 0
+    has_content = False
+    first_word = ""
+    while index < length:
+        char = sql[index]
+        if char == "-" and sql.startswith("--", index):
+            end = sql.find("\n", index)
+            index = length if end < 0 else end + 1
+            continue
+        if char == "/" and sql.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < length and depth:
+                if sql.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif sql.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise QueryError("unterminated block comment")
+            continue
+        if char in "'\"":
+            escaped = (
+                char == "'"
+                and index > 0
+                and sql[index - 1] in "eE"
+                and (index < 2 or not (sql[index - 2].isalnum() or sql[index - 2] == "_"))
+            )
+            index += 1
+            while True:
+                if index >= length:
+                    raise QueryError("unterminated quoted string")
+                if escaped and sql[index] == "\\":
+                    index += 2
+                    continue
+                if sql[index] == char:
+                    if index + 1 < length and sql[index + 1] == char:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            has_content = True
+            if not first_word:
+                first_word = "?"
+            continue
+        if char == "$":
+            tag = _DOLLAR_TAG.match(sql, index)
+            if tag is not None:
+                end = sql.find(tag.group(0), tag.end())
+                if end < 0:
+                    raise QueryError("unterminated dollar-quoted string")
+                index = end + len(tag.group(0))
+                has_content = True
+                if not first_word:
+                    first_word = "?"
+                continue
+        if char == ";":
+            if has_content:
+                statements += 1
+                has_content = False
+            index += 1
+            continue
+        if not char.isspace():
+            if statements and not has_content:
+                raise QueryError("only one SQL statement is allowed per call")
+            if not first_word:
+                match = _LEADING_WORD.match(sql, index)
+                first_word = match.group(0).lower() if match else "?"
+            has_content = True
+        index += 1
+    if has_content:
+        statements += 1
+    if statements != 1:
+        raise QueryError("exactly one SQL statement is required")
+    if first_word in _TRANSACTION_CONTROL:
+        raise QueryError("transaction control statements are not allowed")
+    return sql.strip()
+
+
+def is_masked_column(name: object) -> bool:
+    text = str(name)
+    return bool(_MASKED_NAME.search(text) or _MASKED_SHORT_NAME.search(text))
+
+
+def clean_cell(value: Any) -> Any:
+    """JSON-safe cell, with long text clipped to MAX_CELL_CHARS."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<{len(bytes(value))} bytes>"
+    if isinstance(value, str):
+        text = value
+    elif hasattr(value, "isoformat"):
+        text = value.isoformat()
+    elif isinstance(value, (dict, list, tuple)):
+        text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    else:
+        text = str(value)
+    if len(text) > MAX_CELL_CHARS:
+        return text[:MAX_CELL_CHARS] + "...[truncated]"
+    return text
+
+
+def pack_rows(
+    columns: list[str], rows: list[tuple[Any, ...]], limit: int = MAX_ROWS
+) -> tuple[list[list[Any]], bool, list[str]]:
+    """Mask, clip and size-cap rows. Returns (rows, truncated, masked columns)."""
+    masked_indexes = [i for i, name in enumerate(columns) if is_masked_column(name)]
+    packed: list[list[Any]] = []
+    used = len(json.dumps(columns, ensure_ascii=False, separators=(",", ":")).encode())
+    truncated = len(rows) > limit
+    for row in rows[:limit]:
+        cells = [clean_cell(cell) for cell in row]
+        for i in masked_indexes:
+            if cells[i] is not None:
+                cells[i] = "[masked]"
+        size = len(json.dumps(cells, ensure_ascii=False, separators=(",", ":")).encode()) + 1
+        if used + size > RESULT_BODY_BUDGET:
+            truncated = True
+            break
+        used += size
+        packed.append(cells)
+    return packed, truncated, [columns[i] for i in masked_indexes]
+
+
+_DSN_PASSWORD = re.compile(r"(?i)\b(postgres(?:ql)?(?:\+\w+)?://[^:/@\s]+:)[^@\s]+(@)")
+_LOG_BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}")
+
+
+def redact_credentials(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """Strip known secrets and obvious credential shapes; keep everything else."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = _DSN_PASSWORD.sub(r"\1[redacted]\2", text)
+    text = _BEARER.sub("Bearer [redacted]", text)
+    return _LOG_BOT_TOKEN.sub("[redacted-token]", text)

@@ -4,22 +4,30 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from diagnostic_proxy import HOST_CALL_TIMEOUT_SECONDS, TOOLS, _tool_call
 
 
 class DiagnosticProxyTests(unittest.TestCase):
-    def test_exposes_only_fixed_read_tools_and_forwards_bound_discussion_id(self):
-        self.assertGreaterEqual(HOST_CALL_TIMEOUT_SECONDS, 12)
+    def test_exposes_only_fixed_tools_and_forwards_bound_discussion_id(self):
+        self.assertGreaterEqual(HOST_CALL_TIMEOUT_SECONDS, 25)
         self.assertEqual(
             [tool["name"] for tool in TOOLS],
             [
                 "ketoshop_query",
                 "ketoshop_recent_logs",
                 "ketoshop_finance_summary",
+                "db_sql",
+                "logs",
+                "containers",
             ],
         )
-        for tool in TOOLS:
+        # db_sql can write, so it is the one tool that must not claim read-only.
+        self.assertFalse(
+            next(t for t in TOOLS if t["name"] == "db_sql")["annotations"]["readOnlyHint"]
+        )
+        for tool in (t for t in TOOLS if t["name"] != "db_sql"):
             with self.subTest(tool=tool["name"]):
                 annotations = tool["annotations"]
                 self.assertEqual(
@@ -72,6 +80,48 @@ class DiagnosticProxyTests(unittest.TestCase):
             self.assertEqual(received[0]["lease_id"], "owner-turn-lease")
             self.assertEqual(received[0]["tool"], "ketoshop_query")
             self.assertNotIn("intake_token", received[0])
+
+    def test_new_tools_forward_validated_arguments_and_reject_bad_shapes(self):
+        sent = []
+
+        def fake_host(_socket, payload):
+            sent.append(payload)
+            return {"ok": True, "result": {}}
+
+        with patch("diagnostic_proxy._request_host", fake_host):
+            ok = _tool_call(
+                "s",
+                5,
+                "lease",
+                {"name": "db_sql", "arguments": {"sql": "SELECT 1", "write": False}},
+            )
+            self.assertTrue(ok["ok"])
+            self.assertEqual(
+                sent[0],
+                {
+                    "discussion_id": 5,
+                    "lease_id": "lease",
+                    "tool": "db_sql",
+                    "arguments": {"sql": "SELECT 1", "write": False},
+                },
+            )
+            for name, arguments in (
+                ("db_sql", {}),
+                ("db_sql", {"sql": ""}),
+                ("db_sql", {"sql": "x" * 16_001}),
+                ("db_sql", {"sql": "SELECT 1", "write": "true"}),
+                ("db_sql", {"sql": "SELECT 1", "dsn": "postgresql://x"}),
+                ("logs", {"tail": 2001}),
+                ("logs", {"since_minutes": 1441}),
+                ("logs", {"grep": ""}),
+                ("logs", {"container": 3}),
+                ("containers", {"container": "x"}),
+            ):
+                with self.subTest(name=name, arguments=arguments):
+                    self.assertFalse(
+                        _tool_call("s", 5, "lease", {"name": name, "arguments": arguments})["ok"]
+                    )
+            self.assertEqual(len(sent), 1)
 
 
 if __name__ == "__main__":

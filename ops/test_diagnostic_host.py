@@ -12,7 +12,15 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import diagnostic_host
-from diagnostic_host import AuditLog, DiagnosticHost, _narrow_socket_group
+from diagnostic_host import (
+    MAX_AUDIT_AGE,
+    MAX_AUDIT_LINES,
+    AuditLog,
+    Context,
+    DiagnosticHost,
+    DiagnosticsError,
+    _narrow_socket_group,
+)
 
 
 class SocketGroupTests(unittest.TestCase):
@@ -70,15 +78,19 @@ class SocketGroupTests(unittest.TestCase):
 
 
 class DiagnosticHostTests(unittest.TestCase):
-    def test_audit_prunes_records_older_than_24h_and_caps_at_500(self):
+    def test_audit_prunes_old_records_and_caps_the_line_count(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "audit.jsonl"
             now = datetime.now(timezone.utc)
             records = [
-                {"time": (now - timedelta(hours=25)).isoformat(), "marker": "old"}
+                {
+                    "time": (now - MAX_AUDIT_AGE - timedelta(hours=1)).isoformat(),
+                    "marker": "old",
+                }
             ]
             records.extend(
-                {"time": now.isoformat(), "marker": str(index)} for index in range(500)
+                {"time": now.isoformat(), "marker": str(index)}
+                for index in range(MAX_AUDIT_LINES)
             )
             path.write_text("\n".join(json.dumps(row) for row in records) + "\n")
             AuditLog(path).record(
@@ -93,10 +105,10 @@ class DiagnosticHostTests(unittest.TestCase):
                 }
             )
             kept = [json.loads(line) for line in path.read_text().splitlines()]
-            self.assertEqual(len(kept), 500)
+            self.assertEqual(len(kept), MAX_AUDIT_LINES)
             self.assertNotIn("old", [row.get("marker") for row in kept])
 
-    def test_calls_are_owner_context_checked_capped_and_audited_without_payload(self):
+    def test_calls_are_owner_context_checked_capped_and_audited_without_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             audit = AuditLog(Path(directory) / "audit.jsonl")
             host = DiagnosticHost(
@@ -105,7 +117,7 @@ class DiagnosticHostTests(unittest.TestCase):
                 api_base_url="https://api.test/api/v1",
                 audit=audit,
             )
-            context = Mock(return_value=(3, 41, 9, "ketoshop"))
+            context = Mock(return_value=Context(3, 41, 9, "ketoshop", False))
             host._context = context
             host._orders = Mock(
                 return_value=(
@@ -121,16 +133,16 @@ class DiagnosticHostTests(unittest.TestCase):
                 "query": "SELECT order_id FROM ketoshop_diag_orders",
             }
 
-            for _ in range(10):
+            for _ in range(30):
                 self.assertTrue(host.handle(request)["ok"])
             limited = host.handle(request)
             self.assertFalse(limited["ok"])
-            self.assertIn("10 diagnostic calls", limited["error"])
-            self.assertEqual(context.call_count, 11)
-            self.assertEqual(host._orders.call_count, 10)
+            self.assertIn("30 diagnostic calls", limited["error"])
+            self.assertEqual(context.call_count, 31)
+            self.assertEqual(host._orders.call_count, 30)
 
             records = [json.loads(line) for line in audit.path.read_text().splitlines()]
-            self.assertEqual(len(records), 11)
+            self.assertEqual(len(records), 31)
             self.assertTrue(
                 all(
                     set(record)
@@ -143,16 +155,24 @@ class DiagnosticHostTests(unittest.TestCase):
                         "project_key",
                         "tool",
                         "query_sha256",
+                        "write",
+                        "sql",
+                        "detail",
                         "rows",
                         "result_bytes",
                         "duration_ms",
                         "outcome",
+                        "error",
                     }
                     for record in records
                 )
             )
             audit_text = audit.path.read_text()
-            self.assertNotIn("SELECT", audit_text)
+            # The full statement is audited; result rows never are.
+            self.assertEqual(
+                records[0]["sql"], "SELECT order_id FROM ketoshop_diag_orders"
+            )
+            self.assertNotIn("71001", audit_text)
             self.assertNotIn("private-db-secret", audit_text)
             self.assertNotIn("private-worker-token", audit_text)
             self.assertNotIn("Synthetic Customer", audit_text)
@@ -180,6 +200,7 @@ class DiagnosticHostTests(unittest.TestCase):
                 {
                     "authorized": authorized,
                     "active": authorized,
+                    "owner_initiated": authorized,
                     "project_key": "ketoshop" if authorized else "other",
                     "revision": 4 if authorized else 0,
                     "actor_id": 41 if authorized else 0,
@@ -301,8 +322,6 @@ class DiagnosticHostTests(unittest.TestCase):
         self.assertNotIn("private full text", encoded.decode())
 
         exit_status["value"] = 1
-        from diagnostic_host import DiagnosticsError
-
         with self.assertRaisesRegex(DiagnosticsError, "logs are unavailable"):
             host._logs()
 

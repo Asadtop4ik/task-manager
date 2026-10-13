@@ -1,5 +1,5 @@
 [Unit]
-Description=Task Manager owner-only Ketoshop read diagnostics broker
+Description=Task Manager owner-only project diagnostics broker (database and logs)
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
@@ -37,7 +37,8 @@ ExecStart=/opt/task-manager/diagnostics-venv/bin/python /opt/task-manager/ops/di
 Restart=on-failure
 RestartSec=3
 CPUQuota=25%
-MemoryMax=256M
+# db_sql buffers up to one result set client-side before capping it at 200 rows.
+MemoryMax=512M
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
