@@ -1207,12 +1207,79 @@ class TestDisputeTests(unittest.TestCase):
             self.assertEqual(payload["status"], "pr_opened")
             gate = payload["check_gate"]
             self.assertEqual(gate["status"], "passed")
-            self.assertEqual(gate["fixups"], 1)
+            self.assertEqual(gate["fixups"], 0)  # the disputing fix-up is refunded
             self.assertEqual(gate["total"], 3)
             self.assertEqual(len(env.codex.check_calls), 2)
             self.assertEqual(env.codex.check_calls[1]["expected_tests"], 3)
             self.assertEqual(env.pushed(TASK_PATH), REVISED_SRC)
             self.assertEqual(env.pushed("app.py"), "TOTAL = 5\n")
+
+    def test_dispute_cap_spans_builder_and_fixups(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            _queue_dispute(env, env.patch({}), self._revised(env, {}))
+            env.queue_builder(self._revised(env, {"app.py": "TOTAL = 4\n"}))
+            env.codex.queue_check_result(_failed(["test_ac1_header"]))
+            env.queue_fixup(None, message=self.CONFLICT)
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertTrue(payload["error"].startswith("SPEC_CONFLICT (mezon 2)"))
+            self.assertEqual(len(env.codex.run_exec_calls), 5)  # no second review
+            self.assertEqual(_log(env).count('"event": "acceptance_dispute"'), 1)
+
+    def test_review_prompt_redacts_the_reason(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            line = 'AGENT_SPEC_CONFLICT: {"criterion": 1, "reason": "uses svc-token"}'
+            env.codex.queue_exec_result(_exec_result(final_message=line))
+            _queue_dispute(env, env.patch({}), env.patch({}))
+            env.run()
+            review = env.codex.run_exec_calls[2]["prompt"]
+            self.assertIn("<test-dispute>", review)
+            self.assertNotIn("svc-token", review)
+
+    def test_review_exec_error_keeps_the_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            env.codex.queue_package_result({"patch_b64": _b64(env.patch({}))})
+            original = env.codex.run_exec
+
+            def run_exec(request: dict[str, Any], **kwargs: Any) -> Any:
+                if len(env.codex.run_exec_calls) == 2:  # the review
+                    env.codex.run_exec_calls.append(request)
+                    raise CodexChildError(1, "boom")
+                return original(request, **kwargs)
+
+            env.codex.run_exec = run_exec  # type: ignore[method-assign]
+            payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertTrue(payload["error"].startswith("SPEC_CONFLICT (mezon 2)"))
+
+    def test_too_little_budget_after_the_review_keeps_the_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            env = _Env(Path(tmp))
+            env.queue_author()
+            env.codex.queue_exec_result(_exec_result(final_message=self.CONFLICT))
+            _queue_dispute(env, env.patch({}), self._revised(env, {}))
+            clock = _Clock()
+            original = env.codex.package
+
+            def package(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+                if len(env.codex.package_calls) == 2:  # after the review
+                    clock.t = implement.RUN_BUDGET_S - 300
+                return original(request, **kwargs)
+
+            env.codex.package = package  # type: ignore[method-assign]
+            with clock.patched():
+                payload = env.run()
+            self.assertEqual(payload["status"], "failed")
+            self.assertIn('"outcome": "no_budget_after_review"', _log(env))
+            self.assertEqual(len(env.codex.run_exec_calls), 3)
 
     def test_switch_off_never_disputes(self) -> None:
         with TemporaryDirectory() as tmp:

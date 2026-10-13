@@ -62,6 +62,10 @@ _MIN_AUTHOR_REMAINING_S = 900.0
 # disputed tests or upholds them); only an upheld or repeated conflict fails
 # the run with SPEC_CONFLICT for the owner.
 MAX_TEST_DISPUTES = 1
+# The review (author exec + package/preflight) plus a useful builder re-run and
+# the gate must still fit; after a revision at least FIXUP_MIN_REMAINING_S must
+# be left, or the conflict stands (never an ungated PR with rewritten tests).
+_MIN_DISPUTE_REMAINING_S = 1500.0
 _CHECK_GRACE_S = 60.0
 _CHECK_STATUSES = frozenset({"passed", "failed", "error", "unavailable"})
 _MAX_OUTPUT_TAIL = 4000
@@ -870,7 +874,7 @@ def _resolve_test_dispute(
     revision). Raises `_RunEnded` on cancel."""
     if state.disputes >= MAX_TEST_DISPUTES:
         return None
-    if deadline - _monotonic() < _MIN_AUTHOR_REMAINING_S:
+    if deadline - _monotonic() < _MIN_DISPUTE_REMAINING_S:
         _log_dispute(ctx, work, conflict, "no_budget")
         return None
     state.disputes += 1
@@ -972,12 +976,16 @@ def _resolve_test_dispute(
     except Exception as exc:
         ctx.logger.error(exc, event="acceptance_dispute_package_failed", run_id=work.run_id)
         return None
+    if deadline - _monotonic() < FIXUP_MIN_REMAINING_S:
+        _log_dispute(ctx, work, conflict, "no_budget_after_review")
+        return None
     _log_dispute(
         ctx,
         work,
         conflict,
         "revised",
         sha256=acceptance.sha256_hex(pinned),
+        tests_before=station.test_count,
         tests=test_count,
     )
     run.stage("acceptance_authored", base_sha=base_sha)
@@ -1079,7 +1087,9 @@ def _splice_and_gate(
                 _fail_spec_conflict(ctx, work, run, state, dispute.conflict)
                 raise _RunEnded from None
             station, workspace_patch = resolved
-            # The fix-up's code plus the revised tests, gated again.
+            # The fix-up's code plus the revised tests, gated again; the
+            # disputing fix-up does not use up a slot (disputes are capped).
+            state.fixups -= 1
             new_patch, modified = acceptance.splice(
                 workspace_patch, station.pinned, acceptance_dir, unmodified=(station.raw,)
             )
@@ -1208,8 +1218,9 @@ def _run_fixup(
 ) -> bytes | None:
     """One fix-up exec in the same workspace, then re-package and re-splice.
     Returns the new spliced patch, or `None` if the fix-up produced nothing
-    usable (the caller keeps the previous patch). Raises `_RunEnded` on
-    cancel or a spec conflict."""
+    usable (the caller keeps the previous patch). Raises `_TestDispute` on a
+    spec conflict while a test dispute is still allowed, `_RunEnded` on cancel
+    or any other spec conflict."""
     matrix = ctx.settings.model_matrix["fixup"]
     state.fixup_model = str(matrix["model"])
     try:
